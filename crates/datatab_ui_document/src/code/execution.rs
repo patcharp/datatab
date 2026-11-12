@@ -1,0 +1,4908 @@
+use super::*;
+use crate::data_grid_panel::{LimitedRowActions, LimitedRowTotal};
+use datatab_core::observability::actions as audit_actions;
+
+/// Resolve the `ExecutionSourceContext` for the next query, giving precedence
+/// to a panel-emitted override window over the input-field fallback.
+///
+/// When `override_bounds` is `Some`, the result is a `CollectionWindow` built
+/// from those bounds and the current `targets` / `query_mode`. The `fallback`
+/// is discarded — including its `Err`, since panel bounds are authoritative
+/// and must not be blocked by stale input text.
+///
+/// When `override_bounds` is `None`, the result is whatever the input-driven
+/// `fallback` produced.
+fn resolve_source_context(
+    override_bounds: Option<(i64, i64)>,
+    targets: Vec<String>,
+    query_mode: Option<String>,
+    fallback: Result<datatab_core::ExecutionSourceContext, &'static str>,
+) -> Result<datatab_core::ExecutionSourceContext, &'static str> {
+    if let Some((start_ms, end_ms)) = override_bounds {
+        return Ok(datatab_core::ExecutionSourceContext::CollectionWindow {
+            targets,
+            start_ms,
+            end_ms,
+            query_mode,
+        });
+    }
+    fallback
+}
+
+/// Decides whether a dangerous query runs, asks first or is refused, from the
+/// connection's effective settings. Shared by the code editor and the
+/// key-value console so both apply the same rules.
+pub(crate) fn evaluate_dangerous_with_effective_settings(
+    kind: datatab_core::DangerousQueryKind,
+    is_suppressed: bool,
+    effective: &datatab_core::EffectiveSettings,
+    allow_redis_flush: bool,
+) -> datatab_core::DangerousAction {
+    use datatab_core::DangerousQueryKind::*;
+
+    if !allow_redis_flush && matches!(kind, RedisFlushAll | RedisFlushDb) {
+        return datatab_core::DangerousAction::Block(datatab_i18n::t!(
+            "document.code.execution.toast.redis_flush_disabled"
+        ));
+    }
+
+    if !effective.confirm_dangerous {
+        return datatab_core::DangerousAction::Allow;
+    }
+
+    if !effective.requires_where && matches!(kind, DeleteNoWhere | UpdateNoWhere) {
+        return datatab_core::DangerousAction::Allow;
+    }
+
+    if effective.requires_preview {
+        return datatab_core::DangerousAction::Confirm(kind);
+    }
+
+    if is_suppressed {
+        return datatab_core::DangerousAction::Allow;
+    }
+
+    datatab_core::DangerousAction::Confirm(kind)
+}
+
+/// Returns `true` when the connection's profile is set to read-only and
+/// `query` would do more than read data or metadata.
+///
+/// The query is classified with the connection's own language service, so
+/// driver-owned dialects are rated by their driver. Only the profile setting
+/// is enforced here; a server that rejects writes reports them itself.
+fn is_refused_by_read_only_profile(
+    connected: &datatab_core::ConnectedProfile,
+    query: &str,
+) -> bool {
+    if connected.read_only_reason != Some(datatab_core::ReadOnlyReason::ProfileSetting) {
+        return false;
+    }
+
+    let classification = datatab_core::classify_query_for_language_with_service(
+        &connected.connection.metadata().query_language,
+        query,
+        Some(connected.connection.language_service()),
+    );
+
+    !matches!(
+        classification,
+        datatab_core::ExecutionClassification::Metadata
+            | datatab_core::ExecutionClassification::Read
+    )
+}
+
+fn show_read_only_profile_toast(cx: &mut App) {
+    let msg = datatab_i18n::t!("document.code.execution.toast.read_only_profile");
+    Toast::error(msg.clone())
+        .meta_right(now_hms())
+        .action(copy_action(msg))
+        .push(cx);
+}
+
+fn task_target_for_execution(
+    profile_id: Uuid,
+    connected: &datatab_core::ConnectedProfile,
+    target_db: Option<&str>,
+) -> TaskTarget {
+    let database = target_db.and_then(|database| {
+        (connected.connection.schema_loading_strategy()
+            == SchemaLoadingStrategy::ConnectionPerDatabase
+            && connected
+                .schema
+                .as_ref()
+                .and_then(|schema| schema.current_database())
+                .is_none_or(|current| current != database))
+        .then(|| database.to_string())
+    });
+
+    TaskTarget {
+        profile_id,
+        database,
+    }
+}
+
+impl CodeDocument {
+    /// Returns selected text when a non-empty selection exists.
+    pub(super) fn selected_query(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        self.selected_query_text(cx)
+    }
+
+    fn selected_query_text(&self, cx: &App) -> Option<String> {
+        let state = self.editor.input_state.read(cx);
+        let ranges = state.selected_nonempty_ranges();
+        if ranges.is_empty() {
+            return None;
+        }
+        let fragments = ranges
+            .into_iter()
+            .filter_map(|range| state.value().get(range).map(str::to_string))
+            .collect::<Vec<_>>();
+        let text = fragments.join("\n");
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_string())
+    }
+
+    /// The text an auto-refresh runs, and whether it is the selection: the
+    /// selection when there is one, otherwise the whole buffer, exactly as a
+    /// manual run picks it.
+    pub(super) fn auto_refresh_query(&self, cx: &App) -> (String, bool) {
+        match self.selected_query_text(cx) {
+            Some(selection) => (selection, true),
+            None => (self.editor.input_state.read(cx).value().to_string(), false),
+        }
+    }
+
+    /// Returns the selected text if a selection exists, otherwise the full editor content.
+    fn selected_or_full_query(&self, window: &mut Window, cx: &mut Context<Self>) -> String {
+        self.selected_query(window, cx)
+            .unwrap_or_else(|| self.editor.input_state.read(cx).value().to_string())
+    }
+
+    fn clear_live_output(&mut self) {
+        self.execution.live_output = None;
+        self.execution._live_output_drain = None;
+    }
+
+    fn start_live_output(&mut self, receiver: OutputReceiver, cx: &mut Context<Self>) {
+        self.execution.live_output = Some(LiveOutputState::new(receiver));
+        self.execution._live_output_drain = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(150))
+                    .await;
+
+                let should_continue = cx.update(|cx| {
+                    let Some(entity) = this.upgrade() else {
+                        return false;
+                    };
+
+                    entity.update(cx, |doc, cx| {
+                        let Some(live_output) = doc.execution.live_output.as_mut() else {
+                            return false;
+                        };
+
+                        let changed = live_output.drain();
+
+                        if changed {
+                            cx.notify();
+                        }
+
+                        !live_output.is_finished()
+                    })
+                });
+
+                if !should_continue {
+                    break;
+                }
+            }
+        }));
+    }
+
+    pub fn run_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
+        if !self.supports_connection_context() {
+            self.run_script(window, cx);
+            return;
+        }
+        self.run_query_impl(false, window, cx);
+    }
+
+    fn run_query_impl(&mut self, in_new_tab: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.execution.load_all_rows = None;
+
+        // A selection always runs as-is, without the script confirmation.
+        if let Some(query) = self.selected_query(window, cx) {
+            self.execution.query_origin = None;
+            self.run_query_text(query, in_new_tab, window, cx);
+            return;
+        }
+
+        let state = self.editor.input_state.read(cx);
+        let query = state.value().to_string();
+        let cursor = state.cursor();
+
+        // Without a selection, a buffer of several statements runs only the
+        // one under the cursor; selecting everything runs the whole script.
+        let cursor_statement =
+            statements::cursor_statement(self.effective_language(), &query, cursor)
+                .and_then(|range| Some((range.start, query.get(range)?.to_string())));
+
+        if let Some((origin, statement)) = cursor_statement {
+            // A lone BEGIN leaves a transaction open that later runs silently
+            // join; a lone COMMIT or ROLLBACK ends nothing the script did.
+            if statements::is_transaction_boundary(&statement) {
+                let statement_count = self.effective_language().statement_count(&query);
+                let line = query
+                    .get(..origin)
+                    .map_or(0, |prefix| prefix.matches('\n').count())
+                    + 1;
+
+                self.ask_script_confirm(
+                    PendingScriptConfirm {
+                        query,
+                        in_new_tab,
+                        statement_count,
+                        cursor_statement: Some(CursorStatement {
+                            text: statement,
+                            origin,
+                            line,
+                            offers_script: statements::guard_offers_script(
+                                self.connection_capabilities(cx),
+                            ),
+                        }),
+                    },
+                    window,
+                    cx,
+                );
+                return;
+            }
+
+            self.execution.query_origin = Some(origin);
+            self.run_query_text(statement, in_new_tab, window, cx);
+            return;
+        }
+
+        self.execution.query_origin = Some(0);
+
+        // A language without a statement splitter, or a buffer with a
+        // compound block, runs the whole buffer. When
+        // it holds more than one statement and the driver can execute batches,
+        // confirm before running the entire script.
+        if let Some(statement_count) = self.script_statement_count(&query, cx) {
+            self.ask_script_confirm(
+                PendingScriptConfirm {
+                    query,
+                    in_new_tab,
+                    statement_count,
+                    cursor_statement: None,
+                },
+                window,
+                cx,
+            );
+            return;
+        }
+
+        self.run_query_text(query, in_new_tab, window, cx);
+    }
+
+    /// Shows the script confirmation and moves focus into it, off the editor
+    /// input, so Enter and Escape resolve it instead of editing the buffer
+    /// behind it.
+    fn ask_script_confirm(
+        &mut self,
+        pending: PendingScriptConfirm,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending.script_confirm = Some(pending);
+        self.script_confirm_focus.focus(None, window, cx);
+        cx.notify();
+    }
+
+    /// Shows the dangerous query confirmation and moves focus into it, off
+    /// the editor input, so Enter and Escape resolve it instead of editing the
+    /// buffer behind it.
+    pub(super) fn ask_dangerous_query_confirm(
+        &mut self,
+        pending: PendingDangerousQuery,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending.dangerous_query = Some(pending);
+        self.dangerous_query_focus.focus(None, window, cx);
+        cx.notify();
+    }
+
+    /// Returns the statement count when `query` is a multi-statement script and
+    /// the active connection's driver advertises `MULTI_STATEMENT`.
+    ///
+    /// Returns `None` for a single statement or a driver that cannot execute
+    /// batches, in which case no confirmation is shown.
+    fn script_statement_count(&self, query: &str, cx: &Context<Self>) -> Option<usize> {
+        let count = self.effective_language().statement_count(query);
+        if count <= 1 {
+            return None;
+        }
+
+        let conn_id = self.connection_id?;
+        let app_state = self.app_state.read(cx);
+        let connected = app_state.connections().get(&conn_id)?;
+
+        let supports_batch = connected
+            .connection
+            .metadata()
+            .capabilities
+            .contains(DriverCapabilities::MULTI_STATEMENT);
+
+        supports_batch.then_some(count)
+    }
+
+    /// Capabilities of the active connection's driver, `None` without one.
+    fn connection_capabilities(&self, cx: &Context<Self>) -> Option<DriverCapabilities> {
+        let conn_id = self.connection_id?;
+        let app_state = self.app_state.read(cx);
+        let connected = app_state.connections().get(&conn_id)?;
+
+        Some(connected.connection.metadata().capabilities)
+    }
+
+    pub(super) fn confirm_script_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Enter confirms the dialog; when it offers only the statement under
+        // the cursor, that is what Enter runs.
+        let statement_only = self
+            .pending
+            .script_confirm
+            .as_ref()
+            .and_then(|pending| pending.cursor_statement.as_ref())
+            .is_some_and(|statement| !statement.offers_script);
+        if statement_only {
+            self.confirm_cursor_statement(window, cx);
+            return;
+        }
+
+        let Some(pending) = self.pending.script_confirm.take() else {
+            return;
+        };
+
+        self.script_confirm_focus.restore(cx);
+        self.focus(window, cx);
+        cx.notify();
+        self.execution.query_origin = Some(0);
+        self.run_query_text(pending.query, pending.in_new_tab, window, cx);
+    }
+
+    /// Runs only the transaction boundary the script confirmation was raised
+    /// for, as a run without the confirmation would have.
+    pub(super) fn confirm_cursor_statement(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending.script_confirm.take() else {
+            return;
+        };
+
+        self.script_confirm_focus.restore(cx);
+        self.focus(window, cx);
+        cx.notify();
+
+        let Some(statement) = pending.cursor_statement else {
+            return;
+        };
+
+        self.execution.query_origin = Some(statement.origin);
+        self.run_query_text(statement.text, pending.in_new_tab, window, cx);
+    }
+
+    pub(super) fn cancel_script_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending.script_confirm = None;
+        self.script_confirm_focus.restore(cx);
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    pub(super) fn run_query_text(
+        &mut self,
+        query: String,
+        in_new_tab: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.run_query_text_with(query, in_new_tab, ReadOnlyEnforcement::None, window, cx);
+    }
+
+    /// Runs `query` with the given read-only enforcement. Only auto-refresh
+    /// requests [`ReadOnlyEnforcement::Required`]; every run the user starts
+    /// goes through [`Self::run_query_text`].
+    fn run_query_text_with(
+        &mut self,
+        query: String,
+        in_new_tab: bool,
+        read_only: ReadOnlyEnforcement,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if query.trim().is_empty() {
+            Toast::warning(datatab_i18n::t!(
+                "document.code.execution.toast.enter_query"
+            ))
+            .meta_right(now_hms())
+            .push(cx);
+            return;
+        }
+
+        // Refusing before the dangerous-query check keeps a confirmation from
+        // being asked for a statement that cannot run anyway.
+        let refused_by_read_only_profile = self.connection_id.is_some_and(|conn_id| {
+            self.app_state
+                .read(cx)
+                .connections()
+                .get(&conn_id)
+                .is_some_and(|connected| is_refused_by_read_only_profile(connected, &query))
+        });
+
+        if refused_by_read_only_profile {
+            show_read_only_profile_toast(cx);
+            return;
+        }
+
+        let dangerous_kind = self.connection_id.and_then(|conn_id| {
+            self.app_state
+                .read(cx)
+                .connections()
+                .get(&conn_id)
+                .and_then(|connected| {
+                    connected
+                        .connection
+                        .language_service()
+                        .detect_dangerous(&query)
+                })
+        });
+
+        // An unattended run never asks for a confirmation; a query that needs
+        // one cannot auto-refresh.
+        if dangerous_kind.is_some() && read_only.is_required() {
+            self.fall_back_to_manual_refresh(cx);
+            return;
+        }
+
+        if let Some(kind) = dangerous_kind {
+            let is_suppressed = self
+                .app_state
+                .read(cx)
+                .dangerous_query_suppressions()
+                .is_suppressed(kind);
+
+            let (effective, allow_redis_flush) = {
+                let state = self.app_state.read(cx);
+                let effective = state.effective_settings_for_connection(self.connection_id);
+                let allow_redis_flush = effective
+                    .driver_values
+                    .get("allow_flush")
+                    .map(|value| value == "true")
+                    .unwrap_or(false);
+
+                (effective, allow_redis_flush)
+            };
+
+            match evaluate_dangerous_with_effective_settings(
+                kind,
+                is_suppressed,
+                &effective,
+                allow_redis_flush,
+            ) {
+                DangerousAction::Allow => {}
+                DangerousAction::Confirm(kind) => {
+                    self.ask_dangerous_query_confirm(
+                        PendingDangerousQuery {
+                            query,
+                            kind,
+                            in_new_tab,
+                            suppress: false,
+                        },
+                        window,
+                        cx,
+                    );
+                    return;
+                }
+                DangerousAction::Block(msg) => {
+                    let toast_msg = msg.to_string();
+                    Toast::error(toast_msg.clone())
+                        .meta_right(now_hms())
+                        .action(copy_action(toast_msg))
+                        .push(cx);
+                    return;
+                }
+            }
+        }
+
+        if let Some(conn_id) = self.connection_id
+            && let Some(connected) = self.app_state.read(cx).connections().get(&conn_id)
+        {
+            let lang = connected.connection.language_service();
+            match lang.validate(&query) {
+                ValidationResult::Valid => {}
+                ValidationResult::SyntaxError(diag) => {
+                    let msg = match diag.hint {
+                        Some(ref hint) => {
+                            crate::labels::syntax_error_with_hint(&diag.message, hint)
+                        }
+                        None => diag.message,
+                    };
+                    let toast_msg = msg.to_string();
+                    Toast::error(toast_msg.clone())
+                        .meta_right(now_hms())
+                        .action(copy_action(toast_msg))
+                        .push(cx);
+                    return;
+                }
+                ValidationResult::WrongLanguage { message, .. } => {
+                    let toast_msg = message.to_string();
+                    Toast::error(toast_msg.clone())
+                        .meta_right(now_hms())
+                        .action(copy_action(toast_msg))
+                        .push(cx);
+                    return;
+                }
+            }
+        }
+
+        if self.should_show_source_controls(cx) {
+            let override_bounds = self.pending.window_override.take();
+            let targets = self.current_source_targets(cx);
+            let query_mode = self.current_source_query_mode_value(cx);
+            // Compute the input-driven fallback eagerly so the precedence rule
+            // lives in a single pure helper. The fallback's `Err` is only
+            // surfaced when no override is present — a panel-emitted window
+            // already has valid bounds and must not be blocked by stale inputs.
+            let fallback = self.current_source_context(cx);
+            match resolve_source_context(override_bounds, targets, query_mode, fallback) {
+                Ok(source) => {
+                    self.source.exec_ctx.source = Some(source);
+                }
+                Err(message) => {
+                    self.source.exec_ctx.source = None;
+                    let toast_msg = crate::labels::source_window_error_message(message);
+                    Toast::error(toast_msg.clone())
+                        .meta_right(now_hms())
+                        .action(copy_action(toast_msg))
+                        .push(cx);
+                    return;
+                }
+            }
+        }
+
+        // Run the schema drift preflight check asynchronously so it does not
+        // block the UI thread. The actual execution is deferred to the render
+        // loop via `pending.drift_query`.
+        self.start_drift_preflight(query, in_new_tab, read_only, cx);
+    }
+
+    /// Kick off the async drift preflight for `query`.
+    ///
+    /// Captures a snapshot of the current `table_details` cache and the
+    /// connection, then spawns a background task that calls `check_schema_drift`.
+    /// On completion the result is delivered back to the entity via
+    /// `cx.update`, which sets `pending.drift_query` and calls `cx.notify()` so
+    /// the render loop picks it up.
+    fn start_drift_preflight(
+        &mut self,
+        query: String,
+        in_new_tab: bool,
+        read_only: ReadOnlyEnforcement,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conn_id) = self.connection_id else {
+            // No connection — nothing to preflight; execute directly via pending.
+            self.pending.drift_query = Some(PendingDriftQuery {
+                query,
+                in_new_tab,
+                action: DriftAction::ExecuteNow,
+                cache_updates: Vec::new(),
+                read_only,
+            });
+            cx.notify();
+            return;
+        };
+
+        let state = self.app_state.read(cx);
+        let connections = state.connections();
+        let Some(connected) = connections.get(&conn_id) else {
+            self.pending.drift_query = Some(PendingDriftQuery {
+                query,
+                in_new_tab,
+                action: DriftAction::ExecuteNow,
+                cache_updates: Vec::new(),
+                read_only,
+            });
+            cx.notify();
+            return;
+        };
+
+        let connection = connected.connection.clone();
+        let table_details = connected.table_details.clone();
+
+        let database = self
+            .source
+            .exec_ctx
+            .database
+            .clone()
+            .or_else(|| connected.active_database.clone())
+            .or_else(|| {
+                connected
+                    .schema
+                    .as_ref()
+                    .and_then(|s| s.current_database().map(String::from))
+            });
+
+        let database = match database {
+            Some(database) => database,
+            // Without a database there is no valid fetch key. On
+            // lazy-per-database drivers a fabricated name reaches real
+            // queries (`` `default`.`table` ``), so skip the preflight;
+            // single-catalog drivers ignore the database argument.
+            None if connected.connection.schema_loading_strategy()
+                == datatab_core::SchemaLoadingStrategy::LazyPerDatabase =>
+            {
+                self.pending.drift_query = Some(PendingDriftQuery {
+                    query,
+                    in_new_tab,
+                    action: DriftAction::ExecuteNow,
+                    cache_updates: Vec::new(),
+                    read_only,
+                });
+                cx.notify();
+                return;
+            }
+            None => "default".to_string(),
+        };
+
+        let default_schema = self.source.exec_ctx.schema.clone();
+
+        self.drift.preflight_running = true;
+        cx.notify();
+
+        let query_capture = query.clone();
+
+        let task = cx.background_executor().spawn(async move {
+            check_schema_drift(
+                &connection,
+                &table_details,
+                &query,
+                &database,
+                default_schema.as_deref(),
+            )
+        });
+
+        cx.spawn(async move |this, cx| {
+            let outcome = task.await;
+
+            let _ = this.update(cx, |doc, cx| {
+                doc.drift.preflight_running = false;
+
+                match outcome {
+                    DriftOutcome::Skip => {
+                        // Driver doesn't support table parsing — execute directly.
+                        doc.pending.drift_query = Some(PendingDriftQuery {
+                            query: query_capture,
+                            in_new_tab,
+                            action: DriftAction::ExecuteNow,
+                            cache_updates: Vec::new(),
+                            read_only,
+                        });
+                    }
+
+                    DriftOutcome::Refresh(entries) => {
+                        // No drift — schedule transparent cache update then execute.
+                        doc.pending.drift_query = Some(PendingDriftQuery {
+                            query: query_capture,
+                            in_new_tab,
+                            action: DriftAction::ExecuteNow,
+                            cache_updates: entries,
+                            read_only,
+                        });
+                    }
+
+                    DriftOutcome::Drift(detected) => {
+                        // Build cache updates from unchanged tables, then add
+                        // per-diff fresh infos so "Refresh & re-run" updates them.
+                        let mut all_updates = detected.refreshes.clone();
+                        for diff in &detected.diffs {
+                            let effective_db = diff
+                                .table
+                                .database
+                                .clone()
+                                .unwrap_or_else(|| "default".to_string());
+                            let schema = diff
+                                .table
+                                .schema
+                                .clone()
+                                .or_else(|| diff.fresh.schema.clone());
+                            all_updates.push((
+                                (effective_db, schema, diff.table.table.clone()),
+                                diff.fresh.clone(),
+                            ));
+                        }
+
+                        doc.pending.drift_query = Some(PendingDriftQuery {
+                            query: query_capture,
+                            in_new_tab,
+                            action: DriftAction::Pending,
+                            cache_updates: all_updates,
+                            read_only,
+                        });
+
+                        doc.drift.schema_drift_modal.update(cx, |modal, cx| {
+                            modal.open(detected, cx);
+                        });
+                    }
+                }
+
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn execute_query_internal(
+        &mut self,
+        query: String,
+        in_new_tab: bool,
+        read_only: ReadOnlyEnforcement,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // A Load all rows run goes back to where its result came from, which
+        // may no longer be the document's connection or database.
+        let load_all = self
+            .execution
+            .load_all_rows
+            .take()
+            .filter(|load_all| load_all.query == query);
+        let result_grid = load_all.as_ref().map(|load_all| load_all.grid);
+        let rerun_origin = load_all.map(|load_all| load_all.origin);
+
+        let Some(conn_id) = rerun_origin
+            .as_ref()
+            .map(|origin| origin.connection_id)
+            .or(self.connection_id)
+        else {
+            let msg = datatab_i18n::t!("document.code.execution.toast.no_active_connection");
+            Toast::error(msg.clone())
+                .meta_right(now_hms())
+                .action(copy_action(msg))
+                .push(cx);
+            return;
+        };
+
+        let (connection, active_database, task_target) = {
+            let connections = self.app_state.read(cx).connections();
+            let Some(connected) = connections.get(&conn_id) else {
+                let msg = datatab_i18n::t!("document.code.execution.toast.connection_not_found");
+                Toast::error(msg.clone())
+                    .meta_right(now_hms())
+                    .action(copy_action(msg))
+                    .push(cx);
+                return;
+            };
+
+            if is_refused_by_read_only_profile(connected, &query) {
+                show_read_only_profile_toast(cx);
+                return;
+            }
+
+            if let Some(origin) = &rerun_origin {
+                let database = origin.context.database.clone();
+                (
+                    origin.context.root.clone(),
+                    database.clone(),
+                    task_target_for_execution(conn_id, connected, database.as_deref()),
+                )
+            } else {
+                let active_database = self
+                    .source
+                    .exec_ctx
+                    .database
+                    .clone()
+                    .or_else(|| connected.active_database.clone());
+
+                match connected.resolve_connection_for_execution(active_database.as_deref()) {
+                    Ok(connection) => (
+                        connection,
+                        active_database.clone(),
+                        task_target_for_execution(conn_id, connected, active_database.as_deref()),
+                    ),
+                    Err(datatab_core::ConnectionResolutionError::PendingDatabaseConnection {
+                        database,
+                    }) => {
+                        let msg = datatab_i18n::t!(
+                            "document.code.execution.toast.connecting",
+                            database = database
+                        );
+                        Toast::error(msg.clone())
+                            .meta_right(now_hms())
+                            .action(copy_action(msg))
+                            .push(cx);
+                        return;
+                    }
+                }
+            }
+        };
+
+        let session_context = ExecutionSessionContext {
+            root: connection.clone(),
+            database: active_database.clone(),
+        };
+        // A rerun on a context the document has left runs on that context's
+        // own connection, so the editor session stays bound where it is.
+        let on_session = rerun_origin.is_none()
+            || self
+                .current_execution_context(cx)
+                .is_some_and(|current| current.same_as(&session_context));
+        let exec_ctx = rerun_origin
+            .map(|origin| origin.exec_ctx)
+            .unwrap_or_else(|| self.source.exec_ctx.clone());
+        let origin = ResultOrigin {
+            connection_id: conn_id,
+            context: session_context.clone(),
+            exec_ctx: exec_ctx.clone(),
+        };
+
+        if on_session {
+            self.execution_session_context = Some(session_context);
+        }
+        self.clear_live_output();
+        self.result_tabs.run_in_new_tab = in_new_tab;
+
+        let description = datatab_core::truncate_string_safe(query.trim(), 80);
+        let (task_id, cancel_token) = self.runner.start_primary_for_target(
+            datatab_core::TaskKind::Query,
+            description,
+            Some(task_target.clone()),
+            cx,
+        );
+        self.app_state.update(cx, |state, _cx| {
+            state.set_task_query_text(task_id, query.trim());
+        });
+
+        let exec_id = Uuid::new_v4();
+        let record = ExecutionRecord {
+            id: exec_id,
+            started_at: Instant::now(),
+            finished_at: None,
+            result: None,
+            error: None,
+            rows_affected: None,
+            is_script: false,
+        };
+        self.execution.execution_history.push(record);
+        self.execution.active_execution_index = Some(self.execution.execution_history.len() - 1);
+        self.execution.active_query_task = Some(ActiveQueryTask {
+            task_id,
+            target: task_target.clone(),
+            uses_isolated_session: on_session && connection.execution_session_factory().is_some(),
+        });
+
+        self.state = DocumentState::Executing;
+        cx.emit(DocumentEvent::ExecutionStarted);
+        cx.notify();
+
+        // Drivers that cannot enforce a row budget refuse a request that carries
+        // one, so the editor's cap goes only to the connections that advertise
+        // the enforcement; the others run the query with no cap at all.
+        let row_limit = enforces_request_row_limit(connection.as_ref()).then(|| {
+            if result_grid.is_some() {
+                usize::MAX
+            } else {
+                self.app_state.read(cx).general_settings().editor_row_limit
+            }
+        });
+
+        let session_database = active_database.clone();
+        let mut request = query_request_for_execution(
+            query.clone(),
+            active_database,
+            &exec_ctx,
+            self.effective_language().clone(),
+            row_limit,
+        );
+
+        // Governance ceiling for a driver-dispatched multi-statement script
+        // (see `QueryRequest::confirmed_ceiling`). Reusing `detect_dangerous`
+        // here — rather than threading the earlier `run_query_text` call's
+        // result through `pending` — keeps this a pure re-derivation from
+        // the query text and connection, with no extra state to go stale.
+        // Any dangerous kind reaching this point was already either
+        // confirmed by the user or explicitly allowed by settings, so it is
+        // safe to raise the ceiling; an absent dangerous kind leaves the
+        // ceiling `None`, which the driver defaults to the restrictive
+        // `Read`. This never branches on a concrete driver id — the
+        // downstream driver decides whether the ceiling even applies to it.
+        let confirmed_ceiling = self
+            .app_state
+            .read(cx)
+            .connections()
+            .get(&conn_id)
+            .and_then(|connected| {
+                connected
+                    .connection
+                    .language_service()
+                    .detect_dangerous(&query)
+            });
+        if confirmed_ceiling.is_some() {
+            request =
+                request.with_confirmed_ceiling(datatab_core::ExecutionClassification::Destructive);
+        }
+        request = request.with_read_only(read_only);
+
+        // Capture audit_service, task_target, and started_at before spawning so we can emit
+        // audit events even if the document is closed before the deferred task runs.
+        let audit_service = self.app_state.read(cx).audit_service().clone();
+        let task_target_for_audit = task_target.clone();
+        let started_at = Instant::now();
+        let query_for_cancel = query.clone();
+
+        // Capture honest connection metadata (connection_id string + driver_id) before spawn
+        // so we can emit proper fallback events without needing cx in the async block.
+        let fallback_conn_id = Some(conn_id.to_string());
+        let fallback_driver_id = self
+            .app_state
+            .read(cx)
+            .connections()
+            .get(&conn_id)
+            .map(|c| c.profile.driver_id())
+            .unwrap_or_default();
+
+        let session_binding = self.execution_session.clone();
+        let session_generation = session_binding.current_generation();
+        let task = cx.background_executor().spawn({
+            let connection = connection.clone();
+            let session_binding = session_binding.clone();
+            let dispatch_token = cancel_token.clone();
+            async move {
+                // The editor is released as soon as its task is cancelled, so a
+                // cancel that lands before this worker runs must keep the
+                // statement from reaching the database at all.
+                let execution = if dispatch_token.is_cancelled() {
+                    None
+                } else if on_session {
+                    session_binding.execute_unless_cancelled(
+                        connection,
+                        session_database,
+                        &request,
+                        &dispatch_token,
+                    )
+                } else {
+                    Some(super::execution_session::SessionExecution {
+                        result: connection.execute(&request),
+                        isolated: false,
+                    })
+                };
+
+                match execution {
+                    Some(execution) => (true, execution),
+                    None => {
+                        let skipped = super::execution_session::SessionExecution {
+                            result: Err(DbError::Cancelled),
+                            isolated: false,
+                        };
+                        (false, skipped)
+                    }
+                }
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            let (dispatched, session_execution) = task.await;
+            let session_isolated = session_execution.isolated;
+            let result = session_execution.result;
+
+            if cancel_token.is_cancelled() && session_isolated {
+                // Local task cancellation does not cancel the remote isolated session. Wait for
+                // the completed operation, then retire only that session in the background.
+                let cleanup_binding = session_binding.clone();
+                let cleanup = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let generation = cleanup_binding.invalidate();
+                        cleanup_binding.close_invalidated(generation)
+                    })
+                    .await;
+                if let Err(error) = cleanup {
+                    datatab_ui_base::user_error::report_error_async(
+                        datatab_ui_base::user_error::UserFacingError::new(
+                            datatab_ui_base::user_error::ErrorKind::Driver,
+                            "Could not confirm cleanup of the cancelled isolated query",
+                        )
+                        .with_cause(error.to_string()),
+                        cx,
+                    );
+                }
+            } else if cancel_token.is_cancelled() {
+                log::info!("Query was cancelled, discarding result");
+
+                // The cleanup rolls back the connection's transaction. A query
+                // that never reached the driver left nothing to undo, and
+                // rolling back would discard a transaction the user opened.
+                if dispatched && let Err(error) = connection.cleanup_after_cancel() {
+                    log::warn!("Cleanup after cancel failed: {error}");
+                }
+
+                let inner_result = this.update(cx, |doc, cx| {
+                    doc.complete_cancelled_query(
+                        task_id,
+                        exec_id,
+                        &task_target_for_audit,
+                        Some(query_for_cancel),
+                        cx,
+                    );
+                });
+                if inner_result.is_err() {
+                    let ts_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    let duration_ms = started_at.elapsed().as_millis() as i64;
+                    let details_json = serde_json::json!({ "query": query }).to_string();
+                    let mut event = EventRecord::new(
+                        ts_ms,
+                        EventSeverity::Warn,
+                        EventCategory::Query,
+                        EventOutcome::Cancelled,
+                    )
+                    .with_typed_action(audit_actions::QUERY_CANCEL)
+                    .with_summary("Query cancelled")
+                    .with_connection_context(
+                        fallback_conn_id.clone().unwrap_or_default(),
+                        task_target_for_audit.database.clone().unwrap_or_default(),
+                        fallback_driver_id.clone(),
+                    )
+                    .with_details_json(details_json);
+                    event.source_id = EventSourceId::Local;
+                    event.actor_type = EventActorType::User;
+                    event.duration_ms = Some(duration_ms);
+                    if let Err(error) = audit_service.record(event) {
+                        log::warn!(
+                            "Failed to emit cancelled query audit event via fallback: {error}"
+                        );
+                    }
+                }
+                return;
+            }
+
+            if !cancel_token.is_cancelled()
+                && on_session
+                && !session_binding.is_current_generation(session_generation)
+            {
+                let _ = this.update(cx, |doc, cx| {
+                    doc.discard_stale_query(task_id, exec_id, cx);
+                });
+                return;
+            }
+
+            // Emit fallback when entity is gone AND result delivery fails.
+            // When entity is gone, process_pending_result never runs → emit directly.
+            //
+            // Extract outcome details BEFORE moving result into the closure so we can
+            // emit the correct success/failure event when the entity is already gone.
+            let (outcome, severity, summary, error_detail, action) = match &result {
+                Ok(qr) => {
+                    let affected_rows = qr.affected_rows.unwrap_or(qr.rows.len() as u64);
+                    let rows_label = if qr.affected_rows.is_some() {
+                        "affected"
+                    } else {
+                        "returned"
+                    };
+                    let summary = format!(
+                        "Query executed successfully: {} rows {}",
+                        affected_rows, rows_label
+                    );
+                    (
+                        EventOutcome::Success,
+                        EventSeverity::Info,
+                        summary,
+                        None,
+                        audit_actions::QUERY_EXECUTE,
+                    )
+                }
+                Err(e) => {
+                    let summary = format!("Query failed: {}", e);
+                    (
+                        EventOutcome::Failure,
+                        EventSeverity::Error,
+                        summary,
+                        Some(e.to_string()),
+                        audit_actions::QUERY_EXECUTE_FAILED,
+                    )
+                }
+            };
+
+            // Compute duration before result is consumed by the closure.
+            let duration_ms = started_at.elapsed().as_millis() as i64;
+
+            // Capture query text before it gets moved into PendingQueryResult so we can
+            // use it in the fallback event if needed.
+            let query_text = query.clone();
+
+            let inner_result = this.update(cx, |doc, cx| {
+                doc.pending.result = Some(PendingQueryResult {
+                    task_id,
+                    exec_id,
+                    query,
+                    result,
+                    is_script: false,
+                    read_only,
+                    result_grid,
+                    origin: Some(origin),
+                });
+                cx.notify();
+            });
+
+            // Fallback fires if the entity is gone (this.update failed). If this.update
+            // succeeded, the entity is alive and process_pending_result will emit via the
+            // normal path — no second probe needed. This avoids both double-logging and
+            // the overhead of a separate cx.update call.
+            if inner_result.is_err() {
+                // Entity is gone; process_pending_result won't run. Emit via fallback so the event
+                // is not silently dropped.
+                let ts_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+
+                let details_json = serde_json::json!({ "query": query_text }).to_string();
+
+                let mut event = EventRecord::new(ts_ms, severity, EventCategory::Query, outcome)
+                    .with_typed_action(action)
+                    .with_summary(&summary)
+                    .with_connection_context(
+                        fallback_conn_id.clone().unwrap_or_default(),
+                        task_target_for_audit.database.clone().unwrap_or_default(),
+                        fallback_driver_id.clone(),
+                    )
+                    .with_details_json(details_json);
+                event.source_id = EventSourceId::Local;
+                event.actor_type = EventActorType::User;
+                event.duration_ms = Some(duration_ms);
+                if let Some(err) = error_detail {
+                    event.error_message = Some(err);
+                }
+                if let Err(e) = audit_service.record(event) {
+                    log::warn!("Failed to emit query audit event via fallback: {}", e);
+                }
+            }
+        })
+        .detach();
+    }
+
+    pub(super) fn confirm_dangerous_query(
+        &mut self,
+        suppress: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.pending.dangerous_query.take() else {
+            return;
+        };
+
+        if suppress {
+            self.app_state.update(cx, |state, _| {
+                state
+                    .dangerous_query_suppressions_mut()
+                    .set_suppressed(pending.kind);
+            });
+        }
+
+        // Emit audit event for dangerous query confirmation
+        self.emit_dangerous_query_audit_event(cx, pending.kind);
+
+        self.dangerous_query_focus.restore(cx);
+        self.focus(window, cx);
+        cx.notify();
+        self.execute_query_internal(
+            pending.query,
+            pending.in_new_tab,
+            ReadOnlyEnforcement::None,
+            window,
+            cx,
+        );
+    }
+
+    fn complete_cancelled_query(
+        &mut self,
+        task_id: datatab_core::TaskId,
+        exec_id: Uuid,
+        target: &TaskTarget,
+        query: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        // Determine if this is a script execution by looking up the record
+        let is_script = match self
+            .execution
+            .execution_history
+            .iter()
+            .find(|r| r.id == exec_id)
+        {
+            Some(r) => r.is_script,
+            None => {
+                log::warn!(
+                    "Execution record not found for exec_id={}, cannot determine is_script, defaulting to false",
+                    exec_id
+                );
+                false
+            }
+        };
+
+        if let Some(record) = self
+            .execution
+            .execution_history
+            .iter_mut()
+            .find(|record| record.id == exec_id)
+        {
+            record.finished_at = Some(Instant::now());
+        }
+
+        let is_active_task = self
+            .execution
+            .active_query_task
+            .as_ref()
+            .is_some_and(|task| task.task_id == task_id);
+
+        if is_active_task {
+            self.runner.clear_primary(task_id);
+            self.execution.active_query_task = None;
+            self.state = DocumentState::Clean;
+        }
+
+        if let Some(database) = target.database.as_deref() {
+            self.app_state.update(cx, |state, cx| {
+                if state.remove_database_connection(target.profile_id, database) {
+                    cx.emit(AppStateChanged);
+                }
+            });
+        }
+
+        if is_active_task {
+            cx.emit(DocumentEvent::ExecutionFinished);
+            cx.emit(DocumentEvent::MetaChanged);
+            cx.notify();
+        }
+
+        // Emit audit event for cancelled execution with correct category
+        let duration_ms = self
+            .execution
+            .execution_history
+            .iter()
+            .find(|r| r.id == exec_id)
+            .and_then(|r| {
+                r.finished_at
+                    .map(|finished| finished.saturating_duration_since(r.started_at))
+            })
+            .map(|d| d.as_millis() as i64);
+
+        let summary = if is_script {
+            "Script cancelled"
+        } else {
+            "Query cancelled"
+        };
+
+        self.emit_audit_event(
+            cx,
+            if is_script {
+                EventCategory::Script
+            } else {
+                EventCategory::Query
+            },
+            audit_actions::QUERY_CANCEL,
+            EventOutcome::Cancelled,
+            summary.to_string(),
+            query.as_deref(),
+            duration_ms,
+            None,
+            None,
+        );
+    }
+
+    fn discard_stale_query(
+        &mut self,
+        task_id: datatab_core::TaskId,
+        exec_id: Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(record) = self
+            .execution
+            .execution_history
+            .iter_mut()
+            .find(|record| record.id == exec_id)
+        {
+            record.finished_at = Some(Instant::now());
+            record.error = Some("Execution result discarded after context changed".to_string());
+        }
+        if self
+            .execution
+            .active_query_task
+            .as_ref()
+            .is_some_and(|task| task.task_id == task_id)
+        {
+            self.runner.clear_primary(task_id);
+            self.execution.active_query_task = None;
+            self.state = DocumentState::Clean;
+            cx.emit(DocumentEvent::ExecutionFinished);
+            cx.emit(DocumentEvent::MetaChanged);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn cancel_dangerous_query(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending.dangerous_query = None;
+        self.dangerous_query_focus.restore(cx);
+        self.focus(window, cx);
+        cx.notify();
+    }
+
+    /// Fans a script run's dispatch ledger (`metadata_extra["script_operations"]`,
+    /// a JSON array shaped by `datatab_js`/the driver — see
+    /// `ScriptLedgerEntry`) into one `EventRecord` per entry, all sharing
+    /// `correlation_id`. Keyed on the generic field name only; no driver-id
+    /// branching.
+    fn emit_script_operation_events(
+        &self,
+        cx: &Context<Self>,
+        correlation_id: Uuid,
+        ledger: &[serde_json::Value],
+    ) {
+        let Some(conn_id) = self.connection_id else {
+            return;
+        };
+        let Some((database_name, driver_id)) = self
+            .app_state
+            .read(cx)
+            .connections()
+            .get(&conn_id)
+            .map(|c| {
+                let db = self
+                    .source
+                    .exec_ctx
+                    .database
+                    .clone()
+                    .or(c.active_database.clone());
+                (db.unwrap_or_default(), c.profile.driver_id())
+            })
+        else {
+            return;
+        };
+
+        let audit_service = self.app_state.read(cx).audit_service().clone();
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        for entry in ledger {
+            let failed = entry.get("outcome").and_then(|v| v.as_str()) == Some("failed");
+            let outcome = if failed {
+                EventOutcome::Failure
+            } else {
+                EventOutcome::Success
+            };
+            let action = if failed {
+                audit_actions::QUERY_EXECUTE_FAILED
+            } else {
+                audit_actions::QUERY_EXECUTE
+            };
+            let severity = if failed {
+                EventSeverity::Error
+            } else {
+                EventSeverity::Info
+            };
+            let method = entry.get("method").and_then(|v| v.as_str()).unwrap_or("");
+
+            let mut event = EventRecord::new(ts_ms, severity, EventCategory::Query, outcome)
+                .with_typed_action(action)
+                .with_summary(format!("Script operation .{method}()"))
+                .with_connection_context(
+                    conn_id.to_string(),
+                    database_name.clone(),
+                    driver_id.clone(),
+                )
+                .with_origin(EventOrigin::local())
+                .with_correlation_id(correlation_id.to_string())
+                .with_details_json(entry.to_string());
+
+            if let Some(message) = entry.get("message").and_then(|v| v.as_str()) {
+                event.error_message = Some(message.to_string());
+            }
+
+            if let Err(e) = audit_service.record(event) {
+                log::warn!("Failed to emit script operation audit event: {}", e);
+            }
+        }
+    }
+
+    /// Process pending query selected from history modal (called from render).
+    pub(super) fn process_pending_set_query(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(selected) = self.pending.set_query.take() else {
+            return;
+        };
+
+        self.editor
+            .input_state
+            .update(cx, |state, cx| state.set_value(&selected.sql, window, cx));
+
+        if let Some(name) = selected.name {
+            self.title = name;
+        }
+
+        self.editor.saved_query_id = selected.saved_query_id;
+
+        self.focus_mode = SqlQueryFocus::Editor;
+
+        cx.emit(DocumentEvent::MetaChanged);
+        cx.notify();
+    }
+
+    pub(super) fn process_pending_auto_refresh(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.pending.auto_refresh {
+            return;
+        }
+
+        self.pending.auto_refresh = false;
+
+        if !self.can_auto_refresh(cx) {
+            self.fall_back_to_manual_refresh(cx);
+            return;
+        }
+
+        self.execution.load_all_rows = None;
+        let (query, from_selection) = self.auto_refresh_query(cx);
+        self.execution.query_origin = if from_selection { None } else { Some(0) };
+        self.run_query_text_with(query, false, ReadOnlyEnforcement::Required, window, cx);
+    }
+
+    /// Turns auto-refresh off and tells the user why: the query cannot run
+    /// unattended under read-only enforcement.
+    fn fall_back_to_manual_refresh(&mut self, cx: &mut Context<Self>) {
+        self.refresh.refresh_policy = datatab_core::RefreshPolicy::Manual;
+        self.refresh._refresh_timer = None;
+        self.refresh.refresh_dropdown.update(cx, |dd, cx| {
+            dd.set_selected_index(Some(datatab_core::RefreshPolicy::Manual.index()), cx);
+        });
+        Toast::warning(datatab_i18n::t!(
+            "document.code.execution.toast.auto_refresh_blocked"
+        ))
+        .meta_right(now_hms())
+        .push(cx);
+    }
+
+    /// Process pending query result (called from render where we have window access).
+    pub(super) fn process_pending_result(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending.result.take() else {
+            return;
+        };
+
+        self.clear_live_output();
+        self.state = DocumentState::Clean;
+
+        let Some(record) = self
+            .execution
+            .execution_history
+            .iter_mut()
+            .find(|r| r.id == pending.exec_id)
+        else {
+            return;
+        };
+
+        record.finished_at = Some(Instant::now());
+
+        // Compute duration before we start borrowing self for other operations
+        let duration_ms = record
+            .finished_at
+            .map(|finished| finished.saturating_duration_since(record.started_at))
+            .map(|d| d.as_millis() as i64);
+
+        let is_script = pending.is_script;
+        let read_only_refused = pending.read_only.is_required()
+            && matches!(pending.result, Err(DbError::NotSupported(_)));
+
+        match pending.result {
+            Ok(mut qr) => {
+                if !is_script {
+                    crate::result_warnings::handoff_sql_editor_result(&mut qr, |warning| {
+                        datatab_ui_base::user_error::report_error(warning, cx)
+                    });
+                }
+
+                self.runner.complete_primary(pending.task_id, cx);
+
+                // Use affected_rows when available (INSERT/UPDATE/DELETE), otherwise rows.len() (SELECT)
+                let affected_rows = qr.affected_rows;
+                let row_count = affected_rows.unwrap_or(qr.rows.len() as u64);
+                let execution_time = qr.execution_time;
+
+                // Extract driver-provided audit fields before the result is moved into Arc.
+                let metadata_extra = qr.metadata_extra.clone();
+
+                record.rows_affected = Some(row_count);
+                let arc_result = Arc::new(qr);
+                record.result = Some(arc_result.clone());
+
+                let (database, connection_name) = self
+                    .connection_id
+                    .and_then(|id| self.app_state.read(cx).connections().get(&id))
+                    .map(|c| {
+                        let db = self
+                            .source
+                            .exec_ctx
+                            .database
+                            .clone()
+                            .or(c.active_database.clone());
+                        (db, Some(c.profile.name.clone()))
+                    })
+                    .unwrap_or((None, None));
+
+                let history_entry = HistoryEntry::new(
+                    pending.query.clone(),
+                    database,
+                    connection_name,
+                    execution_time,
+                    Some(row_count as usize),
+                );
+                self.app_state.update(cx, |state, _| {
+                    state.add_history_entry(history_entry);
+                });
+
+                self.setup_data_grid(
+                    arc_result,
+                    pending.query.clone(),
+                    pending.result_grid,
+                    pending.origin,
+                    window,
+                    cx,
+                );
+
+                if self.layout == SqlQueryLayout::EditorOnly {
+                    self.layout = SqlQueryLayout::Split;
+                }
+
+                // Only flip the internal focus_mode to Results when the user is
+                // not actively typing in the editor input. Otherwise the GPUI
+                // focus stays on the input but our key-routing thinks Results
+                // is active, so Workspace::on_key_down sends single-letter keys
+                // (l, r, o, x, …) through the Results keymap layer and steals
+                // them from the editor.
+                let input_focused = self
+                    .editor
+                    .input_state
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window);
+                if !input_focused {
+                    self.focus_mode = SqlQueryFocus::Results;
+                }
+
+                // Emit audit event for successful execution (query or script)
+                let summary = if is_script {
+                    "Script executed successfully".to_string()
+                } else {
+                    // Distinguish between mutation row counts and SELECT result counts
+                    let rows_label = if affected_rows.is_some() {
+                        "affected"
+                    } else {
+                        "returned"
+                    };
+                    format!(
+                        "Query executed successfully: {} rows {}",
+                        row_count, rows_label
+                    )
+                };
+
+                if is_script {
+                    self.emit_audit_event(
+                        cx,
+                        EventCategory::Script,
+                        audit_actions::SCRIPT_EXECUTE,
+                        EventOutcome::Success,
+                        summary,
+                        Some(&pending.query),
+                        duration_ms,
+                        None,
+                        None,
+                    );
+                } else {
+                    self.emit_audit_event(
+                        cx,
+                        EventCategory::Query,
+                        audit_actions::QUERY_EXECUTE,
+                        EventOutcome::Success,
+                        summary,
+                        Some(&pending.query),
+                        duration_ms,
+                        None,
+                        metadata_extra.as_ref(),
+                    );
+                }
+
+                // A driver-dispatched multi-statement script (currently only
+                // MongoDB's JS engine) carries its own dispatch ledger under
+                // the generic `script_operations`/`script_failure` keys.
+                // Fan the ledger into one audit row per dispatched operation
+                // sharing this run's correlation id, and route a mid-script
+                // failure through the same seam every other user-facing
+                // driver failure uses. This is the ONLY catch site for
+                // `script_failure` — the driver never toasts and the engine
+                // never reports.
+                if let Some(extra) = metadata_extra.as_ref() {
+                    if let Some(script_operations) =
+                        extra.get("script_operations").and_then(|v| v.as_array())
+                    {
+                        self.emit_script_operation_events(cx, pending.exec_id, script_operations);
+                    }
+
+                    if let Some(failure) = extra.get("script_failure") {
+                        let message = failure
+                            .get("message")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("script execution failed")
+                            .to_string();
+
+                        self.state = DocumentState::Error;
+                        datatab_ui_base::user_error::report_error(
+                            datatab_ui_base::user_error::UserFacingError::from_formatted(
+                                datatab_ui_base::user_error::ErrorKind::Driver,
+                                datatab_core::FormattedError::new(message),
+                            ),
+                            cx,
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                self.runner.fail_primary(pending.task_id, e.to_string(), cx);
+
+                let error_msg = e.to_string();
+                record.error = Some(error_msg.clone());
+                self.state = DocumentState::Error;
+
+                // A read-only refusal on an unattended run is expected: the
+                // fallback to Manual below tells the user, so it is not shown
+                // as a failed query.
+                if !read_only_refused {
+                    let title: SharedString = if is_script {
+                        datatab_i18n::t!("document.code.execution.result_title.script_failed")
+                            .into()
+                    } else {
+                        datatab_i18n::t!("document.code.execution.result_title.query_failed").into()
+                    };
+                    let now = datatab_core::chrono::Local::now()
+                        .format("%H:%M:%S")
+                        .to_string();
+                    let copy_payload = error_msg.clone();
+
+                    // Pull structured info (code, message, detail, hint) from
+                    // FormattedError when the driver provided it; fall back to
+                    // the to_string() form otherwise.
+                    let mut toast = match e.formatted() {
+                        Some(f) => {
+                            let mut t = datatab_ui_base::toast::Toast::error(title)
+                                .meta_right(now)
+                                .body(f.message.clone());
+                            if let Some(code) = f.code.as_ref() {
+                                t = t.subtitle(format!("ERROR {}", code));
+                            }
+                            if let Some(detail) = f.detail.as_ref() {
+                                t = t.details(detail.clone());
+                            }
+                            if let Some(hint) = f.hint.as_ref() {
+                                t = t.code_block(format!("HINT: {}", hint));
+                            }
+                            t.collapsible()
+                        }
+                        None => datatab_ui_base::toast::Toast::error(title)
+                            .meta_right(now)
+                            .body(error_msg.clone()),
+                    };
+
+                    toast = toast.action(
+                        datatab_ui_base::toast::ToastAction::new(
+                            "copy-error",
+                            datatab_i18n::t!("document.code.execution.copy_error"),
+                        )
+                        .primary()
+                        .on_click(move |cx: &mut App| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                copy_payload.clone(),
+                            ));
+                        }),
+                    );
+                    toast.push(cx);
+                }
+                let _ = window;
+
+                // Emit audit event for failed execution
+                let summary = if is_script {
+                    format!("Script failed: {}", error_msg)
+                } else {
+                    format!("Query failed: {}", error_msg)
+                };
+
+                if is_script {
+                    self.emit_audit_event(
+                        cx,
+                        EventCategory::Script,
+                        audit_actions::SCRIPT_EXECUTE_FAILED,
+                        EventOutcome::Failure,
+                        summary,
+                        Some(&pending.query),
+                        duration_ms,
+                        Some(&error_msg),
+                        None,
+                    );
+                } else {
+                    self.emit_audit_event(
+                        cx,
+                        EventCategory::Query,
+                        audit_actions::QUERY_EXECUTE_FAILED,
+                        EventOutcome::Failure,
+                        summary,
+                        Some(&pending.query),
+                        duration_ms,
+                        Some(&error_msg),
+                        None,
+                    );
+                }
+
+                if read_only_refused {
+                    self.fall_back_to_manual_refresh(cx);
+                }
+            }
+        }
+
+        if self
+            .execution
+            .active_query_task
+            .as_ref()
+            .is_some_and(|task| task.task_id == pending.task_id)
+        {
+            self.execution.active_query_task = None;
+        }
+
+        cx.emit(DocumentEvent::ExecutionFinished);
+        cx.emit(DocumentEvent::MetaChanged);
+    }
+
+    /// Shows `result` in a new tab, or in place of the tab holding
+    /// `result_grid` when set, else of the active tab. A `result_grid` whose
+    /// tab was closed meanwhile drops the result.
+    fn setup_data_grid(
+        &mut self,
+        result: Arc<QueryResult>,
+        query: String,
+        result_grid: Option<gpui::EntityId>,
+        origin: Option<ResultOrigin>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let set_count = if result.has_additional_results() {
+            result.iter_result_sets().count()
+        } else {
+            1
+        };
+        let buffer = self.editor.input_state.read(cx).value().to_string();
+        let captions = super::statements::result_statement_captions(
+            self.effective_language(),
+            &buffer,
+            &query,
+            self.execution.query_origin,
+            set_count,
+        );
+
+        // A multi-statement batch yields one result set per statement. Give
+        // each its own tab so every statement's output is visible, rather than
+        // surfacing only the primary set.
+        if result.has_additional_results() {
+            self.create_result_tabs_for_batch(result, query, captions, origin, window, cx);
+            return;
+        }
+
+        let caption: Option<SharedString> = captions.into_iter().next().flatten().map(Into::into);
+
+        let target_index = match result_grid {
+            Some(grid_id) => {
+                let Some(index) = self
+                    .result_tabs
+                    .result_tabs
+                    .iter()
+                    .position(|tab| tab.grid.entity_id() == grid_id)
+                else {
+                    self.result_tabs.run_in_new_tab = false;
+                    return;
+                };
+                self.result_tabs.active_result_index = Some(index);
+                Some(index)
+            }
+            None if self.result_tabs.run_in_new_tab => None,
+            None => self.result_tabs.active_result_index,
+        };
+
+        self.result_tabs.run_in_new_tab = false;
+
+        let profile_id = origin
+            .as_ref()
+            .map(|origin| origin.connection_id)
+            .or(self.connection_id);
+        let limited_row_actions = self.limited_row_actions(&query, profile_id, cx);
+
+        if let Some(tab) =
+            target_index.and_then(|index| self.result_tabs.result_tabs.get_mut(index))
+        {
+            tab.origin = origin;
+            tab.grid.update(cx, |g, cx| {
+                g.set_query_result(result, query.clone(), profile_id, cx);
+                g.set_result_caption(caption, cx);
+            });
+        } else {
+            self.create_result_tab(result, query, caption, origin, window, cx);
+        }
+
+        if let Some(grid) = self.active_result_grid() {
+            grid.update(cx, |grid, cx| {
+                grid.set_limited_row_actions(limited_row_actions, cx);
+            });
+        }
+    }
+
+    /// Creates one result tab per result set of a multi-statement batch.
+    ///
+    /// The first new tab is activated so the user lands on the first
+    /// statement's output. Each set is rendered on its own, so the per-set
+    /// `additional_results` is stripped from the primary before display.
+    fn create_result_tabs_for_batch(
+        &mut self,
+        result: Arc<QueryResult>,
+        query: String,
+        captions: Vec<Option<String>>,
+        origin: Option<ResultOrigin>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.result_tabs.run_in_new_tab = false;
+
+        let first_new_index = self.result_tabs.result_tabs.len();
+
+        for (index, set) in result.iter_result_sets().enumerate() {
+            let mut single = set.clone();
+            single.additional_results.clear();
+
+            let caption = captions.get(index).cloned().flatten().map(Into::into);
+            self.create_result_tab(
+                Arc::new(single),
+                query.clone(),
+                caption,
+                origin.clone(),
+                window,
+                cx,
+            );
+        }
+
+        if first_new_index < self.result_tabs.result_tabs.len() {
+            self.result_tabs.active_result_index = Some(first_new_index);
+        }
+    }
+
+    fn create_result_tab(
+        &mut self,
+        result: Arc<QueryResult>,
+        query: String,
+        caption: Option<SharedString>,
+        origin: Option<ResultOrigin>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.result_tabs.result_tab_counter += 1;
+        let tab_id = Uuid::new_v4();
+        let title = datatab_i18n::t!(
+            "document.code.execution.result_tab_title",
+            index = self.result_tabs.result_tab_counter
+        );
+
+        let app_state = self.app_state.clone();
+        let profile_id = origin
+            .as_ref()
+            .map(|origin| origin.connection_id)
+            .or(self.connection_id);
+        let grid = cx.new(|cx| {
+            DataGridPanel::new_for_result(result, query.clone(), profile_id, app_state, window, cx)
+        });
+
+        grid.update(cx, |grid, cx| {
+            grid.set_side_panels_hosted(true);
+            grid.set_result_caption(caption, cx);
+        });
+
+        if let Some(panel) = self.source.source_time_range_panel.clone() {
+            grid.update(cx, |g, cx| {
+                g.set_chart_time_range_panel(Some(panel), cx);
+            });
+        }
+
+        let subscription =
+            cx.subscribe(&grid, |this, grid, event: &DataGridEvent, cx| match event {
+                DataGridEvent::RequestHide => {
+                    this.hide_results(cx);
+                }
+                DataGridEvent::RequestToggleMaximize => {
+                    this.toggle_maximize_results(cx);
+                }
+                DataGridEvent::Focused => {
+                    this.focus_mode = SqlQueryFocus::Results;
+                    cx.emit(DocumentEvent::RequestFocus);
+                    cx.notify();
+                }
+                DataGridEvent::RequestSqlPreview {
+                    context,
+                    generation_type,
+                } => {
+                    cx.emit(DocumentEvent::RequestSqlPreview {
+                        context: context.clone(),
+                        generation_type: *generation_type,
+                    });
+                }
+                DataGridEvent::OpenInspector {
+                    title,
+                    content,
+                    content_has_header,
+                } => {
+                    cx.emit(DocumentEvent::OpenInspector {
+                        title: title.clone(),
+                        content: content.clone(),
+                        content_has_header: *content_has_header,
+                    });
+                }
+                DataGridEvent::CloseInspector => {
+                    cx.emit(DocumentEvent::CloseInspector);
+                }
+                DataGridEvent::ChartThisQuery { .. } => {
+                    // CodeDocument result tabs use QueryResult sources created without an
+                    // original_query, so can_chart_from_context_menu is always false for them.
+                    // This arm exists only for exhaustiveness.
+                }
+                DataGridEvent::RefreshPolicyReset(_) => {
+                    // ResultPanel for result tabs has no refresh dropdown
+                    // (query-result grids emit this only when auto-refresh is
+                    // reset; the outer CodeDocument toolbar owns the refresh
+                    // controls). Ignored.
+                }
+                DataGridEvent::RowActionRequested { .. } => {
+                    // Row actions are only emitted from InspectorPanel grids.
+                    // CodeDocument result grids never set a row_action_provider.
+                }
+                DataGridEvent::MutationFinished { .. } | DataGridEvent::RequestClose => {
+                    // A result grid has no primary key, so it is never editable
+                    // and never runs a staged mutation; neither event can come
+                    // from it. A code document's own close flow decides when its
+                    // result tab goes, so `RequestClose` is not forwarded here.
+                }
+                DataGridEvent::CountRowsRequested => {
+                    this.count_result_rows(grid, cx);
+                }
+                DataGridEvent::LoadAllRowsRequested => {
+                    this.pending.load_all_rows = Some(grid.entity_id());
+                    cx.notify();
+                }
+                DataGridEvent::ApplyVisualQuery(_)
+                | DataGridEvent::ClearVisualQuery
+                | DataGridEvent::OpenEditorWithContent { .. } => {
+                    // Builder events are only emitted from table-browsing grids.
+                    // CodeDocument result grids never have a builder panel.
+                }
+                DataGridEvent::OpenReferencedRow { .. } => {
+                    // FK navigation needs a DataSource::Table with FK metadata;
+                    // CodeDocument result grids browse query results.
+                }
+            });
+
+        let view_handle = DataGridPanel::into_view_handle(grid.clone(), cx);
+        let result_panel = cx.new(|cx| ResultPanel::new(view_handle, cx));
+
+        let tab = ResultTab {
+            id: tab_id,
+            title,
+            grid,
+            result_panel,
+            origin,
+            _subscription: subscription,
+        };
+
+        self.result_tabs.result_tabs.push(tab);
+        self.result_tabs.active_result_index = Some(self.result_tabs.result_tabs.len() - 1);
+    }
+
+    /// What a result of `query` may offer when the row limit cuts it short.
+    ///
+    /// Both actions run the query again, so they are offered only for one
+    /// statement that reads. Counting wraps the statement in `COUNT(*)`, which
+    /// only SQL can express.
+    fn limited_row_actions(
+        &self,
+        query: &str,
+        connection_id: Option<Uuid>,
+        cx: &App,
+    ) -> LimitedRowActions {
+        if self.read_only {
+            return LimitedRowActions::default();
+        }
+
+        let language = self.effective_language();
+        if language.statement_count(query) != 1 {
+            return LimitedRowActions::default();
+        }
+
+        let Some(connected) =
+            connection_id.and_then(|id| self.app_state.read(cx).connections().get(&id))
+        else {
+            return LimitedRowActions::default();
+        };
+
+        let classification = datatab_core::classify_query_for_language_with_service(
+            language,
+            query,
+            Some(connected.connection.language_service()),
+        );
+        let reads = classification == datatab_core::ExecutionClassification::Read;
+
+        LimitedRowActions {
+            count: reads && *language == QueryLanguage::Sql,
+            load_all: reads,
+        }
+    }
+
+    /// The query behind a result tab and where it ran.
+    fn result_tab_query(
+        &self,
+        grid: &Entity<DataGridPanel>,
+        cx: &App,
+    ) -> Option<(String, ResultOrigin)> {
+        let tab = self
+            .result_tabs
+            .result_tabs
+            .iter()
+            .find(|tab| tab.grid.entity_id() == grid.entity_id())?;
+        let query = tab.grid.read(cx).result_query()?.to_string();
+        Some((query, tab.origin.clone()?))
+    }
+
+    /// Runs `request` where a result tab's query ran: on the editor session
+    /// while the document is still bound to that context, else on the
+    /// context's own connection, so the session is not reopened elsewhere.
+    fn execute_in_result_context(
+        &self,
+        context: ExecutionSessionContext,
+        request: QueryRequest,
+        cx: &App,
+    ) -> Task<Result<QueryResult, DbError>> {
+        let on_session = self
+            .execution_session_context
+            .as_ref()
+            .is_some_and(|current| current.same_as(&context));
+        let session = self.execution_session.clone();
+
+        cx.background_executor().spawn(async move {
+            if on_session {
+                session
+                    .execute(context.root, context.database, &request)
+                    .result
+            } else {
+                context.root.execute(&request)
+            }
+        })
+    }
+
+    /// Counts the rows of the query behind a result tab, without fetching
+    /// them, where the query ran.
+    fn count_result_rows(&mut self, grid: Entity<DataGridPanel>, cx: &mut Context<Self>) {
+        let Some((query, origin)) = self.result_tab_query(&grid, cx) else {
+            grid.update(cx, |grid, cx| {
+                grid.set_limited_row_total(LimitedRowTotal::Unknown, cx);
+            });
+            return;
+        };
+
+        let generation = grid.read(cx).result_generation();
+        // The count query returns one row; the cap keeps a driver from
+        // collecting more, but only a connection that enforces one may be sent
+        // it (see `enforces_request_row_limit`).
+        let count_row_limit = enforces_request_row_limit(origin.context.root.as_ref()).then_some(1);
+        let request = query_request_for_execution(
+            datatab_core::count_query_from_sql(&query),
+            origin.context.database.clone(),
+            &origin.exec_ctx,
+            self.effective_language().clone(),
+            count_row_limit,
+        );
+        let task = self.execute_in_result_context(origin.context, request, cx);
+
+        cx.spawn(async move |_this, cx| {
+            let total = match task.await {
+                Ok(result) => result
+                    .rows
+                    .first()
+                    .and_then(|row| row.first())
+                    .and_then(count_value)
+                    .ok_or_else(|| "the count query returned no number".to_string()),
+                Err(error) => Err(error.to_string()),
+            };
+
+            cx.update(|cx| {
+                grid.update(cx, |grid, cx| {
+                    if grid.result_generation() != generation {
+                        return;
+                    }
+                    match total {
+                        Ok(total) => grid.set_limited_row_total(LimitedRowTotal::Known(total), cx),
+                        Err(error) => {
+                            grid.set_limited_row_total(LimitedRowTotal::Unknown, cx);
+                            datatab_ui_base::user_error::report_error(
+                                datatab_ui_base::user_error::UserFacingError::new(
+                                    datatab_ui_base::user_error::ErrorKind::Driver,
+                                    datatab_i18n::t!("document.code.execution.count_rows_failed"),
+                                )
+                                .with_cause(error),
+                                cx,
+                            );
+                        }
+                    }
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Runs the query behind a result tab again without the editor row limit,
+    /// on the connection and database it came from, replacing that tab's rows.
+    ///
+    /// The statement was validated and classified as a read when it first ran,
+    /// so the rerun skips the dangerous-query and drift checks of a run the
+    /// user starts, and goes straight to execution, which records the task,
+    /// history and audit as usual.
+    pub(super) fn process_pending_load_all_rows(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(grid_id) = self.pending.load_all_rows.take() else {
+            return;
+        };
+
+        let Some(grid) = self
+            .result_tabs
+            .result_tabs
+            .iter()
+            .find(|tab| tab.grid.entity_id() == grid_id)
+            .map(|tab| tab.grid.clone())
+        else {
+            return;
+        };
+        let Some((query, origin)) = self.result_tab_query(&grid, cx) else {
+            return;
+        };
+
+        self.execution.query_origin = None;
+        self.execution.load_all_rows = Some(LoadAllRows {
+            query: query.clone(),
+            grid: grid_id,
+            origin,
+        });
+        self.execute_query_internal(query, false, ReadOnlyEnforcement::None, window, cx);
+    }
+
+    /// Releases the editor when its running query task was cancelled outside
+    /// it, from the Background tasks panel. The driver call keeps running
+    /// until the database answers the cancel, and its completion still records
+    /// the cancellation; without this the editor kept showing a run the user
+    /// had already cancelled for as long as that call blocked.
+    pub(super) fn sync_external_query_cancellation(&mut self, cx: &mut Context<Self>) {
+        if self.state != DocumentState::Executing {
+            return;
+        }
+
+        let Some(task) = self.execution.active_query_task.as_ref() else {
+            return;
+        };
+
+        let cancelled = self
+            .app_state
+            .read(cx)
+            .tasks()
+            .get(task.task_id)
+            .is_some_and(|task| task.status == datatab_core::TaskStatus::Cancelled);
+
+        if cancelled {
+            self.release_cancelled_execution(cx);
+        }
+    }
+
+    fn release_cancelled_execution(&mut self, cx: &mut Context<Self>) {
+        if let Some(index) = self.execution.active_execution_index
+            && let Some(record) = self.execution.execution_history.get_mut(index)
+            && record.finished_at.is_none()
+        {
+            record.finished_at = Some(Instant::now());
+        }
+
+        self.state = DocumentState::Clean;
+        cx.emit(DocumentEvent::MetaChanged);
+        cx.notify();
+    }
+
+    pub fn cancel_query(&mut self, cx: &mut Context<Self>) {
+        if self.runner.cancel_primary(cx) {
+            if let Some(task) = self.execution.active_query_task.as_ref() {
+                if !task.uses_isolated_session {
+                    self.app_state
+                        .read(cx)
+                        .cancel_query_for_target(&task.target);
+                }
+            } else if let Some(conn_id) = self.connection_id
+                && let Some(connected) = self.app_state.read(cx).connections().get(&conn_id)
+            {
+                let active_database = self
+                    .source
+                    .exec_ctx
+                    .database
+                    .clone()
+                    .or_else(|| connected.active_database.clone());
+                let target =
+                    task_target_for_execution(conn_id, connected, active_database.as_deref());
+
+                self.app_state.read(cx).cancel_query_for_target(&target);
+            }
+
+            self.release_cancelled_execution(cx);
+        }
+    }
+
+    pub fn hide_results(&mut self, cx: &mut Context<Self>) {
+        self.layout = SqlQueryLayout::EditorOnly;
+        self.focus_mode = SqlQueryFocus::Editor;
+        self.results_maximized = false;
+        cx.notify();
+    }
+
+    /// Maximizes the results over the editor, or restores the split when
+    /// they already fill the document. Hidden results come back maximized.
+    pub fn toggle_maximize_results(&mut self, cx: &mut Context<Self>) {
+        if self.layout == SqlQueryLayout::ResultsOnly {
+            self.layout = SqlQueryLayout::Split;
+            self.results_maximized = false;
+        } else {
+            self.layout = SqlQueryLayout::ResultsOnly;
+            self.results_maximized = true;
+        }
+
+        if let Some(grid) = self.active_result_grid() {
+            grid.update(cx, |g, cx| g.set_maximized(self.results_maximized, cx));
+        }
+
+        cx.notify();
+    }
+
+    /// Moves the results between below and beside the editor, and keeps the
+    /// choice for the query tabs opened after it.
+    pub fn toggle_results_position(&mut self, cx: &mut Context<Self>) {
+        self.results_position = self.results_position.toggled();
+        self.results_position.save(self.app_state.read(cx));
+        cx.notify();
+    }
+
+    /// Restores the split when maximized results hide the editor, so moving
+    /// the keyboard to the query text never focuses an input that is not shown.
+    pub(super) fn reveal_editor(&mut self, cx: &mut Context<Self>) {
+        if self.layout == SqlQueryLayout::ResultsOnly {
+            self.toggle_maximize_results(cx);
+        }
+    }
+
+    pub fn run_query_in_new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_only {
+            return;
+        }
+        if !self.supports_connection_context() {
+            self.run_script(window, cx);
+            return;
+        }
+        self.run_query_impl(true, window, cx);
+    }
+
+    /// Prepends `EXPLAIN ` to the active query and executes it.
+    ///
+    /// Uses the selected text when a selection exists, otherwise the full buffer.
+    /// The result appears in the same Results panel as a regular query.
+    pub fn run_explain(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.supports_connection_context() {
+            Toast::warning(datatab_i18n::t!(
+                "document.code.execution.toast.explain_unavailable"
+            ))
+            .meta_right(now_hms())
+            .push(cx);
+            return;
+        }
+
+        let base_query = self.selected_or_full_query(window, cx);
+        if base_query.trim().is_empty() {
+            Toast::warning(datatab_i18n::t!(
+                "document.code.execution.toast.enter_query_to_explain"
+            ))
+            .meta_right(now_hms())
+            .push(cx);
+            return;
+        }
+
+        let explain_query = format!("EXPLAIN {}", base_query);
+        self.run_query_text(explain_query, false, window, cx);
+    }
+
+    pub fn close_result_tab(&mut self, tab_id: Uuid, cx: &mut Context<Self>) {
+        let Some(index) = self
+            .result_tabs
+            .result_tabs
+            .iter()
+            .position(|t| t.id == tab_id)
+        else {
+            return;
+        };
+
+        self.result_tabs.result_tabs.remove(index);
+
+        if self.result_tabs.result_tabs.is_empty() {
+            self.result_tabs.active_result_index = None;
+            self.layout = SqlQueryLayout::EditorOnly;
+            self.focus_mode = SqlQueryFocus::Editor;
+        } else if let Some(active) = self.result_tabs.active_result_index {
+            if active >= self.result_tabs.result_tabs.len() {
+                self.result_tabs.active_result_index = Some(self.result_tabs.result_tabs.len() - 1);
+            } else if active > index {
+                self.result_tabs.active_result_index = Some(active - 1);
+            }
+        }
+
+        cx.notify();
+    }
+
+    pub fn activate_result_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index < self.result_tabs.result_tabs.len() {
+            self.result_tabs.active_result_index = Some(index);
+            cx.notify();
+        }
+    }
+
+    /// Shows the next result tab (`forward`) or the previous one, wrapping
+    /// at either end, and keeps the keyboard on the results when they had
+    /// it. Returns false when there is no result tab.
+    pub(super) fn step_result_tab(
+        &mut self,
+        forward: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let count = self.result_tabs.result_tabs.len();
+        if count == 0 {
+            return false;
+        }
+
+        let current = self.result_tabs.active_result_index.unwrap_or(0);
+        let next = if forward {
+            (current + 1) % count
+        } else {
+            (current + count - 1) % count
+        };
+
+        self.activate_result_tab(next, cx);
+        self.focus_results_if_they_had_it(window, cx);
+        true
+    }
+
+    /// Closes the result tab shown, as its close button does, and moves the
+    /// keyboard to the tab shown next, or to the editor when none is left.
+    /// Returns false when there is no result tab.
+    pub(super) fn close_active_result_tab(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(tab_id) = self
+            .result_tabs
+            .active_result_index
+            .and_then(|index| self.result_tabs.result_tabs.get(index))
+            .map(|tab| tab.id)
+        else {
+            return false;
+        };
+
+        self.close_result_tab(tab_id, cx);
+
+        if self.result_tabs.result_tabs.is_empty() {
+            self.focus_editor_input(window, cx);
+        } else {
+            self.focus_results_if_they_had_it(window, cx);
+        }
+
+        true
+    }
+
+    /// Hides the results, as the header's hide button does, and gives the
+    /// keyboard to the editor, since the results it may have had are gone.
+    pub(super) fn hide_results_from_keyboard(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.hide_results(cx);
+        self.focus_editor_input(window, cx);
+    }
+
+    fn focus_results_if_they_had_it(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focus_mode == SqlQueryFocus::Results
+            && let Some(grid) = self.active_result_grid()
+        {
+            grid.update(cx, |grid, cx| grid.focus_active_view(window, cx));
+        }
+    }
+
+    fn focus_editor_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_mode = SqlQueryFocus::Editor;
+        self.editor
+            .input_state
+            .update(cx, |state, cx| state.focus(window, cx));
+        cx.notify();
+    }
+
+    pub(super) fn active_result_grid(&self) -> Option<Entity<DataGridPanel>> {
+        self.result_tabs
+            .active_result_index
+            .and_then(|i| self.result_tabs.result_tabs.get(i))
+            .map(|tab| tab.grid.clone())
+    }
+
+    /// Returns the `ResultPanel` wrapping the active result tab's grid.
+    ///
+    /// Used by `render_results` to render through `ResultPanel` rather than
+    /// directly rendering the bare `DataGridPanel` entity.
+    pub(super) fn active_result_panel(&self) -> Option<Entity<ResultPanel>> {
+        self.result_tabs
+            .active_result_index
+            .and_then(|i| self.result_tabs.result_tabs.get(i))
+            .map(|tab| tab.result_panel.clone())
+    }
+
+    fn run_script(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        use datatab_app::hook_executor::CompositeExecutor;
+        use datatab_core::{
+            CancelToken, ConnectionHook, HookContext, HookExecutionMode, HookExecutor,
+            HookFailureMode, HookKind, LuaCapabilities, ScriptLanguage, ScriptSource,
+        };
+
+        let content = self.editor.input_state.read(cx).value().to_string();
+        if content.trim().is_empty() {
+            Toast::warning(datatab_i18n::t!(
+                "document.code.execution.toast.enter_script_content"
+            ))
+            .meta_right(now_hms())
+            .push(cx);
+            return;
+        }
+
+        let kind = match self.effective_language() {
+            QueryLanguage::Lua => HookKind::Lua {
+                source: ScriptSource::Inline {
+                    content: content.clone(),
+                },
+                capabilities: LuaCapabilities::all_enabled(),
+            },
+            QueryLanguage::Python => HookKind::Script {
+                language: ScriptLanguage::Python,
+                source: ScriptSource::Inline {
+                    content: content.clone(),
+                },
+                interpreter: None,
+            },
+            QueryLanguage::Bash => HookKind::Script {
+                language: ScriptLanguage::Bash,
+                source: ScriptSource::Inline {
+                    content: content.clone(),
+                },
+                interpreter: None,
+            },
+            _ => return,
+        };
+
+        let hook = ConnectionHook {
+            enabled: true,
+            kind,
+            cwd: None,
+            env: std::collections::HashMap::new(),
+            inherit_env: true,
+            env_denylist: Vec::new(),
+            timeout_ms: Some(30_000),
+            execution_mode: HookExecutionMode::Blocking,
+            ready_signal: None,
+            on_failure: HookFailureMode::Warn,
+        };
+
+        let context = HookContext {
+            profile_id: Uuid::nil(),
+            profile_name: "script-runner".to_string(),
+            db_kind: "none".to_string(),
+            host: None,
+            port: None,
+            database: None,
+            phase: None,
+            dials_configured_endpoint: false,
+        };
+
+        let description =
+            crate::labels::run_script_task_label(self.effective_language().display_name());
+        let (output_sender, output_receiver) = datatab_core::output_channel();
+        let (task_id, cancel_token) =
+            self.runner
+                .start_primary(datatab_core::TaskKind::Query, description, cx);
+
+        let exec_id = Uuid::new_v4();
+        let record = ExecutionRecord {
+            id: exec_id,
+            started_at: Instant::now(),
+            finished_at: None,
+            result: None,
+            error: None,
+            rows_affected: None,
+            is_script: true,
+        };
+        self.execution.execution_history.push(record);
+        self.execution.active_execution_index = Some(self.execution.execution_history.len() - 1);
+
+        self.clear_live_output();
+        self.start_live_output(output_receiver, cx);
+        self.state = DocumentState::Executing;
+        self.result_tabs.run_in_new_tab = false;
+        if self.layout == SqlQueryLayout::EditorOnly {
+            self.layout = SqlQueryLayout::Split;
+        }
+        cx.emit(DocumentEvent::ExecutionStarted);
+        cx.notify();
+
+        // Capture script start time before spawning so we can compute duration for
+        // cancellation fallback even if the document is gone when cancellation is detected.
+        let script_started_at = Instant::now();
+
+        let executor = CompositeExecutor::new();
+        let bg_cancel = cancel_token.clone();
+
+        let task = cx.background_executor().spawn(async move {
+            let started_at = Instant::now();
+            let result = executor.execute_hook(
+                &hook,
+                &context,
+                &bg_cancel,
+                None,
+                Some(&output_sender),
+                None,
+            );
+
+            match result {
+                Ok(hook_result) => {
+                    let mut output = String::new();
+
+                    if !hook_result.stdout.is_empty() {
+                        output.push_str(&hook_result.stdout);
+                    }
+
+                    if !hook_result.stderr.is_empty() {
+                        if !output.is_empty() {
+                            output.push_str("\n--- stderr ---\n");
+                        }
+                        output.push_str(&hook_result.stderr);
+                    }
+
+                    if hook_result.timed_out {
+                        output.push_str("\n[Script timed out]");
+                    }
+
+                    let exit_info = match hook_result.exit_code {
+                        Some(0) => None,
+                        Some(code) => Some(format!("Process exited with code {}", code)),
+                        None if hook_result.timed_out => None,
+                        None => Some("Process exited without status code".to_string()),
+                    };
+
+                    if let Some(info) = exit_info {
+                        if !output.is_empty() {
+                            output.push('\n');
+                        }
+                        output.push_str(&info);
+                    }
+
+                    if output.is_empty() {
+                        output = "(no output)".to_string();
+                    }
+
+                    let elapsed = started_at.elapsed();
+                    Ok(QueryResult {
+                        shape: datatab_core::QueryResultShape::Text,
+                        columns: Vec::new(),
+                        rows: Vec::new(),
+                        affected_rows: None,
+                        execution_time: elapsed,
+                        text_body: Some(output),
+                        raw_bytes: None,
+                        next_page_token: None,
+                        resolved_window: None,
+                        metadata_extra: None,
+                        additional_results: Vec::new(),
+                    })
+                }
+                Err(error) => Err(DbError::query_failed(error)),
+            }
+        });
+
+        // Capture audit_service and script_started_at before spawning the deferred task so we can emit
+        // audit events even if the document is closed before the task runs.
+        let audit_service = self.app_state.read(cx).audit_service().clone();
+        let content_for_cancel = content.clone();
+
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+
+            if cancel_token.is_cancelled() {
+                // Emit cancellation audit event for script (which has no connection context)
+                let dummy_target = TaskTarget {
+                    profile_id: Uuid::nil(),
+                    database: None,
+                };
+                let inner_result = this.update(cx, |doc, cx| {
+                    doc.complete_cancelled_query(
+                        task_id,
+                        exec_id,
+                        &dummy_target,
+                        Some(content_for_cancel),
+                        cx,
+                    );
+                });
+                cx.update(|_| ());
+                if inner_result.is_err() {
+                    // Entity is gone (outer fails) or inner update failed; emit audit event directly
+                    // so it is not silently dropped.
+                    let ts_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    let duration_ms = script_started_at.elapsed().as_millis() as i64;
+                    let details_json = serde_json::json!({ "query": content }).to_string();
+                    let event = EventRecord::new(
+                        ts_ms,
+                        EventSeverity::Warn,
+                        EventCategory::Script,
+                        EventOutcome::Cancelled,
+                    )
+                    .with_typed_action(audit_actions::QUERY_CANCEL)
+                    .with_summary("Script cancelled")
+                    .with_origin(EventOrigin::script())
+                    .with_details_json(details_json)
+                    .with_duration_ms(duration_ms);
+                    if let Err(e) = audit_service.record(event) {
+                        log::warn!(
+                            "Failed to emit cancelled script audit event via fallback: {}",
+                            e
+                        );
+                    }
+                }
+                return;
+            }
+
+            // Emit fallback when entity is gone AND result delivery fails.
+            // When entity is gone, process_pending_result never runs → emit directly.
+            //
+            // Extract outcome details and duration BEFORE moving result into the closure so we can
+            // emit the correct success/failure event when the entity is already gone.
+            let (outcome, severity, summary, error_detail, duration_ms, action) = match &result {
+                Ok(qr) => {
+                    // Script succeeded (output is in the QueryResult text_body)
+                    let summary = "Script executed successfully".to_string();
+                    let duration_ms = Some(qr.execution_time.as_millis() as i64);
+                    (
+                        EventOutcome::Success,
+                        EventSeverity::Info,
+                        summary,
+                        None,
+                        duration_ms,
+                        audit_actions::SCRIPT_EXECUTE,
+                    )
+                }
+                Err(e) => {
+                    let summary = format!("Script failed: {}", e);
+                    let duration_ms = Some(script_started_at.elapsed().as_millis() as i64);
+                    (
+                        EventOutcome::Failure,
+                        EventSeverity::Error,
+                        summary,
+                        Some(e.to_string()),
+                        duration_ms,
+                        audit_actions::SCRIPT_EXECUTE_FAILED,
+                    )
+                }
+            };
+
+            // Capture script content before it gets moved into PendingQueryResult so we can
+            // use it in the fallback event if needed.
+            let script_content = content.clone();
+
+            let inner_result = this.update(cx, |doc, cx| {
+                doc.pending.result = Some(PendingQueryResult {
+                    task_id,
+                    exec_id,
+                    query: content,
+                    result,
+                    is_script: true,
+                    read_only: ReadOnlyEnforcement::None,
+                    result_grid: None,
+                    origin: None,
+                });
+                cx.notify();
+            });
+
+            // Fallback fires if the entity is gone (inner update failed). We do NOT probe
+            // with a second synthetic cx.update call — we use the actual inner update result.
+            if inner_result.is_err() {
+                // Entity is gone; process_pending_result won't run. Emit via fallback so the event
+                // is not silently dropped.
+                let ts_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+
+                let details_json = serde_json::json!({ "query": script_content }).to_string();
+
+                // Scripts have no connection context; use nil profile_id.
+                let mut event = EventRecord::new(ts_ms, severity, EventCategory::Script, outcome)
+                    .with_typed_action(action)
+                    .with_summary(&summary)
+                    .with_origin(EventOrigin::script())
+                    .with_details_json(details_json)
+                    .with_duration_ms(duration_ms.unwrap_or(0));
+                if let Some(err) = error_detail {
+                    event.error_message = Some(err);
+                }
+                if let Err(e) = audit_service.record(event) {
+                    log::warn!("Failed to emit script audit event via fallback: {}", e);
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Handle "Refresh and re-run": apply the pre-fetched fresh table details
+    /// to the cache, close the modal, then queue execution via the render loop.
+    ///
+    /// The fresh `TableInfo` for both changed and unchanged tables was already
+    /// captured during the drift preflight and stored in `pending.drift_query`.
+    pub(super) fn on_schema_drift_refresh(&mut self, cx: &mut Context<Self>) {
+        let Some(pending) = self.pending.drift_query.take() else {
+            return;
+        };
+
+        let Some(conn_id) = self.connection_id else {
+            return;
+        };
+
+        // Apply all fresh table details (changed + unchanged) to the cache.
+        if !pending.cache_updates.is_empty() {
+            self.app_state.update(cx, |state, _cx| {
+                if let Some(connected) = state.connections_mut().get_mut(&conn_id) {
+                    for (key, info) in &pending.cache_updates {
+                        connected.table_details.insert(key.clone(), info.clone());
+                    }
+                }
+            });
+        }
+
+        self.drift.schema_drift_modal.update(cx, |modal, cx| {
+            modal.close(cx);
+        });
+
+        self.pending.drift_query = Some(PendingDriftQuery {
+            query: pending.query,
+            in_new_tab: pending.in_new_tab,
+            action: DriftAction::ExecuteNow,
+            cache_updates: Vec::new(),
+            read_only: pending.read_only,
+        });
+
+        cx.notify();
+    }
+
+    /// Handle "Continue with stale schema": mark the pending query so the render
+    /// loop picks it up and calls `execute_query_internal` with window access.
+    pub(super) fn on_schema_drift_continue(&mut self, cx: &mut Context<Self>) {
+        if let Some(ref mut pending) = self.pending.drift_query {
+            pending.action = DriftAction::ContinueStale;
+        }
+
+        self.drift.schema_drift_modal.update(cx, |modal, cx| {
+            modal.close(cx);
+        });
+
+        cx.notify();
+    }
+
+    /// Process a pending drift action (called from render where window is available).
+    ///
+    /// Must be called via the `pending_*` + `.take()` pattern in the render method to
+    /// avoid multiple borrows.
+    pub(super) fn process_pending_drift_continue(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(pending) = self.pending.drift_query.take() else {
+            return;
+        };
+
+        match pending.action {
+            DriftAction::Pending => {
+                // Modal not yet answered — put it back and wait.
+                self.pending.drift_query = Some(pending);
+            }
+
+            DriftAction::ExecuteNow => {
+                // Transparent refresh: apply cache updates then execute.
+                if !pending.cache_updates.is_empty()
+                    && let Some(conn_id) = self.connection_id
+                {
+                    self.app_state.update(cx, |state, _cx| {
+                        if let Some(connected) = state.connections_mut().get_mut(&conn_id) {
+                            for (key, info) in &pending.cache_updates {
+                                connected.table_details.insert(key.clone(), info.clone());
+                            }
+                        }
+                    });
+                }
+
+                self.execute_query_internal(
+                    pending.query,
+                    pending.in_new_tab,
+                    pending.read_only,
+                    window,
+                    cx,
+                );
+            }
+
+            DriftAction::ContinueStale => {
+                // User chose to proceed without updating the cache.
+                self.execute_query_internal(
+                    pending.query,
+                    pending.in_new_tab,
+                    pending.read_only,
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+}
+
+/// Reads the single value a `COUNT(*)` query returns as a row count.
+fn count_value(value: &datatab_core::Value) -> Option<u64> {
+    use datatab_core::Value;
+    match value {
+        Value::Int(count) => u64::try_from(*count).ok(),
+        Value::Text(count) | Value::Decimal(count) => count.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{query_request_for_execution, resolve_source_context};
+    use crate::code::{apply_editor_row_limit, build_source_window_context};
+    use datatab_core::{
+        ExecutionContext, ExecutionSourceContext, GeneralSettings, QueryLanguage, QueryRequest,
+    };
+    use uuid::Uuid;
+
+    #[test]
+    fn editor_query_request_uses_default_editor_row_limit() {
+        let request = query_request_for_execution(
+            "SELECT 1".into(),
+            None,
+            &ExecutionContext::default(),
+            QueryLanguage::Sql,
+            Some(GeneralSettings::default().editor_row_limit),
+        );
+
+        assert_eq!(request.limit, Some(10_000));
+        assert_eq!(request.statement_timeout, None);
+    }
+
+    #[test]
+    fn editor_query_request_uses_configured_editor_row_limit_for_every_language() {
+        let languages = [
+            QueryLanguage::Sql,
+            QueryLanguage::MongoQuery,
+            QueryLanguage::RedisCommands,
+            QueryLanguage::InfluxQuery,
+            QueryLanguage::Flux,
+            QueryLanguage::CloudWatchLogsInsightsQl,
+            QueryLanguage::Cql,
+        ];
+
+        for language in languages {
+            let request = query_request_for_execution(
+                "query".into(),
+                None,
+                &ExecutionContext::default(),
+                language.clone(),
+                Some(5_000),
+            );
+
+            assert_eq!(request.limit, Some(5_000), "{language:?}");
+            assert_eq!(request.statement_timeout, None, "{language:?}");
+        }
+    }
+
+    /// A connection that cannot enforce a row budget is never sent one: the
+    /// driver would refuse the request instead of running it, so the editor
+    /// query would never reach it. This is the external RPC driver case, where
+    /// the adapter clears [`DriverCapabilities::REQUEST_ROW_LIMIT`].
+    #[test]
+    fn editor_query_request_carries_no_limit_without_an_enforcing_driver() {
+        let request = query_request_for_execution(
+            "SELECT 1".into(),
+            None,
+            &ExecutionContext::default(),
+            QueryLanguage::MongoQuery,
+            None,
+        );
+
+        assert_eq!(request.limit, None);
+        assert_eq!(request.statement_timeout, None);
+    }
+
+    #[test]
+    fn editor_row_limit_preserves_an_explicit_request_limit() {
+        for editor_row_limit in [Some(5_000), None] {
+            for explicit_limit in [0, 25] {
+                let request = apply_editor_row_limit(
+                    QueryRequest::new("SELECT 1").with_limit(explicit_limit),
+                    editor_row_limit,
+                );
+
+                assert_eq!(request.limit, Some(explicit_limit));
+                assert_eq!(request.statement_timeout, None);
+            }
+        }
+    }
+
+    /// No cap leaves a request that has no limit of its own untouched, rather
+    /// than filling one in.
+    #[test]
+    fn editor_row_limit_adds_nothing_without_a_cap() {
+        let request = apply_editor_row_limit(QueryRequest::new("SELECT 1"), None);
+
+        assert_eq!(request.limit, None);
+        assert_eq!(request.statement_timeout, None);
+    }
+
+    #[test]
+    fn count_value_reads_the_count_drivers_return() {
+        use datatab_core::Value;
+
+        assert_eq!(super::count_value(&Value::Int(52_310)), Some(52_310));
+        assert_eq!(super::count_value(&Value::Text(" 7 ".into())), Some(7));
+        assert_eq!(super::count_value(&Value::Decimal("12".into())), Some(12));
+        assert_eq!(super::count_value(&Value::Int(-1)), None);
+        assert_eq!(super::count_value(&Value::Null), None);
+    }
+
+    #[test]
+    fn editor_row_limit_above_u32_range_saturates() {
+        let request = apply_editor_row_limit(QueryRequest::new("SELECT 1"), Some(usize::MAX));
+
+        assert_eq!(request.limit, Some(u32::MAX));
+    }
+
+    /// A panel-emitted override window wins over the input-field fallback,
+    /// even when the fallback would have returned a different valid window.
+    /// This guards the chart-toolbar regression where stale input text
+    /// silently clobbered the panel's preset selection.
+    #[test]
+    fn override_window_wins_over_fallback_collection_window() {
+        let fallback = build_source_window_context(
+            Some("cwli".to_string()),
+            &["/aws/lambda/app".to_string()],
+            Some(1_000),
+            Some(2_000),
+        );
+
+        let resolved = resolve_source_context(
+            Some((5_000, 6_000)),
+            vec!["/aws/lambda/app".to_string()],
+            Some("cwli".to_string()),
+            fallback,
+        )
+        .expect("override path must succeed");
+
+        match resolved {
+            ExecutionSourceContext::CollectionWindow {
+                start_ms, end_ms, ..
+            } => {
+                assert_eq!(start_ms, 5_000);
+                assert_eq!(end_ms, 6_000);
+            }
+            other => panic!("expected CollectionWindow, got {other:?}"),
+        }
+    }
+
+    /// The override path also wins when the fallback errored (e.g. inputs are
+    /// blank or invalid). A panel selection has authoritative bounds and must
+    /// not be blocked by input-validation failures from a control the user
+    /// did not interact with.
+    #[test]
+    fn override_window_wins_when_fallback_errors() {
+        let resolved = resolve_source_context(
+            Some((100, 200)),
+            vec!["bucket".to_string()],
+            None,
+            Err("Start time is required"),
+        )
+        .expect("override path must succeed despite fallback Err");
+
+        match resolved {
+            ExecutionSourceContext::CollectionWindow {
+                targets,
+                start_ms,
+                end_ms,
+                query_mode,
+            } => {
+                assert_eq!(targets, vec!["bucket".to_string()]);
+                assert_eq!(start_ms, 100);
+                assert_eq!(end_ms, 200);
+                assert!(query_mode.is_none());
+            }
+            other => panic!("expected CollectionWindow, got {other:?}"),
+        }
+    }
+
+    /// Without an override, the input-driven fallback is returned verbatim.
+    #[test]
+    fn fallback_passes_through_when_no_override() {
+        let fallback =
+            build_source_window_context(None, &["telegraf".to_string()], Some(10), Some(20));
+
+        let resolved = resolve_source_context(None, vec!["telegraf".to_string()], None, fallback)
+            .expect("fallback must succeed");
+
+        match resolved {
+            ExecutionSourceContext::CollectionWindow {
+                start_ms, end_ms, ..
+            } => {
+                assert_eq!(start_ms, 10);
+                assert_eq!(end_ms, 20);
+            }
+            other => panic!("expected CollectionWindow, got {other:?}"),
+        }
+    }
+
+    /// Without an override, a fallback error propagates unchanged.
+    #[test]
+    fn fallback_error_propagates_when_no_override() {
+        let err = resolve_source_context(None, vec![], None, Err("Select at least one source"))
+            .unwrap_err();
+        assert_eq!(err, "Select at least one source");
+    }
+
+    #[test]
+    fn source_window_execution_request_uses_latest_editor_context() {
+        let exec_ctx = ExecutionContext {
+            connection_id: Some(Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()),
+            database: Some("logs".into()),
+            schema: None,
+            container: None,
+            source: Some(
+                build_source_window_context(
+                    Some("cwli".to_string()),
+                    &["/aws/lambda/app".to_string(), "/aws/ecs/api".to_string()],
+                    Some(10),
+                    Some(20),
+                )
+                .expect("valid source"),
+            ),
+        };
+
+        // "fields @message" contains no macros; CloudWatchLogsInsightsQl passes through unchanged.
+        let request = query_request_for_execution(
+            "fields @message".into(),
+            Some("logs".into()),
+            &exec_ctx,
+            QueryLanguage::CloudWatchLogsInsightsQl,
+            Some(10_000),
+        );
+
+        assert_eq!(request.database.as_deref(), Some("logs"));
+
+        match request.execution_context.and_then(|ctx| ctx.source) {
+            Some(ExecutionSourceContext::CollectionWindow {
+                targets,
+                start_ms,
+                end_ms,
+                query_mode,
+            }) => {
+                assert_eq!(targets, vec!["/aws/lambda/app", "/aws/ecs/api"]);
+                assert_eq!(start_ms, 10);
+                assert_eq!(end_ms, 20);
+                assert_eq!(query_mode.as_deref(), Some("cwli"));
+            }
+            other => panic!("unexpected execution source: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_window_execution_blocks_when_targets_are_missing() {
+        assert_eq!(
+            build_source_window_context(Some("cwli".to_string()), &[], Some(10), Some(20))
+                .unwrap_err(),
+            "Select at least one source"
+        );
+    }
+
+    #[test]
+    fn source_window_execution_blocks_when_bounds_are_missing() {
+        assert_eq!(
+            build_source_window_context(
+                Some("cwli".to_string()),
+                &["/aws/lambda/app".to_string()],
+                None,
+                Some(20),
+            )
+            .unwrap_err(),
+            "Start time is required"
+        );
+        assert_eq!(
+            build_source_window_context(
+                Some("cwli".to_string()),
+                &["/aws/lambda/app".to_string()],
+                Some(10),
+                None,
+            )
+            .unwrap_err(),
+            "End time is required"
+        );
+    }
+
+    #[test]
+    fn source_window_execution_blocks_when_range_is_inverted() {
+        assert_eq!(
+            build_source_window_context(
+                Some("cwli".to_string()),
+                &["/aws/lambda/app".to_string()],
+                Some(20),
+                Some(10),
+            )
+            .unwrap_err(),
+            "Start time must be earlier than end time"
+        );
+    }
+
+    /// REQ-4: macro substitution fires when source is CollectionWindow + InfluxQL.
+    #[test]
+    fn influxql_macro_substituted_when_collection_window() {
+        let exec_ctx = ExecutionContext {
+            connection_id: None,
+            database: None,
+            schema: None,
+            container: None,
+            source: Some(
+                build_source_window_context(
+                    None,
+                    &["cpu".to_string()],
+                    Some(1_710_000_000_000),
+                    Some(1_710_003_600_000),
+                )
+                .expect("valid source"),
+            ),
+        };
+
+        let request = query_request_for_execution(
+            "SELECT mean(usage_user) FROM cpu WHERE $timeFilter GROUP BY time(1m)".into(),
+            None,
+            &exec_ctx,
+            QueryLanguage::InfluxQuery,
+            Some(10_000),
+        );
+
+        assert!(
+            request.sql.contains("time >="),
+            "time >= expected in: {}",
+            request.sql
+        );
+        assert!(
+            request.sql.contains("time <="),
+            "time <= expected in: {}",
+            request.sql
+        );
+        assert!(
+            !request.sql.contains("$timeFilter"),
+            "macro must be replaced, got: {}",
+            request.sql
+        );
+    }
+
+    /// REQ-4: Flux macro substitution fires when source is CollectionWindow + Flux.
+    #[test]
+    fn flux_macro_substituted_when_collection_window() {
+        let exec_ctx = ExecutionContext {
+            connection_id: None,
+            database: None,
+            schema: None,
+            container: None,
+            source: Some(
+                build_source_window_context(
+                    None,
+                    &["telegraf".to_string()],
+                    Some(1_710_000_000_000),
+                    Some(1_710_003_600_000),
+                )
+                .expect("valid source"),
+            ),
+        };
+
+        let request = query_request_for_execution(
+            "from(bucket: \"telegraf\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop)"
+                .into(),
+            None,
+            &exec_ctx,
+            QueryLanguage::Flux,
+            Some(10_000),
+        );
+
+        assert!(
+            !request.sql.contains("v.timeRangeStart"),
+            "v.timeRangeStart macro must be replaced, got: {}",
+            request.sql
+        );
+        assert!(
+            !request.sql.contains("v.timeRangeStop"),
+            "v.timeRangeStop macro must be replaced, got: {}",
+            request.sql
+        );
+        assert!(
+            request.sql.contains("'2024-03-09T16:00:00Z'"),
+            "start RFC3339 expected in: {}",
+            request.sql
+        );
+        assert!(
+            request.sql.contains("'2024-03-09T17:00:00Z'"),
+            "stop RFC3339 expected in: {}",
+            request.sql
+        );
+    }
+
+    /// REQ-6: macros are NOT substituted when no window is bound (source is None).
+    #[test]
+    fn macro_passthrough_when_no_window() {
+        let exec_ctx = ExecutionContext {
+            connection_id: None,
+            database: None,
+            schema: None,
+            container: None,
+            source: None,
+        };
+
+        let query = "SELECT * FROM cpu WHERE time >= $__from";
+        let request = query_request_for_execution(
+            query.into(),
+            None,
+            &exec_ctx,
+            QueryLanguage::InfluxQuery,
+            Some(10_000),
+        );
+
+        assert_eq!(
+            request.sql, query,
+            "query must pass through unchanged when no window"
+        );
+    }
+
+    /// REQ-4: non-InfluxDB language passes through even with a CollectionWindow present.
+    #[test]
+    fn macro_passthrough_for_non_influx_language() {
+        let exec_ctx = ExecutionContext {
+            connection_id: None,
+            database: None,
+            schema: None,
+            container: None,
+            source: Some(
+                build_source_window_context(
+                    Some("sql".to_string()),
+                    &[],
+                    Some(1_710_000_000_000),
+                    Some(1_710_003_600_000),
+                )
+                .expect("valid source"),
+            ),
+        };
+
+        let query = "SELECT $__from FROM table";
+        let request = query_request_for_execution(
+            query.into(),
+            None,
+            &exec_ctx,
+            QueryLanguage::Sql,
+            Some(10_000),
+        );
+
+        assert_eq!(
+            request.sql, query,
+            "SQL language must pass through unchanged"
+        );
+    }
+
+    /// Writing to `PendingActions::drift_query` and then reading it back
+    /// returns the stored value. This exercises the re-entrant write/read path
+    /// that the background drift-preflight task uses: the task writes via
+    /// `cx.update` and the next render cycle reads the same field.
+    #[test]
+    fn drift_query_written_is_readable_on_next_read() {
+        use super::{DriftAction, PendingActions, PendingDriftQuery};
+
+        let mut pending = PendingActions::default();
+
+        assert!(
+            pending.drift_query.is_none(),
+            "drift_query must be None after default construction"
+        );
+
+        pending.drift_query = Some(PendingDriftQuery {
+            query: "SELECT 1".to_string(),
+            in_new_tab: false,
+            action: DriftAction::Pending,
+            cache_updates: Vec::new(),
+            read_only: datatab_core::ReadOnlyEnforcement::None,
+        });
+
+        assert!(
+            pending.drift_query.is_some(),
+            "drift_query must be Some after background-task-style write"
+        );
+
+        let stored = pending.drift_query.as_ref().unwrap();
+        assert_eq!(stored.query, "SELECT 1");
+        assert_eq!(stored.action, DriftAction::Pending);
+    }
+
+    /// When `process_pending_drift_continue` encounters a `Pending` action
+    /// it must put the value back rather than consuming it, so the next render
+    /// cycle can check it again. This verifies the put-back invariant without
+    /// requiring a full GPUI harness by inspecting `PendingActions` directly.
+    #[test]
+    fn drift_query_with_pending_action_survives_put_back() {
+        use super::{DriftAction, PendingActions, PendingDriftQuery};
+
+        let mut pending = PendingActions {
+            drift_query: Some(PendingDriftQuery {
+                query: "SELECT 2".to_string(),
+                in_new_tab: true,
+                action: DriftAction::Pending,
+                cache_updates: Vec::new(),
+                read_only: datatab_core::ReadOnlyEnforcement::None,
+            }),
+            ..Default::default()
+        };
+
+        // Simulate the put-back logic: take the value, inspect action, re-store.
+        let taken = pending.drift_query.take().unwrap();
+        assert_eq!(taken.action, DriftAction::Pending);
+
+        pending.drift_query = Some(taken);
+
+        assert!(
+            pending.drift_query.is_some(),
+            "drift_query must be re-stored when action is Pending"
+        );
+        assert_eq!(
+            pending.drift_query.as_ref().unwrap().query,
+            "SELECT 2",
+            "stored query must be preserved across the put-back"
+        );
+    }
+
+    #[test]
+    fn execution_toast_keys_resolve_in_english() {
+        let keys = [
+            "document.code.execution.toast.enter_query",
+            "document.code.execution.toast.no_active_connection",
+            "document.code.execution.toast.connection_not_found",
+            "document.code.execution.toast.auto_refresh_blocked",
+            "document.code.execution.toast.explain_unavailable",
+            "document.code.execution.toast.enter_query_to_explain",
+            "document.code.execution.toast.enter_script_content",
+            "document.code.execution.toast.write_query_first",
+            "document.code.execution.toast.connecting",
+            "document.code.execution.toast.redis_flush_disabled",
+            "document.code.execution.result_title.query_failed",
+            "document.code.execution.result_title.script_failed",
+            "document.code.execution.copy_error",
+        ];
+
+        for key in keys {
+            let value = datatab_i18n::t!(key, locale = "en");
+
+            assert!(!value.is_empty(), "{key} resolved empty in en");
+            assert_ne!(value, key, "{key} resolved to its own key in en");
+            assert_ne!(value, format!("en.{key}"), "{key} missing from en catalog");
+        }
+    }
+
+    #[test]
+    fn execution_connecting_toast_interpolates_database_name() {
+        let en = datatab_i18n::t!(
+            "document.code.execution.toast.connecting",
+            locale = "en",
+            database = "logs"
+        );
+
+        assert_eq!(en, "Connecting to database 'logs', please wait…");
+    }
+
+    #[test]
+    fn execution_result_tab_title_interpolates_index() {
+        let en = datatab_i18n::t!(
+            "document.code.execution.result_tab_title",
+            locale = "en",
+            index = 3
+        );
+
+        assert_eq!(en, "Result 3");
+    }
+}
+
+#[cfg(test)]
+mod rail_tests {
+    use crate::code::CodeDocument;
+    use crate::handle::DocumentEvent;
+    use datatab_components::theme;
+    use datatab_core::{ColumnKind, ColumnMeta, QueryLanguage, QueryResult, Value};
+    use datatab_storage::bootstrap::StorageRuntime;
+    use datatab_ui_base::AppStateEntity;
+    use datatab_ui_base::toast::{ToastGlobal, ToastHost};
+    use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext};
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn init_test_runtime(cx: &mut TestAppContext) -> Entity<AppStateEntity> {
+        cx.update(gpui_component::init);
+        cx.update(theme::init);
+        cx.update(datatab_ui_base::keymap::init_keymap);
+        cx.update(|cx| {
+            let host = cx.new(|_| ToastHost::new());
+            cx.set_global(ToastGlobal { host });
+        });
+
+        cx.update(|cx| {
+            cx.new(|_| {
+                let storage_runtime =
+                    StorageRuntime::in_memory().expect("isolated storage runtime");
+                AppStateEntity::new_with_storage_runtime(storage_runtime)
+                    .expect("test storage setup")
+            })
+        })
+    }
+
+    fn two_row_result() -> Arc<QueryResult> {
+        let columns = ["id", "name"]
+            .iter()
+            .map(|name| ColumnMeta {
+                name: (*name).to_string(),
+                type_name: "text".to_string(),
+                kind: ColumnKind::Text,
+                nullable: true,
+                is_primary_key: false,
+            })
+            .collect();
+        let rows = (0..2)
+            .map(|_| vec![Value::Text("v".to_string()), Value::Text("w".to_string())])
+            .collect();
+
+        Arc::new(QueryResult::table(columns, rows, None, Duration::ZERO))
+    }
+
+    /// Builds a code tab whose result grid shows the row inspector that follows
+    /// the cursor, the way it is after the user opened it on a result.
+    fn code_tab_with_row_inspector(
+        window: &mut VisualTestContext,
+        app_state: Entity<AppStateEntity>,
+    ) -> Entity<CodeDocument> {
+        let document = window.update(|window, cx| {
+            cx.new(|cx| {
+                CodeDocument::new_with_language(app_state, None, QueryLanguage::Sql, window, cx)
+            })
+        });
+
+        window.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.setup_data_grid(
+                    two_row_result(),
+                    "SELECT 1".to_string(),
+                    None,
+                    None,
+                    window,
+                    cx,
+                );
+            });
+
+            let grid = document
+                .read(cx)
+                .active_result_grid()
+                .expect("the result opens a grid");
+            grid.update(cx, |grid, cx| {
+                grid.set_row_inspector_tracking(true, cx);
+                grid.select_first(cx);
+            });
+        });
+        window.run_until_parked();
+
+        document
+    }
+
+    /// Counts the `OpenInspector` events `document` emits from now on.
+    fn count_inspector_opens(
+        window: &mut VisualTestContext,
+        document: &Entity<CodeDocument>,
+    ) -> Rc<Cell<usize>> {
+        let opens = Rc::new(Cell::new(0));
+        let sink = opens.clone();
+
+        window.update(|_, cx| {
+            cx.subscribe(document, move |_, event: &DocumentEvent, _| {
+                if matches!(event, DocumentEvent::OpenInspector { .. }) {
+                    sink.set(sink.get() + 1);
+                }
+            })
+            .detach();
+        });
+
+        opens
+    }
+
+    fn activate(window: &mut VisualTestContext, document: &Entity<CodeDocument>) {
+        window.update(|_, cx| {
+            document.update(cx, |document, cx| document.set_active_tab(true, cx));
+        });
+        window.run_until_parked();
+    }
+
+    /// Returning to a code tab re-mounts the inspector its visible result grid
+    /// owns, since the workspace hid the rail when the tab became active.
+    #[gpui::test]
+    fn activating_a_code_tab_remounts_its_result_inspector(cx: &mut TestAppContext) {
+        let app_state = init_test_runtime(cx);
+        let window = cx.add_empty_window();
+        let document = code_tab_with_row_inspector(window, app_state);
+        let opens = count_inspector_opens(window, &document);
+
+        activate(window, &document);
+
+        assert_eq!(
+            opens.get(),
+            1,
+            "the visible result grid must re-mount its inspector"
+        );
+    }
+
+    /// A rail the user dismissed stays closed when the tab becomes active again.
+    #[gpui::test]
+    fn activating_after_the_user_closed_the_rail_does_not_remount_it(cx: &mut TestAppContext) {
+        let app_state = init_test_runtime(cx);
+        let window = cx.add_empty_window();
+        let document = code_tab_with_row_inspector(window, app_state);
+
+        window.update(|_, cx| {
+            document.update(cx, |document, cx| document.mark_inspector_closed(cx));
+        });
+        let opens = count_inspector_opens(window, &document);
+
+        activate(window, &document);
+
+        assert_eq!(opens.get(), 0, "a dismissed rail must not come back");
+    }
+
+    /// A code tab without results owns nothing in the rail.
+    #[gpui::test]
+    fn activating_a_code_tab_without_results_mounts_nothing(cx: &mut TestAppContext) {
+        let app_state = init_test_runtime(cx);
+        let window = cx.add_empty_window();
+        let document = window.update(|window, cx| {
+            cx.new(|cx| {
+                CodeDocument::new_with_language(app_state, None, QueryLanguage::Sql, window, cx)
+            })
+        });
+        let opens = count_inspector_opens(window, &document);
+
+        activate(window, &document);
+
+        assert_eq!(opens.get(), 0, "a tab without results has no inspector");
+    }
+}
+
+#[cfg(test)]
+mod confirm_keyboard_tests {
+    // Explicit imports rather than the parent glob: combining `use super::*`
+    // with `#[gpui::test]` sends the gpui_macros expansion into unbounded
+    // recursion.
+    use crate::code::{CodeDocument, PendingDangerousQuery, PendingScriptConfirm};
+    use datatab_components::theme;
+    use datatab_core::{DangerousQueryKind, QueryLanguage};
+    use datatab_storage::bootstrap::StorageRuntime;
+    use datatab_ui_base::AppStateEntity;
+    use datatab_ui_base::modals::test_host::{click_backdrop, host_modal};
+    use datatab_ui_base::toast::{ToastGlobal, ToastHost};
+    use gpui::{
+        AccessibilityFrame, AppContext as _, Bounds, Entity, Focusable as _, FrameObserver,
+        Modifiers, Pixels, TestAppContext, VisualTestContext,
+    };
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
+
+    /// Which confirmation a test opens.
+    #[derive(Clone, Copy)]
+    enum Confirmation {
+        Script,
+        DangerousQuery,
+    }
+
+    /// Opens `confirmation` over a code document whose editor had focus. The
+    /// document has no connection, so running the query ends in a "no active
+    /// connection" toast, which tells a confirmed run from a cancelled one.
+    fn open_confirmation(
+        cx: &mut TestAppContext,
+        confirmation: Confirmation,
+    ) -> (
+        Entity<CodeDocument>,
+        Entity<ToastHost>,
+        &mut VisualTestContext,
+    ) {
+        cx.update(theme::init);
+        cx.update(datatab_ui_base::keymap::init_keymap);
+        let toasts = cx.update(|cx| {
+            let host = cx.new(|_| ToastHost::new());
+            cx.set_global(ToastGlobal { host: host.clone() });
+            host
+        });
+        let app_state = cx.new(|_| {
+            AppStateEntity::new_with_storage_runtime(
+                StorageRuntime::in_memory().expect("in-memory storage"),
+            )
+            .expect("app state")
+        });
+
+        let (document, _outside, window) = host_modal(cx, move |window, cx| {
+            CodeDocument::new_with_language(app_state, None, QueryLanguage::Sql, window, cx)
+        });
+
+        window.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.focus(window, cx);
+
+                let query = "DELETE FROM orders; DELETE FROM items".to_string();
+                match confirmation {
+                    Confirmation::Script => document.ask_script_confirm(
+                        PendingScriptConfirm {
+                            query,
+                            in_new_tab: false,
+                            statement_count: 2,
+                            cursor_statement: None,
+                        },
+                        window,
+                        cx,
+                    ),
+                    Confirmation::DangerousQuery => document.ask_dangerous_query_confirm(
+                        PendingDangerousQuery {
+                            query,
+                            kind: DangerousQueryKind::DeleteNoWhere,
+                            in_new_tab: false,
+                            suppress: false,
+                        },
+                        window,
+                        cx,
+                    ),
+                }
+            });
+        });
+        window.run_until_parked();
+
+        (document, toasts, window)
+    }
+
+    fn is_open(window: &mut VisualTestContext, document: &Entity<CodeDocument>) -> bool {
+        window.update(|_, cx| {
+            let pending = &document.read(cx).pending;
+            pending.script_confirm.is_some() || pending.dangerous_query.is_some()
+        })
+    }
+
+    fn ran_the_query(window: &mut VisualTestContext, toasts: &Entity<ToastHost>) -> bool {
+        let expected = datatab_i18n::t!("document.code.execution.toast.no_active_connection");
+        window.update(|_, cx| toasts.read(cx).last_toast_title()) == Some(expected)
+    }
+
+    fn editor_has_focus(window: &mut VisualTestContext, document: &Entity<CodeDocument>) -> bool {
+        window.update(|window, cx| {
+            let editor = document.read(cx).editor.input_state.clone();
+            editor.read(cx).focus_handle(cx).is_focused(window)
+        })
+    }
+
+    #[gpui::test]
+    fn enter_runs_the_confirmed_script(cx: &mut TestAppContext) {
+        let (document, toasts, window) = open_confirmation(cx, Confirmation::Script);
+
+        window.simulate_keystrokes("enter");
+
+        assert!(!is_open(window, &document));
+        assert!(ran_the_query(window, &toasts));
+    }
+
+    #[gpui::test]
+    fn escape_cancels_the_script_and_returns_to_the_editor(cx: &mut TestAppContext) {
+        let (document, toasts, window) = open_confirmation(cx, Confirmation::Script);
+
+        window.simulate_keystrokes("escape");
+
+        assert!(!is_open(window, &document));
+        assert!(!ran_the_query(window, &toasts));
+        assert!(editor_has_focus(window, &document));
+    }
+
+    #[gpui::test]
+    fn a_backdrop_click_cancels_the_script(cx: &mut TestAppContext) {
+        let (document, toasts, window) = open_confirmation(cx, Confirmation::Script);
+
+        click_backdrop(window);
+
+        assert!(!is_open(window, &document));
+        assert!(!ran_the_query(window, &toasts));
+    }
+
+    #[gpui::test]
+    fn enter_runs_the_dangerous_query(cx: &mut TestAppContext) {
+        let (document, toasts, window) = open_confirmation(cx, Confirmation::DangerousQuery);
+
+        window.simulate_keystrokes("enter");
+
+        assert!(!is_open(window, &document));
+        assert!(ran_the_query(window, &toasts));
+    }
+
+    #[gpui::test]
+    fn escape_cancels_the_dangerous_query_and_returns_to_the_editor(cx: &mut TestAppContext) {
+        let (document, toasts, window) = open_confirmation(cx, Confirmation::DangerousQuery);
+
+        window.simulate_keystrokes("escape");
+
+        assert!(!is_open(window, &document));
+        assert!(!ran_the_query(window, &toasts));
+        assert!(editor_has_focus(window, &document));
+    }
+
+    #[gpui::test]
+    fn a_backdrop_click_cancels_the_dangerous_query(cx: &mut TestAppContext) {
+        let (document, toasts, window) = open_confirmation(cx, Confirmation::DangerousQuery);
+
+        click_backdrop(window);
+
+        assert!(!is_open(window, &document));
+        assert!(!ran_the_query(window, &toasts));
+    }
+
+    /// Keeps the latest frame drawn in the window it observes.
+    #[derive(Default)]
+    struct FrameCapture(Mutex<Option<AccessibilityFrame>>);
+
+    impl FrameObserver for FrameCapture {
+        fn accessibility_updated(&self, frame: &AccessibilityFrame) {
+            *self.0.lock().expect("frame capture lock") = Some(frame.clone());
+        }
+    }
+
+    impl FrameCapture {
+        fn bounds_of(&self, id: &str) -> Option<Bounds<Pixels>> {
+            let frame = self.0.lock().expect("frame capture lock").clone()?;
+            frame
+                .nodes()
+                .find(|(_, node)| node.id() == id)
+                .map(|(_, node)| node.bounds())
+        }
+    }
+
+    /// What a dismissal left behind: how often the document asked to be
+    /// redrawn, and the last frame the window drew.
+    struct Redraws {
+        notifications: Rc<Cell<usize>>,
+        frame: Arc<FrameCapture>,
+    }
+
+    /// Starts watching `document` for redraw requests and the window for drawn
+    /// frames, once the open confirmation is on screen.
+    fn watch_redraws(window: &mut VisualTestContext, document: &Entity<CodeDocument>) -> Redraws {
+        let notifications = Rc::new(Cell::new(0));
+        let frame = Arc::new(FrameCapture::default());
+
+        window.update(|window, cx| {
+            window.observe_frames(&frame);
+            window.refresh();
+
+            let counter = notifications.clone();
+            cx.observe(document, move |_, _| counter.set(counter.get() + 1))
+                .detach();
+        });
+        window.run_until_parked();
+        notifications.set(0);
+
+        Redraws {
+            notifications,
+            frame,
+        }
+    }
+
+    fn click_element(window: &mut VisualTestContext, redraws: &Redraws, id: &str) {
+        let bounds = redraws
+            .frame
+            .bounds_of(id)
+            .unwrap_or_else(|| panic!("`{id}` is drawn"));
+        window.simulate_click(bounds.center(), Modifiers::default());
+        window.run_until_parked();
+    }
+
+    /// The document asked for a redraw and the next frame no longer draws the
+    /// confirmation, so the dialog does not linger on screen after it closed.
+    fn assert_repainted_without(redraws: &Redraws, confirm_button: &str) {
+        assert!(
+            redraws.notifications.get() > 0,
+            "closing the confirmation must notify the document that draws it"
+        );
+        assert!(
+            redraws.frame.bounds_of(confirm_button).is_none(),
+            "the frame drawn after closing must not contain the confirmation"
+        );
+    }
+
+    #[gpui::test]
+    fn escape_redraws_without_the_dangerous_query_confirmation(cx: &mut TestAppContext) {
+        let (document, _toasts, window) = open_confirmation(cx, Confirmation::DangerousQuery);
+        let redraws = watch_redraws(window, &document);
+        assert!(redraws.frame.bounds_of("dangerous-confirm-btn").is_some());
+
+        window.simulate_keystrokes("escape");
+
+        assert!(!is_open(window, &document));
+        assert_repainted_without(&redraws, "dangerous-confirm-btn");
+    }
+
+    #[gpui::test]
+    fn cancel_button_redraws_without_the_dangerous_query_confirmation(cx: &mut TestAppContext) {
+        let (document, toasts, window) = open_confirmation(cx, Confirmation::DangerousQuery);
+        let redraws = watch_redraws(window, &document);
+
+        click_element(window, &redraws, "dangerous-cancel-btn");
+
+        assert!(!is_open(window, &document));
+        assert!(!ran_the_query(window, &toasts));
+        assert_repainted_without(&redraws, "dangerous-confirm-btn");
+    }
+
+    #[gpui::test]
+    fn run_anyway_redraws_without_the_dangerous_query_confirmation(cx: &mut TestAppContext) {
+        let (document, toasts, window) = open_confirmation(cx, Confirmation::DangerousQuery);
+        let redraws = watch_redraws(window, &document);
+
+        click_element(window, &redraws, "dangerous-confirm-btn");
+
+        assert!(!is_open(window, &document));
+        assert!(ran_the_query(window, &toasts));
+        assert_repainted_without(&redraws, "dangerous-confirm-btn");
+    }
+
+    #[gpui::test]
+    fn escape_redraws_without_the_script_confirmation(cx: &mut TestAppContext) {
+        let (document, _toasts, window) = open_confirmation(cx, Confirmation::Script);
+        let redraws = watch_redraws(window, &document);
+        assert!(
+            redraws
+                .frame
+                .bounds_of("script-confirm-cancel-btn")
+                .is_some()
+        );
+
+        window.simulate_keystrokes("escape");
+
+        assert!(!is_open(window, &document));
+        assert_repainted_without(&redraws, "script-confirm-cancel-btn");
+    }
+
+    #[gpui::test]
+    fn cancel_button_redraws_without_the_script_confirmation(cx: &mut TestAppContext) {
+        let (document, toasts, window) = open_confirmation(cx, Confirmation::Script);
+        let redraws = watch_redraws(window, &document);
+
+        click_element(window, &redraws, "script-confirm-cancel-btn");
+
+        assert!(!is_open(window, &document));
+        assert!(!ran_the_query(window, &toasts));
+        assert_repainted_without(&redraws, "script-confirm-cancel-btn");
+    }
+}
+
+#[cfg(test)]
+mod result_tab_keyboard_tests {
+    // Explicit imports rather than the parent glob: combining `use super::*`
+    // with `#[gpui::test]` sends the gpui_macros expansion into unbounded
+    // recursion.
+    use crate::code::{CodeDocument, SqlQueryFocus, SqlQueryLayout};
+    use crate::pane::PaneActionRun;
+    use datatab_app::keymap::Command;
+    use datatab_components::theme;
+    use datatab_core::{ColumnKind, ColumnMeta, QueryLanguage, QueryResult, Value};
+    use datatab_storage::bootstrap::StorageRuntime;
+    use datatab_ui_base::AppStateEntity;
+    use datatab_ui_base::toast::{ToastGlobal, ToastHost};
+    use gpui::{AppContext as _, Entity, Focusable as _, TestAppContext, VisualTestContext};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn one_row_result() -> Arc<QueryResult> {
+        let columns = vec![ColumnMeta {
+            name: "id".to_string(),
+            type_name: "text".to_string(),
+            kind: ColumnKind::Text,
+            nullable: true,
+            is_primary_key: false,
+        }];
+        let rows = vec![vec![Value::Text("v".to_string())]];
+
+        Arc::new(QueryResult::table(columns, rows, None, Duration::ZERO))
+    }
+
+    /// A SQL document with `tab_count` result tabs, the last one shown, and
+    /// the editor and results split, as after running a query that many
+    /// times with Run in new tab.
+    fn document_with_result_tabs(
+        cx: &mut TestAppContext,
+        tab_count: usize,
+    ) -> (Entity<CodeDocument>, &mut VisualTestContext) {
+        cx.update(gpui_component::init);
+        cx.update(theme::init);
+        cx.update(datatab_ui_base::keymap::init_keymap);
+        cx.update(|cx| {
+            let host = cx.new(|_| ToastHost::new());
+            cx.set_global(ToastGlobal { host });
+        });
+
+        let app_state = cx.update(|cx| {
+            cx.new(|_| {
+                let storage_runtime =
+                    StorageRuntime::in_memory().expect("isolated storage runtime");
+                AppStateEntity::new_with_storage_runtime(storage_runtime)
+                    .expect("test storage setup")
+            })
+        });
+
+        let window = cx.add_empty_window();
+        let document = window.update(|window, cx| {
+            cx.new(|cx| {
+                CodeDocument::new_with_language(app_state, None, QueryLanguage::Sql, window, cx)
+            })
+        });
+
+        window.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                for _ in 0..tab_count {
+                    document.result_tabs.run_in_new_tab = true;
+                    document.setup_data_grid(
+                        one_row_result(),
+                        "SELECT 1".to_string(),
+                        None,
+                        None,
+                        window,
+                        cx,
+                    );
+                }
+                document.layout = SqlQueryLayout::Split;
+            });
+        });
+        window.run_until_parked();
+
+        (document, window)
+    }
+
+    fn dispatch(window: &mut VisualTestContext, document: &Entity<CodeDocument>, command: Command) {
+        let handled = window.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.dispatch_command(command, window, cx)
+            })
+        });
+        assert!(handled, "{command:?} must be handled");
+        window.run_until_parked();
+    }
+
+    fn shown_tab(window: &mut VisualTestContext, document: &Entity<CodeDocument>) -> Option<usize> {
+        window.update(|_, cx| document.read(cx).result_tabs.active_result_index)
+    }
+
+    /// From the results, the result view command switches the shown result
+    /// between the views of the results' mode bar (Data, then JSON).
+    #[gpui::test]
+    fn the_result_view_command_switches_the_shown_result(cx: &mut TestAppContext) {
+        use crate::code::SqlQueryFocus;
+        use crate::result_view::ResultViewMode;
+
+        let (document, window) = document_with_result_tabs(cx, 1);
+        window.update(|_, cx| {
+            document.update(cx, |document, _| {
+                document.focus_mode = SqlQueryFocus::Results
+            })
+        });
+
+        let mode = |window: &mut VisualTestContext| {
+            window.update(|_, cx| {
+                document
+                    .read(cx)
+                    .active_result_grid()
+                    .map(|grid| grid.read(cx).result_view_mode())
+            })
+        };
+        assert_eq!(mode(window), Some(ResultViewMode::Table));
+
+        dispatch(window, &document, Command::CycleResultView);
+        assert_eq!(mode(window), Some(ResultViewMode::Json));
+
+        dispatch(window, &document, Command::CycleResultView);
+        assert_eq!(mode(window), Some(ResultViewMode::Table));
+    }
+
+    #[gpui::test]
+    fn result_tab_commands_switch_and_close_the_shown_tab(cx: &mut TestAppContext) {
+        let (document, window) = document_with_result_tabs(cx, 3);
+        assert_eq!(shown_tab(window, &document), Some(2));
+
+        dispatch(window, &document, Command::NextResultTab);
+        assert_eq!(
+            shown_tab(window, &document),
+            Some(0),
+            "next wraps to the first"
+        );
+
+        dispatch(window, &document, Command::PrevResultTab);
+        assert_eq!(
+            shown_tab(window, &document),
+            Some(2),
+            "previous wraps to the last"
+        );
+
+        dispatch(window, &document, Command::PrevResultTab);
+        assert_eq!(shown_tab(window, &document), Some(1));
+
+        let closed_id = window.update(|_, cx| document.read(cx).result_tabs.result_tabs[1].id);
+        dispatch(window, &document, Command::CloseResultTab);
+
+        let ids: Vec<_> = window.update(|_, cx| {
+            document
+                .read(cx)
+                .result_tabs
+                .result_tabs
+                .iter()
+                .map(|tab| tab.id)
+                .collect()
+        });
+        assert_eq!(ids.len(), 2);
+        assert!(!ids.contains(&closed_id), "the shown tab is the one closed");
+        assert_eq!(shown_tab(window, &document), Some(1));
+    }
+
+    #[gpui::test]
+    fn closing_the_last_result_tab_returns_the_keyboard_to_the_editor(cx: &mut TestAppContext) {
+        let (document, window) = document_with_result_tabs(cx, 1);
+
+        dispatch(window, &document, Command::FocusDown);
+        dispatch(window, &document, Command::CloseResultTab);
+
+        let editor_focused = window.update(|window, cx| {
+            let document = document.read(cx);
+            document
+                .editor
+                .input_state
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(window)
+        });
+        assert!(
+            editor_focused,
+            "with no result left, the editor has the keys"
+        );
+    }
+
+    #[gpui::test]
+    fn toggle_results_maximizes_and_restores_like_the_header_button(cx: &mut TestAppContext) {
+        let (document, window) = document_with_result_tabs(cx, 1);
+        let state = |window: &mut VisualTestContext| {
+            window.update(|_, cx| {
+                let document = document.read(cx);
+                (document.layout, document.results_maximized)
+            })
+        };
+
+        dispatch(window, &document, Command::ToggleResults);
+        assert!(state(window) == (SqlQueryLayout::ResultsOnly, true));
+
+        dispatch(window, &document, Command::TogglePanel);
+        assert!(state(window) == (SqlQueryLayout::Split, false));
+
+        dispatch(window, &document, Command::ToggleEditor);
+        assert!(
+            state(window) == (SqlQueryLayout::EditorOnly, false),
+            "Toggle editor hides the results"
+        );
+
+        dispatch(window, &document, Command::ToggleEditor);
+        assert!(state(window) == (SqlQueryLayout::Split, false));
+    }
+
+    /// Moving the keyboard to the query text while the results fill the
+    /// document brings the editor back into view instead of focusing it
+    /// hidden.
+    #[gpui::test]
+    fn focusing_the_text_restores_the_editor_hidden_by_maximized_results(cx: &mut TestAppContext) {
+        let (document, window) = document_with_result_tabs(cx, 1);
+        let state = |window: &mut VisualTestContext| {
+            window.update(|window, cx| {
+                let document = document.read(cx);
+                let editor_focused = document
+                    .editor
+                    .input_state
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window);
+
+                (
+                    document.layout,
+                    document.results_maximized,
+                    document.focus_mode,
+                    editor_focused,
+                )
+            })
+        };
+
+        dispatch(window, &document, Command::ToggleResults);
+        dispatch(window, &document, Command::FocusEditor);
+        assert!(
+            state(window) == (SqlQueryLayout::Split, false, SqlQueryFocus::Editor, true),
+            "Focus editor shows the text it focuses"
+        );
+
+        dispatch(window, &document, Command::FocusDown);
+        dispatch(window, &document, Command::ToggleResults);
+        dispatch(window, &document, Command::FocusUp);
+        assert!(
+            state(window) == (SqlQueryLayout::Split, false, SqlQueryFocus::Editor, true),
+            "stepping up out of maximized results shows the text"
+        );
+    }
+
+    #[gpui::test]
+    fn the_pane_actions_list_the_result_tabs_and_the_results_area(cx: &mut TestAppContext) {
+        let (document, window) = document_with_result_tabs(cx, 2);
+        let actions = window.update(|_, cx| document.read(cx).pane_actions(&document));
+
+        let entries: Vec<(&str, Option<Command>)> = actions
+            .iter()
+            .map(|action| {
+                let command = match action.run {
+                    PaneActionRun::Command(command) => Some(command),
+                    PaneActionRun::Callback(_) => None,
+                };
+                (action.id.as_ref(), command)
+            })
+            .skip_while(|(id, _)| *id != "next-result-tab")
+            .collect();
+
+        assert_eq!(
+            entries,
+            [
+                ("next-result-tab", Some(Command::NextResultTab)),
+                ("previous-result-tab", Some(Command::PrevResultTab)),
+                ("close-result-tab", Some(Command::CloseResultTab)),
+                ("maximize-results", Some(Command::ToggleResults)),
+                ("hide-results", Some(Command::ToggleEditor)),
+                ("results-position", Some(Command::ToggleResultsPosition)),
+            ]
+        );
+
+        let next = actions.iter().find(|action| action.id == "next-result-tab");
+        assert!(
+            next.is_some_and(|action| action.shortcut.is_some()),
+            "the result tab entries show their Results keys"
+        );
+    }
+
+    /// The results area of the editor: its result tabs and the header
+    /// buttons. The grid inside is covered by the data grid's own test.
+    #[gpui::test]
+    fn the_results_chrome_is_covered(cx: &mut TestAppContext) {
+        use crate::keyboard_coverage::{CODE_EDITOR_CHROME, DATA_GRID};
+        use crate::keyboard_test_support::{host_document, init_keyboard_runtime};
+        use datatab_ui_base::keyboard_coverage::{Coverage, FrameCapture};
+
+        init_keyboard_runtime(cx);
+        let app_state = cx.update(|cx| {
+            cx.new(|_| {
+                let storage_runtime =
+                    StorageRuntime::in_memory().expect("isolated storage runtime");
+                AppStateEntity::new_with_storage_runtime(storage_runtime)
+                    .expect("test storage setup")
+            })
+        });
+
+        let (host, window) = host_document(
+            cx,
+            move |window, cx| {
+                let document = cx.new(|cx| {
+                    CodeDocument::new_with_language(app_state, None, QueryLanguage::Sql, window, cx)
+                });
+                document.update(cx, |document, cx| {
+                    for _ in 0..2 {
+                        document.result_tabs.run_in_new_tab = true;
+                        document.setup_data_grid(
+                            one_row_result(),
+                            "SELECT 1".to_string(),
+                            None,
+                            None,
+                            window,
+                            cx,
+                        );
+                    }
+                    document.layout = SqlQueryLayout::Split;
+                });
+                document
+            },
+            |document, cx| document.active_context(cx),
+            |document, command, window, cx| document.dispatch_command(command, window, cx),
+        );
+        let document = window.update(|_, cx| host.read(cx).document.clone());
+        let menu: Vec<String> = window.update(|_, cx| {
+            document
+                .read(cx)
+                .pane_actions(&document)
+                .iter()
+                .map(|action| action.id.to_string())
+                .collect()
+        });
+
+        let capture = FrameCapture::observe(window);
+        let frame = capture.frame(window);
+
+        let checked = Coverage::new(CODE_EDITOR_CHROME)
+            .with_menu_entries(menu)
+            .with_surface(DATA_GRID)
+            .assert_covered(&frame);
+        assert!(
+            checked.iter().any(|id| id.starts_with("result-tab-")),
+            "{checked:?}"
+        );
+        assert!(
+            checked.iter().any(|id| id == "sql-refresh-action"),
+            "Refresh sits in the results header: {checked:?}"
+        );
+    }
+
+    /// Refresh and its interval sit in the results header, so the pane
+    /// actions list them while the header is drawn, and the interval entry
+    /// opens the header's dropdown with keyboard focus.
+    #[gpui::test]
+    fn the_auto_refresh_entry_hands_the_keyboard_to_its_dropdown(cx: &mut TestAppContext) {
+        use crate::keyboard_test_support::{host_document, init_keyboard_runtime};
+
+        init_keyboard_runtime(cx);
+        let app_state = cx.update(|cx| {
+            cx.new(|_| {
+                let storage_runtime =
+                    StorageRuntime::in_memory().expect("isolated storage runtime");
+                AppStateEntity::new_with_storage_runtime(storage_runtime)
+                    .expect("test storage setup")
+            })
+        });
+
+        let (host, window) = host_document(
+            cx,
+            move |window, cx| {
+                let document = cx.new(|cx| {
+                    CodeDocument::new_with_language(app_state, None, QueryLanguage::Sql, window, cx)
+                });
+                document.update(cx, |document, cx| {
+                    document.setup_data_grid(
+                        one_row_result(),
+                        "SELECT 1".to_string(),
+                        None,
+                        None,
+                        window,
+                        cx,
+                    );
+                    document.layout = SqlQueryLayout::Split;
+                });
+                document
+            },
+            |document, cx| document.active_context(cx),
+            |document, command, window, cx| document.dispatch_command(command, window, cx),
+        );
+        let document = window.update(|_, cx| host.read(cx).document.clone());
+
+        window.update(|window, cx| {
+            document.update(cx, |document, cx| document.focus_handle.focus(window, cx));
+        });
+        window.run_until_parked();
+
+        let actions = window.update(|_, cx| document.read(cx).pane_actions(&document));
+        let refresh = actions
+            .iter()
+            .find(|action| action.id == "refresh")
+            .expect("a refresh entry while the results show");
+        assert!(matches!(
+            refresh.run,
+            PaneActionRun::Command(Command::RunQuery)
+        ));
+
+        let auto_refresh = actions
+            .into_iter()
+            .find(|action| action.id == "auto-refresh")
+            .expect("an auto-refresh entry while the results show");
+        let PaneActionRun::Callback(open_interval) = auto_refresh.run else {
+            panic!("the auto-refresh entry runs a callback");
+        };
+
+        window.update(|window, cx| open_interval(window, cx));
+        window.run_until_parked();
+
+        let dropdown = window.update(|_, cx| document.read(cx).refresh.refresh_dropdown.clone());
+        let (open, focused) = window.update(|window, cx| {
+            let dropdown = dropdown.read(cx);
+            (dropdown.is_open(), dropdown.is_focused(window))
+        });
+        assert!(open && focused, "the interval dropdown opens with focus");
+
+        window.simulate_keystrokes("j escape");
+        window.run_until_parked();
+
+        let (open, document_focused) = window.update(|window, cx| {
+            (
+                dropdown.read(cx).is_open(),
+                document.read(cx).focus_handle.is_focused(window),
+            )
+        });
+        assert!(!open, "Escape closes the interval list");
+        assert!(document_focused, "focus returns to the editor pane");
+    }
+}
+
+#[cfg(test)]
+mod auto_refresh_tests {
+    // Explicit imports rather than the parent glob: combining `use super::*`
+    // with `#[gpui::test]` sends the gpui_macros expansion into unbounded
+    // recursion.
+    use crate::code::CodeDocument;
+    use datatab_components::theme;
+    use datatab_core::{
+        ConnectionProfile, DbConfig, DbKind, QueryLanguage, ReadOnlyEnforcement, RefreshPolicy,
+        WritePrivilege,
+    };
+    use datatab_storage::bootstrap::StorageRuntime;
+    use datatab_test_support::FakeDriver;
+    use datatab_ui_base::AppStateEntity;
+    use datatab_ui_base::modals::test_host::host_modal;
+    use datatab_ui_base::toast::{ToastGlobal, ToastHost};
+    use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext};
+    use std::ops::Range;
+
+    /// Opens a code document connected through `driver` and holding `content`.
+    fn open_connected<'a>(
+        cx: &'a mut TestAppContext,
+        driver: &FakeDriver,
+        content: &str,
+    ) -> (
+        Entity<CodeDocument>,
+        Entity<ToastHost>,
+        &'a mut VisualTestContext,
+    ) {
+        open_connected_with_profile(cx, driver, content, false)
+    }
+
+    /// Opens a code document like [`open_connected`], on a profile whose
+    /// read-only setting is `read_only_flag`.
+    fn open_connected_with_profile<'a>(
+        cx: &'a mut TestAppContext,
+        driver: &FakeDriver,
+        content: &str,
+        read_only_flag: bool,
+    ) -> (
+        Entity<CodeDocument>,
+        Entity<ToastHost>,
+        &'a mut VisualTestContext,
+    ) {
+        cx.update(theme::init);
+        cx.update(datatab_ui_base::keymap::init_keymap);
+        let toasts = cx.update(|cx| {
+            let host = cx.new(|_| ToastHost::new());
+            cx.set_global(ToastGlobal { host: host.clone() });
+            host
+        });
+        let app_state = cx.new(|_| {
+            AppStateEntity::new_with_storage_runtime(
+                StorageRuntime::in_memory().expect("in-memory storage"),
+            )
+            .expect("app state")
+        });
+
+        let mut profile = ConnectionProfile::new(
+            "fake",
+            DbConfig::SQLite {
+                path: ":memory:".into(),
+                connection_id: None,
+            },
+        );
+        profile.read_only_flag = read_only_flag;
+        let connection = driver.connect_arc(&profile).expect("fake connection");
+        let profile_id = profile.id;
+        cx.update(|cx| {
+            app_state.update(cx, |app, _| {
+                app.apply_connect_profile(
+                    profile,
+                    connection,
+                    None,
+                    None,
+                    false,
+                    WritePrivilege::Unknown,
+                );
+            });
+        });
+
+        let content = content.to_string();
+        let (document, _outside, window) = host_modal(cx, move |window, cx| {
+            let mut document =
+                CodeDocument::new_with_language(app_state, None, QueryLanguage::Sql, window, cx);
+            document.connection_id = Some(profile_id);
+            document.set_content(&content, window, cx);
+            document
+        });
+        window.run_until_parked();
+
+        (document, toasts, window)
+    }
+
+    fn select(
+        window: &mut VisualTestContext,
+        document: &Entity<CodeDocument>,
+        range: Range<usize>,
+    ) {
+        window.update(|_, cx| {
+            document.update(cx, |document, cx| {
+                document
+                    .editor
+                    .input_state
+                    .update(cx, |state, cx| state.set_selected_range(range, cx));
+            });
+        });
+    }
+
+    fn can_auto_refresh(window: &mut VisualTestContext, document: &Entity<CodeDocument>) -> bool {
+        window.update(|_, cx| document.read(cx).can_auto_refresh(cx))
+    }
+
+    fn settle(window: &mut VisualTestContext) {
+        for _ in 0..3 {
+            window.run_until_parked();
+            window.update(|window, _| window.refresh());
+        }
+        window.run_until_parked();
+    }
+
+    /// Fires one auto-refresh tick on a document whose refresh policy is
+    /// automatic, the way the refresh timer does.
+    fn auto_refresh_tick(window: &mut VisualTestContext, document: &Entity<CodeDocument>) {
+        window.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.refresh.refresh_policy = RefreshPolicy::Interval { every_secs: 5 };
+                document.pending.auto_refresh = true;
+                document.process_pending_auto_refresh(window, cx);
+            });
+        });
+        settle(window);
+    }
+
+    fn refresh_policy(
+        window: &mut VisualTestContext,
+        document: &Entity<CodeDocument>,
+    ) -> RefreshPolicy {
+        window.update(|_, cx| document.read(cx).refresh.refresh_policy)
+    }
+
+    fn showed_blocked_toast(window: &mut VisualTestContext, toasts: &Entity<ToastHost>) -> bool {
+        let expected = datatab_i18n::t!("document.code.execution.toast.auto_refresh_blocked");
+        window.update(|_, cx| toasts.read(cx).last_toast_title()) == Some(expected)
+    }
+
+    fn executed(driver: &FakeDriver) -> Vec<(String, ReadOnlyEnforcement)> {
+        driver
+            .stats()
+            .executed_requests
+            .iter()
+            .map(|request| (request.sql.clone(), request.read_only))
+            .collect()
+    }
+
+    #[gpui::test]
+    fn auto_refresh_runs_the_query_with_read_only_enforcement(cx: &mut TestAppContext) {
+        let driver = FakeDriver::new(DbKind::SQLite).with_read_only_enforcement();
+        let (document, _toasts, window) = open_connected(cx, &driver, "SELECT 1");
+
+        auto_refresh_tick(window, &document);
+
+        assert_eq!(
+            executed(&driver),
+            vec![("SELECT 1".to_string(), ReadOnlyEnforcement::Required)]
+        );
+        assert!(refresh_policy(window, &document).is_auto());
+    }
+
+    fn run_query(window: &mut VisualTestContext, document: &Entity<CodeDocument>) {
+        window.update(|window, cx| {
+            document.update(cx, |document, cx| document.run_query(window, cx));
+        });
+        settle(window);
+    }
+
+    fn showed_read_only_profile_toast(
+        window: &mut VisualTestContext,
+        toasts: &Entity<ToastHost>,
+    ) -> bool {
+        let expected = datatab_i18n::t!("document.code.execution.toast.read_only_profile");
+        window.update(|_, cx| toasts.read(cx).last_toast_title()) == Some(expected)
+    }
+
+    fn has_pending_dangerous_query(
+        window: &mut VisualTestContext,
+        document: &Entity<CodeDocument>,
+    ) -> bool {
+        window.update(|_, cx| document.read(cx).pending.dangerous_query.is_some())
+    }
+
+    #[gpui::test]
+    fn a_read_only_profile_refuses_a_write_from_the_editor(cx: &mut TestAppContext) {
+        let driver = FakeDriver::new(DbKind::SQLite);
+        let (document, toasts, window) = open_connected_with_profile(
+            cx,
+            &driver,
+            "UPDATE users SET name = 'a' WHERE id = 1",
+            true,
+        );
+
+        run_query(window, &document);
+
+        assert!(executed(&driver).is_empty(), "a write must not run");
+        assert!(showed_read_only_profile_toast(window, &toasts));
+    }
+
+    #[gpui::test]
+    fn a_read_only_profile_refuses_ddl_from_the_editor(cx: &mut TestAppContext) {
+        let driver = FakeDriver::new(DbKind::SQLite);
+        let (document, toasts, window) =
+            open_connected_with_profile(cx, &driver, "CREATE TABLE t (id INTEGER)", true);
+
+        run_query(window, &document);
+
+        assert!(executed(&driver).is_empty(), "DDL must not run");
+        assert!(showed_read_only_profile_toast(window, &toasts));
+    }
+
+    #[gpui::test]
+    fn a_read_only_profile_still_runs_a_read_from_the_editor(cx: &mut TestAppContext) {
+        let driver = FakeDriver::new(DbKind::SQLite);
+        let (document, toasts, window) = open_connected_with_profile(cx, &driver, "SELECT 1", true);
+
+        run_query(window, &document);
+
+        assert_eq!(
+            executed(&driver),
+            vec![("SELECT 1".to_string(), ReadOnlyEnforcement::None)]
+        );
+        assert!(!showed_read_only_profile_toast(window, &toasts));
+    }
+
+    #[gpui::test]
+    fn a_read_only_profile_refuses_before_asking_to_confirm_a_dangerous_query(
+        cx: &mut TestAppContext,
+    ) {
+        let driver = FakeDriver::new(DbKind::SQLite);
+        let (document, toasts, window) =
+            open_connected_with_profile(cx, &driver, "DELETE FROM users", true);
+
+        run_query(window, &document);
+
+        assert!(!has_pending_dangerous_query(window, &document));
+        assert!(executed(&driver).is_empty());
+        assert!(showed_read_only_profile_toast(window, &toasts));
+    }
+
+    #[gpui::test]
+    fn a_read_only_profile_refuses_a_confirmed_dangerous_query(cx: &mut TestAppContext) {
+        let driver = FakeDriver::new(DbKind::SQLite);
+        let (document, toasts, window) =
+            open_connected_with_profile(cx, &driver, "DELETE FROM users", true);
+
+        window.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.pending.dangerous_query = Some(super::super::PendingDangerousQuery {
+                    query: "DELETE FROM users".to_string(),
+                    kind: datatab_core::DangerousQueryKind::DeleteNoWhere,
+                    in_new_tab: false,
+                    suppress: false,
+                });
+                document.confirm_dangerous_query(false, window, cx);
+            });
+        });
+        settle(window);
+
+        assert!(
+            executed(&driver).is_empty(),
+            "a confirmed write must not run"
+        );
+        assert!(showed_read_only_profile_toast(window, &toasts));
+    }
+
+    #[gpui::test]
+    fn a_writable_profile_still_runs_a_write_from_the_editor(cx: &mut TestAppContext) {
+        let driver = FakeDriver::new(DbKind::SQLite);
+        let (document, toasts, window) =
+            open_connected(cx, &driver, "UPDATE users SET name = 'a' WHERE id = 1");
+
+        run_query(window, &document);
+
+        assert_eq!(
+            executed(&driver),
+            vec![(
+                "UPDATE users SET name = 'a' WHERE id = 1".to_string(),
+                ReadOnlyEnforcement::None
+            )]
+        );
+        assert!(!showed_read_only_profile_toast(window, &toasts));
+    }
+
+    #[gpui::test]
+    fn a_profile_saved_as_read_only_while_connecting_opens_read_only(cx: &mut TestAppContext) {
+        cx.update(theme::init);
+        cx.update(datatab_ui_base::keymap::init_keymap);
+        let toasts = cx.update(|cx| {
+            let host = cx.new(|_| ToastHost::new());
+            cx.set_global(ToastGlobal { host: host.clone() });
+            host
+        });
+        let app_state = cx.new(|_| {
+            AppStateEntity::new_with_storage_runtime(
+                StorageRuntime::in_memory().expect("in-memory storage"),
+            )
+            .expect("app state")
+        });
+
+        let driver = FakeDriver::new(DbKind::SQLite);
+        let profile_at_connect_start = ConnectionProfile::new(
+            "fake",
+            DbConfig::SQLite {
+                path: ":memory:".into(),
+                connection_id: None,
+            },
+        );
+        let profile_id = profile_at_connect_start.id;
+        let connection = driver
+            .connect_arc(&profile_at_connect_start)
+            .expect("fake connection");
+
+        cx.update(|cx| {
+            app_state.update(cx, |app, _| {
+                app.profiles_mut().push(profile_at_connect_start.clone());
+
+                let mut saved = profile_at_connect_start.clone();
+                saved.read_only_flag = true;
+                app.update_profile(saved);
+
+                app.apply_connect_profile(
+                    profile_at_connect_start,
+                    connection,
+                    None,
+                    None,
+                    false,
+                    WritePrivilege::Unknown,
+                );
+            });
+        });
+
+        let (document, _outside, window) = host_modal(cx, move |window, cx| {
+            let mut document =
+                CodeDocument::new_with_language(app_state, None, QueryLanguage::Sql, window, cx);
+            document.connection_id = Some(profile_id);
+            document.set_content("UPDATE users SET name = 'a' WHERE id = 1", window, cx);
+            document
+        });
+        window.run_until_parked();
+
+        run_query(window, &document);
+
+        assert!(executed(&driver).is_empty());
+        assert!(showed_read_only_profile_toast(window, &toasts));
+    }
+
+    /// Saves the document's connected profile with `read_only_flag`, as the
+    /// connection manager does when the user edits an open connection.
+    fn save_profile_read_only_flag(
+        window: &mut VisualTestContext,
+        document: &Entity<CodeDocument>,
+        read_only_flag: bool,
+    ) {
+        window.update(|_, cx| {
+            let app_state = document.read(cx).app_state.clone();
+            let profile_id = document.read(cx).connection_id.expect("connected");
+
+            app_state.update(cx, |app, _| {
+                let mut profile = app
+                    .connections()
+                    .get(&profile_id)
+                    .expect("profile is connected")
+                    .profile
+                    .clone();
+                profile.read_only_flag = read_only_flag;
+                app.update_profile(profile);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn saving_an_open_profile_as_read_only_refuses_the_next_write(cx: &mut TestAppContext) {
+        let driver = FakeDriver::new(DbKind::SQLite);
+        let (document, toasts, window) =
+            open_connected(cx, &driver, "UPDATE users SET name = 'a' WHERE id = 1");
+
+        save_profile_read_only_flag(window, &document, true);
+        run_query(window, &document);
+
+        assert!(executed(&driver).is_empty());
+        assert!(showed_read_only_profile_toast(window, &toasts));
+    }
+
+    #[gpui::test]
+    fn saving_an_open_profile_as_writable_keeps_it_read_only_until_reconnect(
+        cx: &mut TestAppContext,
+    ) {
+        let driver = FakeDriver::new(DbKind::SQLite);
+        let (document, toasts, window) = open_connected_with_profile(
+            cx,
+            &driver,
+            "UPDATE users SET name = 'a' WHERE id = 1",
+            true,
+        );
+
+        save_profile_read_only_flag(window, &document, false);
+        run_query(window, &document);
+
+        assert!(executed(&driver).is_empty());
+        assert!(showed_read_only_profile_toast(window, &toasts));
+    }
+
+    #[gpui::test]
+    fn a_manual_run_requests_no_read_only_enforcement(cx: &mut TestAppContext) {
+        let driver = FakeDriver::new(DbKind::SQLite).with_read_only_enforcement();
+        let (document, _toasts, window) = open_connected(cx, &driver, "SELECT 1");
+
+        window.update(|window, cx| {
+            document.update(cx, |document, cx| document.run_query(window, cx));
+        });
+        settle(window);
+
+        assert_eq!(
+            executed(&driver),
+            vec![("SELECT 1".to_string(), ReadOnlyEnforcement::None)]
+        );
+    }
+
+    #[gpui::test]
+    fn auto_refresh_falls_back_to_manual_when_the_driver_cannot_enforce_read_only(
+        cx: &mut TestAppContext,
+    ) {
+        let driver = FakeDriver::new(DbKind::SQLite);
+        let (document, toasts, window) = open_connected(cx, &driver, "SELECT 1");
+
+        assert!(!can_auto_refresh(window, &document));
+
+        auto_refresh_tick(window, &document);
+
+        assert!(executed(&driver).is_empty(), "nothing may run unenforced");
+        assert_eq!(refresh_policy(window, &document), RefreshPolicy::Manual);
+        assert!(showed_blocked_toast(window, &toasts));
+    }
+
+    #[gpui::test]
+    fn auto_refresh_falls_back_to_manual_when_the_driver_refuses_at_execution(
+        cx: &mut TestAppContext,
+    ) {
+        let driver = FakeDriver::new(DbKind::SQLite).with_read_only_refusal();
+        let (document, toasts, window) = open_connected(cx, &driver, "SELECT 1");
+
+        auto_refresh_tick(window, &document);
+
+        assert_eq!(
+            executed(&driver),
+            vec![("SELECT 1".to_string(), ReadOnlyEnforcement::Required)]
+        );
+        assert_eq!(refresh_policy(window, &document), RefreshPolicy::Manual);
+        assert!(showed_blocked_toast(window, &toasts));
+        assert_eq!(
+            window.update(|_, cx| toasts.read(cx).toast_count()),
+            1,
+            "a refusal shows only the blocked warning, not a query failure"
+        );
+    }
+
+    #[gpui::test]
+    fn a_selection_holding_a_write_is_not_auto_refreshable(cx: &mut TestAppContext) {
+        let driver = FakeDriver::new(DbKind::SQLite).with_read_only_enforcement();
+        let content = "SELECT 'DELETE FROM items'";
+        let (document, _toasts, window) = open_connected(cx, &driver, content);
+
+        assert!(
+            can_auto_refresh(window, &document),
+            "the whole buffer is a read"
+        );
+
+        let start = content.find("DELETE").expect("write inside the literal");
+        select(window, &document, start..start + "DELETE FROM items".len());
+
+        assert!(!can_auto_refresh(window, &document));
+    }
+
+    #[gpui::test]
+    fn a_read_selection_is_auto_refreshable_and_is_what_runs(cx: &mut TestAppContext) {
+        let driver = FakeDriver::new(DbKind::SQLite).with_read_only_enforcement();
+        let content = "SELECT 1;\nDELETE FROM items";
+        let (document, _toasts, window) = open_connected(cx, &driver, content);
+
+        assert!(
+            !can_auto_refresh(window, &document),
+            "the whole buffer holds a write"
+        );
+
+        select(window, &document, 0.."SELECT 1".len());
+        assert!(can_auto_refresh(window, &document));
+
+        auto_refresh_tick(window, &document);
+
+        assert_eq!(
+            executed(&driver),
+            vec![("SELECT 1".to_string(), ReadOnlyEnforcement::Required)]
+        );
+    }
+}

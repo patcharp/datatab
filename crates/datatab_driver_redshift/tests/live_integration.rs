@@ -1,0 +1,625 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::result_large_err,
+    clippy::unwrap_in_result
+)]
+
+//! Live smoke tests against a real Amazon Redshift cluster.
+//!
+//! No local or Docker-based Redshift emulator exists (LocalStack only
+//! emulates the management/Data API, not the wire protocol), so these tests
+//! read connection details from environment variables instead of spinning up
+//! a testcontainer, and are `#[ignore]`d by default. Run explicitly with:
+//!
+//! ```text
+//! DATATAB_TEST_REDSHIFT_HOST=cluster.abc123.us-east-1.redshift.amazonaws.com \
+//! DATATAB_TEST_REDSHIFT_USER=awsuser \
+//! DATATAB_TEST_REDSHIFT_PASSWORD=... \
+//! DATATAB_TEST_REDSHIFT_DATABASE=dev \
+//! cargo nextest run -p datatab_driver_redshift --run-ignored all
+//! ```
+//!
+//! The metadata-introspection tests below need additional cluster fixtures
+//! and read them from further optional/required env vars (see each test's
+//! `#[ignore]` reason and body):
+//!
+//! - `DATATAB_TEST_REDSHIFT_SCHEMA` (defaults to `public`)
+//! - `DATATAB_TEST_REDSHIFT_EMPTY_SCHEMA` — a schema with zero tables/views
+//! - `DATATAB_TEST_REDSHIFT_TABLE` — a table with a declared DISTKEY and SORTKEY
+//! - `DATATAB_TEST_REDSHIFT_PK_TABLE` — a table with a declared (informational) PRIMARY KEY
+//! - `DATATAB_TEST_REDSHIFT_SUPER_TABLE` / `DATATAB_TEST_REDSHIFT_SUPER_COLUMN` — a table/column of type SUPER or VARBYTE
+
+use datatab_core::secrecy::SecretString;
+use datatab_core::{
+    ConnectionProfile, DbConfig, DbDriver, DbError, QueryRequest, ReadOnlyEnforcement,
+};
+use datatab_driver_redshift::RedshiftDriver;
+use datatab_test_support::containers::{retry_db_operation, with_trust_postgres_port};
+use std::time::Duration;
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL 16 container (wire-compatible early refusal only)"]
+fn redshift_query_safety_refuses_protected_requests_before_prepare() -> Result<(), DbError> {
+    with_trust_postgres_port(|port| {
+        let profile = ConnectionProfile::new(
+            "redshift-protocol-compatibility",
+            DbConfig::Redshift {
+                use_uri: false,
+                uri: None,
+                host: "127.0.0.1".to_string(),
+                port,
+                user: "testuser".to_string(),
+                database: "testdb".to_string(),
+                ssl_mode: Some("disable".to_string()),
+                ssl_root_cert_path: None,
+                ssl_client_cert_path: None,
+                ssl_client_key_path: None,
+                ssh_tunnel: None,
+                ssh_tunnel_profile_id: None,
+            },
+        );
+        let connection = retry_db_operation(Duration::from_secs(30), || -> Result<_, DbError> {
+            let connection = RedshiftDriver::new().connect_with_secrets(&profile, None, None)?;
+            connection.ping()?;
+            Ok(connection)
+        })?;
+
+        let series = "SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3";
+
+        let mut capped = QueryRequest::new(series);
+        capped.limit = Some(2);
+        let capped_result = connection.execute(&capped)?;
+        assert_eq!(capped_result.rows.len(), 2);
+        assert!(capped_result.rows_truncated());
+
+        let mut exact = QueryRequest::new(series);
+        exact.limit = Some(3);
+        let exact_result = connection.execute(&exact)?;
+        assert_eq!(exact_result.rows.len(), 3);
+        assert!(!exact_result.rows_truncated());
+
+        let mut zero = QueryRequest::new("SELECT 42");
+        zero.limit = Some(0);
+        let zero_result = connection.execute(&zero)?;
+        assert!(zero_result.rows.is_empty());
+        assert!(zero_result.rows_truncated());
+
+        let mut user_limited = QueryRequest::new(format!("SELECT * FROM ({series}) AS s LIMIT 1"));
+        user_limited.limit = Some(5);
+        let user_limited_result = connection.execute(&user_limited)?;
+        assert_eq!(user_limited_result.rows.len(), 1);
+        assert!(!user_limited_result.rows_truncated());
+
+        let mut timed = QueryRequest::new("SELECT 42");
+        timed.statement_timeout = Some(Duration::from_secs(1));
+        assert!(matches!(
+            connection.execute(&timed),
+            Err(DbError::NotSupported(_))
+        ));
+
+        let mut write = QueryRequest::new("DELETE FROM missing_table");
+        write.limit = Some(1);
+        assert!(matches!(
+            connection.execute(&write),
+            Err(DbError::NotSupported(_))
+        ));
+
+        let control = connection.execute(&QueryRequest::new("SELECT 42"))?;
+        assert_eq!(control.rows.len(), 1);
+        Ok(())
+    })
+}
+
+struct LiveRedshiftEnv {
+    host: String,
+    port: u16,
+    user: String,
+    password: String,
+    database: String,
+}
+
+impl LiveRedshiftEnv {
+    fn from_env() -> Self {
+        let host = std::env::var("DATATAB_TEST_REDSHIFT_HOST").expect(
+            "DATATAB_TEST_REDSHIFT_HOST must be set to run Redshift live tests (see module docs)",
+        );
+        let port = std::env::var("DATATAB_TEST_REDSHIFT_PORT")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(5439);
+        let user =
+            std::env::var("DATATAB_TEST_REDSHIFT_USER").unwrap_or_else(|_| "awsuser".to_string());
+        let password = std::env::var("DATATAB_TEST_REDSHIFT_PASSWORD")
+            .expect("DATATAB_TEST_REDSHIFT_PASSWORD must be set to run Redshift live tests");
+        let database =
+            std::env::var("DATATAB_TEST_REDSHIFT_DATABASE").unwrap_or_else(|_| "dev".to_string());
+
+        Self {
+            host,
+            port,
+            user,
+            password,
+            database,
+        }
+    }
+
+    fn profile_with_ssl_mode(&self, ssl_mode: &str) -> ConnectionProfile {
+        ConnectionProfile::new(
+            "live-redshift",
+            DbConfig::Redshift {
+                use_uri: false,
+                uri: None,
+                host: self.host.clone(),
+                port: self.port,
+                user: self.user.clone(),
+                database: self.database.clone(),
+                ssl_mode: Some(ssl_mode.to_string()),
+                ssl_root_cert_path: None,
+                ssl_client_cert_path: None,
+                ssl_client_key_path: None,
+                ssh_tunnel: None,
+                ssh_tunnel_profile_id: None,
+            },
+        )
+    }
+}
+
+#[test]
+#[ignore = "requires a real Amazon Redshift cluster; see module docs for required env vars"]
+fn redshift_live_connect_and_select_1_with_sslmode_require() -> Result<(), DbError> {
+    let env = LiveRedshiftEnv::from_env();
+    let driver = RedshiftDriver::new();
+    let profile = env.profile_with_ssl_mode("require");
+
+    let connection = driver.connect_with_secrets(
+        &profile,
+        Some(&SecretString::from(env.password.clone())),
+        None,
+    )?;
+
+    let result = connection.execute(&QueryRequest::new("SELECT 1"))?;
+    assert_eq!(result.rows.len(), 1);
+
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a TLS-only Amazon Redshift cluster; see module docs for required env vars"]
+fn redshift_live_sslmode_disable_on_tls_only_cluster_returns_clear_error() {
+    let env = LiveRedshiftEnv::from_env();
+    let driver = RedshiftDriver::new();
+    let profile = env.profile_with_ssl_mode("disable");
+
+    let result = driver.connect_with_secrets(
+        &profile,
+        Some(&SecretString::from(env.password.clone())),
+        None,
+    );
+
+    match result {
+        Err(DbError::ConnectionFailed(formatted)) => {
+            assert!(!formatted.message.is_empty());
+        }
+        Err(other) => panic!("expected DbError::ConnectionFailed, got {other:?}"),
+        Ok(_) => panic!("expected sslmode=disable to fail against a TLS-only cluster"),
+    }
+}
+
+#[test]
+#[ignore = "performs a real network connection attempt to an unreachable host"]
+fn redshift_live_invalid_host_returns_clear_error_not_panic() {
+    let driver = RedshiftDriver::new();
+    let profile = ConnectionProfile::new(
+        "live-redshift-invalid-host",
+        DbConfig::Redshift {
+            use_uri: false,
+            uri: None,
+            host: "redshift-does-not-exist.invalid".to_string(),
+            port: 5439,
+            user: "awsuser".to_string(),
+            database: "dev".to_string(),
+            ssl_mode: Some("require".to_string()),
+            ssl_root_cert_path: None,
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
+            ssh_tunnel: None,
+            ssh_tunnel_profile_id: None,
+        },
+    );
+
+    let result = driver.connect_with_secrets(&profile, None, None);
+
+    match result {
+        Err(DbError::ConnectionFailed(formatted)) => assert!(!formatted.message.is_empty()),
+        Err(other) => panic!("expected DbError::ConnectionFailed, got {other:?}"),
+        Ok(_) => panic!("expected an unreachable host to fail to connect"),
+    }
+}
+
+#[test]
+#[ignore = "requires a real Amazon Redshift cluster with at least one non-system schema/table/view; see module docs"]
+fn redshift_live_schema_lists_schemas_tables_and_views() -> Result<(), DbError> {
+    let env = LiveRedshiftEnv::from_env();
+    let driver = RedshiftDriver::new();
+    let profile = env.profile_with_ssl_mode("require");
+
+    let connection = driver.connect_with_secrets(
+        &profile,
+        Some(&SecretString::from(env.password.clone())),
+        None,
+    )?;
+
+    let snapshot = connection.schema()?;
+    let schemas = snapshot.schemas();
+    assert!(
+        !schemas.is_empty(),
+        "expected at least one non-system schema"
+    );
+
+    let total_tables: usize = schemas.iter().map(|schema| schema.tables.len()).sum();
+    assert!(
+        total_tables > 0,
+        "expected at least one table across all schemas"
+    );
+
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a real Amazon Redshift cluster with an empty schema; see DATATAB_TEST_REDSHIFT_EMPTY_SCHEMA"]
+fn redshift_live_empty_schema_lists_zero_tables_without_error() -> Result<(), DbError> {
+    let env = LiveRedshiftEnv::from_env();
+    let empty_schema = std::env::var("DATATAB_TEST_REDSHIFT_EMPTY_SCHEMA")
+        .expect("DATATAB_TEST_REDSHIFT_EMPTY_SCHEMA must name a schema with zero tables/views");
+
+    let driver = RedshiftDriver::new();
+    let profile = env.profile_with_ssl_mode("require");
+    let connection = driver.connect_with_secrets(
+        &profile,
+        Some(&SecretString::from(env.password.clone())),
+        None,
+    )?;
+
+    let snapshot = connection.schema()?;
+    let schema = snapshot
+        .schemas()
+        .iter()
+        .find(|schema| schema.name == empty_schema)
+        .unwrap_or_else(|| panic!("schema '{empty_schema}' not found in schema snapshot"));
+
+    assert!(schema.tables.is_empty(), "expected zero tables");
+    assert!(schema.views.is_empty(), "expected zero views");
+
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a real Amazon Redshift table with a declared DISTKEY and SORTKEY; see DATATAB_TEST_REDSHIFT_TABLE"]
+fn redshift_live_table_details_surface_distkey_and_sortkey() -> Result<(), DbError> {
+    let env = LiveRedshiftEnv::from_env();
+    let schema =
+        std::env::var("DATATAB_TEST_REDSHIFT_SCHEMA").unwrap_or_else(|_| "public".to_string());
+    let table = std::env::var("DATATAB_TEST_REDSHIFT_TABLE")
+        .expect("DATATAB_TEST_REDSHIFT_TABLE must name a table with a DISTKEY and SORTKEY");
+
+    let driver = RedshiftDriver::new();
+    let profile = env.profile_with_ssl_mode("require");
+    let connection = driver.connect_with_secrets(
+        &profile,
+        Some(&SecretString::from(env.password.clone())),
+        None,
+    )?;
+
+    let details = connection.table_details(&env.database, Some(&schema), &table)?;
+    let hints = details.storage_hints.unwrap_or_default();
+
+    assert!(
+        hints.iter().any(|hint| hint.label == "Distribution Key"),
+        "expected a Distribution Key storage hint"
+    );
+    assert!(
+        hints.iter().any(|hint| hint.label == "Sort Key"),
+        "expected a Sort Key storage hint"
+    );
+
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a real Amazon Redshift table with a declared (informational) primary key; see DATATAB_TEST_REDSHIFT_PK_TABLE"]
+fn redshift_live_declared_primary_key_is_advisory_with_no_fabricated_index() -> Result<(), DbError>
+{
+    let env = LiveRedshiftEnv::from_env();
+    let schema =
+        std::env::var("DATATAB_TEST_REDSHIFT_SCHEMA").unwrap_or_else(|_| "public".to_string());
+    let table = std::env::var("DATATAB_TEST_REDSHIFT_PK_TABLE")
+        .expect("DATATAB_TEST_REDSHIFT_PK_TABLE must name a table with a declared PRIMARY KEY");
+
+    let driver = RedshiftDriver::new();
+    let profile = env.profile_with_ssl_mode("require");
+    let connection = driver.connect_with_secrets(
+        &profile,
+        Some(&SecretString::from(env.password.clone())),
+        None,
+    )?;
+
+    let details = connection.table_details(&env.database, Some(&schema), &table)?;
+
+    let columns = details.columns.expect("columns must be loaded");
+    assert!(
+        columns.iter().any(|column| column.is_primary_key),
+        "expected at least one column marked is_primary_key"
+    );
+
+    assert!(
+        details.indexes.is_none(),
+        "Redshift has no true indexes; table_details must not fabricate an IndexData list"
+    );
+
+    let hints = details.storage_hints.unwrap_or_default();
+    assert!(
+        hints
+            .iter()
+            .any(|hint| hint.label == "Constraints advisory"),
+        "expected a Constraints advisory storage hint marking the PK as non-enforced"
+    );
+
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a real Amazon Redshift table with a SUPER or VARBYTE column; see DATATAB_TEST_REDSHIFT_SUPER_TABLE/DATATAB_TEST_REDSHIFT_SUPER_COLUMN"]
+fn redshift_live_super_or_varbyte_column_renders_as_text_without_panic() -> Result<(), DbError> {
+    let env = LiveRedshiftEnv::from_env();
+    let schema =
+        std::env::var("DATATAB_TEST_REDSHIFT_SCHEMA").unwrap_or_else(|_| "public".to_string());
+    let table = std::env::var("DATATAB_TEST_REDSHIFT_SUPER_TABLE")
+        .expect("DATATAB_TEST_REDSHIFT_SUPER_TABLE must name a table with a SUPER/VARBYTE column");
+    let column = std::env::var("DATATAB_TEST_REDSHIFT_SUPER_COLUMN")
+        .expect("DATATAB_TEST_REDSHIFT_SUPER_COLUMN must name that SUPER/VARBYTE column");
+
+    let driver = RedshiftDriver::new();
+    let profile = env.profile_with_ssl_mode("require");
+    let connection = driver.connect_with_secrets(
+        &profile,
+        Some(&SecretString::from(env.password.clone())),
+        None,
+    )?;
+
+    let sql = format!("SELECT \"{column}\" FROM \"{schema}\".\"{table}\" LIMIT 1");
+    let result = connection.execute(&QueryRequest::new(&sql))?;
+
+    assert_eq!(result.columns.len(), 1);
+    // A real SUPER/VARBYTE OID must classify as `ColumnKind::Text` here, not
+    // `Unknown` — an `Unknown` result would mean the hardcoded extended-type
+    // OID literals in `redshift_oid_to_kind` do not match this cluster.
+    assert_eq!(result.columns[0].kind, datatab_core::ColumnKind::Text);
+
+    if let Some(row) = result.rows.first() {
+        match &row[0] {
+            datatab_core::Value::Text(_) | datatab_core::Value::Null => {}
+            other => {
+                panic!("expected SUPER/VARBYTE column to decode as text or null, got {other:?}")
+            }
+        }
+    }
+
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a real Amazon Redshift cluster; see module docs for required env vars"]
+fn redshift_live_select_into_is_rejected_at_the_wire_not_executed() {
+    let env = LiveRedshiftEnv::from_env();
+    let driver = RedshiftDriver::new();
+    let profile = env.profile_with_ssl_mode("require");
+
+    let connection = driver
+        .connect_with_secrets(
+            &profile,
+            Some(&SecretString::from(env.password.clone())),
+            None,
+        )
+        .expect("connect should succeed");
+
+    // `classify_query_for_language` treats `SELECT ... INTO ...` as a read
+    // statement (it starts with SELECT), so `ensure_read_only` lets it
+    // through. This test documents that the wire layer still rejects it:
+    // PostgreSQL (and Redshift, which shares its wire protocol) refuses
+    // `SELECT INTO` inside the extended query protocol's `Parse` step
+    // (`client.prepare`), so no table is ever created even though the
+    // shared classifier alone would not have blocked it.
+    let table_name = format!(
+        "datatab_select_into_probe_{}",
+        uuid::Uuid::new_v4().simple()
+    );
+    let sql = format!("SELECT 1 AS x INTO {table_name}");
+
+    let result = connection.execute(&QueryRequest::new(&sql));
+
+    assert!(
+        result.is_err(),
+        "SELECT INTO must be rejected at the wire layer, not silently create a table"
+    );
+}
+
+/// Documents the TLS root-CA + client-certificate (mutual TLS) path against a
+/// real cluster. No local or Docker-based Redshift emulator exists, so this is
+/// `#[ignore]`d like the other live tests. Run it against a cluster fronted by
+/// a private CA (and, for mTLS, requiring a client certificate) with:
+///
+/// ```text
+/// DATATAB_TEST_REDSHIFT_HOST=... \
+/// DATATAB_TEST_REDSHIFT_PASSWORD=... \
+/// DATATAB_TEST_REDSHIFT_SSL_ROOT_CERT=/path/to/private-ca.pem \
+/// DATATAB_TEST_REDSHIFT_SSL_CLIENT_CERT=/path/to/client.pem \
+/// DATATAB_TEST_REDSHIFT_SSL_CLIENT_KEY=/path/to/client-key.pem \
+/// cargo nextest run -p datatab_driver_redshift --run-ignored all \
+///   redshift_live_verify_full_with_private_ca_and_client_cert
+/// ```
+///
+/// A `verify-full` connection here proves the pinned private CA is honored
+/// (the handshake would otherwise fail against a cert the system trust store
+/// does not chain to) and, when the client cert/key are set, that mutual TLS
+/// is negotiated rather than being inert.
+#[test]
+#[ignore = "requires a real Amazon Redshift cluster fronted by a private CA / client cert; see test docs for env vars"]
+fn redshift_live_verify_full_with_private_ca_and_client_cert() {
+    let env = LiveRedshiftEnv::from_env();
+
+    let ssl_root_cert_path = std::env::var("DATATAB_TEST_REDSHIFT_SSL_ROOT_CERT").ok();
+    let ssl_client_cert_path = std::env::var("DATATAB_TEST_REDSHIFT_SSL_CLIENT_CERT").ok();
+    let ssl_client_key_path = std::env::var("DATATAB_TEST_REDSHIFT_SSL_CLIENT_KEY").ok();
+
+    let profile = ConnectionProfile::new(
+        "live-redshift-mtls",
+        DbConfig::Redshift {
+            use_uri: false,
+            uri: None,
+            host: env.host.clone(),
+            port: env.port,
+            user: env.user.clone(),
+            database: env.database.clone(),
+            ssl_mode: Some("verify-full".to_string()),
+            ssl_root_cert_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
+            ssh_tunnel: None,
+            ssh_tunnel_profile_id: None,
+        },
+    );
+
+    let driver = RedshiftDriver::new();
+    let connection = driver
+        .connect_with_secrets(
+            &profile,
+            Some(&SecretString::from(env.password.clone())),
+            None,
+        )
+        .expect("verify-full connection with the pinned private CA / client cert should succeed");
+
+    connection
+        .ping()
+        .expect("ping over the mutually-authenticated TLS connection should succeed");
+}
+
+#[test]
+#[ignore = "requires a real Amazon Redshift cluster; see module docs for required env vars"]
+fn redshift_live_probe_write_privilege_stays_unknown() {
+    // Redshift is wire-enforced read-only by `ensure_read_only` (see
+    // `connection.rs`), so `RedshiftConnection` intentionally does not
+    // override `Connection::probe_write_privilege`. This pins that decision:
+    // a probe result would be redundant with the enforcement that already
+    // rejects every mutating statement, and any grant/role signal from the
+    // server would be misleading given writes never reach the wire either way.
+    let env = LiveRedshiftEnv::from_env();
+    let driver = RedshiftDriver::new();
+    let profile = env.profile_with_ssl_mode("require");
+
+    let connection = driver
+        .connect_with_secrets(
+            &profile,
+            Some(&SecretString::from(env.password.clone())),
+            None,
+        )
+        .expect("connection should succeed");
+
+    assert_eq!(
+        connection.probe_write_privilege(),
+        datatab_core::WritePrivilege::Unknown,
+        "RedshiftConnection must keep the default WritePrivilege::Unknown probe"
+    );
+}
+
+fn read_only_request(sql: &str) -> QueryRequest {
+    QueryRequest::new(sql).with_read_only(ReadOnlyEnforcement::Required)
+}
+
+fn single_text(result: &datatab_core::QueryResult) -> String {
+    match result.rows.first().and_then(|row| row.first()) {
+        Some(datatab_core::Value::Text(text)) => text.clone(),
+        other => panic!("expected one text value, got {other:?}"),
+    }
+}
+
+#[test]
+#[ignore = "requires a disposable PostgreSQL 16 container (wire-compatible read-only transaction)"]
+fn redshift_read_only_requests_run_in_a_read_only_transaction() -> Result<(), DbError> {
+    with_trust_postgres_port(|port| {
+        let profile = ConnectionProfile::new(
+            "redshift-protocol-compatibility",
+            DbConfig::Redshift {
+                use_uri: false,
+                uri: None,
+                host: "127.0.0.1".to_string(),
+                port,
+                user: "testuser".to_string(),
+                database: "testdb".to_string(),
+                ssl_mode: Some("disable".to_string()),
+                ssl_root_cert_path: None,
+                ssl_client_cert_path: None,
+                ssl_client_key_path: None,
+                ssh_tunnel: None,
+                ssh_tunnel_profile_id: None,
+            },
+        );
+        let connection = retry_db_operation(Duration::from_secs(30), || -> Result<_, DbError> {
+            let connection = RedshiftDriver::new().connect_with_secrets(&profile, None, None)?;
+            connection.ping()?;
+            Ok(connection)
+        })?;
+
+        let inside = connection.execute(&read_only_request(
+            "SELECT current_setting('transaction_read_only')",
+        ))?;
+        assert_eq!(single_text(&inside), "on");
+
+        let after = connection.execute(&QueryRequest::new(
+            "SELECT current_setting('transaction_read_only')",
+        ))?;
+        assert_eq!(single_text(&after), "off", "the read-only block was closed");
+
+        for sql in [
+            "WITH doomed AS (DELETE FROM items RETURNING *) SELECT * FROM doomed",
+            "EXPLAIN ANALYZE DELETE FROM items",
+        ] {
+            let outcome = connection.execute(&read_only_request(sql));
+            assert!(
+                matches!(outcome, Err(DbError::NotSupported(_))),
+                "{sql}: expected the local read-only refusal, got {outcome:?}"
+            );
+        }
+
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires a real Amazon Redshift cluster; see module docs for required env vars"]
+fn redshift_live_read_only_request_runs_and_writes_are_refused() -> Result<(), DbError> {
+    let env = LiveRedshiftEnv::from_env();
+    let profile = env.profile_with_ssl_mode("require");
+    let connection = RedshiftDriver::new().connect_with_secrets(
+        &profile,
+        Some(&SecretString::from(env.password.clone())),
+        None,
+    )?;
+
+    let result = connection.execute(&read_only_request("SELECT 1"))?;
+    assert_eq!(result.rows.len(), 1);
+
+    for sql in [
+        "WITH doomed AS (DELETE FROM items RETURNING *) SELECT * FROM doomed",
+        "EXPLAIN ANALYZE DELETE FROM items",
+    ] {
+        assert!(
+            connection.execute(&read_only_request(sql)).is_err(),
+            "{sql}"
+        );
+    }
+
+    Ok(())
+}

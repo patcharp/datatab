@@ -1,0 +1,207 @@
+# DataTab Drivers
+
+This document is a comparative overview of the database drivers shipped with
+DataTab. For per-driver details, follow the link to each driver crate's
+`README.md`. For the internal driver architecture (traits, registration, the
+`DbDriver`/`Connection` seam), see the **Driver System** section of
+[`ARCHITECTURE.md`](../ARCHITECTURE.md). Contributors implementing a driver
+should start with the [Driver Authoring Guide](DRIVER_AUTHORING.md).
+
+## How drivers are abstracted
+
+Every driver exposes a `DriverMetadata` value (defined in
+`crates/datatab_core/src/driver/capabilities.rs`). The UI is driver-agnostic and
+adapts purely from this metadata. The relevant fields are:
+
+- **`DatabaseCategory`** — selects the view model and terminology. Values:
+  `Relational`, `Document`, `KeyValue`, `TimeSeries`, `LogStream`,
+  `ObjectStorage`, `SecretStore`. A category lands together with a driver that declares it.
+- **`QueryLanguage`** — drives editor mode, placeholder text, and query parsing.
+  Values include `Sql`, `MongoQuery`, `RedisCommands`, `Cypher`, `InfluxQuery`,
+  `Flux`, `Cql`, `CloudWatchLogsInsightsQl`, `OpenSearchPpl`, `OpenSearchSql`,
+  the script languages `Lua` / `Python` / `Bash`, and `Custom(String)`.
+- **`DriverCapabilities`** — a `u64` bitflag set declaring supported features
+  (transactions, pagination, schemas, key-value operations, etc.). Convenience
+  bases `RELATIONAL_BASE`, `DOCUMENT_BASE`, and `KEYVALUE_BASE` group the common
+  flags for each category.
+
+The capability flags listed below are exactly the ones each driver's
+`DriverMetadata` sets in code; nothing is inferred.
+
+## Comparison
+
+| Driver | Category | Query language | Key capabilities | Notes / limitations |
+| --- | --- | --- | --- | --- |
+| PostgreSQL | Relational | SQL | Relational base + schemas, SSH tunnel, SSL, auth, foreign keys, check/unique constraints, custom types, `RETURNING`, transactional DDL, routines, multi-statement | Full SQL driver; routine viewer is read-only; transactional DDL except `CREATE INDEX CONCURRENTLY`. |
+| Amazon Redshift | Relational | SQL | Multiple databases, schemas, views, SSH tunnel, SSL/client certificates, auth, query cancellation, prepared statements, pagination, sorting, filtering, CSV/JSON export | Read-only over the PostgreSQL wire protocol; single-statement; exposes Redshift storage hints; no writes/DDL, IAM/SSO, or indexes. |
+| MySQL | Relational | SQL | Relational base + SSH tunnel, SSL, auth, foreign keys, check/unique constraints, routines, multi-statement | DDL is non-transactional; multi-statement scripts split text-based and run sequentially; routine listing covers FUNCTION/PROCEDURE only. |
+| MariaDB | Relational | SQL | Same crate and capabilities as MySQL | Registered as a separate `mariadb` metadata sharing the MySQL implementation. |
+| SQLite | Relational | SQL | Views, indexes, foreign keys, check/unique constraints, prepared statements, insert/update/delete, pagination, sorting, filtering, CSV/JSON export, query cancellation, transactional DDL, multi-statement | Embedded file driver: no network, SSH tunnel, or TLS; no multi-schema namespace. |
+| SQL Server | Relational | SQL | Relational base + schemas, SSH tunnel, SSL, auth, foreign keys, check/unique constraints, transactional DDL, routines, multi-statement | Built on `tiberius`; named-instance lookup unavailable through SSH tunnel; multi-result-set batches return the last set as primary. |
+| MongoDB | Document | MongoQuery | Document base + aggregation, SSH tunnel, indexes | MongoDB shell-style syntax only (no SQL); no query cancellation; parser scoped to supported command patterns. |
+| Redis | Key-Value | RedisCommands | Key-value base + multiple databases, TTL, key types, value size, rename, bulk get, stream range/add/delete, auth, SSH tunnel, SSL | Redis command syntax only (no SQL); no query cancellation; SSH tunneling unavailable in URI mode. |
+| DynamoDB | Document | Custom("DynamoDB") | Auth, pagination, filtering, insert/update/delete, nested documents, arrays | AWS-managed; native command envelope (`scan`/`query`/`put`/`update`/`delete`); no PartiQL/transactions; no query cancellation; `update many+upsert` unsupported. |
+| CloudWatch Logs | Log Stream | Sql (metadata default) | Auth | AWS-managed; executes Logs Insights QL, OpenSearch PPL, and OpenSearch SQL via editor-managed source context; no query cancellation yet. |
+| InfluxDB | Time Series | InfluxQuery | Auth, multiple databases, pagination, CSV/JSON export | v1 and v2 in one crate; InfluxQL on both, Flux on v2 only; read-only (no INSERT/UPDATE/DELETE); no transactions. |
+| ClickHouse | Relational | SQL | Multiple databases, views, auth, pagination, sorting, filtering, grouping, joins, CTEs, windows, CSV/JSON export | HTTP(S), including ClickHouse Cloud; read-oriented DataTab integration with no structured mutations, DDL, transactions, SSH tunneling, or query parameters. |
+| TursoDB | Relational | SQL | Auth token, views, indexes, foreign keys, check/unique constraints, prepared statements, insert/update/delete, pagination, sorting, filtering, CSV/JSON export, transactions, transactional DDL, multi-statement | Remote Turso / libSQL over HTTP (`libsql://`, or `http://` for a local `sqld`); interactive transactions run on per-document server streams; no query cancellation, SSH tunnel, replicas, or database switching. |
+| DuckDB | Relational | SQL | Multiple databases, schemas, views, indexes, foreign keys, check/unique constraints, prepared statements, insert/update/delete with RETURNING, pagination, sorting, filtering, CSV/JSON export, transactions, transactional DDL, query cancellation, row limits, read-only enforcement, multi-statement | Embedded file or in-memory database; attaches a DuckLake catalog on connect; only one process can hold a file for writing; no statement timeouts. |
+| Amazon S3 | Object Storage | Custom("S3") | Auth (profile/SSO or static credentials, custom endpoint), bucket browsing, paginated object navigation, preview, full CRUD, presigned URLs | S3-compatible (Cloudflare R2, MinIO); no multipart upload/transfers panel, no embedded PDF viewer, no lifecycle/ACL management or S3 Select. |
+| AWS Secrets | Secret Store | Custom("AWS Secrets") | Auth (profile/SSO or static credentials, custom endpoint), Secrets Manager and Parameter Store in one connection, paginated listing with name search, parameter path hierarchy, details, explicit value retrieval | Read only (no create, edit, delete, restore, versions or rotation); one region per connection; LocalStack does not honor Parameter Store page sizes. |
+
+## Per-driver summary
+
+### PostgreSQL
+
+Full SQL driver with schema discovery, stored routines (read-only viewer), SSL,
+SSH tunneling, query cancellation via cancel tokens, transactional DDL, and
+PostgreSQL-specific code generation. Multi-statement scripts run as a batch via
+the simple query protocol. See
+[`crates/datatab_driver_postgres/README.md`](../crates/datatab_driver_postgres/README.md).
+
+### Amazon Redshift
+
+Read-only relational SQL driver using the PostgreSQL wire protocol. It supports
+schema, table, view, and column introspection; SSH tunneling; TLS and client
+certificates; query cancellation; and Redshift distribution/sort-key storage
+hints. It does not support writes or DDL, IAM/SSO authentication,
+multi-statement queries, or indexes. See
+[`crates/datatab_driver_redshift/README.md`](../crates/datatab_driver_redshift/README.md).
+
+### MySQL / MariaDB
+
+One crate implements both MySQL and MariaDB. Supports SQL execution, schema
+discovery, query cancellation via `KILL QUERY`, code generation, and routine
+discovery for functions and procedures. DDL is not transactional and
+multi-statement splitting is text-based. See
+[`crates/datatab_driver_mysql/README.md`](../crates/datatab_driver_mysql/README.md).
+
+### SQLite
+
+Embedded, file-based driver with schema discovery, query cancellation via
+interrupt handles, transactional DDL, and code generation. No network transport,
+SSH tunneling, or TLS, and no multi-schema namespace. See
+[`crates/datatab_driver_sqlite/README.md`](../crates/datatab_driver_sqlite/README.md).
+
+### SQL Server
+
+Built on the `tiberius` TDS client. Supports SQL Server / Azure SQL, TLS modes,
+named instances (resolved via SQL Browser), SSH tunneling, per-tab database
+switching, and multi-result-set batches. See
+[`crates/datatab_driver_mssql/README.md`](../crates/datatab_driver_mssql/README.md).
+
+### MongoDB
+
+Document driver with collection browsing, document CRUD, MongoDB shell-style
+query parsing, aggregation, and document-focused schema metadata. SQL is not
+supported and query cancellation is unavailable. See
+[`crates/datatab_driver_mongodb/README.md`](../crates/datatab_driver_mongodb/README.md).
+
+### Redis
+
+Key-value driver covering strings, hashes, lists, sets, sorted sets, and
+streams, plus key scanning, TTL operations, rename, bulk get, and multiple
+logical databases. SQL is not supported and SSH tunneling is unavailable in URI
+mode. See
+[`crates/datatab_driver_redis/README.md`](../crates/datatab_driver_redis/README.md).
+
+### DynamoDB
+
+AWS NoSQL driver built on `aws-sdk-dynamodb` with region/profile/endpoint
+configuration. Table discovery maps PK/SK and GSI/LSI metadata; execution uses a
+native command envelope (`scan`, `query`, `put`, `update`, `delete`). PartiQL and
+DynamoDB transactions are not exposed. See
+[`crates/datatab_driver_dynamodb/README.md`](../crates/datatab_driver_dynamodb/README.md).
+
+### CloudWatch Logs
+
+AWS CloudWatch Logs driver executing queries through `StartQuery` with
+editor-managed time range and log-group source context. Query documents can run
+Logs Insights QL, OpenSearch PPL, and OpenSearch SQL; schema discovery enumerates
+log groups and exposes log streams as event-stream children. Its
+`DriverMetadata.query_language` is set to `Sql` as the default editor mode while
+the actual mode is chosen per query document. See
+[`crates/datatab_driver_cloudwatch/README.md`](../crates/datatab_driver_cloudwatch/README.md).
+
+### InfluxDB
+
+Time-series driver supporting both InfluxDB v1 and v2 in one crate. InfluxQL runs
+on both versions; Flux runs on v2 only. The query API is read-only (no
+INSERT/UPDATE/DELETE, no transactions), with optional default bucket/database and
+per-query bucket routing. See
+[`crates/datatab_driver_influxdb/README.md`](../crates/datatab_driver_influxdb/README.md).
+
+### ClickHouse
+
+Relational SQL driver for self-hosted ClickHouse and ClickHouse Cloud over
+HTTP(S). It discovers databases, tables, views, columns, and engine metadata,
+and supports read-oriented SQL workflows with pagination and visual SELECT
+generation. Structured mutations, DDL, transactions, SSH tunneling, and generic
+query parameters are not supported in this initial scope. See
+[`crates/datatab_driver_clickhouse/README.md`](../crates/datatab_driver_clickhouse/README.md).
+
+### TursoDB
+
+Relational SQL driver for Turso Cloud and self-hosted `sqld` over HTTP, built on
+the `turso_serverless` SDK. It speaks the SQLite dialect, discovers tables,
+views, columns, indexes, foreign keys, and constraints through `sqlite_master`
+and PRAGMAs, and supports typed CRUD, bound parameters, batched scripts, and
+interactive transactions on per-document server streams, one control
+statement per editor run. Query cancellation, savepoints, SSH tunneling,
+embedded replicas, and database switching are not supported. See
+[`crates/datatab_driver_turso/README.md`](../crates/datatab_driver_turso/README.md).
+
+### DuckDB
+
+Embedded analytical SQL driver built on the bundled DuckDB engine. A profile
+opens a database file, or an in-memory database when the path is empty, and can
+attach a DuckLake catalog (a local metadata file or a PostgreSQL, SQLite, or
+MySQL catalog, with data on local disk or object storage) that becomes the
+default database. Every attached catalog is a database in the sidebar, with its
+schemas, tables, and views loaded lazily. It supports bound parameters,
+multi-statement scripts, row limits, cancellation, typed CRUD with `RETURNING`,
+and read-only enforcement through a `READ ONLY` transaction that also refuses
+file and network reads through table functions named in the statement; views
+and macros created earlier, and scalar functions added by extensions, are not
+checked. Statement timeouts are not supported. See
+[`crates/datatab_driver_duckdb/README.md`](../crates/datatab_driver_duckdb/README.md).
+
+### Amazon S3
+
+Object-storage driver for AWS S3 and S3-compatible endpoints (Cloudflare R2,
+MinIO), authenticating via AWS profile/SSO or static credentials with endpoint
+override and path-style addressing. The connection root opens a buckets table;
+bucket browsing paginates per level (AWS-console style) with an optional
+non-paginated tree mode. Object preview covers images natively, text-like
+objects in an inline editable buffer with save-back, and metadata plus
+download/open-externally for PDF and other binary objects; archived storage
+classes (GLACIER, DEEP_ARCHIVE) skip body preview entirely. Supports upload,
+delete, type-to-confirm recursive prefix/bucket delete, folder/bucket
+creation, rename (copy-then-delete), and presigned URLs. It does not support
+multipart upload, a transfers panel, an embedded PDF viewer, lifecycle/ACL
+management, or S3 Select. See
+[`crates/datatab_driver_s3/README.md`](../crates/datatab_driver_s3/README.md).
+
+### AWS Secrets
+
+Secret-store driver for AWS Secrets Manager and Systems Manager Parameter
+Store, authenticating via AWS profile/SSO or static credentials with an
+optional endpoint override. One connection shows both stores in the sidebar.
+Listing is paginated on the server side with name search, and Parameter Store
+paths are browsed one level at a time. Listing and the details pane never
+fetch a value: a value is read only when the user runs Retrieve value, which
+records an audit event without the value. Key/value JSON secrets render as a
+table, other text as plaintext and binary secrets as base64, and secrets owned
+by another service are marked read only. A missing `kms:Decrypt` permission is
+reported as an error, never as an empty value. This release is read only. See
+[`crates/datatab_driver_aws_secrets/README.md`](../crates/datatab_driver_aws_secrets/README.md).
+
+## External RPC drivers
+
+DataTab can load drivers that run out-of-process and communicate over local IPC,
+implemented through `datatab_driver_ipc` and hosted via `datatab_driver_host`.
+These drivers register with the synthetic ID format `rpc:<socket_id>` and supply
+their own `DriverMetadata` (category, query language, capabilities) over the
+wire, so the UI treats them exactly like built-in drivers. For the discovery
+handshake, service lifecycle, and protocol details, see
+[`docs/DRIVER_RPC_PROTOCOL.md`](DRIVER_RPC_PROTOCOL.md).

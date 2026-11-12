@@ -1,0 +1,1948 @@
+//! InfluxDB connection implementation.
+//!
+//! `InfluxConnection` implements the `Connection` trait from `datatab_core`.
+//! It routes queries to the correct HTTP endpoint based on (version, language),
+//! optionally injects time windows, and stores per-query metadata.
+
+use std::sync::RwLock;
+use std::time::Instant;
+
+use datatab_core::{
+    CollectionBrowseRequest, CollectionCountRequest, CollectionPresentation, Connection,
+    DatabaseInfo, DbError, DbKind, DbSchemaInfo, DefaultSqlDialect, DriverMetadata,
+    ExecutionSourceContext, InfluxVersion, InstanceCatalog, LanguageService, MeasurementInfo,
+    QueryLanguage, QueryRequest, QueryResult, ResolvedWindow, SchemaFeatures,
+    SchemaLoadingStrategy, SchemaSnapshot, SourceContextSpec, SourceQueryMode, TableInfo,
+    TimeSeriesSchema, contains_time_macros,
+};
+
+use crate::error_formatter::InfluxErrorFormatter;
+use crate::http::{HttpClient, HttpError, auth_header};
+use crate::injection::{
+    ResolvedWindow as InjectionWindow, flux_has_range_call, influxql_has_time_predicate,
+    inject_flux_window, inject_influxql_window,
+};
+use crate::language_service::InfluxLanguageService;
+use crate::metadata::InfluxQueryMetadata;
+use crate::parser::flux::parse_flux_csv;
+use crate::parser::influxql::parse_influxql_json;
+use crate::query_generator::InfluxQueryGenerator;
+
+const INFLUXQL_MODE: &str = "influxql";
+const FLUX_MODE: &str = "flux";
+
+/// Active connection to an InfluxDB instance.
+pub struct InfluxConnection {
+    http: HttpClient,
+    pub version: InfluxVersion,
+    pub default_language: QueryLanguage,
+    /// Default bucket (v2) or database (v1) from the connection profile.
+    ///
+    /// `None` when the user did not specify one: they must pick a bucket from the
+    /// source-context dropdown before running a query. When set this value is
+    /// pre-selected in the editor but can be overridden at query time.
+    pub default_bucket: Option<String>,
+    pub org: Option<String>,
+    last_metadata: RwLock<Option<InfluxQueryMetadata>>,
+    /// Query generator exposed through `Connection::query_generator()`.
+    ///
+    /// Kept as an owned value so it can be returned as `&dyn QueryGenerator`
+    /// with the connection's lifetime.
+    query_gen: InfluxQueryGenerator,
+}
+
+impl InfluxConnection {
+    /// Create a new connection. Called by `InfluxDriver::connect_with_secrets`.
+    pub fn new(
+        http: HttpClient,
+        version: InfluxVersion,
+        default_language: QueryLanguage,
+        default_bucket: Option<String>,
+        org: Option<String>,
+    ) -> Self {
+        let query_gen =
+            InfluxQueryGenerator::new(version, default_language.clone(), default_bucket.clone());
+
+        Self {
+            http,
+            version,
+            default_language,
+            default_bucket,
+            org,
+            last_metadata: RwLock::new(None),
+            query_gen,
+        }
+    }
+
+    /// Return the metadata from the most recently executed query.
+    pub fn last_query_metadata(&self) -> Option<InfluxQueryMetadata> {
+        self.last_metadata.read().ok()?.clone()
+    }
+
+    /// Build a flat map of driver-specific audit fields from query metadata.
+    ///
+    /// The returned map is attached to `QueryResult.metadata_extra` and merged
+    /// into `details_json` by the generic runner — no driver-id branching needed.
+    pub fn build_metadata_extra_fields(
+        meta: &InfluxQueryMetadata,
+    ) -> std::collections::HashMap<String, serde_json::Value> {
+        let language_str = match meta.language {
+            QueryLanguage::Flux => "flux",
+            QueryLanguage::InfluxQuery => "influxql",
+            _ => "unknown",
+        };
+
+        let version_str = match meta.version {
+            InfluxVersion::V1 => "v1",
+            InfluxVersion::V2 => "v2",
+        };
+
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "language".to_string(),
+            serde_json::Value::String(language_str.to_string()),
+        );
+        map.insert(
+            "version".to_string(),
+            serde_json::Value::String(version_str.to_string()),
+        );
+        map.insert(
+            "bucket_or_database".to_string(),
+            serde_json::Value::String(meta.bucket_or_database.clone()),
+        );
+        map.insert(
+            "injected_window".to_string(),
+            serde_json::Value::Bool(meta.injected_window),
+        );
+
+        // Include start/end ms only when the window was actually injected.
+        if let Some(ref rw) = meta.resolved_window
+            && let (Some(start_str), Some(end_str)) =
+                (rw.start_rfc3339.as_deref(), rw.end_rfc3339.as_deref())
+            && let (Some(start_ms), Some(end_ms)) =
+                (rfc3339_to_ms(start_str), rfc3339_to_ms(end_str))
+        {
+            map.insert(
+                "resolved_window_start_ms".to_string(),
+                serde_json::Value::Number(start_ms.into()),
+            );
+            map.insert(
+                "resolved_window_end_ms".to_string(),
+                serde_json::Value::Number(end_ms.into()),
+            );
+        }
+
+        map
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal query dispatch
+    // -----------------------------------------------------------------------
+
+    /// Extract the first selected target (bucket/database) from the source-context.
+    ///
+    /// Returns `None` when the execution context carries no selected targets.
+    fn resolve_bucket_from_context(&self, req: &QueryRequest) -> Option<String> {
+        req.execution_context
+            .as_ref()
+            .and_then(|ctx| ctx.source.as_ref())
+            .and_then(|src| {
+                match src {
+                    ExecutionSourceContext::CollectionWindow { targets, .. } => {
+                        targets.first().cloned()
+                    }
+                    // InstanceMetricQuery/InstanceInspectorQuery are intercepted at the
+                    // top of execute(), so only CollectionWindow reaches this point.
+                    _ => None,
+                }
+            })
+    }
+
+    /// Resolve the effective query language for this request.
+    ///
+    /// Reads the query mode from the execution context when present, otherwise
+    /// falls back to `default_language`. Returns an error if Flux is requested
+    /// on v1 (not supported).
+    fn resolve_language(&self, req: &QueryRequest) -> Result<QueryLanguage, DbError> {
+        let mode = req
+            .execution_context
+            .as_ref()
+            .and_then(|ctx| ctx.source.as_ref())
+            .and_then(|src| {
+                match src {
+                    ExecutionSourceContext::CollectionWindow { query_mode, .. } => {
+                        query_mode.as_deref()
+                    }
+                    // InstanceMetricQuery/InstanceInspectorQuery are intercepted at the
+                    // top of execute(), so only CollectionWindow reaches this point.
+                    _ => None,
+                }
+            });
+
+        let language = match mode {
+            Some(FLUX_MODE) => QueryLanguage::Flux,
+            Some(INFLUXQL_MODE) => QueryLanguage::InfluxQuery,
+            Some(other) => {
+                return Err(DbError::query_failed(format!(
+                    "unknown InfluxDB query mode: {other}"
+                )));
+            }
+            None => self.default_language.clone(),
+        };
+
+        if language == QueryLanguage::Flux && self.version == InfluxVersion::V1 {
+            return Err(DbError::query_failed(
+                "Flux queries are not supported on InfluxDB v1".to_string(),
+            ));
+        }
+
+        Ok(language)
+    }
+
+    /// Read the time window from the execution context (milliseconds → RFC 3339 strings).
+    fn extract_window(req: &QueryRequest) -> InjectionWindow {
+        let (start_ms, end_ms) = req
+            .execution_context
+            .as_ref()
+            .and_then(|ctx| ctx.source.as_ref())
+            .map(|src| {
+                match src {
+                    ExecutionSourceContext::CollectionWindow {
+                        start_ms, end_ms, ..
+                    } => (Some(*start_ms), Some(*end_ms)),
+                    // InstanceMetricQuery/InstanceInspectorQuery are intercepted at the
+                    // top of execute(), so only CollectionWindow reaches this point.
+                    _ => (None, None),
+                }
+            })
+            .unwrap_or((None, None));
+
+        InjectionWindow {
+            start_rfc3339: start_ms.map(ms_to_rfc3339),
+            end_rfc3339: end_ms.map(ms_to_rfc3339),
+        }
+    }
+
+    /// Execute the final query string using the appropriate HTTP endpoint.
+    ///
+    /// `bucket` is the resolved per-query bucket or database name. For InfluxQL
+    /// queries it is injected into the URL (`?db=<bucket>`). For Flux queries the
+    /// bucket lives inside the query text itself, so this parameter is unused.
+    fn dispatch(
+        &self,
+        language: QueryLanguage,
+        bucket: &str,
+        query: &str,
+        started: Instant,
+    ) -> Result<QueryResult, DbError> {
+        let http_result = match (self.version, &language) {
+            (InfluxVersion::V1, QueryLanguage::InfluxQuery) => {
+                self.http.execute_influxql_v1(bucket, query)
+            }
+            (InfluxVersion::V2, QueryLanguage::InfluxQuery) => {
+                let org = self.org.as_deref().unwrap_or("");
+                self.http.execute_influxql_v2(bucket, org, query)
+            }
+            (InfluxVersion::V2, QueryLanguage::Flux) => {
+                let org = self.org.as_deref().unwrap_or("");
+                self.http.execute_flux_v2(org, query)
+            }
+            (InfluxVersion::V1, QueryLanguage::Flux) => {
+                // Guard: should have been caught by resolve_language, but be defensive.
+                return Err(DbError::query_failed(
+                    "Flux queries are not supported on InfluxDB v1".to_string(),
+                ));
+            }
+            _ => {
+                return Err(DbError::query_failed(format!(
+                    "unsupported language {:?} for this InfluxDB version",
+                    language
+                )));
+            }
+        };
+
+        let resp = http_result.map_err(map_http_error)?;
+
+        if resp.status >= 400 {
+            let fe = InfluxErrorFormatter::format_http_error(resp.status, &resp.body);
+            return Err(if resp.status == 401 || resp.status == 403 {
+                DbError::AuthFailed(fe)
+            } else {
+                DbError::QueryFailed(fe)
+            });
+        }
+
+        let mut result = match language {
+            QueryLanguage::Flux => {
+                parse_flux_csv(&resp.body).map_err(|e| DbError::query_failed(e.to_string()))?
+            }
+            _ => {
+                parse_influxql_json(&resp.body).map_err(|e| DbError::query_failed(e.to_string()))?
+            }
+        };
+
+        result.execution_time = started.elapsed();
+        Ok(result)
+    }
+}
+
+/// Applies the request row budget to a parsed response. Both parsers flatten
+/// every InfluxQL statement and every Flux table into one result set, so the
+/// single budget is shared across all of them by construction.
+fn apply_row_budget(result: &mut QueryResult, limit: Option<u32>) {
+    let Some(limit) = limit else {
+        return;
+    };
+    let budget = usize::try_from(limit).unwrap_or(usize::MAX);
+    if result.rows.len() > budget {
+        result.rows.truncate(budget);
+        result.set_rows_truncated(true);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Connection trait
+// ---------------------------------------------------------------------------
+
+impl Connection for InfluxConnection {
+    /// Every measurement is indexed by its `time` column.
+    fn collection_facets(
+        &self,
+        _collection: &datatab_core::CollectionRef,
+    ) -> Vec<datatab_core::ObjectFacet> {
+        vec![
+            datatab_core::ObjectFacet::TimeSeries(datatab_core::TimeSeriesFacet {
+                time_column: Some("time".to_string()),
+            }),
+            datatab_core::ObjectFacet::Tabular,
+        ]
+    }
+
+    fn metadata(&self) -> &DriverMetadata {
+        &crate::driver::INFLUXDB_METADATA
+    }
+
+    fn ping(&self) -> Result<(), DbError> {
+        // Probe liveness without requiring a specific bucket or database.
+        //
+        // v1: SHOW DATABASES against the always-present `_internal` database.
+        // v2: GET /api/v2/buckets?limit=1 — a lightweight authenticated read
+        //     that works regardless of whether a default bucket was configured.
+        match self.version {
+            InfluxVersion::V1 => {
+                let resp = self
+                    .http
+                    .execute_influxql_v1("_internal", "SHOW DATABASES")
+                    .map_err(map_http_error)?;
+                if resp.status >= 400 {
+                    return Err(DbError::connection_failed(format!(
+                        "ping failed: HTTP {}",
+                        resp.status
+                    )));
+                }
+            }
+            InfluxVersion::V2 => {
+                let org = self.org.as_deref().unwrap_or("");
+                let base = self.http.base_url.trim_end_matches('/');
+                let url = format!(
+                    "{base}/api/v2/buckets?limit=1&org={}",
+                    urlencoding::encode(org)
+                );
+                let resp = self.http_get_raw(&url).map_err(map_http_error)?;
+                if resp.status >= 400 {
+                    return Err(if resp.status == 401 || resp.status == 403 {
+                        DbError::AuthFailed(InfluxErrorFormatter::format_http_error(
+                            resp.status,
+                            &resp.body,
+                        ))
+                    } else {
+                        DbError::connection_failed(format!("ping failed: HTTP {}", resp.status))
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn close(&mut self) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    fn instance_catalog(&self) -> Option<Box<dyn InstanceCatalog>> {
+        // v1 has no `/metrics` or `/health` telemetry surface this catalog
+        // can rely on, mirroring the probe_write_privilege v1 gate below.
+        if self.version != InfluxVersion::V2 {
+            return None;
+        }
+
+        Some(Box::new(
+            crate::instance_catalog::InfluxInstanceCatalog::new(self.http.clone()),
+        ))
+    }
+
+    fn execute(&self, req: &QueryRequest) -> Result<QueryResult, DbError> {
+        if req.statement_timeout.is_some() {
+            return Err(DbError::NotSupported(
+                "InfluxDB: requested statement timeout is unsupported; rejected before execution"
+                    .to_string(),
+            ));
+        }
+        if req.limit.is_some()
+            && let Some(
+                ExecutionSourceContext::InstanceMetricQuery { .. }
+                | ExecutionSourceContext::InstanceInspectorQuery { .. },
+            ) = req
+                .execution_context
+                .as_ref()
+                .and_then(|context| context.source.as_ref())
+        {
+            return Err(DbError::NotSupported("InfluxDB: row limits on instance catalog queries are unsupported; rejected before execution".to_string()));
+        }
+        req.refuse_read_only_enforcement("InfluxDB")?;
+
+        if let Some(source) = req
+            .execution_context
+            .as_ref()
+            .and_then(|ctx| ctx.source.as_ref())
+        {
+            // Gated on v2 for the same reason `instance_catalog()` is. v1 does
+            // serve `/metrics`, so without this an instance query routed to a
+            // v1 connection would answer from a catalog that connection
+            // reports it does not have.
+            let is_instance_query = matches!(
+                source,
+                ExecutionSourceContext::InstanceMetricQuery { .. }
+                    | ExecutionSourceContext::InstanceInspectorQuery { .. }
+            );
+
+            if is_instance_query && self.version != InfluxVersion::V2 {
+                return Err(DbError::NotSupported(
+                    "InfluxDB instance metrics and inspectors require v2".to_string(),
+                ));
+            }
+
+            match source {
+                ExecutionSourceContext::InstanceMetricQuery { metric_id, .. } => {
+                    return crate::instance_catalog::dispatch_metric_series(&self.http, metric_id);
+                }
+                ExecutionSourceContext::InstanceInspectorQuery { metric_id } => {
+                    return crate::instance_catalog::dispatch_inspector_snapshot(
+                        &self.http, metric_id,
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        let started = Instant::now();
+        let language = self.resolve_language(req)?;
+
+        // Resolve the effective bucket/database for this query.
+        //
+        // Priority: (1) first target from source-context dropdown, (2) profile default.
+        // InfluxQL queries embed the bucket in the URL (`?db=<bucket>`), so they need
+        // an explicit value. Flux queries carry the bucket inside the query text, so
+        // the resolved bucket is only used for metadata recording in that case.
+        let resolved_bucket = self
+            .resolve_bucket_from_context(req)
+            .or_else(|| self.default_bucket.clone());
+
+        // For InfluxQL, a bucket is required to route the HTTP request.
+        // Flux queries reference the bucket inside the query text, so we allow
+        // proceeding without one — the user wrote `from(bucket: "...")` themselves.
+        if language != QueryLanguage::Flux && resolved_bucket.is_none() {
+            return Err(DbError::query_failed(
+                "Select a source bucket from the dropdown before running a query".to_string(),
+            ));
+        }
+
+        let bucket_for_dispatch = resolved_bucket.as_deref().unwrap_or("");
+
+        let window = Self::extract_window(req);
+
+        let injected_window;
+        let resolved_window: Option<ResolvedWindow>;
+        let final_query: String;
+
+        // When the query already contains explicit time-range macros (substituted upstream by
+        // `substitute_time_macros`), the user has declared their own time bounds. Skip the
+        // inject-when-absent logic entirely so the macro-derived predicates win (REQ-5).
+        if contains_time_macros(&req.sql) {
+            final_query = req.sql.clone();
+            injected_window = false;
+            resolved_window = None;
+        } else {
+            match language {
+                QueryLanguage::Flux => {
+                    let had_range = flux_has_range_call(&req.sql);
+                    final_query = inject_flux_window(&req.sql, &window);
+                    injected_window = !had_range
+                        && (window.start_rfc3339.is_some() || window.end_rfc3339.is_some())
+                        && flux_has_range_call(&final_query);
+                    resolved_window = if injected_window {
+                        window_to_resolved(&window, language.clone())
+                    } else {
+                        None
+                    };
+                }
+                _ => {
+                    let had_predicate = influxql_has_time_predicate(&req.sql);
+                    final_query = inject_influxql_window(&req.sql, &window);
+                    injected_window = !had_predicate
+                        && (window.start_rfc3339.is_some() || window.end_rfc3339.is_some());
+                    resolved_window = if injected_window {
+                        window_to_resolved(&window, language.clone())
+                    } else {
+                        None
+                    };
+                }
+            }
+        }
+
+        let mut result =
+            self.dispatch(language.clone(), bucket_for_dispatch, &final_query, started)?;
+
+        if let Some(ref rw) = resolved_window {
+            result.resolved_window = Some(rw.clone());
+        }
+
+        // Record the actual bucket used for this query, not the profile default.
+        let effective_bucket = resolved_bucket
+            .clone()
+            .unwrap_or_else(|| "<flux-inline>".to_string());
+
+        // Build and store per-query metadata for both audit forwarding and UI inspection.
+        let meta = InfluxQueryMetadata {
+            version: self.version,
+            language,
+            resolved_window: resolved_window.as_ref().map(|rw| InjectionWindow {
+                start_rfc3339: Some(rfc3339_from_ms(rw.start_ms)),
+                end_rfc3339: Some(rfc3339_from_ms(rw.end_ms)),
+            }),
+            bucket_or_database: effective_bucket,
+            injected_window,
+        };
+
+        // Attach audit fields to the result so the generic runner can forward them
+        // into details_json without any driver-id branching.
+        result.metadata_extra = Some(Self::build_metadata_extra_fields(&meta));
+        // Runs after the audit fields replace `metadata_extra`, which would
+        // otherwise erase the truncation flag.
+        apply_row_budget(&mut result, req.limit);
+
+        match self.last_metadata.write() {
+            Ok(mut guard) => *guard = Some(meta),
+            Err(e) => log::warn!("Failed to store query metadata (lock poisoned): {e}"),
+        }
+
+        Ok(result)
+    }
+
+    fn cancel(&self, _handle: &datatab_core::QueryHandle) -> Result<(), DbError> {
+        Err(DbError::NotSupported(
+            "Query cancellation not supported for InfluxDB".to_string(),
+        ))
+    }
+
+    fn schema(&self) -> Result<SchemaSnapshot, DbError> {
+        let measurements = self.fetch_measurements()?;
+
+        // Enumerate all accessible buckets/databases so the UI can populate
+        // the "Bucket"/"Database" source-context dropdown with every reachable
+        // target, not just the profile default.
+        let databases = self.list_databases().unwrap_or_else(|e| {
+            // Permission to list all buckets/databases is not always granted.
+            // Log the failure at warn level so operators can diagnose it, then
+            // fall back to showing only the profile default so the UI is not empty.
+            log::warn!("list_databases failed (falling back to profile default bucket): {e}");
+
+            match &self.default_bucket {
+                Some(bucket) => vec![DatabaseInfo {
+                    name: bucket.clone(),
+                    is_current: true,
+                }],
+                None => vec![],
+            }
+        });
+
+        // Mark the profile default as current so the UI can pre-select it.
+        // When no default is set, no bucket is pre-selected.
+        let databases = databases
+            .into_iter()
+            .map(|mut db| {
+                db.is_current = self
+                    .default_bucket
+                    .as_deref()
+                    .map(|d| db.name == d)
+                    .unwrap_or(false);
+                db
+            })
+            .collect();
+
+        let schema = TimeSeriesSchema {
+            databases,
+            current_database: self.default_bucket.clone(),
+            measurements,
+            retention_policies: Vec::new(),
+        };
+
+        Ok(SchemaSnapshot::time_series(schema))
+    }
+
+    fn list_databases(&self) -> Result<Vec<DatabaseInfo>, DbError> {
+        match self.version {
+            InfluxVersion::V1 => {
+                let resp = self
+                    .http
+                    .execute_influxql_v1("_internal", "SHOW DATABASES")
+                    .map_err(map_http_error)
+                    .and_then(reject_error_status)?;
+                parse_influxql_string_list(&resp.body, "name")
+            }
+            InfluxVersion::V2 => {
+                let org = self.org.as_deref().unwrap_or("");
+                let base = self.http.base_url.trim_end_matches('/');
+                let url = format!("{base}/api/v2/buckets?org={}", urlencoding::encode(org));
+                let http_resp = self
+                    .http_get_raw(&url)
+                    .map_err(map_http_error)
+                    .and_then(reject_error_status)?;
+                parse_v2_buckets_response(&http_resp)
+            }
+        }
+    }
+
+    fn kind(&self) -> DbKind {
+        DbKind::InfluxDB
+    }
+
+    /// Every bucket (v2) or database (v1) is reachable over the same HTTP
+    /// client, so measurements load per bucket on demand instead of only for
+    /// the profile default.
+    fn schema_loading_strategy(&self) -> SchemaLoadingStrategy {
+        SchemaLoadingStrategy::LazyPerDatabase
+    }
+
+    /// Lists a bucket's measurements as the `tables` of a `DbSchemaInfo`,
+    /// which is how lazily loaded time-series databases are cached.
+    fn schema_for_database(&self, database: &str) -> Result<DbSchemaInfo, DbError> {
+        let tables = self
+            .fetch_measurement_names(database)?
+            .into_iter()
+            .map(|name| TableInfo {
+                name,
+                schema: Some(database.to_string()),
+                columns: None,
+                indexes: None,
+                foreign_keys: None,
+                constraints: None,
+                sample_fields: None,
+                presentation: CollectionPresentation::default(),
+                child_items: None,
+                storage_hints: None,
+                pseudo_columns: Box::default(),
+            })
+            .collect();
+
+        Ok(DbSchemaInfo {
+            name: database.to_string(),
+            tables,
+            views: Vec::new(),
+            custom_types: None,
+        })
+    }
+
+    fn schema_features(&self) -> SchemaFeatures {
+        SchemaFeatures::empty()
+    }
+
+    fn dialect(&self) -> &dyn datatab_core::SqlDialect {
+        &DefaultSqlDialect
+    }
+
+    fn language_service(&self) -> &dyn LanguageService {
+        &InfluxLanguageService
+    }
+
+    fn source_context_spec(&self) -> Option<SourceContextSpec> {
+        let query_modes = match self.version {
+            InfluxVersion::V1 => vec![SourceQueryMode {
+                value: INFLUXQL_MODE.to_string(),
+                label: "InfluxQL".to_string(),
+                query_language: QueryLanguage::InfluxQuery,
+            }],
+            InfluxVersion::V2 => vec![
+                SourceQueryMode {
+                    value: INFLUXQL_MODE.to_string(),
+                    label: "InfluxQL".to_string(),
+                    query_language: QueryLanguage::InfluxQuery,
+                },
+                SourceQueryMode {
+                    value: FLUX_MODE.to_string(),
+                    label: "Flux".to_string(),
+                    query_language: QueryLanguage::Flux,
+                },
+            ],
+        };
+
+        let targets_label = match self.version {
+            InfluxVersion::V1 => "Database".to_string(),
+            InfluxVersion::V2 => "Bucket".to_string(),
+        };
+
+        let targets_placeholder = match self.version {
+            InfluxVersion::V1 => "Select database…".to_string(),
+            InfluxVersion::V2 => "Select bucket…".to_string(),
+        };
+
+        Some(SourceContextSpec {
+            targets_label,
+            targets_placeholder,
+            // Pre-select the profile default bucket when one is set.
+            // When None, the user must choose from the dropdown before running.
+            default_target: self.default_bucket.clone(),
+            start_label: "Start".to_string(),
+            end_label: "End".to_string(),
+            query_mode_label: Some("Syntax".to_string()),
+            default_query_mode: Some(INFLUXQL_MODE.to_string()),
+            query_modes,
+        })
+    }
+
+    /// Browse a measurement as a paginated time-series result.
+    ///
+    /// The statement comes from `InfluxQueryGenerator::browse_query`, the same
+    /// text `collection_browse_query` hands the UI, so the label a user sees is
+    /// the query that runs:
+    ///
+    /// - InfluxQL (v1, and v2 by default): `SELECT * FROM "<measurement>" ORDER BY time DESC LIMIT n OFFSET m`
+    /// - Flux (v2 with Flux as default): `from` / `range` / `filter` / `sort` / `limit`, plus `tail` past the first page
+    ///
+    /// The `collection.database` field carries the bucket/database name from the sidebar leaf,
+    /// which is used directly in the query instead of the connection default.
+    fn browse_collection(&self, request: &CollectionBrowseRequest) -> Result<QueryResult, DbError> {
+        let started = Instant::now();
+        let query = self.query_gen.browse_query(request);
+
+        match query.language {
+            QueryLanguage::Flux => {
+                let org = self.org.as_deref().unwrap_or("");
+                let resp = self
+                    .http
+                    .execute_flux_v2(org, &query.text)
+                    .map_err(map_http_error)?;
+
+                if resp.status >= 400 {
+                    let fe = InfluxErrorFormatter::format_http_error(resp.status, &resp.body);
+                    return Err(DbError::QueryFailed(fe));
+                }
+
+                let mut result =
+                    parse_flux_csv(&resp.body).map_err(|e| DbError::query_failed(e.to_string()))?;
+                result.execution_time = started.elapsed();
+                Ok(result)
+            }
+
+            language => self.dispatch(language, &request.collection.database, &query.text, started),
+        }
+    }
+
+    /// Count points in a measurement.
+    ///
+    /// Uses `SELECT count(*) FROM "<measurement>"` via InfluxQL, which returns one count
+    /// value per field. We take the maximum count across all returned columns as the
+    /// total-points estimate — this is accurate when all fields are present on every point,
+    /// and is a conservative lower bound otherwise.
+    ///
+    /// For v2 Flux connections, a Flux aggregation query is used instead.
+    fn count_collection(&self, request: &CollectionCountRequest) -> Result<u64, DbError> {
+        let measurement = escape_influxql_ident(&request.collection.name);
+        let bucket = &request.collection.database;
+
+        match (self.version, &self.default_language) {
+            (InfluxVersion::V2, QueryLanguage::Flux) => {
+                let bucket_escaped = escape_flux_string(bucket);
+                let measurement_escaped = escape_flux_string(&request.collection.name);
+
+                let query = format!(
+                    "from(bucket: \"{bucket_escaped}\")\
+                     \n  |> range(start: -24h)\
+                     \n  |> filter(fn: (r) => r._measurement == \"{measurement_escaped}\")\
+                     \n  |> count()\
+                     \n  |> sum()",
+                );
+
+                let org = self.org.as_deref().unwrap_or("");
+                let resp = self
+                    .http
+                    .execute_flux_v2(org, &query)
+                    .map_err(map_http_error)?;
+
+                if resp.status >= 400 {
+                    let fe = InfluxErrorFormatter::format_http_error(resp.status, &resp.body);
+                    return Err(DbError::QueryFailed(fe));
+                }
+
+                let result =
+                    parse_flux_csv(&resp.body).map_err(|e| DbError::query_failed(e.to_string()))?;
+
+                let count = result
+                    .rows
+                    .iter()
+                    .filter_map(|row| {
+                        row.iter().find_map(|val| match val {
+                            datatab_core::Value::Int(n) => Some(*n as u64),
+                            datatab_core::Value::Float(f) => Some(*f as u64),
+                            _ => None,
+                        })
+                    })
+                    .sum();
+
+                Ok(count)
+            }
+
+            _ => {
+                // InfluxQL: SELECT count(*) returns one row with one count per field.
+                // We take the maximum count as the best estimate of total points.
+                // The bucket comes from the collection reference (sidebar leaf).
+                let query = format!("SELECT count(*) FROM {measurement}",);
+
+                let started = Instant::now();
+                let result =
+                    self.dispatch(self.default_language.clone(), bucket, &query, started)?;
+
+                let max_count = result
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.iter())
+                    .filter_map(|val| match val {
+                        datatab_core::Value::Int(n) => Some(*n as u64),
+                        datatab_core::Value::Float(f) => Some(*f as u64),
+                        _ => None,
+                    })
+                    .max()
+                    .unwrap_or(0);
+
+                Ok(max_count)
+            }
+        }
+    }
+
+    fn query_generator(&self) -> Option<&dyn datatab_core::QueryGenerator> {
+        Some(&self.query_gen)
+    }
+
+    fn probe_write_privilege(&self) -> datatab_core::WritePrivilege {
+        // v1 has no token-scoped authorization API to probe: its username
+        // grants are all-or-nothing per database and are not queryable
+        // through an HTTP endpoint, so this stays `Unknown` by design.
+        if self.version != InfluxVersion::V2 {
+            return datatab_core::WritePrivilege::Unknown;
+        }
+
+        let response = match self.http.fetch_authorizations_v2(self.org.as_deref()) {
+            Ok(response) if response.status == 200 => response,
+            _ => return datatab_core::WritePrivilege::Unknown,
+        };
+
+        let permissions = parse_influx_authorizations_permissions(&response.body);
+        classify_influx_permissions(&permissions)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
+
+/// One permission entry from a v2 `/api/v2/authorizations` response.
+struct InfluxPermission {
+    action: String,
+    resource_type: String,
+}
+
+/// Parses the `authorizations[].permissions[]` entries out of a v2
+/// authorizations response body.
+///
+/// Tolerant of malformed or unexpected JSON: any parse failure, or an entry
+/// missing `action`/`resource.type`, is skipped rather than propagated. The
+/// caller treats an empty result the same as a probe failure.
+fn parse_influx_authorizations_permissions(body: &str) -> Vec<InfluxPermission> {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
+        return Vec::new();
+    };
+
+    let Some(authorizations) = json.get("authorizations").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+
+    authorizations
+        .iter()
+        .filter_map(|authorization| authorization.get("permissions")?.as_array())
+        .flatten()
+        .filter_map(|permission| {
+            let action = permission.get("action")?.as_str()?.to_string();
+            let resource_type = permission
+                .get("resource")?
+                .get("type")?
+                .as_str()?
+                .to_string();
+            Some(InfluxPermission {
+                action,
+                resource_type,
+            })
+        })
+        .collect()
+}
+
+/// Classifies the connecting token's permissions into a [`WritePrivilege`]
+/// verdict.
+///
+/// Any `write` permission scoped to `buckets` (all-buckets or a specific
+/// bucket) makes the result `Writable`. Otherwise, any `read` permission on
+/// `buckets` makes it `ReadOnly`. An empty or entirely unrecognized
+/// permission list is `Unknown`.
+fn classify_influx_permissions(permissions: &[InfluxPermission]) -> datatab_core::WritePrivilege {
+    let mut saw_read_permission = false;
+
+    for permission in permissions {
+        if permission.resource_type != "buckets" {
+            continue;
+        }
+        match permission.action.as_str() {
+            "write" => return datatab_core::WritePrivilege::Writable,
+            "read" => saw_read_permission = true,
+            _ => {}
+        }
+    }
+
+    if saw_read_permission {
+        datatab_core::WritePrivilege::ReadOnly
+    } else {
+        datatab_core::WritePrivilege::Unknown
+    }
+}
+
+impl InfluxConnection {
+    fn fetch_measurements(&self) -> Result<Vec<MeasurementInfo>, DbError> {
+        // When no default bucket is configured, skip measurement listing.
+        // The sidebar shows databases (buckets) and the user expands them individually.
+        // Measurement listing is only meaningful for a specific bucket/database.
+        let Some(bucket) = self.default_bucket.as_deref() else {
+            return Ok(vec![]);
+        };
+
+        Ok(self
+            .fetch_measurement_names(bucket)?
+            .into_iter()
+            .map(|name| MeasurementInfo {
+                name,
+                tags: Vec::new(),
+                fields: Vec::new(),
+            })
+            .collect())
+    }
+
+    fn fetch_measurement_names(&self, bucket: &str) -> Result<Vec<String>, DbError> {
+        // v1 uses native InfluxQL `SHOW MEASUREMENTS`. v2 cannot rely on the InfluxQL
+        // compatibility endpoint here because it requires a DBRP mapping between the
+        // bucket and a v1 database name — those mappings are not created automatically
+        // for every bucket. The Flux `schema.measurements` query works against any v2
+        // bucket regardless of DBRP configuration.
+        match self.version {
+            InfluxVersion::V1 => self.fetch_measurements_v1(bucket),
+            InfluxVersion::V2 => self.fetch_measurements_v2_flux(bucket),
+        }
+    }
+
+    fn fetch_measurements_v1(&self, bucket: &str) -> Result<Vec<String>, DbError> {
+        let resp = self
+            .http
+            .execute_influxql_v1(bucket, "SHOW MEASUREMENTS")
+            .map_err(map_http_error)
+            .and_then(reject_error_status)?;
+
+        let result =
+            parse_influxql_json(&resp.body).map_err(|e| DbError::query_failed(e.to_string()))?;
+
+        Ok(result
+            .rows
+            .iter()
+            .filter_map(|row| {
+                row.first().and_then(|v| match v {
+                    datatab_core::Value::Text(s) => Some(s.clone()),
+                    _ => None,
+                })
+            })
+            .collect())
+    }
+
+    fn fetch_measurements_v2_flux(&self, bucket: &str) -> Result<Vec<String>, DbError> {
+        let org = self.org.as_deref().unwrap_or("");
+        let query = format!(
+            "import \"influxdata/influxdb/schema\"\nschema.measurements(bucket: \"{}\")",
+            escape_flux_string(bucket)
+        );
+
+        let resp = self
+            .http
+            .execute_flux_v2(org, &query)
+            .map_err(map_http_error)
+            .and_then(reject_error_status)?;
+
+        let result =
+            parse_flux_csv(&resp.body).map_err(|e| DbError::query_failed(e.to_string()))?;
+
+        // schema.measurements emits a `_value` column with the measurement names.
+        let value_idx = result
+            .columns
+            .iter()
+            .position(|c| c.name == "_value")
+            .unwrap_or(0);
+
+        Ok(result
+            .rows
+            .iter()
+            .filter_map(|row| {
+                row.get(value_idx).and_then(|v| match v {
+                    datatab_core::Value::Text(s) => Some(s.clone()),
+                    _ => None,
+                })
+            })
+            .collect())
+    }
+
+    /// Issue a raw GET request using the embedded HTTP client (for v2 REST APIs
+    /// not available as InfluxQL, such as `/api/v2/buckets`).
+    fn http_get_raw(&self, url: &str) -> Result<crate::http::HttpResponseBody, HttpError> {
+        // Reuse the client through a helper path that constructs the URL externally.
+        // We delegate to HttpClient::execute_influxql_v1 as a proxy because the HttpClient
+        // does not expose a raw GET method publicly; instead we add a dedicated path here.
+        // This is a minor design concession: a full REST client would expose `get(url)`.
+        //
+        // For now we call the v2 buckets URL via the blocking reqwest client indirectly
+        // through execute_influxql_v2 with an empty bucket. However, this does not match
+        // the correct path. We therefore expose a workaround: build the HTTP client ourselves.
+        //
+        // The cleanest solution without breaking the HttpClient API is to make this call
+        // directly, accepting a small code duplication.
+        use std::time::Duration;
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .gzip(true)
+            .use_rustls_tls()
+            .build()
+            .map_err(|e| HttpError::Transport(e.to_string()))?;
+
+        let mut req_builder = client.get(url);
+        if let Some((name, value)) = auth_header(&self.http.auth) {
+            req_builder = req_builder.header(name, value);
+        }
+
+        let resp = req_builder
+            .send()
+            .map_err(|e| HttpError::Transport(e.to_string()))?;
+
+        let status = resp.status().as_u16();
+        let content_type = resp
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        let body = resp.text().map_err(|e| HttpError::Body(e.to_string()))?;
+
+        Ok(crate::http::HttpResponseBody {
+            status,
+            content_type,
+            body,
+        })
+    }
+}
+
+/// Convert an HTTP error to a `DbError`.
+fn map_http_error(e: HttpError) -> DbError {
+    match e {
+        HttpError::Server { status, ref body } => {
+            let fe = InfluxErrorFormatter::format_http_error(status, body);
+            if status == 401 || status == 403 {
+                DbError::AuthFailed(fe)
+            } else {
+                DbError::ConnectionFailed(fe)
+            }
+        }
+        HttpError::Transport(msg) | HttpError::Body(msg) => DbError::connection_failed(msg),
+    }
+}
+
+/// Parse a flat InfluxQL string list from a SHOW DATABASES / SHOW MEASUREMENTS result.
+/// Turns an HTTP error status into a `DbError` carrying the server's message,
+/// so an error body is never parsed as an empty listing.
+fn reject_error_status(
+    resp: crate::http::HttpResponseBody,
+) -> Result<crate::http::HttpResponseBody, DbError> {
+    if resp.status < 400 {
+        return Ok(resp);
+    }
+
+    let formatted = InfluxErrorFormatter::format_http_error(resp.status, &resp.body);
+    Err(if resp.status == 401 || resp.status == 403 {
+        DbError::AuthFailed(formatted)
+    } else {
+        DbError::QueryFailed(formatted)
+    })
+}
+
+fn parse_influxql_string_list(
+    body: &str,
+    _column_name: &str,
+) -> Result<Vec<DatabaseInfo>, DbError> {
+    let result = parse_influxql_json(body).map_err(|e| DbError::query_failed(e.to_string()))?;
+
+    let databases: Vec<DatabaseInfo> = result
+        .rows
+        .iter()
+        .filter_map(|row| {
+            row.first().and_then(|v| match v {
+                datatab_core::Value::Text(s) => Some(DatabaseInfo {
+                    name: s.clone(),
+                    is_current: false,
+                }),
+                _ => None,
+            })
+        })
+        .collect();
+
+    Ok(databases)
+}
+
+/// Parse the InfluxDB v2 `/api/v2/buckets` JSON response into a list of `DatabaseInfo`.
+fn parse_v2_buckets_response(
+    resp: &crate::http::HttpResponseBody,
+) -> Result<Vec<DatabaseInfo>, DbError> {
+    let root: serde_json::Value = serde_json::from_str(&resp.body)
+        .map_err(|e| DbError::query_failed(format!("failed to parse buckets response: {e}")))?;
+
+    let buckets = root
+        .get("buckets")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| DbError::query_failed("missing 'buckets' field in response".to_string()))?;
+
+    let result = buckets
+        .iter()
+        .filter_map(|b| {
+            b.get("name")
+                .and_then(|v| v.as_str())
+                .map(|name| DatabaseInfo {
+                    name: name.to_string(),
+                    is_current: false,
+                })
+        })
+        .collect();
+
+    Ok(result)
+}
+
+/// Convert an `InjectionWindow` into a `ResolvedWindow`.
+fn window_to_resolved(window: &InjectionWindow, language: QueryLanguage) -> Option<ResolvedWindow> {
+    let start_ms = window.start_rfc3339.as_deref().and_then(rfc3339_to_ms)?;
+    let end_ms = window.end_rfc3339.as_deref().and_then(rfc3339_to_ms)?;
+
+    Some(ResolvedWindow {
+        start_ms,
+        end_ms,
+        language,
+    })
+}
+
+/// Convert a Unix timestamp in milliseconds to an RFC 3339 string.
+fn ms_to_rfc3339(ms: i64) -> String {
+    use chrono::{DateTime, Utc};
+    let dt = DateTime::<Utc>::from_timestamp_millis(ms).unwrap_or(DateTime::UNIX_EPOCH);
+    dt.to_rfc3339()
+}
+
+/// Convert an RFC 3339 string to a Unix timestamp in milliseconds.
+fn rfc3339_to_ms(s: &str) -> Option<i64> {
+    use chrono::DateTime;
+    DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.timestamp_millis())
+}
+
+/// Convert a millisecond timestamp back to RFC 3339 (used for metadata).
+fn rfc3339_from_ms(ms: i64) -> String {
+    ms_to_rfc3339(ms)
+}
+
+/// Escape a string for safe interpolation inside a Flux double-quoted literal.
+pub(crate) fn escape_flux_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Wrap an InfluxQL identifier in double quotes, escaping any embedded quotes.
+///
+/// InfluxQL identifiers (measurement names, field keys) are quoted with double
+/// quotes. Embedded double quotes are escaped by doubling them.
+pub(crate) fn escape_influxql_ident(s: &str) -> String {
+    format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+// ---------------------------------------------------------------------------
+// Tests (C.8.1 – C.8.3) — dispatcher correctness using in-process checks
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datatab_core::WritePrivilege;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    #[test]
+    fn influx_query_safety_refuses_protected_requests_before_dispatch() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("local listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        let address = listener.local_addr().expect("listener address");
+        let received = Arc::new(AtomicUsize::new(0));
+        let server_received = Arc::clone(&received);
+        let server = std::thread::spawn(move || {
+            let until = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < until {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        server_received.fetch_add(1, Ordering::SeqCst);
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(1)))
+                            .expect("read timeout");
+                        let mut buffer = [0; 4096];
+                        // One read consumes whatever the client flushed so far;
+                        // the fixture answers with a canned body regardless of
+                        // request framing, so the count is deliberately unused.
+                        let _request_bytes = stream.read(&mut buffer).expect("request bytes");
+                        let body = r#"{"results":[{"statement_id":0,"series":[{"name":"cpu","columns":["time","value"],"values":[[1,2]]}]}]}"#;
+                        write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).expect("response");
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("accept: {error}"),
+                }
+            }
+        });
+        let http = HttpClient::new(
+            format!("http://{address}"),
+            crate::http::AuthCreds::None,
+            InfluxVersion::V2,
+        )
+        .expect("client");
+        let conn = InfluxConnection::new(
+            http,
+            InfluxVersion::V2,
+            QueryLanguage::InfluxQuery,
+            Some("db".into()),
+            Some("org".into()),
+        );
+        let contexts = [
+            None,
+            Some(ExecutionSourceContext::InstanceMetricQuery {
+                metric_id: "influx.go_goroutines".into(),
+                start_ms: 0,
+                end_ms: 1,
+            }),
+            Some(ExecutionSourceContext::InstanceInspectorQuery {
+                metric_id: "influx.metrics".into(),
+            }),
+        ];
+        for context in contexts {
+            let is_editor_query = context.is_none();
+            for (limit, timeout) in [
+                (Some(0), None),
+                (Some(12), None),
+                (None, Some(Duration::from_secs(1))),
+            ] {
+                // Editor queries enforce a row limit; they are covered below.
+                if is_editor_query && limit.is_some() {
+                    continue;
+                }
+                let mut req = QueryRequest::new("SELECT * FROM cpu");
+                req.limit = limit;
+                req.statement_timeout = timeout;
+                req.execution_context = context.clone().map(|source| ExecutionContext {
+                    source: Some(source),
+                    ..Default::default()
+                });
+                let error = conn
+                    .execute(&req)
+                    .expect_err("protected request must be refused");
+                assert!(matches!(error, DbError::NotSupported(_)), "{error}");
+                assert_eq!(
+                    received.load(Ordering::SeqCst),
+                    0,
+                    "no protected request reaches HTTP"
+                );
+            }
+        }
+        let read_only = QueryRequest::new("SELECT * FROM cpu")
+            .with_read_only(datatab_core::ReadOnlyEnforcement::Required);
+        let error = conn
+            .execute(&read_only)
+            .expect_err("read-only enforcement must be refused");
+        assert!(matches!(error, DbError::NotSupported(_)), "{error}");
+        assert_eq!(received.load(Ordering::SeqCst), 0);
+        assert!(!conn.metadata().enforces_read_only());
+
+        let result = conn
+            .execute(&QueryRequest::new("SELECT * FROM cpu"))
+            .expect("unprotected dispatch");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(received.load(Ordering::SeqCst), 1);
+
+        let mut zero_limit = QueryRequest::new("SELECT * FROM cpu");
+        zero_limit.limit = Some(0);
+        let result = conn
+            .execute(&zero_limit)
+            .expect("an editor query enforces a row limit");
+        assert!(result.rows.is_empty());
+        assert!(result.rows_truncated());
+        assert_eq!(received.load(Ordering::SeqCst), 2);
+
+        let mut roomy_limit = QueryRequest::new("SELECT * FROM cpu");
+        roomy_limit.limit = Some(12);
+        let result = conn
+            .execute(&roomy_limit)
+            .expect("an editor query enforces a row limit");
+        assert_eq!(result.rows.len(), 1);
+        assert!(!result.rows_truncated());
+        assert_eq!(received.load(Ordering::SeqCst), 3);
+        server.join().expect("server thread");
+    }
+
+    /// Serves one canned HTTP response and returns the raw request it received.
+    fn serve_once(
+        content_type: &'static str,
+        body: &'static str,
+    ) -> (String, std::thread::JoinHandle<String>) {
+        serve_once_with_status("200 OK", content_type, body)
+    }
+
+    fn serve_once_with_status(
+        status: &'static str,
+        content_type: &'static str,
+        body: &'static str,
+    ) -> (String, std::thread::JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("local listener");
+        let address = listener.local_addr().expect("listener address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+
+            let mut request = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                let read = stream.read(&mut buffer).expect("request bytes");
+                request.extend_from_slice(buffer.get(..read).unwrap_or_default());
+                let text = String::from_utf8_lossy(&request);
+                let Some(header_end) = text.find("\r\n\r\n") else {
+                    continue;
+                };
+                let content_length = text
+                    .get(..header_end)
+                    .unwrap_or_default()
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())
+                            .flatten()
+                    })
+                    .unwrap_or(0);
+                if read == 0 || request.len() >= header_end + 4 + content_length {
+                    break;
+                }
+            }
+
+            write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .expect("response");
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        (format!("http://{address}"), server)
+    }
+
+    #[test]
+    fn schema_for_database_lists_the_requested_bucket_measurements() {
+        let (endpoint, server) = serve_once(
+            "text/csv",
+            "#datatype,string,long,string\r\n#group,false,false,false\r\n#default,_result,,\r\n,result,table,_value\r\n,,0,cpu\r\n,,0,disk\r\n",
+        );
+        let http = HttpClient::new(endpoint, crate::http::AuthCreds::None, InfluxVersion::V2)
+            .expect("client");
+        let conn = InfluxConnection::new(
+            http,
+            InfluxVersion::V2,
+            QueryLanguage::InfluxQuery,
+            None,
+            Some("org".into()),
+        );
+
+        assert_eq!(
+            conn.schema_loading_strategy(),
+            SchemaLoadingStrategy::LazyPerDatabase
+        );
+
+        let schema = conn
+            .schema_for_database("metrics")
+            .expect("schema for a bucket that is not the profile default");
+        let request = server.join().expect("server thread");
+
+        assert!(
+            request.contains("schema.measurements(bucket: \\\"metrics\\\")"),
+            "the measurement listing must target the requested bucket: {request}"
+        );
+        assert_eq!(schema.name, "metrics");
+        let names: Vec<&str> = schema
+            .tables
+            .iter()
+            .map(|table| table.name.as_str())
+            .collect();
+        assert_eq!(names, ["cpu", "disk"]);
+        assert!(
+            schema
+                .tables
+                .iter()
+                .all(|table| table.schema.as_deref() == Some("metrics"))
+        );
+        assert!(schema.views.is_empty());
+    }
+
+    fn unauthorized_v2_connection() -> (InfluxConnection, std::thread::JoinHandle<String>) {
+        let (endpoint, server) = serve_once_with_status(
+            "401 Unauthorized",
+            "application/json",
+            r#"{"code":"unauthorized","message":"unauthorized access"}"#,
+        );
+        let http = HttpClient::new(endpoint, crate::http::AuthCreds::None, InfluxVersion::V2)
+            .expect("client");
+        let conn = InfluxConnection::new(
+            http,
+            InfluxVersion::V2,
+            QueryLanguage::InfluxQuery,
+            None,
+            Some("org".into()),
+        );
+        (conn, server)
+    }
+
+    #[test]
+    fn list_databases_reports_a_rejected_token_as_an_auth_failure() {
+        let (conn, server) = unauthorized_v2_connection();
+
+        let error = conn
+            .list_databases()
+            .expect_err("a 401 must not be read as a bucket list");
+        server.join().expect("server thread");
+
+        assert!(matches!(error, DbError::AuthFailed(_)), "{error:?}");
+        assert!(
+            error.to_string().contains("unauthorized access"),
+            "the server's message must reach the user: {error}"
+        );
+    }
+
+    #[test]
+    fn schema_for_database_reports_a_rejected_token_as_an_auth_failure() {
+        let (conn, server) = unauthorized_v2_connection();
+
+        let error = conn
+            .schema_for_database("metrics")
+            .expect_err("a 401 must not be read as an empty measurement list");
+        server.join().expect("server thread");
+
+        assert!(matches!(error, DbError::AuthFailed(_)), "{error:?}");
+    }
+
+    fn result_with_rows(count: usize) -> QueryResult {
+        let rows = (0..count)
+            .map(|index| vec![datatab_core::Value::Int(index as i64)])
+            .collect();
+        QueryResult::table(Vec::new(), rows, None, std::time::Duration::ZERO)
+    }
+
+    #[test]
+    fn row_budget_keeps_rows_within_the_limit_and_marks_only_dropped_rows() {
+        let mut unlimited = result_with_rows(5);
+        apply_row_budget(&mut unlimited, None);
+        assert_eq!(unlimited.rows.len(), 5);
+        assert!(!unlimited.rows_truncated());
+
+        let mut exact = result_with_rows(5);
+        apply_row_budget(&mut exact, Some(5));
+        assert_eq!(exact.rows.len(), 5);
+        assert!(!exact.rows_truncated());
+
+        let mut over = result_with_rows(5);
+        apply_row_budget(&mut over, Some(3));
+        assert_eq!(over.rows.len(), 3);
+        assert_eq!(over.rows[2], vec![datatab_core::Value::Int(2)]);
+        assert!(over.rows_truncated());
+
+        let mut zero = result_with_rows(5);
+        apply_row_budget(&mut zero, Some(0));
+        assert!(zero.rows.is_empty());
+        assert!(zero.rows_truncated());
+
+        let mut empty = result_with_rows(0);
+        apply_row_budget(&mut empty, Some(0));
+        assert!(empty.rows.is_empty());
+        assert!(!empty.rows_truncated());
+    }
+
+    #[test]
+    fn row_budget_is_shared_across_every_statement_of_one_influxql_response() {
+        let body = r#"{"results":[
+            {"statement_id":0,"series":[{"name":"cpu","columns":["time","value"],"values":[[1,1],[2,2]]}]},
+            {"statement_id":1,"series":[{"name":"cpu","columns":["time","value"],"values":[[3,3],[4,4]]}]}
+        ]}"#;
+        let mut result = parse_influxql_json(body).expect("parse");
+        assert_eq!(result.rows.len(), 4);
+        apply_row_budget(&mut result, Some(3));
+        assert_eq!(result.rows.len(), 3);
+        assert!(result.rows_truncated());
+    }
+
+    #[test]
+    fn escape_flux_string_escapes_quotes_and_backslashes() {
+        assert_eq!(escape_flux_string("plain"), "plain");
+        assert_eq!(escape_flux_string("a\"b"), "a\\\"b");
+        assert_eq!(escape_flux_string("a\\b"), "a\\\\b");
+        // Backslash must be doubled BEFORE quote escaping so the order matters:
+        // input  a\"b  →  a\\\"b (4 chars in, 6 chars out)
+        assert_eq!(escape_flux_string("a\\\"b"), "a\\\\\\\"b");
+    }
+
+    use datatab_core::{ExecutionContext, ExecutionSourceContext, QueryRequest};
+
+    fn make_request_with_mode(sql: &str, mode: Option<&str>) -> QueryRequest {
+        let source = ExecutionSourceContext::CollectionWindow {
+            targets: vec![],
+            start_ms: 1704067200000,
+            end_ms: 1704070800000,
+            query_mode: mode.map(|s| s.to_string()),
+        };
+
+        let ctx = ExecutionContext {
+            source: Some(source),
+            ..Default::default()
+        };
+
+        QueryRequest::new(sql).with_execution_context(Some(ctx))
+    }
+
+    // C.8.1 — V1 + Flux should fail early
+    #[test]
+    fn v1_flux_mode_returns_error_without_http_call() {
+        // We test resolve_language directly (no HTTP needed).
+        let conn = InfluxConnection::new(
+            // We need an HttpClient but we can't easily mock it.
+            // Instead we test resolve_language directly via a stub.
+            build_stub_http(),
+            InfluxVersion::V1,
+            QueryLanguage::InfluxQuery,
+            Some("mydb".to_string()),
+            None,
+        );
+
+        let req = make_request_with_mode("from(bucket: \"b\")", Some("flux"));
+        let result = conn.resolve_language(&req);
+        assert!(result.is_err(), "Flux on V1 must return an error");
+        let err = result.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not supported"),
+            "error must mention not supported: {msg}"
+        );
+    }
+
+    // C.8.1b — execute() with no bucket and no context target returns a clear error
+    #[test]
+    fn execute_without_bucket_and_no_context_returns_clear_error() {
+        let conn = InfluxConnection::new(
+            build_stub_http(),
+            InfluxVersion::V2,
+            QueryLanguage::InfluxQuery,
+            None, // no default bucket
+            None,
+        );
+
+        // A plain InfluxQL request with no execution context (no selected bucket).
+        let req = QueryRequest::new("SELECT * FROM cpu");
+        let err = conn.execute(&req).expect_err("must fail without a bucket");
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("select a source bucket") || msg.contains("bucket"),
+            "error must guide the user to select a bucket: {msg}"
+        );
+    }
+
+    // C.8.2 — resolve_language dispatches correctly
+    #[test]
+    fn resolve_language_influxql_mode_returns_influxql() {
+        let conn = InfluxConnection::new(
+            build_stub_http(),
+            InfluxVersion::V2,
+            QueryLanguage::InfluxQuery,
+            Some("b".to_string()),
+            Some("org".to_string()),
+        );
+
+        let req = make_request_with_mode("SELECT 1", Some("influxql"));
+        let lang = conn.resolve_language(&req).expect("must resolve");
+        assert_eq!(lang, QueryLanguage::InfluxQuery);
+    }
+
+    #[test]
+    fn resolve_language_flux_mode_on_v2_returns_flux() {
+        let conn = InfluxConnection::new(
+            build_stub_http(),
+            InfluxVersion::V2,
+            QueryLanguage::InfluxQuery,
+            Some("b".to_string()),
+            Some("org".to_string()),
+        );
+
+        let req = make_request_with_mode("from(bucket: \"b\")", Some("flux"));
+        let lang = conn.resolve_language(&req).expect("must resolve");
+        assert_eq!(lang, QueryLanguage::Flux);
+    }
+
+    // C.8.2b — resolve_bucket_from_context prefers context target over default_bucket
+    #[test]
+    fn resolve_bucket_from_context_prefers_context_target() {
+        let conn = InfluxConnection::new(
+            build_stub_http(),
+            InfluxVersion::V2,
+            QueryLanguage::InfluxQuery,
+            Some("default-bucket".to_string()),
+            None,
+        );
+
+        // Provide a different bucket via the execution context targets.
+        let source = ExecutionSourceContext::CollectionWindow {
+            targets: vec!["context-bucket".to_string()],
+            start_ms: 0,
+            end_ms: 1,
+            query_mode: None,
+        };
+        let ctx = ExecutionContext {
+            source: Some(source),
+            ..Default::default()
+        };
+        let req = QueryRequest::new("SELECT 1").with_execution_context(Some(ctx));
+
+        let bucket = conn.resolve_bucket_from_context(&req);
+        assert_eq!(
+            bucket.as_deref(),
+            Some("context-bucket"),
+            "context target must take precedence over default_bucket"
+        );
+    }
+
+    // C.8.2c — resolve_bucket_from_context returns None when no target is set
+    #[test]
+    fn resolve_bucket_from_context_returns_none_without_target() {
+        let conn = InfluxConnection::new(
+            build_stub_http(),
+            InfluxVersion::V2,
+            QueryLanguage::InfluxQuery,
+            Some("default-bucket".to_string()),
+            None,
+        );
+
+        // Empty targets list (user has not selected a bucket in the dropdown).
+        let source = ExecutionSourceContext::CollectionWindow {
+            targets: vec![],
+            start_ms: 0,
+            end_ms: 1,
+            query_mode: None,
+        };
+        let ctx = ExecutionContext {
+            source: Some(source),
+            ..Default::default()
+        };
+        let req = QueryRequest::new("SELECT 1").with_execution_context(Some(ctx));
+
+        let bucket = conn.resolve_bucket_from_context(&req);
+        assert!(
+            bucket.is_none(),
+            "empty targets must yield None from context resolution"
+        );
+    }
+
+    // C.8.3 — extract_window reads start_ms / end_ms
+    #[test]
+    fn extract_window_reads_start_and_end_ms() {
+        let req = make_request_with_mode("SELECT 1", None);
+        let window = InfluxConnection::extract_window(&req);
+        assert!(window.start_rfc3339.is_some(), "start must be present");
+        assert!(window.end_rfc3339.is_some(), "end must be present");
+    }
+
+    // D.3.2 — metadata_extra produced by build_metadata_extra_fields contains required audit keys
+    #[test]
+    fn metadata_extra_fields_contains_required_audit_keys_with_injection() {
+        use crate::injection::ResolvedWindow as InjectionWindow;
+
+        let meta = InfluxQueryMetadata {
+            version: InfluxVersion::V2,
+            language: QueryLanguage::InfluxQuery,
+            resolved_window: Some(InjectionWindow {
+                start_rfc3339: Some("2024-01-01T00:00:00Z".to_string()),
+                end_rfc3339: Some("2024-01-01T01:00:00Z".to_string()),
+            }),
+            bucket_or_database: "my_bucket".to_string(),
+            injected_window: true,
+        };
+
+        let extra = InfluxConnection::build_metadata_extra_fields(&meta);
+
+        assert_eq!(
+            extra.get("language").and_then(|v| v.as_str()),
+            Some("influxql")
+        );
+        assert_eq!(extra.get("version").and_then(|v| v.as_str()), Some("v2"));
+        assert_eq!(
+            extra.get("bucket_or_database").and_then(|v| v.as_str()),
+            Some("my_bucket")
+        );
+        assert_eq!(
+            extra.get("injected_window").and_then(|v| v.as_bool()),
+            Some(true)
+        );
+        assert!(
+            extra.contains_key("resolved_window_start_ms"),
+            "must have start_ms"
+        );
+        assert!(
+            extra.contains_key("resolved_window_end_ms"),
+            "must have end_ms"
+        );
+    }
+
+    #[test]
+    fn metadata_extra_fields_no_window_when_not_injected() {
+        let meta = InfluxQueryMetadata {
+            version: InfluxVersion::V1,
+            language: QueryLanguage::InfluxQuery,
+            resolved_window: None,
+            bucket_or_database: "testdb".to_string(),
+            injected_window: false,
+        };
+
+        let extra = InfluxConnection::build_metadata_extra_fields(&meta);
+
+        assert_eq!(extra.get("version").and_then(|v| v.as_str()), Some("v1"));
+        assert_eq!(
+            extra.get("injected_window").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert!(!extra.contains_key("resolved_window_start_ms"));
+        assert!(!extra.contains_key("resolved_window_end_ms"));
+    }
+
+    fn build_stub_http() -> HttpClient {
+        // Use a non-routable address; won't make real connections in unit tests.
+        HttpClient::new(
+            "http://127.0.0.1:19999".to_string(),
+            crate::http::AuthCreds::None,
+            InfluxVersion::V2,
+        )
+        .expect("stub HTTP client build")
+    }
+
+    // Guard logic tests (REQ-5) — verify the macro guard decision path.
+    //
+    // The guard branches on `contains_time_macros(&req.sql)`. These tests confirm that
+    // the function correctly identifies which queries should skip injection and which
+    // should proceed through the normal inject-when-absent path. They do not call
+    // `execute()` (which requires an HTTP connection) but validate the predicate that
+    // drives the guard decision.
+
+    /// Queries with explicit macros trigger the guard (injection skipped).
+    #[test]
+    fn guard_macros_present_triggers_skip_injection() {
+        // After substitution by the UI layer, the macro token is replaced. However,
+        // if macros somehow reach the driver unsubstituted (e.g., no window), the guard
+        // ensures injection is not attempted on a syntactically invalid query.
+        assert!(
+            datatab_core::contains_time_macros(
+                "SELECT mean(usage_user) FROM cpu WHERE $timeFilter GROUP BY time(1m)"
+            ),
+            "$timeFilter macro must be detected"
+        );
+        assert!(
+            datatab_core::contains_time_macros("SELECT * FROM cpu WHERE time >= $__from"),
+            "$__from macro must be detected"
+        );
+        assert!(
+            datatab_core::contains_time_macros("SELECT * FROM cpu WHERE time <= $__to"),
+            "$__to macro must be detected"
+        );
+        assert!(
+            datatab_core::contains_time_macros(
+                "from(bucket: \"x\") |> range(start: v.timeRangeStart, stop: v.timeRangeStop)"
+            ),
+            "Flux v.timeRangeStart/Stop macros must be detected"
+        );
+    }
+
+    /// Macro-free queries do not trigger the guard (injection proceeds normally).
+    #[test]
+    fn guard_macro_free_query_does_not_trigger_skip() {
+        assert!(
+            !datatab_core::contains_time_macros("SELECT * FROM cpu"),
+            "plain InfluxQL must not be flagged as macro-bearing"
+        );
+        assert!(
+            !datatab_core::contains_time_macros("SELECT * FROM cpu WHERE time > now() - 1h"),
+            "query with native time predicate must not be flagged"
+        );
+    }
+
+    /// After macro substitution the resulting query contains no raw macro tokens,
+    /// so the guard lets injection proceed normally (existing predicate check still stops it).
+    #[test]
+    fn guard_does_not_fire_on_substituted_query() {
+        let substituted = "SELECT mean(usage_user) FROM cpu WHERE time >= '2024-03-09T16:00:00Z' AND time <= '2024-03-09T17:00:00Z' GROUP BY time(1m)";
+
+        // The substituted form contains `time >=`, so the existing inject logic also
+        // skips injection (influxql_has_time_predicate returns true). Confirm neither
+        // guard path is triggered unexpectedly.
+        assert!(
+            !datatab_core::contains_time_macros(substituted),
+            "substituted query must not be flagged as macro-bearing"
+        );
+
+        // Confirm injection logic would also skip it via the existing predicate check.
+        assert!(
+            crate::injection::influxql_has_time_predicate(substituted),
+            "substituted query must have a time predicate detected"
+        );
+    }
+
+    // C.8.4 — escape_influxql_ident wraps plain names and escapes embedded quotes
+    #[test]
+    fn escape_influxql_ident_wraps_plain_name() {
+        assert_eq!(escape_influxql_ident("cpu"), "\"cpu\"");
+        assert_eq!(
+            escape_influxql_ident("my_measurement"),
+            "\"my_measurement\""
+        );
+    }
+
+    #[test]
+    fn escape_influxql_ident_escapes_embedded_double_quotes() {
+        // Embedded " is doubled per InfluxQL quoting rules.
+        assert_eq!(escape_influxql_ident("a\"b"), "\"a\"\"b\"");
+    }
+
+    const AUTHORIZATIONS_FIXTURE_WRITE: &str = r#"{
+        "authorizations": [
+            {
+                "id": "0123456789abcdef",
+                "permissions": [
+                    {"action": "read", "resource": {"type": "buckets"}},
+                    {"action": "write", "resource": {"type": "buckets", "id": "abc123"}}
+                ]
+            }
+        ]
+    }"#;
+
+    const AUTHORIZATIONS_FIXTURE_READ_ONLY: &str = r#"{
+        "authorizations": [
+            {
+                "id": "0123456789abcdef",
+                "permissions": [
+                    {"action": "read", "resource": {"type": "buckets", "id": "abc123"}}
+                ]
+            }
+        ]
+    }"#;
+
+    const AUTHORIZATIONS_FIXTURE_NON_BUCKET_PERMISSIONS: &str = r#"{
+        "authorizations": [
+            {
+                "id": "0123456789abcdef",
+                "permissions": [
+                    {"action": "write", "resource": {"type": "orgs"}}
+                ]
+            }
+        ]
+    }"#;
+
+    #[test]
+    fn parse_influx_authorizations_permissions_reads_fixture_json() {
+        let permissions = parse_influx_authorizations_permissions(AUTHORIZATIONS_FIXTURE_WRITE);
+        assert_eq!(permissions.len(), 2);
+        assert!(
+            permissions
+                .iter()
+                .any(|p| p.action == "write" && p.resource_type == "buckets")
+        );
+    }
+
+    #[test]
+    fn parse_influx_authorizations_permissions_malformed_json_returns_empty() {
+        let permissions = parse_influx_authorizations_permissions("not json");
+        assert!(permissions.is_empty());
+    }
+
+    #[test]
+    fn parse_influx_authorizations_permissions_missing_authorizations_key_returns_empty() {
+        let permissions = parse_influx_authorizations_permissions(r#"{"foo": "bar"}"#);
+        assert!(permissions.is_empty());
+    }
+
+    #[test]
+    fn classify_influx_permissions_write_on_buckets_is_writable() {
+        let permissions = parse_influx_authorizations_permissions(AUTHORIZATIONS_FIXTURE_WRITE);
+        assert_eq!(
+            classify_influx_permissions(&permissions),
+            WritePrivilege::Writable
+        );
+    }
+
+    #[test]
+    fn classify_influx_permissions_read_only_on_buckets_is_read_only() {
+        let permissions = parse_influx_authorizations_permissions(AUTHORIZATIONS_FIXTURE_READ_ONLY);
+        assert_eq!(
+            classify_influx_permissions(&permissions),
+            WritePrivilege::ReadOnly
+        );
+    }
+
+    #[test]
+    fn classify_influx_permissions_non_bucket_permissions_is_unknown() {
+        let permissions =
+            parse_influx_authorizations_permissions(AUTHORIZATIONS_FIXTURE_NON_BUCKET_PERMISSIONS);
+        assert_eq!(
+            classify_influx_permissions(&permissions),
+            WritePrivilege::Unknown
+        );
+    }
+
+    #[test]
+    fn classify_influx_permissions_empty_is_unknown() {
+        assert_eq!(classify_influx_permissions(&[]), WritePrivilege::Unknown);
+    }
+}

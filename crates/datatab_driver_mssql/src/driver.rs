@@ -1,0 +1,7601 @@
+use std::collections::HashMap;
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
+use datatab_core::QueryGenerator;
+use datatab_core::secrecy::{ExposeSecret, SecretString};
+use datatab_core::{
+    AddColumnRequest, AlterColumnRequest, CodeGenCapabilities, CodeGenerator, ColumnAssignment,
+    ColumnInfo, ColumnMeta, Connection, ConnectionErrorFormatter, ConnectionExt, ConnectionProfile,
+    ConstraintInfo, ConstraintKind, CreationBlocker, CrudResult, CustomTypeInfo, CustomTypeKind,
+    DatabaseCategory, DatabaseInfo, DbConfig, DbDriver, DbError, DbKind, DbSchemaInfo,
+    DdlCapabilities, DdlRejection, DeploymentClass, DescribeRequest, DocumentConnection,
+    DriverCapabilities, DriverFormDef, DriverLimits, DriverMetadata, DropColumnRequest,
+    ExecutionSourceContext, ExplainRequest, ForeignKeyBuilder, ForeignKeyInfo, FormFieldKind,
+    FormSection, FormTab, FormValues, FormattedError, Icon, IdentitySpec, IndexData, IndexInfo,
+    InstanceCatalog, IsolationLevel, KeyValueConnection, MetadataCompleteness,
+    MissingCreationMetadata, MutationCapabilities, PaginationStyle, PlaceholderStyle,
+    PrimaryKeySpec, QueryCancelHandle, QueryCapabilities, QueryErrorFormatter, QueryHandle,
+    QueryLanguage, QueryRequest, QueryResult, RecordIdentity, RelationalConnection,
+    RelationalSchema, RoutineInfo, RoutineKind, Row, RowDelete, RowInsert, RowPatch,
+    SchemaFeatures, SchemaForeignKeyBuilder, SchemaForeignKeyInfo, SchemaIndexBuilder,
+    SchemaIndexInfo, SchemaLoadingStrategy, SchemaSnapshot, SortDirection, SqlDialect,
+    SqlMutationGenerator, SshTunnelConfig, SyntaxInfo, TableBrowseRequest, TableCountRequest,
+    TableCreationMetadata, TableInfo, TransactionCapabilities, TransactionStateNote,
+    TransferFamily, Value, ViewInfo, WhereOperator, field, field_password, field_required,
+    field_use_uri, generate_delete_template, generate_drop_table, generate_insert_template,
+    generate_select_star, generate_truncate, generate_update_template, render_semantic_filter_sql,
+    sanitize_uri, ssh_tab, validate_ddl_fragment, when_checked, when_unchecked, with_default,
+};
+use datatab_ssh::{OpenedSshTunnel, SshTunnel};
+use tiberius::{AuthMethod, Client, Config, EncryptionLevel, SqlBrowser};
+use tokio::net::TcpStream;
+use tokio::runtime::{Builder, Runtime};
+use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
+
+type TiberiusClient = Client<Compat<TcpStream>>;
+
+pub static SQLSERVER_FORM: LazyLock<DriverFormDef> = LazyLock::new(|| DriverFormDef {
+    tabs: vec![
+        FormTab {
+            id: "main".into(),
+            label: "Main".into(),
+            sections: vec![
+                FormSection {
+                    title: "Server".into(),
+                    icon: Some(datatab_core::FormSectionIcon::Server),
+                    fields: vec![
+                        field_use_uri(),
+                        when_checked(
+                            field_required(
+                                "uri",
+                                "Connection URI",
+                                FormFieldKind::Text,
+                                "sqlserver://user:pass@localhost:1433/db",
+                            ),
+                            "use_uri",
+                        ),
+                        when_unchecked(
+                            with_default(
+                                field_required("host", "Host", FormFieldKind::Text, "localhost"),
+                                "localhost",
+                            ),
+                            "use_uri",
+                        ),
+                        when_unchecked(
+                            with_default(
+                                field_required("port", "Port", FormFieldKind::Number, "1433"),
+                                "1433",
+                            ),
+                            "use_uri",
+                        ),
+                        when_unchecked(
+                            field(
+                                "database",
+                                "Database",
+                                FormFieldKind::Text,
+                                "optional - leave empty for default",
+                            ),
+                            "use_uri",
+                        ),
+                        when_unchecked(
+                            field(
+                                "instance",
+                                "Instance",
+                                FormFieldKind::Text,
+                                "optional - e.g. SQLEXPRESS",
+                            ),
+                            "use_uri",
+                        ),
+                    ],
+                },
+                FormSection {
+                    title: "Authentication".into(),
+                    icon: Some(datatab_core::FormSectionIcon::Authentication),
+                    fields: vec![
+                        when_unchecked(
+                            with_default(
+                                field_required("user", "User", FormFieldKind::Text, "sa"),
+                                "sa",
+                            ),
+                            "use_uri",
+                        ),
+                        field_password(),
+                    ],
+                },
+            ],
+        },
+        ssh_tab(),
+    ],
+});
+
+/// SQL Server driver metadata.
+pub static METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverMetadata {
+    id: "mssql".into(),
+    display_name: "SQL Server".into(),
+    description: "Microsoft SQL Server relational database".into(),
+    category: DatabaseCategory::Relational,
+    transfer_family: TransferFamily::Sql,
+    deployment_class: Some(DeploymentClass::SelfHosted),
+    query_language: QueryLanguage::Sql,
+    capabilities: DriverCapabilities::from_bits_truncate(
+        DriverCapabilities::RELATIONAL_BASE.bits()
+            | DriverCapabilities::NATIVE_CONSOLE.bits()
+            | DriverCapabilities::REQUEST_ROW_LIMIT.bits()
+            | DriverCapabilities::SCHEMAS.bits()
+            | DriverCapabilities::SSH_TUNNEL.bits()
+            | DriverCapabilities::SSL.bits()
+            | DriverCapabilities::AUTHENTICATION.bits()
+            | DriverCapabilities::FOREIGN_KEYS.bits()
+            | DriverCapabilities::CHECK_CONSTRAINTS.bits()
+            | DriverCapabilities::UNIQUE_CONSTRAINTS.bits()
+            | DriverCapabilities::TRANSACTIONAL_DDL.bits()
+            | DriverCapabilities::ROUTINES.bits()
+            | DriverCapabilities::MULTI_STATEMENT.bits()
+            | DriverCapabilities::INSTANCE_METRICS.bits()
+            | DriverCapabilities::INSTANCE_INSPECTOR.bits()
+            | DriverCapabilities::CHART_AUTHORING.bits()
+            | DriverCapabilities::BULK_INSERT.bits()
+            | DriverCapabilities::TRUNCATE_TABLE.bits(),
+    ),
+    default_port: Some(1433),
+    uri_scheme: "sqlserver".into(),
+    icon: Icon::Database,
+    syntax: Some(SyntaxInfo {
+        // T-SQL identifiers are bracketed (`[name]`), but `SyntaxInfo`
+        // models the quote as a single `char`. The dialect's
+        // `quote_identifier` (see `MssqlDialect` impl) emits the
+        // bracket-pair form correctly and is the authoritative source
+        // for SQL generation. The `'"'` here is a placeholder — T-SQL
+        // does accept `"name"` when `QUOTED_IDENTIFIER` is ON, so it is
+        // not actively wrong, but new consumers should call
+        // `dialect().quote_identifier()` rather than reading this field.
+        identifier_quote: '"',
+        string_quote: '\'',
+        placeholder_style: PlaceholderStyle::QuestionMark,
+        supports_schemas: true,
+        default_schema: Some("dbo".to_string()),
+        case_sensitive_identifiers: false,
+        misreads_unknown_quoted_identifiers: false,
+    }),
+    query: Some(QueryCapabilities {
+        pagination: vec![PaginationStyle::Offset],
+        where_operators: vec![
+            WhereOperator::Eq,
+            WhereOperator::Ne,
+            WhereOperator::Gt,
+            WhereOperator::Gte,
+            WhereOperator::Lt,
+            WhereOperator::Lte,
+            WhereOperator::Like,
+            WhereOperator::Null,
+            WhereOperator::In,
+            WhereOperator::NotIn,
+            WhereOperator::And,
+            WhereOperator::Or,
+            WhereOperator::Not,
+        ],
+        supports_order_by: true,
+        order_by_mode: datatab_core::OrderByMode::AnyColumns,
+        supports_group_by: true,
+        supports_having: true,
+        supports_distinct: true,
+        supports_limit: true,
+        supports_offset: true,
+        supports_joins: true,
+        supports_subqueries: true,
+        supports_union: true,
+        supports_intersect: true,
+        supports_except: true,
+        supports_case_expressions: true,
+        supports_window_functions: true,
+        supports_ctes: true,
+        supports_explain: false,
+        max_query_parameters: 2100,
+        max_order_by_columns: 0,
+        max_group_by_columns: 0,
+    }),
+    mutation: Some(MutationCapabilities {
+        supports_insert: true,
+        supports_update: true,
+        supports_delete: true,
+        supports_upsert: false,
+        supports_returning: true,
+        supports_batch: true,
+        supports_bulk_update: true,
+        supports_bulk_delete: true,
+        max_insert_values: 1000,
+    }),
+    ddl: Some(DdlCapabilities {
+        supports_create_database: true,
+        supports_drop_database: true,
+        supports_create_table: true,
+        supports_drop_table: true,
+        supports_alter_table: true,
+        supports_create_index: true,
+        supports_drop_index: true,
+        supports_create_view: true,
+        supports_drop_view: true,
+        supports_create_trigger: true,
+        supports_drop_trigger: true,
+        transactional_ddl: true,
+        supports_add_column: true,
+        supports_drop_column: true,
+        supports_rename_column: false,
+        supports_alter_column: true,
+        supports_add_constraint: true,
+        supports_drop_constraint: true,
+    }),
+    transactions: Some(TransactionCapabilities {
+        supports_transactions: true,
+        supported_isolation_levels: vec![
+            IsolationLevel::ReadUncommitted,
+            IsolationLevel::ReadCommitted,
+            IsolationLevel::RepeatableRead,
+            IsolationLevel::Serializable,
+            IsolationLevel::Snapshot,
+        ],
+        default_isolation_level: Some(IsolationLevel::ReadCommitted),
+        supports_savepoints: true,
+        supports_nested_transactions: false,
+        supports_read_only: false,
+        supports_deferrable: false,
+    }),
+    limits: Some(DriverLimits {
+        max_query_length: 0,
+        max_parameters: 2100,
+        max_result_rows: 0,
+        max_connections: 0,
+        max_nested_subqueries: 32,
+        max_identifier_length: 128,
+        max_columns: 1024,
+        max_indexes_per_table: 999,
+        // T-SQL caps a single multi-row INSERT ... VALUES statement at 1000 rows.
+        max_bulk_insert_rows: 1000,
+    }),
+    ssl_modes: Some(&[
+        datatab_core::SslModeOption {
+            id: "off",
+            label: "off",
+        },
+        datatab_core::SslModeOption {
+            id: "on",
+            label: "on (accept self-signed)",
+        },
+        datatab_core::SslModeOption {
+            id: "required",
+            label: "required (validate cert)",
+        },
+    ]),
+    ssl_cert_fields: Some(datatab_core::SslCertFields {
+        root_cert: true,
+        client_cert: false,
+    }),
+    classification_override: None,
+    default_chunk_size: None,
+    supports_lock_timeout: false,
+    editor_profile: None,
+});
+
+// =============================================================================
+// SQL Server SQL dialect
+// =============================================================================
+
+pub struct MssqlDialect;
+
+static MSSQL_DIALECT: MssqlDialect = MssqlDialect;
+
+impl SqlDialect for MssqlDialect {
+    fn quote_identifier(&self, name: &str) -> String {
+        // SQL Server uses [bracket] quoting. Any closing bracket inside the
+        // identifier must be doubled to be safe.
+        let escaped = name.replace(']', "]]");
+        format!("[{}]", escaped)
+    }
+
+    fn qualified_table(&self, schema: Option<&str>, table: &str) -> String {
+        match schema {
+            Some(s) => format!(
+                "{}.{}",
+                self.quote_identifier(s),
+                self.quote_identifier(table)
+            ),
+            None => self.quote_identifier(table),
+        }
+    }
+
+    fn value_to_literal(&self, value: &Value) -> String {
+        value_to_mssql_literal(value)
+    }
+
+    fn escape_string(&self, s: &str) -> String {
+        s.replace('\'', "''")
+    }
+
+    fn placeholder_style(&self) -> PlaceholderStyle {
+        PlaceholderStyle::QuestionMark
+    }
+
+    fn supports_returning(&self) -> bool {
+        // SQL Server returns affected rows via the OUTPUT clause rather than
+        // RETURNING. The driver's CRUD methods build the OUTPUT clause
+        // directly; SqlQueryBuilder's RETURNING path is bypassed.
+        true
+    }
+
+    fn supports_row_constructor_in(&self) -> bool {
+        // T-SQL does not support row-value constructors in IN lists:
+        //   (col_a, col_b) IN ((?, ?), ...)
+        // Composite PK chunked DML must use OR-of-AND predicates instead.
+        false
+    }
+
+    fn limit_clause(&self, n: u32) -> String {
+        // T-SQL has no LIMIT keyword. The equivalent is OFFSET ... FETCH NEXT,
+        // which must appear after ORDER BY. The caller is responsible for
+        // including ORDER BY before this clause.
+        format!("OFFSET 0 ROWS FETCH NEXT {} ROWS ONLY", n)
+    }
+
+    fn limit_offset_clause(&self, n: u32, offset: u64) -> String {
+        format!("OFFSET {} ROWS FETCH NEXT {} ROWS ONLY", offset, n)
+    }
+
+    fn select_limit_offset_clause(
+        &self,
+        limit: Option<u64>,
+        offset: u64,
+        has_order_by: bool,
+    ) -> Option<String> {
+        if limit.is_none() && offset == 0 {
+            return None;
+        }
+
+        let mut clause = String::new();
+
+        // OFFSET ... FETCH is only valid after ORDER BY in T-SQL. A constant
+        // subquery satisfies it without sorting by any column, which a
+        // positional `ORDER BY 1` cannot do for text, image or xml columns.
+        if !has_order_by {
+            clause.push_str("ORDER BY (SELECT NULL)\n");
+        }
+
+        clause.push_str(&format!("OFFSET {} ROWS", offset));
+
+        if let Some(n) = limit {
+            clause.push_str(&format!(" FETCH NEXT {} ROWS ONLY", n));
+        }
+
+        Some(clause)
+    }
+
+    fn having_repeats_aggregate_expressions(&self) -> bool {
+        true
+    }
+
+    fn build_upsert_statement(
+        &self,
+        _schema: Option<&str>,
+        _table: &str,
+        _assignments: &[ColumnAssignment],
+        _conflict_columns: &[String],
+        _update_assignments: &[ColumnAssignment],
+    ) -> Option<String> {
+        // SQL Server uses MERGE for upsert; not generated here to avoid producing
+        // an incorrect template. Use UPDATE/INSERT separately.
+        None
+    }
+}
+
+/// Returns `true` when `s` looks like a SQL Server-safe numeric literal:
+/// optional sign, decimal digits with at most one `.`, and an optional
+/// `e[+-]?\d+` exponent. Accepts inputs the engine itself would emit when
+/// formatting a `numeric`/`decimal`/`float` value as text.
+fn is_numeric_literal(s: &str) -> bool {
+    let mut chars = s.chars().peekable();
+    if matches!(chars.peek(), Some('+' | '-')) {
+        chars.next();
+    }
+    let mut has_digit = false;
+    let mut seen_dot = false;
+    while let Some(c) = chars.next() {
+        match c {
+            '0'..='9' => has_digit = true,
+            '.' if !seen_dot => seen_dot = true,
+            'e' | 'E' if has_digit => {
+                if matches!(chars.peek(), Some('+' | '-')) {
+                    chars.next();
+                }
+                let mut exp_digits = 0usize;
+                for ec in chars.by_ref() {
+                    if ec.is_ascii_digit() {
+                        exp_digits += 1;
+                    } else {
+                        return false;
+                    }
+                }
+                return exp_digits > 0;
+            }
+            _ => return false,
+        }
+    }
+    has_digit
+}
+
+fn value_to_mssql_literal(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Bool(b) => {
+            // SQL Server BIT uses 0/1.
+            if *b { "1" } else { "0" }.to_string()
+        }
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => {
+            if f.is_nan() || f.is_infinite() {
+                "NULL".to_string()
+            } else {
+                f.to_string()
+            }
+        }
+        Value::Text(s) => format!("N'{}'", s.replace('\'', "''")),
+        Value::Bytes(b) => {
+            let hex: String = b.iter().map(|byte| format!("{:02X}", byte)).collect();
+            format!("0x{}", hex)
+        }
+        Value::Json(s) => format!("N'{}'", s.replace('\'', "''")),
+        Value::Decimal(s) => {
+            // `Value::Decimal` is a public variant. The driver's own conversion
+            // path (`tiberius::ColumnData::Numeric -> Value::Decimal`) emits a
+            // well-formed string, but other producers (MCP tools, external RPC
+            // drivers, tests) can construct it from untrusted input. Validate
+            // before inlining; emit NULL if the string isn't a plain numeric
+            // literal so we never splice arbitrary text into SQL.
+            if is_numeric_literal(s) {
+                s.clone()
+            } else {
+                "NULL".to_string()
+            }
+        }
+        Value::DateTime(dt) => format!("'{}'", dt.format("%Y-%m-%d %H:%M:%S%.f")),
+        Value::Date(d) => format!("'{}'", d.format("%Y-%m-%d")),
+        Value::Time(t) => format!("'{}'", t.format("%H:%M:%S%.f")),
+        Value::Array(_) | Value::Document(_) | Value::ObjectId(_) => {
+            let json = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+            format!("N'{}'", json.replace('\'', "''"))
+        }
+        Value::Unsupported(_) => "NULL".to_string(),
+    }
+}
+
+// =============================================================================
+// SQL Server Code Generator
+// =============================================================================
+
+pub struct MssqlCodeGenerator;
+
+static MSSQL_CODE_GENERATOR: MssqlCodeGenerator = MssqlCodeGenerator;
+
+impl MssqlCodeGenerator {
+    fn quote(&self, name: &str) -> String {
+        MSSQL_DIALECT.quote_identifier(name)
+    }
+
+    fn qualified(&self, schema: Option<&str>, name: &str) -> String {
+        MSSQL_DIALECT.qualified_table(schema, name)
+    }
+}
+
+impl CodeGenerator for MssqlCodeGenerator {
+    fn capabilities(&self) -> CodeGenCapabilities {
+        CodeGenCapabilities::ADD_COLUMN
+            | CodeGenCapabilities::DROP_COLUMN
+            | CodeGenCapabilities::ALTER_COLUMN
+    }
+
+    /// T-SQL's `ALTER TABLE ... ADD` grammar has no `COLUMN` keyword (unlike
+    /// `DROP COLUMN` / `ALTER COLUMN`, which both require it).
+    fn generate_add_column(&self, req: &AddColumnRequest) -> Result<Vec<String>, DdlRejection> {
+        validate_ddl_fragment(req.type_name, "column type")?;
+        if let Some(default) = req.default {
+            validate_ddl_fragment(default, "column default")?;
+        }
+
+        let table = self.qualified(req.schema_name, req.table_name);
+        let mut sql = format!(
+            "ALTER TABLE {} ADD {} {}",
+            table,
+            self.quote(req.column_name),
+            req.type_name
+        );
+
+        if !req.nullable {
+            sql.push_str(" NOT NULL");
+        }
+        if let Some(default) = req.default {
+            sql.push_str(&format!(" DEFAULT {}", default));
+        }
+        sql.push(';');
+
+        Ok(vec![sql])
+    }
+
+    fn generate_drop_column(&self, req: &DropColumnRequest) -> Result<Vec<String>, DdlRejection> {
+        let table = self.qualified(req.schema_name, req.table_name);
+        Ok(vec![format!(
+            "ALTER TABLE {} DROP COLUMN {};",
+            table,
+            self.quote(req.column_name)
+        )])
+    }
+
+    /// SQL Server's `ALTER COLUMN` always requires the full data type, and
+    /// omitting `NULL`/`NOT NULL` leaves the server to decide nullability —
+    /// this generator never relies on that ambiguity, so a type change
+    /// without an explicit nullable is rejected rather than guessed.
+    ///
+    /// Column defaults are separate named constraint objects in SQL Server
+    /// (`ALTER TABLE ... ADD CONSTRAINT ... DEFAULT ... FOR col`), so
+    /// changing or dropping one requires the constraint's name, which this
+    /// request does not carry. Default changes are rejected for that reason.
+    fn generate_alter_column(&self, req: &AlterColumnRequest) -> Result<Vec<String>, DdlRejection> {
+        if req.default.is_some() {
+            return Err(DdlRejection {
+                reason: "SQL Server default constraints must be dropped and re-added by name; not derivable from this request".to_string(),
+                followup: None,
+            });
+        }
+
+        if let Some(new_type) = req.new_type {
+            validate_ddl_fragment(new_type, "column type")?;
+        }
+
+        let table = self.qualified(req.schema_name, req.table_name);
+        let column = self.quote(req.column_name);
+
+        match (req.new_type, req.nullable) {
+            (Some(new_type), Some(nullable)) => {
+                let null_clause = if nullable { "NULL" } else { "NOT NULL" };
+                Ok(vec![format!(
+                    "ALTER TABLE {} ALTER COLUMN {} {} {};",
+                    table, column, new_type, null_clause
+                )])
+            }
+            (Some(_), None) => Err(DdlRejection {
+                reason: "SQL Server requires an explicit nullability together with a type change (ALTER COLUMN needs the full column definition)".to_string(),
+                followup: None,
+            }),
+            (None, Some(_)) => Err(DdlRejection {
+                reason: "SQL Server requires the column type to change nullability (ALTER COLUMN needs the full column definition)".to_string(),
+                followup: None,
+            }),
+            (None, None) => Err(DdlRejection {
+                reason: "ALTER COLUMN requires at least one of: type, nullable, default"
+                    .to_string(),
+                followup: None,
+            }),
+        }
+    }
+}
+
+// =============================================================================
+// MssqlDriver
+// =============================================================================
+
+pub struct MssqlDriver;
+
+impl MssqlDriver {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Default for MssqlDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DbDriver for MssqlDriver {
+    fn kind(&self) -> DbKind {
+        DbKind::SqlServer
+    }
+
+    fn metadata(&self) -> &DriverMetadata {
+        &METADATA
+    }
+
+    fn picker_rank(&self) -> u16 {
+        3
+    }
+
+    fn driver_key(&self) -> datatab_core::DriverKey {
+        "builtin:mssql".into()
+    }
+
+    fn connect_with_secrets(
+        &self,
+        profile: &ConnectionProfile,
+        password: Option<&SecretString>,
+        ssh_secret: Option<&SecretString>,
+    ) -> Result<Box<dyn Connection>, DbError> {
+        let config = extract_mssql_config(&profile.config)?;
+
+        let password = password.map(|value| value.expose_secret());
+        let ssh_secret = ssh_secret.map(|value| value.expose_secret());
+
+        if config.use_uri {
+            return self.connect_with_uri(config.uri.as_deref().unwrap_or(""), password);
+        }
+
+        if let Some(tunnel_config) = &config.ssh_tunnel {
+            self.connect_via_ssh_tunnel(tunnel_config, ssh_secret, &config, password)
+        } else {
+            self.connect_direct(&config, password)
+        }
+    }
+
+    fn test_connection(&self, profile: &ConnectionProfile) -> Result<(), DbError> {
+        let conn = self.connect_with_secrets(profile, None, None)?;
+        conn.ping()
+    }
+
+    fn form_definition(&self) -> &DriverFormDef {
+        &SQLSERVER_FORM
+    }
+
+    fn build_config(&self, values: &FormValues) -> Result<DbConfig, DbError> {
+        let use_uri = values.get("use_uri").map(|s| s == "true").unwrap_or(false);
+        let uri = values.get("uri").filter(|s| !s.is_empty()).cloned();
+
+        if use_uri {
+            if uri.is_none() {
+                return Err(DbError::InvalidProfile(
+                    "Connection URI is required when using URI mode".to_string(),
+                ));
+            }
+
+            return Ok(DbConfig::SqlServer {
+                use_uri: true,
+                uri,
+                host: String::new(),
+                port: 1433,
+                user: String::new(),
+                database: None,
+                instance: None,
+                ssl_mode: Some("on".to_string()),
+                trust_server_certificate: true,
+                ssl_root_cert_path: None,
+                ssh_tunnel: None,
+                ssh_tunnel_profile_id: None,
+            });
+        }
+
+        let host = values
+            .get("host")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| DbError::InvalidProfile("Host is required".to_string()))?
+            .clone();
+
+        let port: u16 = values
+            .get("port")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| DbError::InvalidProfile("Port is required".to_string()))?
+            .parse()
+            .map_err(|_| DbError::InvalidProfile("Invalid port number".to_string()))?;
+
+        let user = values
+            .get("user")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| DbError::InvalidProfile("User is required".to_string()))?
+            .clone();
+
+        let database = values.get("database").filter(|s| !s.is_empty()).cloned();
+        let instance = values.get("instance").filter(|s| !s.is_empty()).cloned();
+
+        // SSL Mode is the single user-facing knob. The trust-cert flag is
+        // derived from it so the UI doesn't need a second checkbox:
+        //   off      -> no encryption (trust is irrelevant)
+        //   on       -> encrypted, accept self-signed certs (dev/corporate)
+        //   required -> encrypted, validate cert chain (production CA cert)
+        let ssl_mode_value = values
+            .get("ssl_mode")
+            .filter(|s| !s.is_empty())
+            .cloned()
+            .unwrap_or_else(|| "on".to_string());
+        let trust_server_certificate = !matches!(ssl_mode_value.as_str(), "required");
+        let ssl_root_cert_path = values
+            .get("ssl_root_cert_path")
+            .filter(|s| !s.trim().is_empty())
+            .cloned();
+
+        Ok(DbConfig::SqlServer {
+            use_uri: false,
+            uri: None,
+            host,
+            port,
+            user,
+            database,
+            instance,
+            ssl_mode: Some(ssl_mode_value),
+            trust_server_certificate,
+            ssl_root_cert_path,
+            ssh_tunnel: None,
+            ssh_tunnel_profile_id: None,
+        })
+    }
+
+    fn extract_values(&self, config: &DbConfig) -> FormValues {
+        let mut values = HashMap::new();
+
+        if let DbConfig::SqlServer {
+            use_uri,
+            uri,
+            host,
+            port,
+            user,
+            database,
+            instance,
+            ..
+        } = config
+        {
+            values.insert(
+                "use_uri".to_string(),
+                if *use_uri { "true" } else { "" }.to_string(),
+            );
+            values.insert("uri".to_string(), uri.clone().unwrap_or_default());
+            values.insert("host".to_string(), host.clone());
+            values.insert("port".to_string(), port.to_string());
+            values.insert("user".to_string(), user.clone());
+            values.insert("database".to_string(), database.clone().unwrap_or_default());
+            values.insert("instance".to_string(), instance.clone().unwrap_or_default());
+        }
+
+        values
+    }
+
+    fn build_uri(&self, values: &FormValues, password: &str) -> Option<String> {
+        let host = values.get("host").map(|s| s.as_str()).unwrap_or("");
+        let port = values.get("port").map(|s| s.as_str()).unwrap_or("1433");
+        let user = values.get("user").map(|s| s.as_str()).unwrap_or("");
+        let database = values.get("database").map(|s| s.as_str()).unwrap_or("");
+        let instance = values.get("instance").map(|s| s.as_str()).unwrap_or("");
+
+        let credentials = if !user.is_empty() {
+            if !password.is_empty() {
+                format!(
+                    "{}:{}@",
+                    urlencoding::encode(user),
+                    urlencoding::encode(password)
+                )
+            } else {
+                format!("{}@", urlencoding::encode(user))
+            }
+        } else {
+            String::new()
+        };
+
+        let db_part = if !database.is_empty() {
+            format!("/{}", database)
+        } else {
+            String::new()
+        };
+
+        let query_part = if !instance.is_empty() {
+            // Database segment is required before a query string; emit an
+            // empty one if the user did not pick a default database.
+            let separator = if db_part.is_empty() { "/" } else { "" };
+            format!("{}?instance={}", separator, urlencoding::encode(instance))
+        } else {
+            String::new()
+        };
+
+        Some(format!(
+            "sqlserver://{}{}:{}{}{}",
+            credentials, host, port, db_part, query_part
+        ))
+    }
+
+    fn parse_uri(&self, uri: &str) -> Option<FormValues> {
+        let stripped = uri
+            .strip_prefix("sqlserver://")
+            .or_else(|| uri.strip_prefix("mssql://"))?;
+
+        let mut values = HashMap::new();
+        let (credentials, host_part) = if let Some(at_pos) = stripped.rfind('@') {
+            (&stripped[..at_pos], &stripped[at_pos + 1..])
+        } else {
+            ("", stripped)
+        };
+
+        if !credentials.is_empty() {
+            if let Some(colon) = credentials.find(':') {
+                let user = urlencoding::decode(&credentials[..colon])
+                    .unwrap_or_default()
+                    .into_owned();
+                values.insert("user".to_string(), user);
+                let password = urlencoding::decode(&credentials[colon + 1..])
+                    .unwrap_or_default()
+                    .into_owned();
+                if !password.is_empty() {
+                    values.insert("password".to_string(), password);
+                }
+            } else {
+                let user = urlencoding::decode(credentials)
+                    .unwrap_or_default()
+                    .into_owned();
+                values.insert("user".to_string(), user);
+            }
+        }
+
+        let (host_port, after_host) = if let Some(slash) = host_part.find('/') {
+            (&host_part[..slash], &host_part[slash + 1..])
+        } else {
+            (host_part, "")
+        };
+
+        let (database, query_string) = match after_host.split_once('?') {
+            Some((db, q)) => (db, q),
+            None => (after_host, ""),
+        };
+        values.insert("database".to_string(), database.to_string());
+
+        // Split host_port into host[\instance][:port]. SSMS-style
+        // `host\instance` plus an optional `:port` suffix.
+        let (host_and_instance, port_str) = match host_port.rfind(':') {
+            Some(colon) => (&host_port[..colon], &host_port[colon + 1..]),
+            None => (host_port, "1433"),
+        };
+        let (host, instance) = match host_and_instance.find('\\') {
+            Some(bs) => (&host_and_instance[..bs], &host_and_instance[bs + 1..]),
+            None => (host_and_instance, ""),
+        };
+        values.insert("host".to_string(), host.to_string());
+        values.insert("port".to_string(), port_str.to_string());
+        if !instance.is_empty() {
+            values.insert("instance".to_string(), instance.to_string());
+        }
+
+        // ?instance=… overrides the backslash form if both are present.
+        for pair in query_string.split('&').filter(|p| !p.is_empty()) {
+            if let Some((key, value)) = pair.split_once('=')
+                && key.eq_ignore_ascii_case("instance")
+                && !value.is_empty()
+            {
+                let decoded = urlencoding::decode(value)
+                    .map(|cow| cow.into_owned())
+                    .unwrap_or_else(|_| value.to_string());
+                values.insert("instance".to_string(), decoded);
+            }
+        }
+
+        Some(values)
+    }
+
+    fn with_database(&self, config: &DbConfig, database: &str) -> Option<DbConfig> {
+        match config {
+            DbConfig::SqlServer {
+                use_uri,
+                uri,
+                host,
+                port,
+                user,
+                instance,
+                ssl_mode,
+                trust_server_certificate,
+                ssl_root_cert_path,
+                ssh_tunnel,
+                ssh_tunnel_profile_id,
+                ..
+            } => Some(DbConfig::SqlServer {
+                use_uri: *use_uri,
+                uri: uri.clone(),
+                host: host.clone(),
+                port: *port,
+                user: user.clone(),
+                database: Some(database.to_string()),
+                instance: instance.clone(),
+                ssl_mode: ssl_mode.clone(),
+                trust_server_certificate: *trust_server_certificate,
+                ssl_root_cert_path: ssl_root_cert_path.clone(),
+                ssh_tunnel: ssh_tunnel.clone(),
+                ssh_tunnel_profile_id: *ssh_tunnel_profile_id,
+            }),
+            _ => None,
+        }
+    }
+}
+
+struct ExtractedMssqlConfig {
+    use_uri: bool,
+    uri: Option<String>,
+    host: String,
+    port: u16,
+    user: String,
+    database: Option<String>,
+    instance: Option<String>,
+    ssl_mode: String,
+    trust_server_certificate: bool,
+    ssl_root_cert_path: Option<String>,
+    ssh_tunnel: Option<SshTunnelConfig>,
+}
+
+fn extract_mssql_config(config: &DbConfig) -> Result<ExtractedMssqlConfig, DbError> {
+    match config {
+        DbConfig::SqlServer {
+            use_uri,
+            uri,
+            host,
+            port,
+            user,
+            database,
+            instance,
+            ssl_mode,
+            trust_server_certificate,
+            ssl_root_cert_path,
+            ssh_tunnel,
+            ..
+        } => Ok(ExtractedMssqlConfig {
+            use_uri: *use_uri,
+            uri: uri.clone(),
+            host: host.clone(),
+            port: *port,
+            user: user.clone(),
+            database: database.clone(),
+            instance: instance.clone(),
+            ssl_mode: ssl_mode.clone().unwrap_or_else(|| "on".to_string()),
+            trust_server_certificate: *trust_server_certificate,
+            ssl_root_cert_path: ssl_root_cert_path.clone(),
+            ssh_tunnel: ssh_tunnel.clone(),
+        }),
+        _ => Err(DbError::InvalidProfile(
+            "Expected SQL Server configuration".to_string(),
+        )),
+    }
+}
+
+fn encryption_for(ssl_mode: &str) -> EncryptionLevel {
+    match ssl_mode {
+        "off" | "disabled" => EncryptionLevel::Off,
+        "required" => EncryptionLevel::Required,
+        // "on" or unknown
+        _ => EncryptionLevel::On,
+    }
+}
+
+fn build_tiberius_config(params: &MssqlConnectParams) -> Config {
+    let mut config = Config::new();
+    config.host(params.host);
+
+    if let Some(instance) = params.instance {
+        // Leave port unset so tiberius defaults to 1434 for the SQL Browser
+        // SSRP lookup; Browser then returns the instance's actual TCP port.
+        // Calling `config.port(...)` here would direct the Browser query at
+        // the wrong UDP port and produce a connection reset (os error 10054).
+        config.instance_name(instance);
+    } else {
+        config.port(params.port);
+    }
+
+    if let Some(database) = params.database
+        && !database.is_empty()
+    {
+        config.database(database);
+    }
+
+    config.authentication(AuthMethod::sql_server(params.user, params.password));
+    config.encryption(encryption_for(params.ssl_mode));
+
+    // tiberius panics when both trust_cert and trust_cert_ca are set, so the
+    // CA only applies when the mode validates the chain.
+    if params.trust_server_certificate {
+        config.trust_cert();
+    } else if let Some(path) = params.ssl_root_cert_path {
+        config.trust_cert_ca(path);
+    }
+
+    // The manual-field connection form has no field for it, so our identity
+    // always applies here — unlike the ADO/JDBC and URL-scheme paths, there
+    // is no user-supplied value that could ever win.
+    config.application_name(manual_mode_application_name());
+
+    config
+}
+
+/// The `Application Name` reported for connections built from discrete
+/// profile fields (host/port/user/...), where the caller has no way to set
+/// their own value.
+fn manual_mode_application_name() -> &'static str {
+    datatab_core::client_identity()
+}
+
+struct MssqlConnectParams<'a> {
+    host: &'a str,
+    port: u16,
+    user: &'a str,
+    password: &'a str,
+    database: Option<&'a str>,
+    instance: Option<&'a str>,
+    ssl_mode: &'a str,
+    trust_server_certificate: bool,
+    ssl_root_cert_path: Option<&'a str>,
+}
+
+fn build_runtime() -> Result<Runtime, DbError> {
+    Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            DbError::ConnectionFailed(format!("Failed to start tokio runtime: {}", e).into())
+        })
+}
+
+/// Short, non-reversible fingerprint of a password for diagnostic logs.
+///
+/// Uses SHA-256 with a fixed seed string and returns the leading 16 hex chars
+/// of the digest. The point is to let users compare two values for equality
+/// (e.g. "did the password reaching tiberius differ from what I typed?")
+/// without ever exposing the password itself.
+fn password_fingerprint(password: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"datatab-mssql-password-fingerprint:v1");
+    hasher.update(password.as_bytes());
+    let digest = hasher.finalize();
+    // SHA-256 always produces a 32-byte digest, so `get(..8)` is infallible —
+    // the `unwrap_or_default` is just to keep clippy's indexing_slicing lint
+    // happy without an `expect`.
+    hex::encode(digest.get(..8).unwrap_or_default())
+}
+
+async fn establish_tiberius(config: Config) -> Result<TiberiusClient, tiberius::error::Error> {
+    // `connect_named` falls back to a direct `host:port` connect when no
+    // instance is set, and performs a SQL Browser (UDP 1434) lookup when
+    // one is. Using it unconditionally keeps the two paths in one place.
+    let tcp = TcpStream::connect_named(&config).await?;
+    tcp.set_nodelay(true)?;
+    enable_tcp_keepalive(&tcp)?;
+    Client::connect(config, tcp.compat_write()).await
+}
+
+/// How long a session may sit idle before the OS starts probing the peer.
+///
+/// NAT gateways and firewalls commonly drop TCP flows that stay silent for a
+/// few minutes. The drop is only noticed on the next write, which then fails
+/// with a broken pipe. Probing well inside that window keeps the flow alive.
+const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+
+fn enable_tcp_keepalive(tcp: &TcpStream) -> std::io::Result<()> {
+    let keepalive = socket2::TcpKeepalive::new().with_time(TCP_KEEPALIVE_IDLE);
+    socket2::SockRef::from(tcp).set_tcp_keepalive(&keepalive)
+}
+
+/// Fetch the server-side session id (`@@SPID`) and the actual session
+/// database (`DB_NAME()`) for the open client.
+///
+/// `@@SPID` returns a SQL `smallint`, so we widen to `i32` for the rest of
+/// the driver. Returns `0` on any decoding failure rather than propagating
+/// — a missing SPID just means cancel becomes a no-op, which is fine. The
+/// database is resolved in the same round trip: a default-login URI or a
+/// host/port profile without a database still starts in the login's
+/// default database, and callers must see that actual database instead of
+/// an unknown (None) selection.
+async fn capture_session_info(
+    client: &mut TiberiusClient,
+) -> Result<(i32, Option<String>), tiberius::error::Error> {
+    let stream = client.simple_query("SELECT @@SPID, DB_NAME()").await?;
+    let row = stream.into_row().await?;
+    let spid = row
+        .as_ref()
+        .and_then(|r| r.get::<i16, _>(0))
+        .map(|s| s as i32)
+        .unwrap_or(0);
+    let database = row
+        .as_ref()
+        .and_then(|r| r.get::<&str, _>(1))
+        .map(str::to_string);
+    Ok((spid, database))
+}
+
+impl MssqlDriver {
+    fn connect_with_uri(
+        &self,
+        base_uri: &str,
+        password: Option<&str>,
+    ) -> Result<Box<dyn Connection>, DbError> {
+        let uri = inject_password_into_mssql_uri(base_uri, password);
+        log::info!("Connecting to SQL Server via URI {}", sanitize_uri(&uri));
+        if let Some(pw) = password {
+            log::debug!(
+                "URI auth payload — password_chars: {}, password_bytes: {}, password_fingerprint: {}",
+                pw.chars().count(),
+                pw.len(),
+                password_fingerprint(pw),
+            );
+        }
+
+        // Prefer our own URL parser when the URI looks like one
+        // (`sqlserver://` / `mssql://`). Tiberius's ADO parser is too
+        // permissive: it accepts our URL as a single key=value pair
+        // (key=`sqlserver://sa:pw@host/?instance`, value=`NAME`) and
+        // returns a Config with empty host/auth that then dials a
+        // default `localhost:1433`. ADO/JDBC parsers stay available for
+        // genuine `Server=…;` / `jdbc:sqlserver://…` connection strings.
+        let is_mssql_url = uri.starts_with("sqlserver://") || uri.starts_with("mssql://");
+        let config = if is_mssql_url {
+            parse_mssql_url(&uri).map_err(|e| format_mssql_uri_error(&e, base_uri))?
+        } else {
+            let mut config = Config::from_ado_string(&uri)
+                .or_else(|_| Config::from_jdbc_string(&uri))
+                .map_err(|e| format_mssql_uri_error(&e, base_uri))?;
+
+            // tiberius parses `Application Name=` / `ApplicationName=` out of
+            // the raw string but exposes no getter on `Config`, so we scan
+            // the same raw string ourselves to decide whether the caller
+            // already set one before applying our default.
+            if !ado_sets_application_name(&uri) {
+                config.application_name(datatab_core::client_identity());
+            }
+
+            config
+        };
+
+        let reconnect_config = config.clone();
+        let runtime = build_runtime()?;
+
+        let (client, spid, database) = runtime
+            .block_on(async move {
+                let mut client = establish_tiberius(config).await?;
+                let (spid, database) = capture_session_info(&mut client).await?;
+                Ok::<_, tiberius::error::Error>((client, spid, database))
+            })
+            .map_err(|e| format_mssql_uri_error(&e, base_uri))?;
+
+        log::info!(
+            "[CONNECT] SQL Server connection established via URI (spid: {}, database: {:?})",
+            spid,
+            database
+        );
+
+        Ok(Box::new(MssqlConnection {
+            inner: Arc::new(Mutex::new(MssqlConnectionInner {
+                client: Some(client),
+                runtime,
+            })),
+            current_database: Mutex::new(database),
+            ssh_tunnel: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            spid: Arc::new(AtomicI32::new(spid)),
+            reconnect_config: Arc::new(reconnect_config),
+            poisoned: Arc::new(AtomicBool::new(false)),
+        }))
+    }
+
+    fn connect_direct(
+        &self,
+        config: &ExtractedMssqlConfig,
+        password: Option<&str>,
+    ) -> Result<Box<dyn Connection>, DbError> {
+        log::info!(
+            "Connecting directly to SQL Server at {}:{} as {} (database: {:?}, instance: {:?}, ssl_mode: {})",
+            config.host,
+            config.port,
+            config.user,
+            config.database,
+            config.instance,
+            config.ssl_mode
+        );
+
+        let resolved_password = password.unwrap_or("");
+        log::debug!(
+            "Auth payload — user_len: {}, password_chars: {}, password_bytes: {}, password_fingerprint: {}",
+            config.user.chars().count(),
+            resolved_password.chars().count(),
+            resolved_password.len(),
+            password_fingerprint(resolved_password),
+        );
+
+        let tiberius_config = build_tiberius_config(&MssqlConnectParams {
+            host: &config.host,
+            port: config.port,
+            user: &config.user,
+            password: resolved_password,
+            database: config.database.as_deref(),
+            instance: config.instance.as_deref(),
+            ssl_mode: &config.ssl_mode,
+            trust_server_certificate: config.trust_server_certificate,
+            ssl_root_cert_path: config.ssl_root_cert_path.as_deref(),
+        });
+
+        let established = establish_mssql_session(tiberius_config, &config.host, config.port)?;
+
+        log::info!(
+            "Successfully connected to {}:{} (spid: {}, database: {:?})",
+            config.host,
+            config.port,
+            established.spid,
+            established.database
+        );
+
+        let effective_database =
+            resolve_session_database(established.database.clone(), config.database.clone());
+
+        Ok(Box::new(build_mssql_connection(
+            established,
+            effective_database,
+            None,
+        )))
+    }
+
+    fn connect_via_ssh_tunnel(
+        &self,
+        tunnel_config: &SshTunnelConfig,
+        ssh_secret: Option<&str>,
+        config: &ExtractedMssqlConfig,
+        password: Option<&str>,
+    ) -> Result<Box<dyn Connection>, DbError> {
+        let total_start = Instant::now();
+
+        let OpenedSshTunnel { tunnel, ssh_host } =
+            datatab_ssh::open_tunnel(tunnel_config, ssh_secret, &config.host, config.port)?;
+        let local_port = tunnel.local_port();
+
+        let tiberius_config = build_tiberius_config(&MssqlConnectParams {
+            host: "127.0.0.1",
+            port: local_port,
+            user: &config.user,
+            password: password.unwrap_or(""),
+            database: config.database.as_deref(),
+            // The SSH tunnel forwards to a TCP port, so we cannot use a named
+            // instance lookup via the SQL Browser service.
+            instance: None,
+            ssl_mode: &config.ssl_mode,
+            trust_server_certificate: config.trust_server_certificate,
+            ssl_root_cert_path: config.ssl_root_cert_path.as_deref(),
+        });
+
+        // The reconnect config points at the same 127.0.0.1:<local_port> that
+        // the SSH tunnel owns. As long as the `SshTunnel` value lives on
+        // `MssqlConnection`, the tunnel stays open and a fresh connection
+        // (for KILL or for reconnect) can reuse it.
+        let established = establish_mssql_session(tiberius_config, &config.host, config.port)?;
+
+        log::info!(
+            "[CONNECT] Total connection time: {:.2}ms ({}:{} via SSH {}, spid: {})",
+            total_start.elapsed().as_secs_f64() * 1000.0,
+            config.host,
+            config.port,
+            ssh_host,
+            established.spid
+        );
+
+        let effective_database =
+            resolve_session_database(established.database.clone(), config.database.clone());
+
+        Ok(Box::new(build_mssql_connection(
+            established,
+            effective_database,
+            Some(tunnel),
+        )))
+    }
+}
+
+/// Bundle of pieces produced by `establish_mssql_session`.
+struct EstablishedMssqlSession {
+    client: TiberiusClient,
+    runtime: Runtime,
+    spid: i32,
+    database: Option<String>,
+    reconnect_config: tiberius::Config,
+}
+
+/// Resolve the connection's effective database: the session's actual
+/// database (`DB_NAME()`) wins, and the configured database is kept only
+/// as a fallback when the server does not report one. A default-login
+/// connect without a configured database must surface the login's actual
+/// default database instead of an unknown (None) selection.
+fn resolve_session_database(session: Option<String>, configured: Option<String>) -> Option<String> {
+    session.or(configured)
+}
+
+/// Build a tokio runtime, open the tiberius client, and capture `@@SPID`
+/// plus `DB_NAME()`.
+///
+/// Shared by `connect_direct` and `connect_via_ssh_tunnel` so the
+/// runtime/client/session plumbing lives in one place. `host`/`port` are
+/// only used to format a meaningful error if the dial fails.
+fn establish_mssql_session(
+    tiberius_config: Config,
+    host: &str,
+    port: u16,
+) -> Result<EstablishedMssqlSession, DbError> {
+    let reconnect_config = tiberius_config.clone();
+    let runtime = build_runtime()?;
+    let (client, spid, database) = runtime
+        .block_on(async move {
+            let mut client = establish_tiberius(tiberius_config).await?;
+            let (spid, database) = capture_session_info(&mut client).await?;
+            Ok::<_, tiberius::error::Error>((client, spid, database))
+        })
+        .map_err(|e| format_mssql_connect_error(&e, host, port))?;
+    Ok(EstablishedMssqlSession {
+        client,
+        runtime,
+        spid,
+        database,
+        reconnect_config,
+    })
+}
+
+fn build_mssql_connection(
+    session: EstablishedMssqlSession,
+    current_database: Option<String>,
+    ssh_tunnel: Option<SshTunnel>,
+) -> MssqlConnection {
+    MssqlConnection {
+        inner: Arc::new(Mutex::new(MssqlConnectionInner {
+            client: Some(session.client),
+            runtime: session.runtime,
+        })),
+        current_database: Mutex::new(current_database),
+        ssh_tunnel,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        spid: Arc::new(AtomicI32::new(session.spid)),
+        reconnect_config: Arc::new(session.reconnect_config),
+        poisoned: Arc::new(AtomicBool::new(false)),
+    }
+}
+
+// =============================================================================
+// MssqlConnection
+// =============================================================================
+
+pub(crate) struct MssqlConnectionInner {
+    pub(crate) client: Option<TiberiusClient>,
+    pub(crate) runtime: Runtime,
+}
+
+pub struct MssqlConnection {
+    inner: Arc<Mutex<MssqlConnectionInner>>,
+    current_database: Mutex<Option<String>>,
+    #[allow(dead_code)]
+    ssh_tunnel: Option<SshTunnel>,
+    cancelled: Arc<AtomicBool>,
+
+    // Cancellation state. `spid` is the server-side session id captured at
+    // connect time (and refreshed after each reconnect). `reconnect_config`
+    // is a cloneable tiberius Config we can use to (a) open a side-channel
+    // connection to send `KILL <spid>` and (b) rebuild the primary client
+    // after the session is killed. `poisoned` is set true once KILL has been
+    // sent so `cleanup_after_cancel` knows it needs to reconnect.
+    spid: Arc<AtomicI32>,
+    reconnect_config: Arc<tiberius::Config>,
+    poisoned: Arc<AtomicBool>,
+}
+
+struct MssqlCancelHandle {
+    cancelled: Arc<AtomicBool>,
+    spid: Arc<AtomicI32>,
+    reconnect_config: Arc<tiberius::Config>,
+    poisoned: Arc<AtomicBool>,
+}
+
+impl QueryCancelHandle for MssqlCancelHandle {
+    fn cancel(&self) -> Result<(), DbError> {
+        // Mark cancellation requested first so `execute()` can translate the
+        // server's "session was killed" error to `DbError::Cancelled` even
+        // if the KILL itself races with the query completing normally.
+        self.cancelled.store(true, Ordering::SeqCst);
+
+        let spid = self.spid.load(Ordering::SeqCst);
+        if spid == 0 {
+            // No session id captured yet — nothing meaningful to kill. Mark
+            // the connection poisoned so the next `execute()` runs
+            // `cleanup_after_cancel`, which clears both flags. Without this
+            // the `cancelled` flag stays set forever and every subsequent
+            // query short-circuits to `DbError::Cancelled`.
+            self.poisoned.store(true, Ordering::SeqCst);
+            return Ok(());
+        }
+
+        // Use a fresh single-threaded runtime for the kill round-trip. We
+        // must never share the runtime that's currently driving the
+        // in-flight query, since blocking on it would deadlock.
+        let rt = Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| DbError::query_failed(format!("Failed to start KILL runtime: {}", e)))?;
+
+        let config = (*self.reconnect_config).clone();
+        let result: Result<(), tiberius::error::Error> = rt.block_on(async move {
+            let tcp = TcpStream::connect_named(&config).await?;
+            tcp.set_nodelay(true)?;
+            let mut killer = Client::connect(config, tcp.compat_write()).await?;
+            killer
+                .simple_query(format!("KILL {}", spid))
+                .await?
+                .into_results()
+                .await?;
+            Ok(())
+        });
+
+        // Mark as poisoned regardless of whether KILL succeeded: if it failed
+        // the primary connection may still be in an unknown state and
+        // forcing a reconnect on next use is safer than reusing it.
+        self.poisoned.store(true, Ordering::SeqCst);
+
+        match result {
+            Ok(()) => {
+                log::info!("[CANCEL] KILL {} sent successfully", spid);
+                Ok(())
+            }
+            Err(err) => {
+                // `poisoned == true` is already set above, so the next
+                // `execute()` will run `cleanup_after_cancel` and reconnect.
+                // Surfacing this transport failure to the caller would show
+                // "cancel failed" in the UI even though recovery is armed,
+                // so log it and report success instead.
+                log::error!(
+                    "[CANCEL] KILL {} transport failed (recovery armed): {}",
+                    spid,
+                    err
+                );
+                Ok(())
+            }
+        }
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+impl MssqlConnection {
+    fn with_client<F, R>(&self, f: F) -> Result<R, DbError>
+    where
+        F: FnOnce(&Runtime, &mut TiberiusClient) -> Result<R, DbError>,
+    {
+        let mut guard = match self.inner.lock() {
+            Ok(g) => g,
+            Err(poison_err) => poison_err.into_inner(),
+        };
+
+        let inner = &mut *guard;
+        let client = inner.client.as_mut().ok_or_else(|| {
+            DbError::ConnectionFailed("SQL Server connection has been closed".to_string().into())
+        })?;
+
+        f(&inner.runtime, client)
+    }
+
+    fn execute_simple(&self, sql: &str) -> Result<QueryResult, DbError> {
+        self.execute_simple_bounded(sql, None)
+    }
+
+    /// Run a batch, retaining at most `limit` rows across all of its result
+    /// sets. `None` keeps the uncapped behavior.
+    fn execute_simple_bounded(
+        &self,
+        sql: &str,
+        limit: Option<u32>,
+    ) -> Result<QueryResult, DbError> {
+        let start = Instant::now();
+        let sql_owned = sql.to_string();
+
+        // Multi-statement batches in SQL Server can produce multiple result
+        // sets (e.g. `SELECT 1; SELECT 2;` or a stored procedure with
+        // several `SELECT`s). We return the LAST result set as the primary
+        // `QueryResult` (preserving the historical "last statement wins" UX)
+        // and attach every earlier set to `additional_results` in batch
+        // order, so callers that want the full batch can walk it via
+        // `QueryResult::iter_result_sets()`. Column metadata comes from each
+        // set's METADATA token, so a `SELECT` that returned zero rows still
+        // carries its column headers. Pure preparation batches
+        // (`SET LOCK_TIMEOUT 5000`) emit no metadata, produce no result set,
+        // and surface as an empty primary, which is what callers expect.
+        // Under a row limit the stream is still drained to completion, so
+        // every mutation and later statement finishes and late server errors
+        // still surface.
+        let collected = self.with_client(|runtime, client| {
+            runtime.block_on(async move {
+                let mut stream = client
+                    .simple_query(sql_owned)
+                    .await
+                    .map_err(|e| format_mssql_query_error(&e))?;
+
+                let mut remaining = limit.map(|limit| limit as usize);
+                collect_result_sets(&mut stream, &mut remaining).await
+            })
+        })?;
+
+        let total_time = start.elapsed();
+        let result = build_multi_result(collected, total_time);
+
+        log::debug!(
+            "[QUERY] Completed in {:.2}ms, primary={}r/{}c, additional_sets={}",
+            total_time.as_secs_f64() * 1000.0,
+            result.rows.len(),
+            result.columns.len(),
+            result.additional_results.len()
+        );
+
+        Ok(result)
+    }
+
+    /// Read `@@TRANCOUNT` for the shared session.
+    ///
+    /// Runs as its own batch, so tiberius flushes whatever a previous (failed)
+    /// batch left on the wire before sending it, and the probe's stream is
+    /// fully consumed before the client is released.
+    fn transaction_count(&self) -> Result<i32, DbError> {
+        self.with_client(|runtime, client| {
+            runtime.block_on(async move {
+                let row = client
+                    .simple_query("SELECT @@TRANCOUNT")
+                    .await
+                    .map_err(|e| format_mssql_query_error(&e))?
+                    .into_row()
+                    .await
+                    .map_err(|e| format_mssql_query_error(&e))?;
+
+                row.as_ref()
+                    .map(|row| row.try_get::<i32, _>(0))
+                    .transpose()
+                    .map_err(|e| format_mssql_query_error(&e))?
+                    .flatten()
+                    .ok_or_else(|| DbError::query_failed("SELECT @@TRANCOUNT returned no value"))
+            })
+        })
+    }
+
+    /// Probe `@@TRANCOUNT` before a batch that could open a transaction.
+    ///
+    /// Returns `None` when the batch cannot open one (no round trip is spent)
+    /// or when the probe fails, in which case a failed batch is never treated
+    /// as the owner of an open transaction.
+    fn transaction_count_before_batch(&self, sql: &str) -> Option<i32> {
+        if !batch_can_open_transaction(sql) {
+            return None;
+        }
+
+        match self.transaction_count() {
+            Ok(count) => Some(count),
+            Err(error) => {
+                log::warn!("[QUERY] @@TRANCOUNT probe before batch failed: {}", error);
+                None
+            }
+        }
+    }
+
+    fn rollback_open_transaction(&self) -> Result<(), DbError> {
+        self.with_client(|runtime, client| {
+            runtime.block_on(async move {
+                client
+                    .simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
+                    .await
+                    .map_err(|e| format_mssql_query_error(&e))?
+                    .into_results()
+                    .await
+                    .map_err(|e| format_mssql_query_error(&e))?;
+
+                Ok(())
+            })
+        })
+    }
+
+    /// Inspect the session after a failed batch and resolve the transaction
+    /// it may have left open.
+    ///
+    /// A transaction the batch itself opened (count went from 0 to > 0) is
+    /// rolled back; any other open transaction is left alone and reported.
+    /// If the session cannot be inspected, the original error is returned
+    /// unchanged.
+    fn resolve_failed_batch_transaction(
+        &self,
+        error: DbError,
+        transaction_count_before: Option<i32>,
+    ) -> DbError {
+        let transaction_count_after = match self.transaction_count() {
+            Ok(count) => count,
+            Err(probe_error) => {
+                log::warn!(
+                    "[QUERY] @@TRANCOUNT probe after failed batch failed: {}",
+                    probe_error
+                );
+                return error;
+            }
+        };
+
+        match failed_batch_transaction_action(transaction_count_before, transaction_count_after) {
+            FailedBatchTransactionAction::None => error,
+            FailedBatchTransactionAction::ReportStillOpen => {
+                error.with_transaction_note(TransactionStateNote::StillOpen)
+            }
+            FailedBatchTransactionAction::RollBack => match self.rollback_open_transaction() {
+                Ok(()) => error.with_transaction_note(TransactionStateNote::RolledBack),
+                Err(rollback_error) => {
+                    log::warn!(
+                        "[QUERY] Rolling back the transaction a failed batch opened failed: {}",
+                        rollback_error
+                    );
+                    error.with_transaction_note(TransactionStateNote::StillOpen)
+                }
+            },
+        }
+    }
+}
+
+/// One collected result set. `truncated` is set only when the shared row
+/// budget ran out while this set was streaming and at least one of its rows
+/// was discarded.
+struct CollectedSet {
+    columns: Vec<ColumnMeta>,
+    rows: Vec<Row>,
+    truncated: bool,
+}
+
+/// Drive a tiberius `QueryStream` item by item, capturing column metadata from
+/// the result-set METADATA tokens rather than from rows.
+///
+/// Each `Metadata` item starts a new set built from the declared columns, so a
+/// result set that produced zero rows still carries its columns. Each `Row`
+/// item is appended to the most recently started set. Statements that emit no
+/// metadata (e.g. `SET LOCK_TIMEOUT 5000`) create no set at all.
+///
+/// `remaining` is one row budget shared by every set of the batch, consumed in
+/// stream order: `None` is uncapped and `Some(0)` retains nothing. The stream
+/// is pull-based, so a row past the budget is read off the wire and dropped
+/// without being converted. The loop always drains the stream to its end,
+/// because stopping early would leave later statements unexecuted and let the
+/// stream's drop swallow a server error raised after the budget ran out.
+///
+/// The returned sets are passed through [`finalize_result_sets`] so empty,
+/// metadata-less batches are dropped while empty-but-columned sets are kept.
+async fn collect_result_sets(
+    stream: &mut tiberius::QueryStream<'_>,
+    remaining: &mut Option<usize>,
+) -> Result<Vec<CollectedSet>, DbError> {
+    use futures_util::TryStreamExt;
+
+    let mut sets: Vec<CollectedSet> = Vec::new();
+
+    while let Some(item) = stream
+        .try_next()
+        .await
+        .map_err(|e| format_mssql_query_error(&e))?
+    {
+        if let Some(metadata) = item.as_metadata() {
+            let columns = metadata
+                .columns()
+                .iter()
+                .map(tiberius_column_to_meta)
+                .collect();
+            sets.push(CollectedSet {
+                columns,
+                rows: Vec::new(),
+                truncated: false,
+            });
+            continue;
+        }
+
+        if let Some(row) = item.into_row() {
+            let retain = match remaining {
+                Some(0) => false,
+                Some(left) => {
+                    *left -= 1;
+                    true
+                }
+                None => true,
+            };
+
+            if !retain {
+                match sets.last_mut() {
+                    Some(set) => set.truncated = true,
+                    // TDS always sends METADATA before rows; should a row ever
+                    // arrive first, keep the omission visible.
+                    None => sets.push(CollectedSet {
+                        columns: Vec::new(),
+                        rows: Vec::new(),
+                        truncated: true,
+                    }),
+                }
+                continue;
+            }
+
+            let converted: Row = (0..row.columns().len())
+                .map(|idx| tiberius_value_to_value(&row, idx))
+                .collect();
+
+            match sets.last_mut() {
+                Some(set) => set.rows.push(converted),
+                None => sets.push(CollectedSet {
+                    columns: Vec::new(),
+                    rows: vec![converted],
+                    truncated: false,
+                }),
+            }
+        }
+    }
+
+    Ok(finalize_result_sets(sets))
+}
+
+/// Drop result sets that carry neither columns, rows nor a discarded row,
+/// while preserving empty-but-columned sets (a `SELECT` that returned zero
+/// rows still has its column headers) and sets whose rows were all discarded
+/// under the row budget. Factored out so it can be unit-tested without a live
+/// SQL Server.
+fn finalize_result_sets(sets: Vec<CollectedSet>) -> Vec<CollectedSet> {
+    sets.into_iter()
+        .filter(|set| !set.columns.is_empty() || !set.rows.is_empty() || set.truncated)
+        .collect()
+}
+
+fn tiberius_column_to_meta(column: &tiberius::Column) -> ColumnMeta {
+    ColumnMeta {
+        name: column.name().to_string(),
+        type_name: format!("{:?}", column.column_type()),
+        kind: tiberius_column_to_kind(column.column_type()),
+        nullable: true,
+        is_primary_key: false,
+    }
+}
+
+/// Splits a list of result sets into a primary `QueryResult` plus additional
+/// sets, mirroring the multi-result-set contract on
+/// `QueryResult::additional_results`.
+///
+/// The LAST set becomes the primary (this preserves the historical "last
+/// statement wins" UX for `SELECT 1; SELECT 2;` style batches), and every
+/// earlier set is attached to `additional_results` in batch order. Empty
+/// input yields an empty primary.
+///
+/// Factored out of `execute_simple` so it can be unit-tested without a live
+/// SQL Server.
+fn build_multi_result(
+    mut collected: Vec<CollectedSet>,
+    total_time: std::time::Duration,
+) -> QueryResult {
+    let Some(primary) = collected.pop() else {
+        return QueryResult::table(Vec::new(), Vec::new(), None, total_time);
+    };
+
+    let mut result = QueryResult::table(primary.columns, primary.rows, None, total_time);
+    result.set_rows_truncated(primary.truncated);
+    for set in collected {
+        // Each additional set shares the same total batch duration;
+        // tiberius doesn't expose per-statement timing.
+        let mut additional = QueryResult::table(set.columns, set.rows, None, total_time);
+        additional.set_rows_truncated(set.truncated);
+        result.push_additional_result(additional);
+    }
+    result
+}
+
+fn tiberius_value_to_value(row: &tiberius::Row, idx: usize) -> Value {
+    use tiberius::ColumnData;
+
+    // tiberius rows expose values as `ColumnData<'_>` via `row.cells()` /
+    // `row.try_get`. We extract column data to detect typed nulls and avoid
+    // panicking on type mismatches.
+    let column = match row.columns().get(idx) {
+        Some(col) => col,
+        None => return Value::Null,
+    };
+
+    let cell: Option<&ColumnData<'static>> = row.cells().nth(idx).map(|(_, data)| data);
+    let data = match cell {
+        Some(d) => d,
+        None => return Value::Null,
+    };
+
+    match data {
+        ColumnData::U8(v) => v.map(|v| Value::Int(v as i64)).unwrap_or(Value::Null),
+        ColumnData::I16(v) => v.map(|v| Value::Int(v as i64)).unwrap_or(Value::Null),
+        ColumnData::I32(v) => v.map(|v| Value::Int(v as i64)).unwrap_or(Value::Null),
+        ColumnData::I64(v) => v.map(Value::Int).unwrap_or(Value::Null),
+        ColumnData::F32(v) => v.map(|v| Value::Float(v as f64)).unwrap_or(Value::Null),
+        ColumnData::F64(v) => v.map(Value::Float).unwrap_or(Value::Null),
+        ColumnData::Bit(v) => v.map(Value::Bool).unwrap_or(Value::Null),
+        ColumnData::String(v) => v
+            .as_ref()
+            .map(|s| Value::Text(s.to_string()))
+            .unwrap_or(Value::Null),
+        ColumnData::Guid(v) => v
+            .as_ref()
+            .map(|g| Value::Text(g.to_string()))
+            .unwrap_or(Value::Null),
+        ColumnData::Binary(v) => v
+            .as_ref()
+            .map(|b| Value::Bytes(b.to_vec()))
+            .unwrap_or(Value::Null),
+        ColumnData::Numeric(v) => v
+            .as_ref()
+            .map(|n| Value::Decimal(n.to_string()))
+            .unwrap_or(Value::Null),
+        ColumnData::Xml(v) => v
+            .as_ref()
+            .map(|x| Value::Text(x.to_string()))
+            .unwrap_or(Value::Null),
+        ColumnData::DateTime(_)
+        | ColumnData::SmallDateTime(_)
+        | ColumnData::Time(_)
+        | ColumnData::Date(_)
+        | ColumnData::DateTime2(_)
+        | ColumnData::DateTimeOffset(_) => extract_temporal(row, idx, column.column_type()),
+    }
+}
+
+/// Maps a tiberius `ColumnType` to the cross-driver `ColumnKind` the chart
+/// engine and other consumers rely on.
+///
+/// Variants whose semantic category isn't representable (`Guid`, `Xml`, `Udt`,
+/// `BigVarBin`/`BigBinary`/`Image`, `SSVariant`, `Null`) map to `Unknown` so
+/// chart auto-detect excludes them rather than treating them as text. `TIME`
+/// also maps to `Unknown`: it yields a wall-clock `Value::Time` the chart
+/// engine cannot place on a time axis.
+fn tiberius_column_to_kind(column_type: tiberius::ColumnType) -> datatab_core::ColumnKind {
+    use datatab_core::ColumnKind;
+    use tiberius::ColumnType;
+
+    match column_type {
+        ColumnType::Bit | ColumnType::Bitn => ColumnKind::Integer,
+        ColumnType::Int1
+        | ColumnType::Int2
+        | ColumnType::Int4
+        | ColumnType::Int8
+        | ColumnType::Intn => ColumnKind::Integer,
+        ColumnType::Float4
+        | ColumnType::Float8
+        | ColumnType::Floatn
+        | ColumnType::Money
+        | ColumnType::Money4
+        | ColumnType::Decimaln
+        | ColumnType::Numericn => ColumnKind::Float,
+        ColumnType::Datetime
+        | ColumnType::Datetime4
+        | ColumnType::Datetimen
+        | ColumnType::Datetime2
+        | ColumnType::Daten
+        | ColumnType::DatetimeOffsetn => ColumnKind::Timestamp,
+        ColumnType::Null
+        | ColumnType::Guid
+        | ColumnType::Xml
+        | ColumnType::Udt
+        | ColumnType::BigVarBin
+        | ColumnType::BigBinary
+        | ColumnType::Image
+        | ColumnType::SSVariant
+        // TIME yields Value::Time (a wall-clock time-of-day with no absolute
+        // instant); the chart engine cannot plot it on a time axis, so it must
+        // not advertise Timestamp.
+        | ColumnType::Timen => ColumnKind::Unknown,
+        ColumnType::BigVarChar
+        | ColumnType::BigChar
+        | ColumnType::NVarchar
+        | ColumnType::NChar
+        | ColumnType::Text
+        | ColumnType::NText => ColumnKind::Text,
+    }
+}
+
+fn extract_temporal(row: &tiberius::Row, idx: usize, _column_type: tiberius::ColumnType) -> Value {
+    // tiberius exposes typed accessors for chrono types; we try them in order
+    // of decreasing precision and fall back to a string representation.
+    if let Ok(Some(v)) = row.try_get::<chrono::DateTime<Utc>, _>(idx) {
+        return Value::DateTime(v);
+    }
+
+    if let Ok(Some(v)) = row.try_get::<NaiveDateTime, _>(idx) {
+        return Value::DateTime(DateTime::<Utc>::from_naive_utc_and_offset(v, Utc));
+    }
+
+    if let Ok(Some(v)) = row.try_get::<NaiveDate, _>(idx) {
+        return Value::Date(v);
+    }
+
+    if let Ok(Some(v)) = row.try_get::<NaiveTime, _>(idx) {
+        return Value::Time(v);
+    }
+
+    Value::Null
+}
+
+impl Connection for MssqlConnection {
+    fn metadata(&self) -> &DriverMetadata {
+        &METADATA
+    }
+
+    fn language_service(&self) -> &dyn datatab_core::LanguageService {
+        // T-SQL has constructs that the shared tree-sitter-sequel parser
+        // doesn't recognise (TOP, OUTPUT INSERTED, MERGE, CROSS APPLY,
+        // WITH (NOLOCK), OFFSET ROWS FETCH NEXT, etc.). Returning the
+        // T-SQL-aware service suppresses the noisy parse diagnostics
+        // while keeping dangerous-query detection.
+        &crate::TSqlLanguageService
+    }
+
+    fn probe_write_privilege(&self) -> datatab_core::WritePrivilege {
+        self.inner
+            .lock()
+            .ok()
+            .map(|mut inner| crate::instance_catalog::probe_mssql_write_privilege(&mut inner))
+            .unwrap_or(datatab_core::WritePrivilege::Unknown)
+    }
+
+    fn instance_catalog(&self) -> Option<Box<dyn InstanceCatalog>> {
+        let mut inner = self.inner.lock().ok()?;
+        let view_server_state_available =
+            crate::instance_catalog::MssqlInstanceCatalog::probe_view_server_state(&mut inner);
+        drop(inner);
+
+        Some(Box::new(
+            crate::instance_catalog::MssqlInstanceCatalog::new(
+                Arc::clone(&self.inner),
+                view_server_state_available,
+            ),
+        ))
+    }
+
+    fn ping(&self) -> Result<(), DbError> {
+        self.execute_simple("SELECT 1").map(|_| ())
+    }
+
+    fn close(&mut self) -> Result<(), DbError> {
+        if let Ok(mut guard) = self.inner.lock() {
+            guard.client = None;
+        }
+        Ok(())
+    }
+
+    fn execute(&self, req: &QueryRequest) -> Result<QueryResult, DbError> {
+        // Refuse what this driver cannot honor before anything else runs, so a
+        // refusal has no side effects. That includes the post-cancel recovery
+        // below, which clears a pending cancellation signal. There is no
+        // statement deadline mechanism (no watchdog, no KILL-based deadline,
+        // no session-level SET), and the instance-catalog dispatch paths run
+        // whole catalog queries with no place to apply a row cap.
+        if req.statement_timeout.is_some() {
+            return Err(DbError::NotSupported(
+                "SQL Server: the requested statement timeout cannot be honored safely by this driver; the request was rejected before execution".to_string(),
+            ));
+        }
+        // SQL Server has no read-only transaction mode to apply per request.
+        req.refuse_read_only_enforcement("SQL Server")?;
+
+        if req.limit.is_some()
+            && let Some(source) = req
+                .execution_context
+                .as_ref()
+                .and_then(|ctx| ctx.source.as_ref())
+        {
+            match source {
+                ExecutionSourceContext::InstanceMetricQuery { .. } => {
+                    return Err(DbError::NotSupported(
+                        "SQL Server: a row limit cannot be applied to an instance metric query; the request was rejected before execution".to_string(),
+                    ));
+                }
+                ExecutionSourceContext::InstanceInspectorQuery { .. } => {
+                    return Err(DbError::NotSupported(
+                        "SQL Server: a row limit cannot be applied to an instance inspector query; the request was rejected before execution".to_string(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        // Do not blanket-reset `cancelled` here — that would race with a
+        // `cancel()` that fires between two executions and silently drop the
+        // signal. Instead, recover the connection if a previous cancel left
+        // it poisoned (which is what `cleanup_after_cancel` is for) before
+        // dispatching the new query.
+        if self.poisoned.load(Ordering::SeqCst) {
+            self.cleanup_after_cancel()?;
+        }
+
+        // Support explicit database override per query, mirroring postgres/mysql.
+        if let Some(database) = req.database.as_deref() {
+            self.set_active_database(Some(database))?;
+        }
+
+        if let Some(source) = req
+            .execution_context
+            .as_ref()
+            .and_then(|ctx| ctx.source.as_ref())
+        {
+            match source {
+                ExecutionSourceContext::InstanceMetricQuery { metric_id, .. } => {
+                    let mut inner = self.inner.lock().map_err(|_| {
+                        DbError::QueryFailed("mssql inner mutex poisoned".to_string().into())
+                    })?;
+                    return crate::instance_catalog::dispatch_metric_series(&mut inner, metric_id);
+                }
+                ExecutionSourceContext::InstanceInspectorQuery { metric_id } => {
+                    let mut inner = self.inner.lock().map_err(|_| {
+                        DbError::QueryFailed("mssql inner mutex poisoned".to_string().into())
+                    })?;
+                    return crate::instance_catalog::dispatch_inspector_snapshot(
+                        &mut inner, metric_id,
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        // Slice by char boundary, not byte index: SQL with multi-byte UTF-8
+        // (CJK identifiers, `N'…'` literals with non-ASCII, accented comments)
+        // would panic on `&req.sql[..80]` when 80 falls mid-codepoint.
+        let sql_preview = match req.sql.char_indices().nth(80) {
+            Some((idx, _)) => format!("{}...", &req.sql[..idx]),
+            None => req.sql.clone(),
+        };
+        log::debug!("[QUERY] Executing: {}", sql_preview.replace('\n', " "));
+
+        let transaction_count_before = self.transaction_count_before_batch(&req.sql);
+
+        match self.execute_simple_bounded(&req.sql, req.limit) {
+            Ok(result) => {
+                if self.cancelled.load(Ordering::SeqCst) {
+                    Err(DbError::Cancelled)
+                } else {
+                    Ok(result)
+                }
+            }
+            Err(err) => {
+                // After KILL, the server raises a session-terminated error
+                // (596 / 233 / 6005) on the next read from the killed
+                // connection. Map any such error to `Cancelled` when the user
+                // actually requested cancellation, so the UI surfaces the
+                // expected outcome instead of a confusing protocol error.
+                if self.cancelled.load(Ordering::SeqCst) || is_kill_error(&err) {
+                    Err(DbError::Cancelled)
+                } else {
+                    Err(self.resolve_failed_batch_transaction(err, transaction_count_before))
+                }
+            }
+        }
+    }
+
+    fn cancel(&self, _handle: &QueryHandle) -> Result<(), DbError> {
+        self.cancel_handle().cancel()
+    }
+
+    fn cancel_active(&self) -> Result<(), DbError> {
+        self.cancel_handle().cancel()
+    }
+
+    fn cancel_handle(&self) -> Arc<dyn QueryCancelHandle> {
+        Arc::new(MssqlCancelHandle {
+            cancelled: self.cancelled.clone(),
+            spid: self.spid.clone(),
+            reconnect_config: self.reconnect_config.clone(),
+            poisoned: self.poisoned.clone(),
+        })
+    }
+
+    fn cleanup_after_cancel(&self) -> Result<(), DbError> {
+        // Only reconnect if a previous `cancel()` poisoned the connection.
+        // For ordinary errors (no KILL involved) the existing client is still
+        // usable and this is a no-op.
+        if !self.poisoned.load(Ordering::SeqCst) {
+            self.cancelled.store(false, Ordering::SeqCst);
+            return Ok(());
+        }
+
+        log::info!("[CLEANUP] Reconnecting SQL Server connection after KILL");
+
+        let config = (*self.reconnect_config).clone();
+        let active_database = self
+            .current_database
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+
+        let new_session: Result<(TiberiusClient, i32, Option<String>), tiberius::error::Error> = {
+            let mut guard = match self.inner.lock() {
+                Ok(g) => g,
+                Err(poison_err) => poison_err.into_inner(),
+            };
+
+            // Drop the old client first so the underlying socket closes
+            // promptly; tiberius does not always tear down on KILL alone.
+            guard.client = None;
+
+            guard.runtime.block_on(async move {
+                let mut client = establish_tiberius(config).await?;
+                let (spid, database) = capture_session_info(&mut client).await?;
+                Ok((client, spid, database))
+            })
+        };
+
+        let (new_client, new_spid, new_database) = new_session.map_err(|e| {
+            log::error!("[CLEANUP] Reconnect failed: {}", e);
+            // Address fields aren't worth reconstructing here — the message
+            // from tiberius is already host-aware via Config::get_addr().
+            format_mssql_connect_error(&e, "?", 0)
+        })?;
+
+        {
+            let mut guard = match self.inner.lock() {
+                Ok(g) => g,
+                Err(poison_err) => poison_err.into_inner(),
+            };
+            guard.client = Some(new_client);
+        }
+
+        self.spid.store(new_spid, Ordering::SeqCst);
+
+        // The new session starts in whatever the login defaults to. If the
+        // user was previously on a specific database, restore that selection
+        // before clearing the poisoned flag — otherwise a failing `USE [db]`
+        // would leave the connection alive on the login's default database
+        // while callers (with `poisoned == false`) assume recovery succeeded
+        // on the requested one. With the clear deferred, a USE failure leaves
+        // `poisoned == true`, so the next `execute()` triggers another
+        // recovery attempt instead of silently running on the wrong DB.
+        if let Some(db) = active_database {
+            let escaped = db.replace(']', "]]");
+            self.execute_simple(&format!("USE [{}]", escaped))?;
+        } else if let Some(db) = new_database {
+            // No previous selection to restore: the reconnect landed in the
+            // login's default database, so track that actual database rather
+            // than leaving the selection unknown.
+            if let Ok(mut current) = self.current_database.lock() {
+                *current = Some(db);
+            }
+        }
+
+        self.poisoned.store(false, Ordering::SeqCst);
+        self.cancelled.store(false, Ordering::SeqCst);
+
+        log::info!("[CLEANUP] Reconnect complete, new SPID = {}", new_spid);
+        Ok(())
+    }
+
+    fn schema_snapshot_authority(&self) -> datatab_core::SchemaSnapshotAuthority {
+        datatab_core::SchemaSnapshotAuthority::EnumerationOnly
+    }
+
+    fn schema(&self) -> Result<SchemaSnapshot, DbError> {
+        let total_start = Instant::now();
+        log::debug!("[SCHEMA] Starting schema fetch");
+
+        let databases = self.list_databases()?;
+        let current_database = self
+            .current_database
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+
+        log::debug!(
+            "[SCHEMA] Fetched {} databases in {:.2}ms",
+            databases.len(),
+            total_start.elapsed().as_secs_f64() * 1000.0
+        );
+
+        Ok(SchemaSnapshot::relational(RelationalSchema {
+            databases,
+            current_database,
+            schemas: Vec::new(),
+            tables: Vec::new(),
+            views: Vec::new(),
+        }))
+    }
+
+    fn list_databases(&self) -> Result<Vec<DatabaseInfo>, DbError> {
+        // Hide built-in system databases.
+        let sql = "SELECT name FROM sys.databases \
+                   WHERE name NOT IN ('master','tempdb','model','msdb') \
+                   ORDER BY name";
+
+        let result = self.execute_simple(sql)?;
+        let current = self
+            .current_database
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+
+        Ok(result
+            .rows
+            .into_iter()
+            .filter_map(|row| {
+                row.into_iter().next().and_then(|v| match v {
+                    Value::Text(s) => Some(s),
+                    _ => None,
+                })
+            })
+            .map(|name| DatabaseInfo {
+                is_current: current.as_ref() == Some(&name),
+                name,
+            })
+            .collect())
+    }
+
+    fn schema_for_database(&self, database: &str) -> Result<DbSchemaInfo, DbError> {
+        log::debug!("[SCHEMA] Fetching schema for database: {}", database);
+
+        let escaped_db = database.replace(']', "]]");
+        let qualified = format!("[{}]", escaped_db);
+
+        // Shallow table list scoped to the requested database.
+        let tables_sql = format!(
+            "SELECT s.name AS schema_name, t.name AS table_name \
+             FROM {qualified}.sys.tables t \
+             JOIN {qualified}.sys.schemas s ON s.schema_id = t.schema_id \
+             WHERE t.is_ms_shipped = 0 \
+             ORDER BY s.name, t.name",
+            qualified = qualified
+        );
+
+        let table_rows = self.execute_simple(&tables_sql)?;
+        let mut tables = Vec::new();
+
+        for row in table_rows.rows {
+            let mut iter = row.into_iter();
+            let schema_name = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let table_name = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+
+            tables.push(TableInfo {
+                name: table_name,
+                schema: Some(schema_name),
+                columns: None,
+                indexes: None,
+                foreign_keys: None,
+                constraints: None,
+                sample_fields: None,
+                presentation: datatab_core::CollectionPresentation::DataGrid,
+                child_items: None,
+                storage_hints: None,
+                pseudo_columns: Box::default(),
+            });
+        }
+
+        let views_sql = format!(
+            "SELECT s.name AS schema_name, v.name AS view_name \
+             FROM {qualified}.sys.views v \
+             JOIN {qualified}.sys.schemas s ON s.schema_id = v.schema_id \
+             WHERE v.is_ms_shipped = 0 \
+             ORDER BY s.name, v.name",
+            qualified = qualified
+        );
+
+        let view_rows = self.execute_simple(&views_sql)?;
+        let mut views = Vec::new();
+
+        for row in view_rows.rows {
+            let mut iter = row.into_iter();
+            let schema_name = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let view_name = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+
+            views.push(ViewInfo {
+                name: view_name,
+                schema: Some(schema_name),
+            });
+        }
+
+        Ok(DbSchemaInfo {
+            name: database.to_string(),
+            tables,
+            views,
+            custom_types: None,
+        })
+    }
+
+    fn table_details(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<TableInfo, DbError> {
+        let schema_name = schema.unwrap_or("dbo");
+
+        log::debug!(
+            "[SCHEMA] Fetching details for table: {}.{}.{}",
+            database,
+            schema_name,
+            table
+        );
+
+        let columns = self.fetch_columns(database, schema_name, table)?;
+        let indexes = self.fetch_indexes(database, schema_name, table)?;
+        let foreign_keys = self.fetch_foreign_keys(database, schema_name, table)?;
+        let constraints = self.fetch_constraints(database, schema_name, table)?;
+
+        Ok(TableInfo {
+            name: table.to_string(),
+            schema: Some(schema_name.to_string()),
+            columns: Some(columns),
+            indexes: Some(IndexData::Relational(indexes)),
+            foreign_keys: Some(foreign_keys),
+            constraints: Some(constraints),
+            sample_fields: None,
+            presentation: datatab_core::CollectionPresentation::DataGrid,
+            child_items: None,
+            storage_hints: None,
+            pseudo_columns: Box::default(),
+        })
+    }
+
+    fn table_creation_metadata(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<Option<TableCreationMetadata>, DbError> {
+        let schema_name = schema.unwrap_or("dbo");
+        let escaped_db = database.replace(']', "]]");
+        let qualified_db = format!("[{escaped_db}]");
+        let escaped_schema = schema_name.replace('\'', "''");
+        let escaped_table = table.replace('\'', "''");
+        let where_clause = format!("s.name = '{escaped_schema}' AND tbl.name = '{escaped_table}'");
+
+        // Table-level properties: memory-optimized and system-versioned
+        // temporal tables have creation semantics this generator cannot
+        // express; a table on a non-default filegroup would silently lose
+        // its storage placement when the ON clause is omitted.
+        let table_sql = format!(
+            "SELECT tbl.is_memory_optimized, tbl.temporal_type, \
+             CASE WHEN EXISTS(SELECT 1 FROM {qualified_db}.sys.key_constraints kc \
+                    WHERE kc.type = 'PK' AND kc.parent_object_id = tbl.object_id) \
+                  THEN 1 ELSE 0 END AS has_pk, \
+             ds.is_default, \
+             ISNULL((SELECT MAX(i.type) FROM {qualified_db}.sys.indexes i \
+                     WHERE i.object_id = tbl.object_id AND i.is_primary_key = 1), 0) AS pk_index_type, \
+             ISNULL((SELECT MAX(p.data_compression) FROM {qualified_db}.sys.partitions p \
+                     WHERE p.object_id = tbl.object_id AND p.index_id IN (0, 1)), 0) AS data_compression \
+             FROM {qualified_db}.sys.tables tbl \
+             JOIN {qualified_db}.sys.schemas s ON s.schema_id = tbl.schema_id \
+             JOIN {qualified_db}.sys.indexes ti ON ti.object_id = tbl.object_id \
+                   AND ti.index_id IN (0, 1) \
+             JOIN {qualified_db}.sys.data_spaces ds ON ds.data_space_id = ti.data_space_id \
+             WHERE {where_clause}"
+        );
+        let table_result = self.execute_simple(&table_sql)?;
+        let Some(table_row) = table_result.rows.into_iter().next() else {
+            // Table not found in the reference: metadata is unavailable, and
+            // callers must treat that as absent rather than as "no identity".
+            return Ok(None);
+        };
+
+        let mut table_iter = table_row.into_iter();
+        let is_memory_optimized = value_is_truthy(table_iter.next());
+        let temporal_type = match table_iter.next() {
+            Some(Value::Int(n)) => n,
+            _ => 0,
+        };
+        let has_primary_key = value_is_truthy(table_iter.next());
+        let on_default_filegroup = value_is_truthy(table_iter.next());
+        // sys.indexes.type: 1 = clustered, 2 = nonclustered. A plain
+        // `PRIMARY KEY (…)` in generated DDL creates a clustered key, so a
+        // nonclustered source key must refuse rather than silently cluster.
+        let pk_index_type = match table_iter.next() {
+            Some(Value::Int(n)) => n,
+            _ => 0,
+        };
+        // sys.partitions.data_compression: 0 = none, 1 = row, 2 = page.
+        let data_compression = match table_iter.next() {
+            Some(Value::Int(n)) => n,
+            _ => 0,
+        };
+
+        let mut blockers = Vec::new();
+        if is_memory_optimized {
+            blockers.push(CreationBlocker {
+                code: "memory_optimized".to_string(),
+                message: "memory-optimized tables require an In-Memory OLTP filegroup".to_string(),
+                column: None,
+            });
+        }
+        // sys.tables.temporal_type: 0 = non-temporal, 1 = history table,
+        // 2 = system-versioned.
+        if temporal_type != 0 {
+            blockers.push(CreationBlocker {
+                code: "system_versioned_temporal".to_string(),
+                message: "system-versioned temporal tables require history-table wiring"
+                    .to_string(),
+                column: None,
+            });
+        }
+        if has_primary_key && pk_index_type == 2 {
+            blockers.push(CreationBlocker {
+                code: "nonclustered_primary_key".to_string(),
+                message: "a nonclustered primary key would be recreated as clustered".to_string(),
+                column: None,
+            });
+        }
+        if data_compression != 0 {
+            blockers.push(CreationBlocker {
+                code: "data_compression".to_string(),
+                message: "row/page compression would be silently lost".to_string(),
+                column: None,
+            });
+        }
+
+        let mut missing: Vec<MissingCreationMetadata> = Vec::new();
+        if !on_default_filegroup {
+            missing.push(MissingCreationMetadata::StorageOptions);
+        }
+
+        // Column-level properties that block faithful generation.
+        let column_sql = format!(
+            "SELECT c.name, c.is_computed, c.is_sparse, c.is_filestream, c.is_rowguidcol, \
+                    t.is_user_defined, t.is_assembly_type, c.collation_name, \
+                    t.name AS type_name, c.xml_collection_id \
+             FROM {qualified_db}.sys.columns c \
+             JOIN {qualified_db}.sys.tables tbl ON tbl.object_id = c.object_id \
+             JOIN {qualified_db}.sys.schemas s ON s.schema_id = tbl.schema_id \
+             JOIN {qualified_db}.sys.types t ON t.user_type_id = c.user_type_id \
+             WHERE {where_clause} ORDER BY c.column_id"
+        );
+        let column_result = self.execute_simple(&column_sql)?;
+        for row in column_result.rows {
+            let mut iter = row.into_iter();
+            let column_name = match iter.next() {
+                Some(Value::Text(name)) => name,
+                _ => continue,
+            };
+            let is_computed = value_is_truthy(iter.next());
+            let is_sparse = value_is_truthy(iter.next());
+            let is_filestream = value_is_truthy(iter.next());
+            let is_rowguidcol = value_is_truthy(iter.next());
+            let is_user_defined = value_is_truthy(iter.next());
+            let is_assembly_type = value_is_truthy(iter.next());
+            let collation_name = match iter.next() {
+                Some(Value::Text(collation)) => Some(collation),
+                _ => None,
+            };
+
+            let mut push_blocker = |code: &str, message: String| {
+                blockers.push(CreationBlocker {
+                    code: code.to_string(),
+                    message,
+                    column: Some(column_name.clone()),
+                });
+            };
+            if is_computed {
+                push_blocker(
+                    "computed_column",
+                    "computed columns are not reproducible from introspection".to_string(),
+                );
+            }
+            if is_user_defined || is_assembly_type {
+                push_blocker(
+                    "user_defined_type",
+                    "the column type is a user-defined/CLR type that must pre-exist in the target"
+                        .to_string(),
+                );
+            }
+            if is_sparse {
+                push_blocker(
+                    "sparse_column",
+                    "sparse column storage would be silently lost".to_string(),
+                );
+            }
+            if is_filestream {
+                push_blocker(
+                    "filestream_column",
+                    "FILESTREAM storage would be silently lost".to_string(),
+                );
+            }
+            if is_rowguidcol {
+                push_blocker(
+                    "rowguidcol_property",
+                    "the ROWGUIDCOL property would be silently lost".to_string(),
+                );
+            }
+            if let Some(collation) = collation_name {
+                // sys.columns.collation_name is non-null for every text-typed
+                // column, whether the collation was explicitly declared or
+                // inherited from the database default. Even a column matching
+                // the SOURCE database default is unsafe: a column created in
+                // the target without COLLATE inherits the TARGET database
+                // default, which is unknown at reference-introspection time
+                // and may differ.
+                push_blocker(
+                    "column_collation",
+                    format!("collation '{collation}' cannot be reproduced in the target database"),
+                );
+            }
+            let type_name = match iter.next() {
+                Some(Value::Text(name)) => name,
+                _ => String::new(),
+            };
+            let xml_collection_id = match iter.next() {
+                Some(Value::Int(n)) => n,
+                _ => 0,
+            };
+            if let Some(message) = typed_xml_blocker(&type_name, xml_collection_id) {
+                push_blocker("typed_xml", message.to_string());
+            }
+        }
+
+        // Identity: exact seed/increment read as server-converted text so
+        // numeric(38,0) magnitudes beyond i64 survive verbatim.
+        let identity_sql = format!(
+            "SELECT c.name, CONVERT(NVARCHAR(4000), ic.seed_value), \
+                    CONVERT(NVARCHAR(4000), ic.increment_value), ic.is_not_for_replication \
+             FROM {qualified_db}.sys.identity_columns ic \
+             JOIN {qualified_db}.sys.columns c ON c.object_id = ic.object_id \
+                   AND c.column_id = ic.column_id \
+             JOIN {qualified_db}.sys.tables tbl ON tbl.object_id = ic.object_id \
+             JOIN {qualified_db}.sys.schemas s ON s.schema_id = tbl.schema_id \
+             WHERE {where_clause} ORDER BY c.column_id"
+        );
+        let identity_result = self.execute_simple(&identity_sql)?;
+        let mut identity: Option<IdentitySpec> = None;
+        for row in identity_result.rows {
+            let mut iter = row.into_iter();
+            let column_name = match iter.next() {
+                Some(Value::Text(name)) => name,
+                _ => continue,
+            };
+            let seed = match iter.next() {
+                Some(Value::Text(seed)) => seed,
+                _ => {
+                    missing.push(MissingCreationMetadata::IdentitySeedOrIncrement);
+                    continue;
+                }
+            };
+            let increment = match iter.next() {
+                Some(Value::Text(increment)) => increment,
+                _ => {
+                    missing.push(MissingCreationMetadata::IdentitySeedOrIncrement);
+                    continue;
+                }
+            };
+            if value_is_truthy(iter.next()) {
+                blockers.push(CreationBlocker {
+                    code: "identity_not_for_replication".to_string(),
+                    message: "the identity's NOT FOR REPLICATION property would be silently lost"
+                        .to_string(),
+                    column: Some(column_name.clone()),
+                });
+            }
+            identity = Some(IdentitySpec {
+                column: column_name,
+                seed,
+                increment,
+            });
+        }
+
+        // Primary-key column order in declared key order, with key-column
+        // direction (a descending key column cannot be expressed by the
+        // ordered-column contract).
+        let pk_sql = format!(
+            "SELECT c.name, ic.is_descending_key \
+             FROM {qualified_db}.sys.key_constraints kc \
+             JOIN {qualified_db}.sys.indexes i ON i.object_id = kc.parent_object_id \
+                   AND i.index_id = kc.unique_index_id \
+             JOIN {qualified_db}.sys.index_columns ic ON ic.object_id = i.object_id \
+                   AND ic.index_id = i.index_id AND ic.key_ordinal >= 1 \
+             JOIN {qualified_db}.sys.columns c ON c.object_id = ic.object_id \
+                   AND c.column_id = ic.column_id \
+             JOIN {qualified_db}.sys.tables tbl ON tbl.object_id = kc.parent_object_id \
+             JOIN {qualified_db}.sys.schemas s ON s.schema_id = tbl.schema_id \
+             WHERE kc.type = 'PK' AND {where_clause} ORDER BY ic.key_ordinal"
+        );
+        let pk_result = self.execute_simple(&pk_sql)?;
+        let mut pk_columns = Vec::new();
+        let mut descending_pk_key = false;
+        for row in pk_result.rows {
+            let mut iter = row.into_iter();
+            let name = match iter.next() {
+                Some(Value::Text(name)) => name,
+                _ => continue,
+            };
+            if value_is_truthy(iter.next()) {
+                descending_pk_key = true;
+            }
+            pk_columns.push(name);
+        }
+        let primary_key = if has_primary_key && !pk_columns.is_empty() {
+            if descending_pk_key {
+                blockers.push(CreationBlocker {
+                    code: "descending_primary_key".to_string(),
+                    message: "a descending primary-key column would be recreated ascending"
+                        .to_string(),
+                    column: None,
+                });
+            }
+            Some(PrimaryKeySpec {
+                columns: pk_columns,
+            })
+        } else {
+            if has_primary_key {
+                missing.push(MissingCreationMetadata::PrimaryKeyOrder);
+            }
+            None
+        };
+
+        // Column defaults: distinguish a genuinely absent default
+        // (default_object_id = 0) from a KNOWN default whose definition is
+        // not available (legacy sp_bindefault-bound defaults, permission-
+        // hidden definitions). The latter must surface as named
+        // incompleteness, never silently drop on generation.
+        let defaults_sql = format!(
+            "SELECT \
+                ISNULL(SUM(CASE WHEN c.default_object_id <> 0 THEN 1 ELSE 0 END), 0) AS defaults_total, \
+                ISNULL(SUM(CASE WHEN c.default_object_id <> 0 AND dc.definition IS NULL \
+                                THEN 1 ELSE 0 END), 0) AS defaults_unreadable \
+             FROM {qualified_db}.sys.columns c \
+             LEFT JOIN {qualified_db}.sys.default_constraints dc \
+                   ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id \
+             JOIN {qualified_db}.sys.tables tbl ON tbl.object_id = c.object_id \
+             JOIN {qualified_db}.sys.schemas s ON s.schema_id = tbl.schema_id \
+             WHERE {where_clause}"
+        );
+        let defaults_result = self.execute_simple(&defaults_sql)?;
+        let (defaults_total, defaults_unreadable) = defaults_result
+            .rows
+            .into_iter()
+            .next()
+            .map(|row| {
+                let mut iter = row.into_iter();
+                let total = match iter.next() {
+                    Some(Value::Int(n)) => n.max(0) as usize,
+                    _ => 0,
+                };
+                let unreadable = match iter.next() {
+                    Some(Value::Int(n)) => n.max(0) as usize,
+                    _ => 0,
+                };
+                (total, unreadable)
+            })
+            .unwrap_or((0, 0));
+        if let Some(missing_defaults) =
+            default_expression_availability(defaults_total, defaults_unreadable)
+        {
+            missing.push(missing_defaults);
+        }
+
+        let completeness = if missing.is_empty() {
+            MetadataCompleteness::Complete
+        } else {
+            MetadataCompleteness::Partial { missing }
+        };
+
+        Ok(Some(TableCreationMetadata {
+            schema: Some(schema_name.to_string()),
+            table: table.to_string(),
+            completeness,
+            identity,
+            primary_key,
+            blockers,
+        }))
+    }
+
+    fn view_details(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+        view: &str,
+    ) -> Result<ViewInfo, DbError> {
+        let schema_name = schema.unwrap_or("dbo");
+        log::debug!(
+            "[SCHEMA] Fetching details for view: {}.{}.{}",
+            database,
+            schema_name,
+            view
+        );
+
+        // We only return the basic name/schema today; the `ViewInfo` shape
+        // doesn't carry a definition field. The query here also asserts
+        // the view actually exists in the requested database, which is the
+        // useful side-effect for error reporting.
+        let escaped_db = database.replace(']', "]]");
+        let qualified_db = format!("[{}]", escaped_db);
+        let escaped_schema = schema_name.replace('\'', "''");
+        let escaped_view = view.replace('\'', "''");
+
+        let sql = format!(
+            "SELECT 1 FROM {qualified_db}.sys.views v \
+             JOIN {qualified_db}.sys.schemas s ON s.schema_id = v.schema_id \
+             WHERE s.name = '{escaped_schema}' AND v.name = '{escaped_view}'",
+        );
+        self.execute_simple(&sql)?;
+
+        Ok(ViewInfo {
+            name: view.to_string(),
+            schema: Some(schema_name.to_string()),
+        })
+    }
+
+    fn schema_features(&self) -> SchemaFeatures {
+        SchemaFeatures::FOREIGN_KEYS
+            | SchemaFeatures::CHECK_CONSTRAINTS
+            | SchemaFeatures::UNIQUE_CONSTRAINTS
+            | SchemaFeatures::CUSTOM_TYPES
+            | SchemaFeatures::FUNCTIONS
+    }
+
+    fn schema_types(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+    ) -> Result<Vec<CustomTypeInfo>, DbError> {
+        let schema_name = schema.unwrap_or("dbo");
+        self.fetch_custom_types(database, schema_name)
+    }
+
+    fn schema_indexes(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+    ) -> Result<Vec<SchemaIndexInfo>, DbError> {
+        let schema_name = schema.unwrap_or("dbo");
+        self.fetch_schema_indexes(database, schema_name)
+    }
+
+    fn schema_foreign_keys(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+    ) -> Result<Vec<SchemaForeignKeyInfo>, DbError> {
+        let schema_name = schema.unwrap_or("dbo");
+        self.fetch_schema_foreign_keys(database, schema_name)
+    }
+
+    fn schema_routines(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+    ) -> Result<Vec<RoutineInfo>, DbError> {
+        let schema_name = schema.unwrap_or("dbo");
+        get_schema_routines(self, database, schema_name)
+    }
+
+    fn routine_definition(
+        &self,
+        _database: &str,
+        _schema: &str,
+        specific_name: &str,
+    ) -> Result<String, DbError> {
+        // specific_name is the object_id serialized as a decimal string.
+        // Parse and validate it to prevent any SQL injection before embedding
+        // it into the query string.
+        let object_id: i64 = specific_name.trim().parse().map_err(|_| {
+            DbError::query_failed(format!(
+                "Invalid routine specific_name (expected object_id): {}",
+                specific_name
+            ))
+        })?;
+
+        let sql = format!("SELECT OBJECT_DEFINITION({}) AS definition", object_id);
+        let rows = self.execute_simple(&sql)?;
+
+        let definition = rows.rows.into_iter().next().and_then(|row| {
+            row.into_iter().next().and_then(|v| match v {
+                Value::Text(s) => Some(s),
+                _ => None,
+            })
+        });
+
+        match definition {
+            Some(def) => Ok(def),
+            None => Ok(format!(
+                "-- Definition not available for this routine (object_id: {}).\n\
+                 -- CLR routines, encrypted objects, and CLR aggregates have no T-SQL definition.\n",
+                object_id
+            )),
+        }
+    }
+
+    fn set_active_database(&self, database: Option<&str>) -> Result<(), DbError> {
+        let mut current = self
+            .current_database
+            .lock()
+            .map_err(|e| DbError::query_failed(format!("Lock error: {}", e)))?;
+
+        if current.as_deref() == database {
+            return Ok(());
+        }
+
+        if let Some(db) = database {
+            let escaped = db.replace(']', "]]");
+            let sql = format!("USE [{}]", escaped);
+            self.execute_simple(&sql)?;
+        }
+
+        *current = database.map(|s| s.to_string());
+        Ok(())
+    }
+
+    fn active_database(&self) -> Option<String> {
+        self.current_database
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+    }
+
+    fn kind(&self) -> DbKind {
+        DbKind::SqlServer
+    }
+
+    fn schema_loading_strategy(&self) -> SchemaLoadingStrategy {
+        SchemaLoadingStrategy::LazyPerDatabase
+    }
+
+    /// SQL Server-specific browse implementation.
+    ///
+    /// Overridden because the default impl in `datatab_core` (a) emits the
+    /// MySQL-style `LIMIT n OFFSET m` syntax, which SQL Server does not accept,
+    /// and (b) forwards the table's schema (e.g. `dbo`) as the *database* via
+    /// `with_database`, which would make the driver issue `USE [dbo]` — a 911
+    /// "database does not exist" error, since `dbo` is a schema. We embed the
+    /// schema in the `FROM` clause and leave the active database alone. The
+    /// request's database, when the caller knows it, is embedded the same way,
+    /// which is what lets a table in another database be read without a `USE`
+    /// and without depending on where the session happens to be.
+    fn browse_table(&self, request: &TableBrowseRequest) -> Result<QueryResult, DbError> {
+        self.execute(&QueryRequest::new(browse_sql(request)?))
+    }
+
+    /// SQL Server-specific count implementation.
+    ///
+    /// The default impl is mostly correct, but we override it for symmetry with
+    /// `browse_table` and to make explicit that the schema, and the request's
+    /// database when it has one, are part of the `FROM` clause — never the
+    /// active database.
+    fn count_table(&self, request: &TableCountRequest) -> Result<u64, DbError> {
+        let result = self.execute(&QueryRequest::new(count_sql(request)?))?;
+        Ok(result
+            .rows
+            .first()
+            .and_then(|row| row.first())
+            .and_then(|v| match v {
+                Value::Int(n) => Some(*n as u64),
+                _ => None,
+            })
+            .unwrap_or(0))
+    }
+
+    fn fetch_row_by_pk(
+        &self,
+        database: &str,
+        schema: &str,
+        table: &str,
+        pk_column: &str,
+        pk_value: &Value,
+    ) -> Result<Option<std::collections::HashMap<String, Value>>, DbError> {
+        let sql = row_by_pk_sql(Some(database), schema, table, pk_column, pk_value);
+        let result = self.execute(&QueryRequest::new(sql))?;
+        let columns = result.columns;
+        let Some(row) = result.rows.into_iter().next() else {
+            return Ok(None);
+        };
+
+        let map = columns
+            .into_iter()
+            .zip(row)
+            .map(|(col, val)| (col.name, val))
+            .collect();
+
+        Ok(Some(map))
+    }
+
+    /// Batched `fetch_row_by_pk`: one `WHERE pk IN (...)` statement per chunk
+    /// of at most 100 values. Honors `projection`; an empty projection list
+    /// falls back to `*` rather than emitting invalid SQL.
+    fn fetch_rows_by_pks(
+        &self,
+        database: &str,
+        schema: &str,
+        table: &str,
+        pk_column: &str,
+        values: &[Value],
+        projection: Option<&[String]>,
+    ) -> Result<Vec<std::collections::HashMap<String, Value>>, DbError> {
+        if values.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut rows = Vec::with_capacity(values.len());
+        for chunk in values.chunks(100) {
+            let sql = rows_by_pks_sql(Some(database), schema, table, pk_column, chunk, projection);
+            let result = self.execute(&QueryRequest::new(sql))?;
+            let columns = result.columns;
+            for row in result.rows {
+                rows.push(
+                    columns
+                        .iter()
+                        .zip(row)
+                        .map(|(col, val)| (col.name.clone(), val))
+                        .collect(),
+                );
+            }
+        }
+
+        Ok(rows)
+    }
+
+    fn fetch_dependents(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<Vec<datatab_core::RelationRef>, DbError> {
+        let sql = dependents_sql(database);
+        let schema = schema.unwrap_or("dbo").to_string();
+        let table = table.to_string();
+
+        let rows = self.with_client(|runtime, client| {
+            runtime.block_on(async move {
+                let rows = client
+                    .query(sql, &[&schema, &table])
+                    .await
+                    .map_err(|e| format_mssql_query_error(&e))?
+                    .into_first_result()
+                    .await
+                    .map_err(|e| format_mssql_query_error(&e))?;
+
+                rows.iter()
+                    .map(|row| {
+                        let column = |index: usize| {
+                            row.try_get::<&str, _>(index)
+                                .map_err(|e| format_mssql_query_error(&e))
+                                .map(|value| value.unwrap_or_default().to_string())
+                        };
+                        Ok((column(0)?, column(1)?, column(2)?))
+                    })
+                    .collect::<Result<Vec<_>, DbError>>()
+            })
+        })?;
+
+        Ok(dependents_from_rows(rows))
+    }
+
+    fn referenced_tables(&self, query: &str) -> Option<Vec<datatab_core::QueryTableRef>> {
+        Some(datatab_core::extract_referenced_tables(query))
+    }
+
+    fn generate_code(&self, generator_id: &str, table: &TableInfo) -> Result<String, DbError> {
+        match generator_id {
+            "select_star" => Ok(generate_select_star(&MSSQL_DIALECT, table, 100)),
+            "insert" => Ok(generate_insert_template(&MSSQL_DIALECT, table)),
+            "update" => Ok(generate_update_template(&MSSQL_DIALECT, table)),
+            "delete" => Ok(generate_delete_template(&MSSQL_DIALECT, table)),
+            "truncate" => Ok(generate_truncate(&MSSQL_DIALECT, table)),
+            "drop_table" => Ok(generate_drop_table(&MSSQL_DIALECT, table)),
+            // CREATE TABLE for SQL Server is only faithful when generated
+            // from reference-side creation metadata (identity seed/increment,
+            // primary-key order, blockers), which a plain TableInfo cannot
+            // carry and the target cannot introspect for a table it does not
+            // have. Refuse with an actionable pointer instead of generating
+            // lossy DDL. This id is deliberately absent from the sidebar
+            // code-generators list: that UI has no reference metadata, so
+            // offering it would present an unusable command.
+            "create_table" => Err(DbError::NotSupported(
+                "CREATE TABLE generation for SQL Server requires reference creation metadata \
+                 (identity seed/increment, primary-key order, blockers) that a plain TableInfo \
+                 cannot carry; use generate_code_with_creation_metadata with metadata captured \
+                 from the reference connection"
+                    .to_string(),
+            )),
+            _ => Err(DbError::NotSupported(format!(
+                "Code generator '{}' not supported",
+                generator_id
+            ))),
+        }
+    }
+
+    fn generate_code_with_creation_metadata(
+        &self,
+        generator_id: &str,
+        table: &TableInfo,
+        creation_metadata: Option<&TableCreationMetadata>,
+    ) -> Result<String, DbError> {
+        match generator_id {
+            "create_table" => mssql_create_table_ddl(table, creation_metadata),
+            _ => self.generate_code(generator_id, table),
+        }
+    }
+
+    fn update_row(&self, patch: &RowPatch) -> Result<CrudResult, DbError> {
+        if !patch.identity.is_valid() {
+            return Err(DbError::QueryFailed(
+                "Cannot update row: invalid row identity (missing primary key)"
+                    .to_string()
+                    .into(),
+            ));
+        }
+
+        if !patch.has_changes() {
+            return Err(DbError::QueryFailed(
+                "No changes to save".to_string().into(),
+            ));
+        }
+
+        let sql = build_update_with_output(patch)?;
+        log::debug!("[UPDATE] Executing: {}", sql);
+
+        let result = self.execute_simple(&sql)?;
+        Ok(result_first_row_to_crud(result))
+    }
+
+    fn insert_row(&self, insert: &RowInsert) -> Result<CrudResult, DbError> {
+        if !insert.is_valid() {
+            return Err(DbError::QueryFailed(
+                "Cannot insert row: no columns specified".to_string().into(),
+            ));
+        }
+
+        let sql = build_insert_with_output(insert)?;
+        log::debug!("[INSERT] Executing: {}", sql);
+
+        let result = self.execute_simple(&sql)?;
+        Ok(result_first_row_to_crud(result))
+    }
+
+    fn delete_row(&self, delete: &RowDelete) -> Result<CrudResult, DbError> {
+        if !delete.is_valid() {
+            return Err(DbError::QueryFailed(
+                "Cannot delete row: invalid row identity (missing primary key)"
+                    .to_string()
+                    .into(),
+            ));
+        }
+
+        let sql = build_delete_with_output(delete)?;
+        log::debug!("[DELETE] Executing: {}", sql);
+
+        let result = self.execute_simple(&sql)?;
+        Ok(result_first_row_to_crud(result))
+    }
+
+    fn describe_table(&self, request: &DescribeRequest) -> Result<QueryResult, DbError> {
+        let schema = request.table.schema.as_deref().unwrap_or("dbo");
+        let escaped_schema = schema.replace('\'', "''");
+        let escaped_table = request.table.name.replace('\'', "''");
+
+        // Qualify every `sys.*` lookup with the connection's tracked active
+        // database. MSSQL supports multi-DB-per-connection and the UI
+        // navigates across databases without reconnecting, so an unqualified
+        // `sys.columns` query would silently return metadata from whichever
+        // database happens to be active server-side — not the one the
+        // request points at. `fetch_columns` / `fetch_indexes` /
+        // `fetch_foreign_keys` already do this; describe_table should match.
+        let database = self
+            .current_database
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .unwrap_or_else(|| "master".to_string());
+        let escaped_db = database.replace(']', "]]");
+        let qualified_db = format!("[{}]", escaped_db);
+
+        let sql = format!(
+            "SELECT \
+                c.name AS column_name, \
+                t.name AS data_type, \
+                CASE WHEN c.is_nullable = 1 THEN 'YES' ELSE 'NO' END AS is_nullable, \
+                CAST(dc.definition AS NVARCHAR(MAX)) AS column_default, \
+                c.max_length AS character_maximum_length \
+             FROM {qualified_db}.sys.columns c \
+             JOIN {qualified_db}.sys.tables tbl ON tbl.object_id = c.object_id \
+             JOIN {qualified_db}.sys.schemas s ON s.schema_id = tbl.schema_id \
+             JOIN {qualified_db}.sys.types t ON t.user_type_id = c.user_type_id \
+             LEFT JOIN {qualified_db}.sys.default_constraints dc \
+               ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id \
+             WHERE s.name = '{escaped_schema}' AND tbl.name = '{escaped_table}' \
+             ORDER BY c.column_id",
+            qualified_db = qualified_db,
+            escaped_schema = escaped_schema,
+            escaped_table = escaped_table,
+        );
+
+        self.execute(&QueryRequest::new(sql))
+    }
+
+    fn explain(&self, request: &ExplainRequest) -> Result<QueryResult, DbError> {
+        // SQL Server requires SET SHOWPLAN_XML to be the only statement in
+        // its batch, so we run three separate batches: turn it on, run the
+        // query (which compiles but does not execute, returning the plan
+        // as a single nvarchar(max) row), then turn it off. We unset
+        // SHOWPLAN even if the middle batch fails so the session state
+        // does not leak.
+
+        // Mirror `execute()`'s poison/cleanup pattern: a prior cancel may
+        // have left the underlying tiberius client dead. Without this an
+        // EXPLAIN issued after a cancel would hit a closed socket and
+        // surface a protocol-level error instead of triggering reconnect.
+        if self.poisoned.load(Ordering::SeqCst) {
+            self.cleanup_after_cancel()?;
+        }
+
+        let query = match &request.query {
+            Some(q) => q.clone(),
+            None => format!(
+                "SELECT * FROM {} ORDER BY (SELECT NULL) OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY",
+                request.table.quoted_with(self.dialect())
+            ),
+        };
+
+        self.execute_simple("SET SHOWPLAN_XML ON")?;
+        let plan_result = self.execute_simple(&query);
+        // If the cleanup batch fails, every subsequent query on this session
+        // keeps returning XML plan rows instead of real data (SHOWPLAN is
+        // session-scoped). Mark the connection poisoned so the next
+        // `execute()` rebuilds the tiberius client via `cleanup_after_cancel`,
+        // which starts a fresh session with SHOWPLAN off.
+        if let Err(off_err) = self.execute_simple("SET SHOWPLAN_XML OFF") {
+            log::error!(
+                "[EXPLAIN] SET SHOWPLAN_XML OFF failed, poisoning session: {}",
+                off_err
+            );
+            self.poisoned.store(true, Ordering::SeqCst);
+        }
+        plan_result
+    }
+
+    fn dialect(&self) -> &dyn SqlDialect {
+        &MSSQL_DIALECT
+    }
+
+    fn code_generator(&self) -> &dyn CodeGenerator {
+        &MSSQL_CODE_GENERATOR
+    }
+
+    fn query_generator(&self) -> Option<&dyn QueryGenerator> {
+        static GENERATOR: SqlMutationGenerator = SqlMutationGenerator::new(&MSSQL_DIALECT);
+        Some(&GENERATOR)
+    }
+
+    fn build_truncate_sql(&self, table: &str) -> Result<String, DbError> {
+        let quoted_table = MSSQL_DIALECT.quote_identifier(table);
+        Ok(format!("TRUNCATE TABLE {}", quoted_table))
+    }
+
+    fn build_drop_index_sql(
+        &self,
+        index_name: &str,
+        table_name: Option<&str>,
+        if_exists: bool,
+    ) -> Result<String, DbError> {
+        let quoted_index = MSSQL_DIALECT.quote_identifier(index_name);
+        let table = table_name
+            .map(|t| MSSQL_DIALECT.quote_identifier(t))
+            .unwrap_or_else(|| "[table_name]".to_string());
+
+        if if_exists {
+            Ok(format!(
+                "DROP INDEX IF EXISTS {} ON {}",
+                quoted_index, table
+            ))
+        } else {
+            Ok(format!("DROP INDEX {} ON {}", quoted_index, table))
+        }
+    }
+
+    fn version_query(&self) -> Result<&'static str, DbError> {
+        Ok("SELECT @@VERSION")
+    }
+
+    fn supports_transactional_ddl(&self) -> bool {
+        true
+    }
+}
+
+impl MssqlConnection {
+    fn fetch_columns(
+        &self,
+        database: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<Vec<ColumnInfo>, DbError> {
+        let escaped_db = database.replace(']', "]]");
+        let qualified_db = format!("[{}]", escaped_db);
+        let escaped_schema = schema.replace('\'', "''");
+        let escaped_table = table.replace('\'', "''");
+
+        let sql = format!(
+            "SELECT \
+                c.name AS column_name, \
+                t.name AS type_name, \
+                c.is_nullable AS nullable, \
+                CAST(dc.definition AS NVARCHAR(MAX)) AS column_default, \
+                CASE WHEN ic.column_id IS NOT NULL THEN 1 ELSE 0 END AS is_pk, \
+                c.max_length, c.precision, c.scale \
+             FROM {qualified_db}.sys.columns c \
+             JOIN {qualified_db}.sys.tables tbl ON tbl.object_id = c.object_id \
+             JOIN {qualified_db}.sys.schemas s ON s.schema_id = tbl.schema_id \
+             JOIN {qualified_db}.sys.types t ON t.user_type_id = c.user_type_id \
+             LEFT JOIN {qualified_db}.sys.default_constraints dc \
+               ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id \
+             LEFT JOIN {qualified_db}.sys.indexes pk \
+               ON pk.object_id = c.object_id AND pk.is_primary_key = 1 \
+             LEFT JOIN {qualified_db}.sys.index_columns ic \
+               ON ic.object_id = pk.object_id AND ic.index_id = pk.index_id \
+               AND ic.column_id = c.column_id \
+             WHERE s.name = '{escaped_schema}' AND tbl.name = '{escaped_table}' \
+             ORDER BY c.column_id",
+            qualified_db = qualified_db,
+            escaped_schema = escaped_schema,
+            escaped_table = escaped_table
+        );
+
+        let result = self.execute_simple(&sql)?;
+        let mut columns = Vec::new();
+
+        for row in result.rows {
+            let mut iter = row.into_iter();
+
+            let name = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let type_name = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => String::new(),
+            };
+            let nullable = value_is_truthy(iter.next());
+            let default_value = match iter.next() {
+                Some(Value::Text(s)) => Some(s),
+                _ => None,
+            };
+            let is_primary_key = value_is_truthy(iter.next());
+            let max_length = match iter.next() {
+                Some(Value::Int(n)) => n as i32,
+                _ => 0,
+            };
+            let precision = match iter.next() {
+                Some(Value::Int(n)) => n.clamp(0, u8::MAX as i64) as u8,
+                _ => 0,
+            };
+            let scale = match iter.next() {
+                Some(Value::Int(n)) => n.clamp(0, u8::MAX as i64) as u8,
+                _ => 0,
+            };
+
+            columns.push(ColumnInfo {
+                name,
+                // Full dimensions (lengths incl. MAX, precision/scale,
+                // temporal scale) are baked in here; identity deliberately
+                // stays out of the type name — it travels in
+                // `table_creation_metadata`.
+                type_name: mssql_column_type_name(&type_name, max_length, precision, scale),
+                nullable,
+                default_value,
+                is_primary_key,
+                enum_values: None,
+            });
+        }
+
+        Ok(columns)
+    }
+
+    fn fetch_indexes(
+        &self,
+        database: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<Vec<IndexInfo>, DbError> {
+        let escaped_db = database.replace(']', "]]");
+        let qualified_db = format!("[{}]", escaped_db);
+        let escaped_schema = schema.replace('\'', "''");
+        let escaped_table = table.replace('\'', "''");
+
+        let sql = format!(
+            "SELECT \
+                i.name AS index_name, \
+                c.name AS column_name, \
+                i.is_unique, \
+                i.is_primary_key, \
+                ic.key_ordinal \
+             FROM {qualified_db}.sys.indexes i \
+             JOIN {qualified_db}.sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
+             JOIN {qualified_db}.sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+             JOIN {qualified_db}.sys.tables tbl ON tbl.object_id = i.object_id \
+             JOIN {qualified_db}.sys.schemas s ON s.schema_id = tbl.schema_id \
+             WHERE s.name = '{escaped_schema}' AND tbl.name = '{escaped_table}' \
+               AND i.name IS NOT NULL \
+             ORDER BY i.name, ic.key_ordinal",
+            qualified_db = qualified_db,
+            escaped_schema = escaped_schema,
+            escaped_table = escaped_table
+        );
+
+        let result = self.execute_simple(&sql)?;
+
+        let mut grouped: indexmap_for_indexes::IndexMap<String, IndexInfo> =
+            indexmap_for_indexes::IndexMap::new();
+
+        for row in result.rows {
+            let mut iter = row.into_iter();
+
+            let index_name = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let column_name = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let is_unique = value_is_truthy(iter.next());
+            let is_primary = value_is_truthy(iter.next());
+            // key_ordinal is consumed only for ORDER BY purposes
+            let _ = iter.next();
+
+            let entry = grouped
+                .entry(index_name.clone())
+                .or_insert_with(|| IndexInfo {
+                    name: index_name,
+                    columns: Vec::new(),
+                    is_unique,
+                    is_primary,
+                });
+            entry.columns.push(column_name);
+        }
+
+        Ok(grouped.into_iter().map(|(_, v)| v).collect())
+    }
+
+    fn fetch_foreign_keys(
+        &self,
+        database: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<Vec<ForeignKeyInfo>, DbError> {
+        let escaped_db = database.replace(']', "]]");
+        let qualified_db = format!("[{}]", escaped_db);
+        let escaped_schema = schema.replace('\'', "''");
+        let escaped_table = table.replace('\'', "''");
+
+        let sql = format!(
+            "SELECT \
+                fk.name AS constraint_name, \
+                pc.name AS column_name, \
+                rs.name AS referenced_schema, \
+                rt.name AS referenced_table, \
+                rc.name AS referenced_column, \
+                fk.delete_referential_action_desc, \
+                fk.update_referential_action_desc \
+             FROM {qualified_db}.sys.foreign_keys fk \
+             JOIN {qualified_db}.sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id \
+             JOIN {qualified_db}.sys.tables pt ON pt.object_id = fk.parent_object_id \
+             JOIN {qualified_db}.sys.schemas ps ON ps.schema_id = pt.schema_id \
+             JOIN {qualified_db}.sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id \
+             JOIN {qualified_db}.sys.tables rt ON rt.object_id = fk.referenced_object_id \
+             JOIN {qualified_db}.sys.schemas rs ON rs.schema_id = rt.schema_id \
+             JOIN {qualified_db}.sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id \
+             WHERE ps.name = '{escaped_schema}' AND pt.name = '{escaped_table}' \
+             ORDER BY fk.name, fkc.constraint_column_id",
+            qualified_db = qualified_db,
+            escaped_schema = escaped_schema,
+            escaped_table = escaped_table
+        );
+
+        let result = self.execute_simple(&sql)?;
+
+        let mut builder = ForeignKeyBuilder::new();
+
+        for row in result.rows {
+            let mut iter = row.into_iter();
+
+            let name = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let column = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let referenced_schema = match iter.next() {
+                Some(Value::Text(s)) => Some(s),
+                _ => None,
+            };
+            let referenced_table = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let referenced_column = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let on_delete = match iter.next() {
+                Some(Value::Text(s)) if s != "NO_ACTION" => Some(normalize_fk_action(&s)),
+                _ => None,
+            };
+            let on_update = match iter.next() {
+                Some(Value::Text(s)) if s != "NO_ACTION" => Some(normalize_fk_action(&s)),
+                _ => None,
+            };
+
+            builder.add_column(
+                name,
+                column,
+                referenced_schema,
+                referenced_table,
+                referenced_column,
+                on_delete,
+                on_update,
+            );
+        }
+
+        Ok(builder.build_sorted())
+    }
+
+    fn fetch_constraints(
+        &self,
+        database: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<Vec<ConstraintInfo>, DbError> {
+        let escaped_db = database.replace(']', "]]");
+        let qualified_db = format!("[{}]", escaped_db);
+        let escaped_schema = schema.replace('\'', "''");
+        let escaped_table = table.replace('\'', "''");
+
+        let mut grouped: indexmap_for_indexes::IndexMap<String, ConstraintInfo> =
+            indexmap_for_indexes::IndexMap::new();
+
+        self.collect_check_constraints(
+            &qualified_db,
+            &escaped_schema,
+            &escaped_table,
+            &mut grouped,
+        )?;
+        self.collect_unique_constraints(
+            &qualified_db,
+            &escaped_schema,
+            &escaped_table,
+            &mut grouped,
+        )?;
+
+        Ok(grouped.into_iter().map(|(_, v)| v).collect())
+    }
+
+    fn collect_check_constraints(
+        &self,
+        qualified_db: &str,
+        escaped_schema: &str,
+        escaped_table: &str,
+        grouped: &mut indexmap_for_indexes::IndexMap<String, ConstraintInfo>,
+    ) -> Result<(), DbError> {
+        let sql = format!(
+            "SELECT \
+                cc.name AS constraint_name, \
+                CAST(cc.definition AS NVARCHAR(MAX)) AS check_clause, \
+                c.name AS column_name \
+             FROM {qualified_db}.sys.check_constraints cc \
+             JOIN {qualified_db}.sys.tables tbl ON tbl.object_id = cc.parent_object_id \
+             JOIN {qualified_db}.sys.schemas s ON s.schema_id = tbl.schema_id \
+             LEFT JOIN {qualified_db}.sys.columns c \
+               ON c.object_id = cc.parent_object_id AND c.column_id = cc.parent_column_id \
+             WHERE s.name = '{escaped_schema}' AND tbl.name = '{escaped_table}' \
+             ORDER BY cc.name"
+        );
+
+        let rows = self.execute_simple(&sql)?;
+        for row in rows.rows {
+            let mut iter = row.into_iter();
+            let name = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let check_clause = match iter.next() {
+                Some(Value::Text(s)) => Some(s),
+                _ => None,
+            };
+            let column = match iter.next() {
+                Some(Value::Text(s)) => Some(s),
+                _ => None,
+            };
+
+            let entry = grouped
+                .entry(name.clone())
+                .or_insert_with(|| ConstraintInfo {
+                    name,
+                    kind: ConstraintKind::Check,
+                    columns: Vec::new(),
+                    check_clause,
+                });
+            if let Some(column) = column
+                && !entry.columns.contains(&column)
+            {
+                entry.columns.push(column);
+            }
+        }
+        Ok(())
+    }
+
+    /// UNIQUE constraints — surfaced as unique indexes that are not the
+    /// table's primary key. `sys.indexes.is_unique_constraint` flags those
+    /// backing an explicit UNIQUE constraint definition.
+    fn collect_unique_constraints(
+        &self,
+        qualified_db: &str,
+        escaped_schema: &str,
+        escaped_table: &str,
+        grouped: &mut indexmap_for_indexes::IndexMap<String, ConstraintInfo>,
+    ) -> Result<(), DbError> {
+        let sql = format!(
+            "SELECT \
+                i.name AS index_name, \
+                c.name AS column_name, \
+                ic.key_ordinal \
+             FROM {qualified_db}.sys.indexes i \
+             JOIN {qualified_db}.sys.index_columns ic \
+               ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
+             JOIN {qualified_db}.sys.columns c \
+               ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+             JOIN {qualified_db}.sys.tables tbl ON tbl.object_id = i.object_id \
+             JOIN {qualified_db}.sys.schemas s ON s.schema_id = tbl.schema_id \
+             WHERE s.name = '{escaped_schema}' AND tbl.name = '{escaped_table}' \
+               AND i.is_unique_constraint = 1 \
+             ORDER BY i.name, ic.key_ordinal"
+        );
+
+        let rows = self.execute_simple(&sql)?;
+        for row in rows.rows {
+            let mut iter = row.into_iter();
+            let name = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let column = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let _ordinal = iter.next();
+
+            let entry = grouped
+                .entry(name.clone())
+                .or_insert_with(|| ConstraintInfo {
+                    name,
+                    kind: ConstraintKind::Unique,
+                    columns: Vec::new(),
+                    check_clause: None,
+                });
+            entry.columns.push(column);
+        }
+        Ok(())
+    }
+
+    fn fetch_custom_types(
+        &self,
+        database: &str,
+        schema: &str,
+    ) -> Result<Vec<CustomTypeInfo>, DbError> {
+        let escaped_db = database.replace(']', "]]");
+        let qualified_db = format!("[{}]", escaped_db);
+        let escaped_schema = schema.replace('\'', "''");
+
+        // User-defined alias types map most cleanly to DataTab's Domain kind
+        // (a wrapper around a base type). CLR/table-typed types are
+        // exposed as Composite for now.
+        let sql = format!(
+            "SELECT \
+                t.name AS type_name, \
+                bt.name AS base_type_name, \
+                t.is_table_type \
+             FROM {qualified_db}.sys.types t \
+             JOIN {qualified_db}.sys.schemas s ON s.schema_id = t.schema_id \
+             LEFT JOIN {qualified_db}.sys.types bt \
+               ON bt.user_type_id = t.system_type_id AND bt.is_user_defined = 0 \
+             WHERE t.is_user_defined = 1 AND s.name = '{escaped_schema}' \
+             ORDER BY t.name"
+        );
+
+        let rows = self.execute_simple(&sql)?;
+        let mut types = Vec::new();
+
+        for row in rows.rows {
+            let mut iter = row.into_iter();
+            let name = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let base_type = match iter.next() {
+                Some(Value::Text(s)) => Some(s),
+                _ => None,
+            };
+            let is_table_type = value_is_truthy(iter.next());
+
+            let kind = if is_table_type {
+                CustomTypeKind::Composite
+            } else {
+                CustomTypeKind::Domain
+            };
+
+            types.push(CustomTypeInfo {
+                name,
+                schema: Some(schema.to_string()),
+                kind,
+                enum_values: None,
+                base_type,
+            });
+        }
+
+        Ok(types)
+    }
+
+    fn fetch_schema_indexes(
+        &self,
+        database: &str,
+        schema: &str,
+    ) -> Result<Vec<SchemaIndexInfo>, DbError> {
+        let escaped_db = database.replace(']', "]]");
+        let qualified_db = format!("[{}]", escaped_db);
+        let escaped_schema = schema.replace('\'', "''");
+
+        let sql = format!(
+            "SELECT \
+                tbl.name AS table_name, \
+                i.name AS index_name, \
+                c.name AS column_name, \
+                i.is_unique, \
+                i.is_primary_key, \
+                ic.key_ordinal \
+             FROM {qualified_db}.sys.indexes i \
+             JOIN {qualified_db}.sys.index_columns ic \
+               ON ic.object_id = i.object_id AND ic.index_id = i.index_id \
+             JOIN {qualified_db}.sys.columns c \
+               ON c.object_id = ic.object_id AND c.column_id = ic.column_id \
+             JOIN {qualified_db}.sys.tables tbl ON tbl.object_id = i.object_id \
+             JOIN {qualified_db}.sys.schemas s ON s.schema_id = tbl.schema_id \
+             WHERE s.name = '{escaped_schema}' AND i.name IS NOT NULL \
+             ORDER BY tbl.name, i.name, ic.key_ordinal"
+        );
+
+        let rows = self.execute_simple(&sql)?;
+        let mut builder = SchemaIndexBuilder::new();
+
+        for row in rows.rows {
+            let mut iter = row.into_iter();
+            let table_name = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let index_name = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let column = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let is_unique = value_is_truthy(iter.next());
+            let is_primary = value_is_truthy(iter.next());
+            let _ordinal = iter.next();
+
+            builder.add_column(table_name.clone(), index_name.clone(), column, is_unique);
+            if is_primary {
+                builder.set_primary(&table_name, &index_name);
+            }
+        }
+
+        Ok(builder.build_sorted())
+    }
+
+    fn fetch_schema_foreign_keys(
+        &self,
+        database: &str,
+        schema: &str,
+    ) -> Result<Vec<SchemaForeignKeyInfo>, DbError> {
+        let escaped_db = database.replace(']', "]]");
+        let qualified_db = format!("[{}]", escaped_db);
+        let escaped_schema = schema.replace('\'', "''");
+
+        let sql = format!(
+            "SELECT \
+                pt.name AS table_name, \
+                fk.name AS constraint_name, \
+                pc.name AS column_name, \
+                rs.name AS referenced_schema, \
+                rt.name AS referenced_table, \
+                rc.name AS referenced_column, \
+                fk.delete_referential_action_desc, \
+                fk.update_referential_action_desc \
+             FROM {qualified_db}.sys.foreign_keys fk \
+             JOIN {qualified_db}.sys.foreign_key_columns fkc ON fkc.constraint_object_id = fk.object_id \
+             JOIN {qualified_db}.sys.tables pt ON pt.object_id = fk.parent_object_id \
+             JOIN {qualified_db}.sys.schemas ps ON ps.schema_id = pt.schema_id \
+             JOIN {qualified_db}.sys.columns pc \
+               ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id \
+             JOIN {qualified_db}.sys.tables rt ON rt.object_id = fk.referenced_object_id \
+             JOIN {qualified_db}.sys.schemas rs ON rs.schema_id = rt.schema_id \
+             JOIN {qualified_db}.sys.columns rc \
+               ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id \
+             WHERE ps.name = '{escaped_schema}' \
+             ORDER BY pt.name, fk.name, fkc.constraint_column_id"
+        );
+
+        let rows = self.execute_simple(&sql)?;
+        let mut builder = SchemaForeignKeyBuilder::new();
+
+        for row in rows.rows {
+            let mut iter = row.into_iter();
+            let table_name = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let name = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let column = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let referenced_schema = match iter.next() {
+                Some(Value::Text(s)) => Some(s),
+                _ => None,
+            };
+            let referenced_table = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let referenced_column = match iter.next() {
+                Some(Value::Text(s)) => s,
+                _ => continue,
+            };
+            let on_delete = match iter.next() {
+                Some(Value::Text(s)) if s != "NO_ACTION" => Some(normalize_fk_action(&s)),
+                _ => None,
+            };
+            let on_update = match iter.next() {
+                Some(Value::Text(s)) if s != "NO_ACTION" => Some(normalize_fk_action(&s)),
+                _ => None,
+            };
+
+            builder.add_column(
+                table_name,
+                name,
+                column,
+                referenced_schema,
+                referenced_table,
+                referenced_column,
+                on_update,
+                on_delete,
+            );
+        }
+
+        Ok(builder.build_sorted())
+    }
+}
+
+// Local indexmap usage so we don't depend on datatab_core's indexmap re-export.
+mod indexmap_for_indexes {
+    pub(super) use indexmap::IndexMap;
+}
+
+/// Map an MSSQL `sys.objects.type` code (trimmed) to a `RoutineKind`.
+///
+/// SQL Server stores the type as `char(2)` with trailing spaces; callers must
+/// trim before passing.  Returns `None` for codes that are not exposed in the
+/// routines folder (e.g. table-valued assembly objects other than AF).
+fn mssql_type_to_routine_kind(type_code: &str) -> Option<RoutineKind> {
+    match type_code {
+        "P" => Some(RoutineKind::Procedure),
+        "FN" | "IF" | "TF" => Some(RoutineKind::Function),
+        "AF" => Some(RoutineKind::Aggregate),
+        _ => None,
+    }
+}
+
+fn get_schema_routines(
+    conn: &MssqlConnection,
+    database: &str,
+    schema: &str,
+) -> Result<Vec<RoutineInfo>, DbError> {
+    let escaped_db = database.replace(']', "]]");
+    let qualified_db = format!("[{}]", escaped_db);
+    let escaped_schema = schema.replace('\'', "''");
+
+    // Join sys.objects with sys.schemas to enumerate stored procedures,
+    // scalar functions (FN), inline table-valued functions (IF),
+    // multi-statement table-valued functions (TF), and CLR aggregates (AF).
+    // object_id serves as the stable identity used to fetch the definition.
+    let sql = format!(
+        "SELECT o.name, RTRIM(o.type) AS type_code, CAST(o.object_id AS VARCHAR(20)) AS object_id \
+         FROM {qualified_db}.sys.objects o \
+         JOIN {qualified_db}.sys.schemas s ON s.schema_id = o.schema_id \
+         WHERE s.name = '{escaped_schema}' \
+           AND o.type IN ('P ', 'FN', 'IF', 'TF', 'AF') \
+         ORDER BY o.name",
+    );
+
+    let rows = conn.execute_simple(&sql)?;
+    let mut routines = Vec::with_capacity(rows.rows.len());
+
+    for row in rows.rows {
+        let mut iter = row.into_iter();
+
+        let name = match iter.next() {
+            Some(Value::Text(s)) => s,
+            _ => continue,
+        };
+        let type_code = match iter.next() {
+            Some(Value::Text(s)) => s,
+            _ => continue,
+        };
+        let object_id_str = match iter.next() {
+            Some(Value::Text(s)) => s,
+            _ => continue,
+        };
+
+        let Some(kind) = mssql_type_to_routine_kind(type_code.trim()) else {
+            continue;
+        };
+
+        routines.push(RoutineInfo {
+            name: name.clone(),
+            kind,
+            // Use object_id as specific_name — it is the stable numeric
+            // identity used in routine_definition to call OBJECT_DEFINITION().
+            specific_name: object_id_str,
+            parameter_types: Vec::new(),
+            return_type_hint: None,
+        });
+    }
+
+    Ok(routines)
+}
+
+fn normalize_fk_action(action: &str) -> String {
+    // Convert tiberius/sys.foreign_keys descriptors ("NO_ACTION", "CASCADE",
+    // "SET_NULL", "SET_DEFAULT") into the canonical SQL clause form.
+    action.replace('_', " ")
+}
+
+fn value_is_truthy(value: Option<Value>) -> bool {
+    match value {
+        Some(Value::Bool(b)) => b,
+        Some(Value::Int(i)) => i != 0,
+        _ => false,
+    }
+}
+
+/// Returns `true` when a server error looks like it was raised because the
+/// session was killed (rather than being a real query failure).
+///
+/// SQL Server emits one of:
+///   - 596: Cannot continue the execution because the session is in the kill state.
+///   - 233 / 10054 family: connection-reset variants after the socket closes.
+///   - 6005: SHUTDOWN is in progress (rare, but also fires for some KILL paths).
+///
+/// These codes are stable across modern SQL Server versions. The check is
+/// only used to translate post-KILL errors into `DbError::Cancelled`, so
+/// false negatives just result in a slightly less specific error message;
+/// false positives would mask real errors, which is why the list is small.
+fn is_kill_error(err: &DbError) -> bool {
+    matches!(err,
+        DbError::QueryFailed(fe)
+        | DbError::ConstraintViolation(fe)
+        | DbError::SyntaxError(fe)
+        | DbError::AuthFailed(fe)
+        | DbError::PermissionDenied(fe)
+        | DbError::ObjectNotFound(fe)
+        | DbError::ConnectionFailed(fe)
+        if matches!(fe.code.as_deref(), Some("596") | Some("233") | Some("6005"))
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Failed-batch transaction handling
+// ---------------------------------------------------------------------------
+
+/// What to do with the session's transaction after a batch failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailedBatchTransactionAction {
+    /// No transaction is open.
+    None,
+
+    /// The failed batch opened the open transaction, so roll it back.
+    RollBack,
+
+    /// A transaction is open that the batch is not known to have opened.
+    ReportStillOpen,
+}
+
+/// Decide how to treat the session's transaction after a failed batch.
+///
+/// `transaction_count_before` is `Some` only when the batch could open a
+/// transaction and `@@TRANCOUNT` was read before it ran. Only a transition
+/// from 0 to a positive count proves the batch opened the transaction.
+fn failed_batch_transaction_action(
+    transaction_count_before: Option<i32>,
+    transaction_count_after: i32,
+) -> FailedBatchTransactionAction {
+    if transaction_count_after <= 0 {
+        return FailedBatchTransactionAction::None;
+    }
+
+    if transaction_count_before == Some(0) {
+        FailedBatchTransactionAction::RollBack
+    } else {
+        FailedBatchTransactionAction::ReportStillOpen
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BatchToken {
+    Word(String),
+    Comma,
+    Other,
+}
+
+/// Whether a T-SQL batch contains a statement that can open a transaction:
+/// `BEGIN TRAN[SACTION]`, `BEGIN DISTRIBUTED TRAN[SACTION]`, or a `SET` that
+/// turns on `IMPLICIT_TRANSACTIONS` (directly or through `ANSI_DEFAULTS`).
+///
+/// String literals, quoted and bracketed identifiers, and comments are
+/// skipped. Keywords are matched as adjacent tokens rather than by splitting
+/// statements, because T-SQL batches often omit semicolons. `BEGIN ... END`,
+/// `BEGIN TRY`, and `BEGIN CATCH` do not match.
+fn batch_can_open_transaction(sql: &str) -> bool {
+    let tokens = tokenize_batch(sql);
+    let mut remaining = tokens.as_slice();
+
+    while let [_, rest @ ..] = remaining {
+        if opens_explicit_transaction(remaining) || enables_implicit_transactions(remaining) {
+            return true;
+        }
+
+        remaining = rest;
+    }
+
+    false
+}
+
+fn opens_explicit_transaction(tokens: &[BatchToken]) -> bool {
+    match tokens {
+        [BatchToken::Word(begin), BatchToken::Word(keyword), ..]
+            if begin == "BEGIN" && is_transaction_keyword(keyword) =>
+        {
+            true
+        }
+        [
+            BatchToken::Word(begin),
+            BatchToken::Word(distributed),
+            BatchToken::Word(keyword),
+            ..,
+        ] if begin == "BEGIN"
+            && distributed == "DISTRIBUTED"
+            && is_transaction_keyword(keyword) =>
+        {
+            true
+        }
+        _ => false,
+    }
+}
+
+fn is_transaction_keyword(word: &str) -> bool {
+    word == "TRAN" || word == "TRANSACTION"
+}
+
+/// Matches `SET option [, option ...] ON` where one of the options turns on
+/// implicit transactions.
+fn enables_implicit_transactions(tokens: &[BatchToken]) -> bool {
+    let [BatchToken::Word(set), options @ ..] = tokens else {
+        return false;
+    };
+
+    if set != "SET" {
+        return false;
+    }
+
+    let mut remaining = options;
+    let mut enables_implicit = false;
+
+    loop {
+        let [BatchToken::Word(option), after_option @ ..] = remaining else {
+            return false;
+        };
+
+        if option == "IMPLICIT_TRANSACTIONS" || option == "ANSI_DEFAULTS" {
+            enables_implicit = true;
+        }
+
+        match after_option {
+            [BatchToken::Comma, next @ ..] => remaining = next,
+            [BatchToken::Word(value), ..] => return enables_implicit && value == "ON",
+            _ => return false,
+        }
+    }
+}
+
+/// Split a T-SQL batch into uppercase words, commas, and opaque tokens,
+/// dropping whitespace and comments. String literals and delimited
+/// identifiers become a single opaque token.
+fn tokenize_batch(sql: &str) -> Vec<BatchToken> {
+    let characters: Vec<char> = sql.chars().collect();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+
+    while let Some(&current) = characters.get(index) {
+        let next = characters.get(index + 1).copied();
+
+        if current.is_whitespace() {
+            index += 1;
+            continue;
+        }
+
+        if current == '-' && next == Some('-') {
+            index = skip_line_comment(&characters, index);
+            continue;
+        }
+
+        if current == '/' && next == Some('*') {
+            index = skip_block_comment(&characters, index);
+            continue;
+        }
+
+        let closing_delimiter = match current {
+            '\'' => Some('\''),
+            '"' => Some('"'),
+            '[' => Some(']'),
+            _ => None,
+        };
+
+        if let Some(closing) = closing_delimiter {
+            index = skip_delimited(&characters, index, closing);
+            tokens.push(BatchToken::Other);
+            continue;
+        }
+
+        if is_batch_word_character(current) {
+            let start = index;
+
+            while characters
+                .get(index)
+                .is_some_and(|&character| is_batch_word_character(character))
+            {
+                index += 1;
+            }
+
+            let word: String = characters
+                .get(start..index)
+                .unwrap_or_default()
+                .iter()
+                .collect();
+            tokens.push(BatchToken::Word(word.to_ascii_uppercase()));
+            continue;
+        }
+
+        tokens.push(if current == ',' {
+            BatchToken::Comma
+        } else {
+            BatchToken::Other
+        });
+        index += 1;
+    }
+
+    tokens
+}
+
+fn is_batch_word_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '@' | '#' | '$')
+}
+
+/// Returns the index just past the end of the `--` comment starting at `start`.
+fn skip_line_comment(characters: &[char], start: usize) -> usize {
+    characters
+        .get(start..)
+        .unwrap_or_default()
+        .iter()
+        .position(|&character| character == '\n')
+        .map_or(characters.len(), |offset| start + offset + 1)
+}
+
+/// Returns the index just past the `/* ... */` comment starting at `start`.
+/// SQL Server allows block comments to nest.
+fn skip_block_comment(characters: &[char], start: usize) -> usize {
+    let mut depth = 0usize;
+    let mut index = start;
+
+    while let Some(&current) = characters.get(index) {
+        let next = characters.get(index + 1).copied();
+
+        if current == '/' && next == Some('*') {
+            depth += 1;
+            index += 2;
+        } else if current == '*' && next == Some('/') {
+            depth = depth.saturating_sub(1);
+            index += 2;
+
+            if depth == 0 {
+                return index;
+            }
+        } else {
+            index += 1;
+        }
+    }
+
+    characters.len()
+}
+
+/// Returns the index just past the delimited token starting at `start`,
+/// treating a doubled closing delimiter as an escaped character.
+fn skip_delimited(characters: &[char], start: usize, closing: char) -> usize {
+    let mut index = start + 1;
+
+    while let Some(&current) = characters.get(index) {
+        if current != closing {
+            index += 1;
+            continue;
+        }
+
+        if characters.get(index + 1) == Some(&closing) {
+            index += 2;
+            continue;
+        }
+
+        return index + 1;
+    }
+
+    characters.len()
+}
+
+// ---------------------------------------------------------------------------
+// OUTPUT-clause SQL builders
+// ---------------------------------------------------------------------------
+//
+// SQL Server places the OUTPUT clause between the target and the
+// VALUES/SET/WHERE clauses, not at the end like Postgres `RETURNING`.
+// We build the SQL directly rather than threading a new dialect hook
+// through `SqlQueryBuilder`, keeping the change local to this driver.
+
+fn build_insert_with_output(insert: &RowInsert) -> Result<String, DbError> {
+    let table = MSSQL_DIALECT.qualified_table(insert.schema.as_deref(), &insert.table);
+    let columns = insert
+        .assignments
+        .iter()
+        .map(|a| MSSQL_DIALECT.quote_identifier(&a.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let values = insert
+        .assignments
+        .iter()
+        .map(|a| MSSQL_DIALECT.value_to_literal(&a.value))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    Ok(format!(
+        "INSERT INTO {} ({}) OUTPUT INSERTED.* VALUES ({})",
+        table, columns, values
+    ))
+}
+
+fn build_update_with_output(patch: &RowPatch) -> Result<String, DbError> {
+    let table = MSSQL_DIALECT.qualified_table(patch.schema.as_deref(), &patch.table);
+    let set_clause = patch
+        .changes
+        .iter()
+        .map(|change| {
+            format!(
+                "{} = {}",
+                MSSQL_DIALECT.quote_identifier(&change.name),
+                MSSQL_DIALECT.value_to_literal(&change.value)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let where_clause = identity_where_clause(&patch.identity)?;
+
+    Ok(format!(
+        "UPDATE {} SET {} OUTPUT INSERTED.* WHERE {}",
+        table, set_clause, where_clause
+    ))
+}
+
+fn build_delete_with_output(delete: &RowDelete) -> Result<String, DbError> {
+    let table = MSSQL_DIALECT.qualified_table(delete.schema.as_deref(), &delete.table);
+    let where_clause = identity_where_clause(&delete.identity)?;
+
+    Ok(format!(
+        "DELETE FROM {} OUTPUT DELETED.* WHERE {}",
+        table, where_clause
+    ))
+}
+
+fn identity_where_clause(identity: &RecordIdentity) -> Result<String, DbError> {
+    match identity {
+        RecordIdentity::Composite { columns, values } => {
+            if columns.is_empty() || columns.len() != values.len() {
+                return Err(DbError::QueryFailed(
+                    "Row identity has no columns".to_string().into(),
+                ));
+            }
+            Ok(columns
+                .iter()
+                .zip(values.iter())
+                .map(|(col, value)| {
+                    format!(
+                        "{} = {}",
+                        MSSQL_DIALECT.quote_identifier(col),
+                        MSSQL_DIALECT.value_to_literal(value)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" AND "))
+        }
+        RecordIdentity::ObjectId(_) | RecordIdentity::Key(_) => Err(DbError::NotSupported(
+            "SQL Server row mutations require a composite primary-key identity".to_string(),
+        )),
+    }
+}
+
+fn result_first_row_to_crud(result: QueryResult) -> CrudResult {
+    // The OUTPUT-clause result is parsed through `execute_simple`, which
+    // populates `ColumnMeta::kind` from the tiberius column type. The
+    // column metadata travels with the QueryResult; CrudResult itself
+    // only carries the row (matching postgres/mysql).
+    match result.rows.into_iter().next() {
+        Some(row) => CrudResult::success(row),
+        None => CrudResult::empty(),
+    }
+}
+
+impl RelationalConnection for MssqlConnection {}
+
+impl ConnectionExt for MssqlConnection {
+    fn as_relational(&self) -> Option<&dyn RelationalConnection> {
+        Some(self)
+    }
+
+    fn as_document(&self) -> Option<&dyn DocumentConnection> {
+        None
+    }
+
+    fn as_keyvalue(&self) -> Option<&dyn KeyValueConnection> {
+        None
+    }
+}
+
+// =============================================================================
+// URI helpers
+// =============================================================================
+
+fn inject_password_into_mssql_uri(base_uri: &str, password: Option<&str>) -> String {
+    let password = match password {
+        Some(p) if !p.is_empty() => p,
+        _ => return base_uri.to_string(),
+    };
+
+    let prefixes = ["sqlserver://", "mssql://"];
+    for prefix in prefixes {
+        if let Some(rest) = base_uri.strip_prefix(prefix) {
+            if let Some(at_pos) = rest.rfind('@') {
+                let user_pass = &rest[..at_pos];
+                let after_at = &rest[at_pos..];
+
+                if user_pass.contains(':') {
+                    return base_uri.to_string();
+                }
+
+                return format!(
+                    "{}{}:{}{}",
+                    prefix,
+                    user_pass,
+                    urlencoding::encode(password),
+                    after_at
+                );
+            }
+
+            return base_uri.to_string();
+        }
+    }
+
+    base_uri.to_string()
+}
+
+/// Parse a `sqlserver://user:pass@host:port/db?...` URI into a tiberius Config.
+struct ParsedMssqlUri<'a> {
+    credentials: &'a str,
+    host: &'a str,
+    instance_from_host: Option<String>,
+    explicit_port: Option<u16>,
+    database: &'a str,
+    params: &'a str,
+}
+
+struct UriQueryParams {
+    encryption: EncryptionLevel,
+    trust_cert_override: Option<bool>,
+    instance_from_query: Option<String>,
+    application_name: Option<String>,
+}
+
+fn split_mssql_uri(uri: &str) -> Result<ParsedMssqlUri<'_>, tiberius::error::Error> {
+    let stripped = uri
+        .strip_prefix("sqlserver://")
+        .or_else(|| uri.strip_prefix("mssql://"))
+        .ok_or_else(|| {
+            tiberius::error::Error::Conversion("unsupported SQL Server URI scheme".into())
+        })?;
+
+    let (credentials, host_part) = match stripped.rfind('@') {
+        Some(at_pos) => (&stripped[..at_pos], &stripped[at_pos + 1..]),
+        None => ("", stripped),
+    };
+
+    let (host_port, query_part) = match host_part.find('/') {
+        Some(slash) => (&host_part[..slash], &host_part[slash + 1..]),
+        None => (host_part, ""),
+    };
+
+    let (database, params) = match query_part.find('?') {
+        Some(qmark) => (&query_part[..qmark], &query_part[qmark + 1..]),
+        None => (query_part, ""),
+    };
+
+    let (host_and_instance, explicit_port) = match host_port.rfind(':') {
+        Some(colon) => {
+            let port: u16 = host_port[colon + 1..].parse().map_err(|_| {
+                tiberius::error::Error::Conversion("invalid SQL Server URI port".into())
+            })?;
+            (&host_port[..colon], Some(port))
+        }
+        None => (host_port, None),
+    };
+
+    // SSMS-style `host\instance`. The trailing `?instance=…` may also set
+    // it and wins if both are supplied (resolved by the caller).
+    let (host, instance_from_host) = match host_and_instance.find('\\') {
+        Some(bs) => (
+            &host_and_instance[..bs],
+            Some(host_and_instance[bs + 1..].to_string()),
+        ),
+        None => (host_and_instance, None),
+    };
+
+    Ok(ParsedMssqlUri {
+        credentials,
+        host,
+        instance_from_host,
+        explicit_port,
+        database,
+        params,
+    })
+}
+
+/// Detects whether a raw ADO/JDBC connection string already declares an
+/// `Application Name` (tiberius also accepts the no-space `ApplicationName`
+/// alias), so we know not to override the caller's own value.
+///
+/// `Config` parses this out internally but exposes no getter, so we scan the
+/// same raw string tiberius parsed rather than re-deriving it from a `Config`.
+fn ado_sets_application_name(s: &str) -> bool {
+    s.split(';').any(|pair| {
+        let Some((key, _)) = pair.split_once('=') else {
+            return false;
+        };
+        let normalized = key.trim().to_ascii_lowercase();
+        normalized == "application name" || normalized == "applicationname"
+    })
+}
+
+fn parse_uri_query_params(params: &str) -> UriQueryParams {
+    // SSL Mode is the single user-facing knob; trust_cert is derived from
+    // it unless the caller explicitly overrides via `?trust=` in the URI.
+    //
+    //   encrypt=off       -> Off,      trust irrelevant
+    //   encrypt=on        -> On,       trust=true  (accept self-signed)
+    //   encrypt=required  -> Required, trust=false (validate cert)
+    let mut out = UriQueryParams {
+        encryption: EncryptionLevel::On,
+        trust_cert_override: None,
+        instance_from_query: None,
+        application_name: None,
+    };
+
+    for pair in params.split('&').filter(|p| !p.is_empty()) {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        match key.to_ascii_lowercase().as_str() {
+            "encrypt" => {
+                out.encryption = match value.to_ascii_lowercase().as_str() {
+                    "true" | "yes" | "on" | "1" => EncryptionLevel::On,
+                    "false" | "no" | "off" | "0" => EncryptionLevel::Off,
+                    "strict" | "required" => EncryptionLevel::Required,
+                    _ => EncryptionLevel::On,
+                };
+            }
+            "trustservercertificate" | "trust_server_certificate" | "trust" => {
+                out.trust_cert_override = Some(matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "true" | "1" | "yes"
+                ));
+            }
+            "instance" | "instancename" | "instance_name" if !value.is_empty() => {
+                let decoded = urlencoding::decode(value)
+                    .map(|cow| cow.into_owned())
+                    .unwrap_or_else(|_| value.to_string());
+                out.instance_from_query = Some(decoded);
+            }
+            "applicationname" if !value.is_empty() => {
+                let decoded = urlencoding::decode(value)
+                    .map(|cow| cow.into_owned())
+                    .unwrap_or_else(|_| value.to_string());
+                out.application_name = Some(decoded);
+            }
+            _ => {}
+        }
+    }
+
+    out
+}
+
+fn apply_uri_credentials(config: &mut Config, credentials: &str) {
+    if credentials.is_empty() {
+        return;
+    }
+    let (user_part, password_part) = match credentials.find(':') {
+        Some(colon) => (&credentials[..colon], &credentials[colon + 1..]),
+        None => (credentials, ""),
+    };
+    let user = urlencoding::decode(user_part)
+        .map(|cow| cow.into_owned())
+        .unwrap_or_default();
+    let password = urlencoding::decode(password_part)
+        .map(|cow| cow.into_owned())
+        .unwrap_or_default();
+    config.authentication(AuthMethod::sql_server(user, password));
+}
+
+fn parse_mssql_url(uri: &str) -> Result<Config, tiberius::error::Error> {
+    let parsed = split_mssql_uri(uri)?;
+    let query = parse_uri_query_params(parsed.params);
+
+    // `?instance=` wins over the SSMS-style `host\instance` form.
+    let instance = query
+        .instance_from_query
+        .or(parsed.instance_from_host)
+        .filter(|s| !s.is_empty());
+
+    let mut config = Config::new();
+    config.host(parsed.host);
+
+    if !parsed.database.is_empty() {
+        let decoded = urlencoding::decode(parsed.database)
+            .map(|cow| cow.into_owned())
+            .unwrap_or_else(|_| parsed.database.to_string());
+        config.database(decoded);
+    }
+
+    apply_uri_credentials(&mut config, parsed.credentials);
+
+    match (instance, parsed.explicit_port) {
+        (Some(name), _) => {
+            // Named instance: leave port unset so tiberius hits 1434 for
+            // the Browser query and then dials whatever port Browser
+            // returns. Any user-supplied port in the URI is ignored in
+            // this mode — that matches SSMS/ADO behavior.
+            config.instance_name(name);
+        }
+        (None, Some(port)) => {
+            config.port(port);
+        }
+        (None, None) => {
+            config.port(1433);
+        }
+    }
+
+    config.encryption(query.encryption);
+    let trust_cert = query
+        .trust_cert_override
+        .unwrap_or(!matches!(query.encryption, EncryptionLevel::Required));
+    if trust_cert {
+        config.trust_cert();
+    }
+
+    // A user-supplied `?applicationname=` always wins over our default.
+    config.application_name(
+        query
+            .application_name
+            .unwrap_or_else(|| datatab_core::client_identity().to_string()),
+    );
+
+    Ok(config)
+}
+
+// =============================================================================
+// Error formatting
+// =============================================================================
+
+pub struct MssqlErrorFormatter;
+
+/// Semantic class of an MSSQL error code, used to pick a `DbError` variant.
+///
+/// SQL Server reports errors as numeric `code()` values rather than ANSI
+/// SQLSTATEs, so the shared `FormattedError::into_query_error()` classifier
+/// (which inspects SQLSTATE prefixes) cannot route them. We classify here
+/// and construct the `DbError` variant directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MssqlErrorClass {
+    Auth,
+    Permission,
+    NotFound,
+    Constraint,
+    Syntax,
+}
+
+fn classify_mssql_code(code: u32) -> Option<MssqlErrorClass> {
+    match code {
+        // Login / auth
+        4060 | 18450 | 18452 | 18456 | 18486 | 18487 | 18488 => Some(MssqlErrorClass::Auth),
+
+        // Permission / access
+        229 | 230 | 262 | 297 | 916 => Some(MssqlErrorClass::Permission),
+
+        // Object not found
+        // 208: Invalid object name
+        // 207: Invalid column name
+        // 2812: Could not find stored procedure
+        // 4902: Cannot find object (ALTER)
+        208 | 207 | 2812 | 4902 => Some(MssqlErrorClass::NotFound),
+
+        // Constraint violations
+        // 547: FK violation / CHECK constraint conflict
+        // 2627: Unique constraint
+        // 2601: Unique index
+        // 515: Cannot insert NULL into column (NOT NULL violation)
+        // 8152: String or binary data would be truncated
+        // 245: Conversion failed (often constraint-shaped failure)
+        // 334: Target table has enabled triggers; OUTPUT clause requires INTO.
+        //      Raised when CRUD with `OUTPUT INSERTED.*` / `OUTPUT DELETED.*`
+        //      targets a table (or updateable view) with `INSTEAD OF` triggers.
+        547 | 2627 | 2601 | 515 | 8152 | 245 | 334 => Some(MssqlErrorClass::Constraint),
+
+        // Syntax / batch parsing
+        // 102: Incorrect syntax near
+        // 156: Incorrect syntax near the keyword
+        // 8180: Statement(s) could not be prepared
+        102 | 156 | 8180 => Some(MssqlErrorClass::Syntax),
+
+        _ => None,
+    }
+}
+
+/// Extract structured location info (table, constraint) from common SQL Server
+/// constraint-violation messages.
+///
+/// Messages look like:
+///   "Violation of PRIMARY KEY constraint 'PK_users'. Cannot insert
+///    duplicate key in object 'dbo.users'. The duplicate key value is (1)."
+///   "The INSERT statement conflicted with the FOREIGN KEY constraint
+///    'FK_orders_user'. The conflict occurred in database 'app',
+///    table 'dbo.users', column 'id'."
+fn extract_location_from_message(message: &str) -> datatab_core::ErrorLocation {
+    let mut location = datatab_core::ErrorLocation::new();
+
+    if let Some(name) = find_quoted_after(message, "constraint") {
+        location = location.with_constraint(name);
+    }
+
+    if let Some(qualified) =
+        find_quoted_after(message, "object").or_else(|| find_quoted_after(message, "table"))
+    {
+        if let Some((schema, table)) = qualified.split_once('.') {
+            location = location
+                .with_schema(schema.trim_matches(|c| c == '[' || c == ']'))
+                .with_table(table.trim_matches(|c| c == '[' || c == ']'));
+        } else {
+            location = location.with_table(qualified);
+        }
+    }
+
+    if let Some(column) = find_quoted_after(message, "column") {
+        location = location.with_column(column);
+    }
+
+    location
+}
+
+fn find_quoted_after(haystack: &str, marker: &str) -> Option<String> {
+    let lower = haystack.to_ascii_lowercase();
+    let marker_lower = marker.to_ascii_lowercase();
+    let mut search_from = 0;
+
+    while let Some(idx) = lower[search_from..].find(&marker_lower) {
+        let abs = search_from + idx + marker_lower.len();
+        if let Some(rest) = haystack.get(abs..)
+            && let Some(start) = rest.find('\'')
+        {
+            let after_quote = &rest[start + 1..];
+            if let Some(end) = after_quote.find('\'') {
+                return Some(after_quote[..end].to_string());
+            }
+        }
+        search_from = abs;
+    }
+    None
+}
+
+impl MssqlErrorFormatter {
+    fn classify_tiberius_error(err: &tiberius::error::Error) -> FormattedError {
+        match err {
+            tiberius::error::Error::Server(token) => {
+                let message = token.message().to_string();
+                let mut fe =
+                    FormattedError::new(message.clone()).with_code(token.code().to_string());
+
+                let state = token.state();
+                if state != 0 {
+                    fe = fe.with_detail(format!("State {}, line {}", state, token.line()));
+                }
+
+                let location = extract_location_from_message(&message);
+                if !location.is_empty() {
+                    fe = fe.with_location(location);
+                }
+
+                fe
+            }
+            tiberius::error::Error::Protocol(msg) => {
+                FormattedError::new(format!("Protocol error: {}", msg))
+            }
+            tiberius::error::Error::Encoding(msg) => {
+                FormattedError::new(format!("Encoding error: {}", msg))
+            }
+            tiberius::error::Error::Conversion(msg) => {
+                FormattedError::new(format!("Conversion error: {}", msg))
+            }
+            tiberius::error::Error::Utf8 => FormattedError::new("Invalid UTF-8 in response"),
+            tiberius::error::Error::Utf16 => FormattedError::new("Invalid UTF-16 in response"),
+            tiberius::error::Error::ParseInt(e) => {
+                FormattedError::new(format!("Integer parse error: {}", e))
+            }
+            tiberius::error::Error::Io { kind, message } => {
+                FormattedError::new(format!("I/O {}: {}", kind, message))
+            }
+            other => FormattedError::new(other.to_string()),
+        }
+    }
+
+    fn route_query_error(fe: FormattedError) -> DbError {
+        if let Some(class) = fe
+            .code
+            .as_deref()
+            .and_then(|c| c.parse::<u32>().ok())
+            .and_then(classify_mssql_code)
+        {
+            return match class {
+                MssqlErrorClass::Auth => DbError::AuthFailed(fe),
+                MssqlErrorClass::Permission => DbError::PermissionDenied(fe),
+                MssqlErrorClass::NotFound => DbError::ObjectNotFound(fe),
+                MssqlErrorClass::Constraint => DbError::ConstraintViolation(fe),
+                MssqlErrorClass::Syntax => DbError::SyntaxError(fe),
+            };
+        }
+
+        // Fall back to the shared SQLSTATE classifier (which will just return
+        // QueryFailed for MSSQL codes that don't match a SQLSTATE prefix).
+        fe.into_query_error()
+    }
+}
+
+impl QueryErrorFormatter for MssqlErrorFormatter {
+    fn format_query_error(&self, error: &(dyn std::error::Error + 'static)) -> FormattedError {
+        if let Some(err) = error.downcast_ref::<tiberius::error::Error>() {
+            Self::classify_tiberius_error(err)
+        } else {
+            FormattedError::new(error.to_string())
+        }
+    }
+}
+
+impl ConnectionErrorFormatter for MssqlErrorFormatter {
+    fn format_connection_error(
+        &self,
+        error: &(dyn std::error::Error + 'static),
+        host: &str,
+        port: u16,
+    ) -> FormattedError {
+        let source = error.to_string();
+        let message = if source.contains("Login failed") || source.contains("18456") {
+            "Authentication failed. Check your username and password.".to_string()
+        } else if source.contains("Cannot open database") {
+            format!("Database does not exist or login lacks access: {}", source)
+        } else if source.contains("Connection refused") {
+            format!(
+                "Could not connect to {}:{}. The server may be unreachable, behind a firewall, or requires an SSH tunnel.",
+                host, port
+            )
+        } else if source.contains("Name or service not known")
+            || source.contains("nodename nor servname")
+            || source.contains("failed to lookup address")
+        {
+            format!("Could not resolve hostname: {}", host)
+        } else {
+            format!("Connection error: {}", source)
+        };
+
+        FormattedError::new(message)
+    }
+
+    fn format_uri_error(
+        &self,
+        error: &(dyn std::error::Error + 'static),
+        sanitized_uri: &str,
+    ) -> FormattedError {
+        FormattedError::new(format!(
+            "Connection error with URI {}: {}",
+            sanitized_uri, error
+        ))
+    }
+}
+
+static MSSQL_ERROR_FORMATTER: MssqlErrorFormatter = MssqlErrorFormatter;
+
+fn format_mssql_connect_error(e: &tiberius::error::Error, host: &str, port: u16) -> DbError {
+    // Tiberius bubbles up login failures as `Server` token errors, not as
+    // a separate `Auth` variant. We classify by the numeric code first so
+    // 18456 etc. surface as `AuthFailed`, then fall back to the host-aware
+    // connection error message for everything else.
+    let server_fe = match e {
+        tiberius::error::Error::Server(_) => Some(MssqlErrorFormatter::classify_tiberius_error(e)),
+        _ => None,
+    };
+
+    if let Some(fe) = server_fe
+        && let Some(code) = fe.code.as_deref().and_then(|c| c.parse::<u32>().ok())
+        && matches!(classify_mssql_code(code), Some(MssqlErrorClass::Auth))
+    {
+        log::error!("SQL Server login failed: {}", fe.message);
+        return DbError::AuthFailed(fe);
+    }
+
+    let formatted = MSSQL_ERROR_FORMATTER.format_connection_error(e, host, port);
+    log::error!("SQL Server connection failed: {}", formatted.message);
+    formatted.into_connection_error()
+}
+
+fn format_mssql_query_error(e: &tiberius::error::Error) -> DbError {
+    let formatted = MSSQL_ERROR_FORMATTER.format_query_error(e);
+    let message = formatted.to_display_string();
+    log::error!("SQL Server query failed: {}", message);
+    MssqlErrorFormatter::route_query_error(formatted)
+}
+
+fn format_mssql_uri_error(e: &tiberius::error::Error, uri: &str) -> DbError {
+    let sanitized = sanitize_uri(uri);
+    let formatted = MSSQL_ERROR_FORMATTER.format_uri_error(e, &sanitized);
+    log::error!("SQL Server URI connection failed: {}", formatted.message);
+    formatted.into_connection_error()
+}
+
+// ---------------------------------------------------------------------------
+// Faithful CREATE TABLE generation (DBF-161)
+// ---------------------------------------------------------------------------
+
+/// Renders a column type name with exact dimensions from `sys.columns`:
+/// character/binary lengths (UTF-16 byte counts halved for `n*` types,
+/// `-1` meaning `MAX`), decimal precision/scale, and temporal scale.
+pub(crate) fn mssql_column_type_name(
+    base: &str,
+    max_length: i32,
+    precision: u8,
+    scale: u8,
+) -> String {
+    match base {
+        "char" | "varchar" | "binary" | "varbinary" => {
+            if max_length < 0 {
+                format!("{base}(max)")
+            } else {
+                format!("{base}({max_length})")
+            }
+        }
+        // Unicode types store 2 bytes per character (UTF-16 code units), so
+        // sys.columns.max_length is double the declared character length.
+        "nchar" | "nvarchar" => {
+            if max_length < 0 {
+                format!("{base}(max)")
+            } else {
+                format!("{base}({})", max_length / 2)
+            }
+        }
+        "decimal" | "numeric" => format!("{base}({precision},{scale})"),
+        "datetime2" | "datetimeoffset" | "time" => format!("{base}({scale})"),
+        // float defaults to float(53), which is written without precision.
+        "float" if precision < 53 => format!("{base}({precision})"),
+        _ => base.to_string(),
+    }
+}
+
+/// The bare type name without any `(…)` dimensions, lowercased.
+fn mssql_base_type(type_name: &str) -> &str {
+    let base = match type_name.find('(') {
+        Some(index) => &type_name[..index],
+        None => type_name,
+    };
+    base.trim()
+}
+
+/// SQL Server identity columns accept `int`/`bigint`/`smallint`/`tinyint`
+/// and `decimal`/`numeric` with scale 0.
+fn mssql_type_supports_identity(type_name: &str) -> bool {
+    match mssql_base_type(type_name).to_ascii_lowercase().as_str() {
+        "int" | "bigint" | "smallint" | "tinyint" => true,
+        "decimal" | "numeric" => type_name.ends_with(",0)"),
+        _ => false,
+    }
+}
+
+/// Bounded decimal-integer grammar for identity seed/increment: an optional
+/// minus sign followed by at most 38 ASCII digits (the numeric(38,0) bound).
+fn is_valid_identity_decimal(value: &str) -> bool {
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    !digits.is_empty() && digits.len() <= 38 && digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Given the number of columns carrying a default (`default_object_id <> 0`)
+/// and how many of those have an UNAVAILABLE definition (bound defaults,
+/// permission-hidden definitions), returns the missing-creation property that
+/// blocks faithful generation, if any. A genuinely absent default is fine.
+pub(crate) fn default_expression_availability(
+    _defaults_total: usize,
+    defaults_unreadable: usize,
+) -> Option<MissingCreationMetadata> {
+    if defaults_unreadable > 0 {
+        Some(MissingCreationMetadata::ColumnDefaultExpressions)
+    } else {
+        None
+    }
+}
+
+/// Detect a typed `xml` column: sys.columns reports a nonzero
+/// `xml_collection_id` exactly when an xml-typed column is bound to an XML
+/// schema collection. Generating plain `xml` would silently drop that
+/// binding, so the column must be named as a blocker instead.
+pub(crate) fn typed_xml_blocker(type_name: &str, xml_collection_id: i64) -> Option<&'static str> {
+    if type_name.eq_ignore_ascii_case("xml") && xml_collection_id != 0 {
+        Some(
+            "a typed xml column is bound to an XML schema collection that cannot be recreated; \
+             generating a plain xml type would silently drop the binding",
+        )
+    } else {
+        None
+    }
+}
+
+fn missing_property_label(missing: &MissingCreationMetadata) -> &'static str {
+    match missing {
+        MissingCreationMetadata::IdentitySeedOrIncrement => "identity seed/increment",
+        MissingCreationMetadata::PrimaryKeyOrder => "primary-key column order",
+        MissingCreationMetadata::ColumnDefaultExpressions => "column default expressions",
+        MissingCreationMetadata::StorageOptions => "storage options",
+    }
+}
+
+/// Validates reference-side creation metadata against the table it is
+/// supposed to describe. Every refusal names the problem: generation must
+/// fail closed rather than silently flattening identity, key order, or
+/// unsupported creation semantics into a lossy statement.
+fn validate_creation_metadata(
+    table: &TableInfo,
+    metadata: &TableCreationMetadata,
+) -> Result<(), DbError> {
+    if metadata.table != table.name || metadata.schema != table.schema {
+        let bound = match &metadata.schema {
+            Some(schema) => format!("[{schema}].[{}]", metadata.table),
+            None => format!("[{}]", metadata.table),
+        };
+        let requested = match &table.schema {
+            Some(schema) => format!("[{schema}].[{}]", table.name),
+            None => format!("[{}]", table.name),
+        };
+        return Err(DbError::NotSupported(format!(
+            "creation metadata is bound to {bound} but CREATE TABLE was requested for {requested}",
+        )));
+    }
+
+    let columns = table.columns.as_deref().ok_or_else(|| {
+        DbError::NotSupported("CREATE TABLE generation requires loaded column metadata".to_string())
+    })?;
+    if columns.is_empty() {
+        return Err(DbError::NotSupported(
+            "CREATE TABLE generation requires at least one column".to_string(),
+        ));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    for column in columns {
+        if !seen.insert(column.name.as_str()) {
+            return Err(DbError::NotSupported(format!(
+                "duplicate column name '{}' in table metadata",
+                column.name
+            )));
+        }
+    }
+
+    if !metadata.blockers.is_empty() {
+        let described = metadata
+            .blockers
+            .iter()
+            .map(|blocker| match &blocker.column {
+                Some(column) => format!("{} (column '{}')", blocker.code, column),
+                None => blocker.code.clone(),
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(DbError::NotSupported(format!(
+            "table has creation semantics faithful generation cannot express: {described}"
+        )));
+    }
+
+    if let MetadataCompleteness::Partial { missing } = &metadata.completeness {
+        let described = missing
+            .iter()
+            .map(missing_property_label)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(DbError::NotSupported(format!(
+            "reference metadata is incomplete ({described}); recapture a deep snapshot of the reference before generating"
+        )));
+    }
+
+    if let Some(identity) = &metadata.identity {
+        let column = columns
+            .iter()
+            .find(|column| column.name == identity.column)
+            .ok_or_else(|| {
+                DbError::NotSupported(format!(
+                    "identity spec names column '{}' which is not part of the table",
+                    identity.column
+                ))
+            })?;
+        if !mssql_type_supports_identity(&column.type_name) {
+            return Err(DbError::NotSupported(format!(
+                "identity column '{}' has type '{}' which cannot carry an identity",
+                identity.column, column.type_name
+            )));
+        }
+        for (label, value) in [("seed", &identity.seed), ("increment", &identity.increment)] {
+            if !is_valid_identity_decimal(value) {
+                return Err(DbError::NotSupported(format!(
+                    "identity {label} '{value}' is not a bounded decimal integer (numeric(38,0))"
+                )));
+            }
+        }
+    }
+
+    if let Some(primary_key) = &metadata.primary_key {
+        if primary_key.columns.is_empty() {
+            return Err(DbError::NotSupported(
+                "primary-key spec is empty".to_string(),
+            ));
+        }
+        let mut key_columns = std::collections::HashSet::new();
+        for name in &primary_key.columns {
+            if !columns.iter().any(|column| &column.name == name) {
+                return Err(DbError::NotSupported(format!(
+                    "primary-key spec names column '{name}' which is not part of the table"
+                )));
+            }
+            if !key_columns.insert(name.as_str()) {
+                return Err(DbError::NotSupported(format!(
+                    "primary-key spec lists column '{name}' twice"
+                )));
+            }
+        }
+        // The metadata key set and the per-column flags must agree, otherwise
+        // one of the two views is stale.
+        let flagged: Vec<&str> = columns
+            .iter()
+            .filter(|column| column.is_primary_key)
+            .map(|column| column.name.as_str())
+            .collect();
+        let flagged_set: std::collections::HashSet<&str> = flagged.iter().copied().collect();
+        let spec_set: std::collections::HashSet<&str> =
+            primary_key.columns.iter().map(String::as_str).collect();
+        if flagged_set != spec_set {
+            return Err(DbError::NotSupported(
+                "primary-key spec disagrees with the table's primary-key column flags".to_string(),
+            ));
+        }
+    } else if columns.iter().any(|column| column.is_primary_key) {
+        return Err(DbError::NotSupported(
+            "table has primary-key columns but the metadata declares none; \
+             recapture a deep snapshot of the reference"
+                .to_string(),
+        ));
+    }
+
+    Ok(())
+}
+
+/// Renders a faithful `CREATE TABLE` from reference-side metadata, refusing
+/// (named `NotSupported`) when the metadata is missing, incomplete, or
+/// describes creation semantics the generator cannot express.
+pub(crate) fn mssql_create_table_ddl(
+    table: &TableInfo,
+    creation_metadata: Option<&TableCreationMetadata>,
+) -> Result<String, DbError> {
+    let Some(metadata) = creation_metadata else {
+        return Err(DbError::NotSupported(
+            "faithful CREATE TABLE requires reference creation metadata, but none was supplied; \
+             snapshots captured before creation-metadata support must be recaptured as a deep snapshot"
+                .to_string(),
+        ));
+    };
+
+    validate_creation_metadata(table, metadata)?;
+
+    let Some(columns) = table.columns.as_deref() else {
+        // Unreachable after validate_creation_metadata, but never panic.
+        return Err(DbError::NotSupported(
+            "CREATE TABLE generation requires loaded column metadata".to_string(),
+        ));
+    };
+
+    let mut lines: Vec<String> = Vec::with_capacity(columns.len() + 1);
+    for column in columns {
+        let mut line = format!(
+            "    {} {}",
+            mssql_bracket_identifier(&column.name),
+            column.type_name
+        );
+        if let Some(identity) = metadata
+            .identity
+            .as_ref()
+            .filter(|identity| identity.column == column.name)
+        {
+            line.push_str(&format!(
+                " IDENTITY({}, {})",
+                identity.seed, identity.increment
+            ));
+        }
+        line.push_str(if column.nullable {
+            " NULL"
+        } else {
+            " NOT NULL"
+        });
+        if let Some(default) = column.default_value.as_deref() {
+            line.push_str(&format!(" DEFAULT {default}"));
+        }
+        lines.push(line);
+    }
+
+    if let Some(primary_key) = &metadata.primary_key {
+        let key_columns = primary_key
+            .columns
+            .iter()
+            .map(|column| mssql_bracket_identifier(column))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("    PRIMARY KEY ({key_columns})"));
+    }
+
+    let qualified = match &table.schema {
+        Some(schema) => format!(
+            "{}.{}",
+            mssql_bracket_identifier(schema),
+            mssql_bracket_identifier(&table.name)
+        ),
+        None => mssql_bracket_identifier(&table.name),
+    };
+
+    Ok(format!(
+        "CREATE TABLE {qualified} (\n{}\n)",
+        lines.join(",\n")
+    ))
+}
+
+fn mssql_bracket_identifier(identifier: &str) -> String {
+    format!("[{}]", identifier.replace(']', "]]"))
+}
+
+/// The `FROM` target for a table. SQL Server keeps the database separate from
+/// the schema, so a table outside the session's current database has to be
+/// named with it. With no database in the request the two-part form is what the
+/// session database resolves against, which is the behaviour callers had before
+/// the request carried one.
+fn qualified_table_in(database: Option<&str>, schema: Option<&str>, table: &str) -> String {
+    let Some(database) = database else {
+        return MSSQL_DIALECT.qualified_table(schema, table);
+    };
+
+    match schema {
+        Some(schema) => format!(
+            "{}.{}.{}",
+            MSSQL_DIALECT.quote_identifier(database),
+            MSSQL_DIALECT.quote_identifier(schema),
+            MSSQL_DIALECT.quote_identifier(table)
+        ),
+        // `[db]..[table]` leaves the schema to the database's own default.
+        None => format!(
+            "{}..{}",
+            MSSQL_DIALECT.quote_identifier(database),
+            MSSQL_DIALECT.quote_identifier(table)
+        ),
+    }
+}
+
+/// The statement a table browse runs. Built outside the connection so a unit
+/// test can pin the SQL without a live server.
+fn browse_sql(request: &TableBrowseRequest) -> Result<String, DbError> {
+    let table = qualified_table_in(
+        request.database.as_deref(),
+        request.table.schema.as_deref(),
+        &request.table.name,
+    );
+    let mut sql = format!(
+        "SELECT {} FROM {}",
+        request.select_list_with(&MSSQL_DIALECT),
+        table
+    );
+
+    if let Some(filter) = request.semantic_filter.as_ref() {
+        let where_clause = render_semantic_filter_sql(filter, &MSSQL_DIALECT)?;
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_clause);
+    } else if let Some(filter) = request.filter.as_ref() {
+        let trimmed = filter.trim();
+        if !trimmed.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(trimmed);
+        }
+    }
+
+    // `OFFSET ... FETCH NEXT` requires `ORDER BY`; fall back to an order-neutral
+    // `ORDER BY (SELECT NULL)` when the caller didn't supply one, which is valid
+    // for every column type.
+    if request.order_by.is_empty() {
+        sql.push_str(" ORDER BY (SELECT NULL)");
+    } else {
+        sql.push_str(" ORDER BY ");
+        let parts: Vec<String> = request
+            .order_by
+            .iter()
+            .map(|col| {
+                let dir = match col.direction {
+                    SortDirection::Ascending => "ASC",
+                    SortDirection::Descending => "DESC",
+                };
+                format!("{} {}", col.column.quoted_with(&MSSQL_DIALECT), dir)
+            })
+            .collect();
+        sql.push_str(&parts.join(", "));
+    }
+
+    sql.push_str(&format!(
+        " OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
+        request.pagination.offset(),
+        request.pagination.limit()
+    ));
+
+    Ok(sql)
+}
+
+/// The statement a row count runs.
+fn count_sql(request: &TableCountRequest) -> Result<String, DbError> {
+    let table = qualified_table_in(
+        request.database.as_deref(),
+        request.table.schema.as_deref(),
+        &request.table.name,
+    );
+    let mut sql = format!("SELECT COUNT(*) FROM {}", table);
+
+    if let Some(filter) = request.semantic_filter.as_ref() {
+        let where_clause = render_semantic_filter_sql(filter, &MSSQL_DIALECT)?;
+        sql.push_str(" WHERE ");
+        sql.push_str(&where_clause);
+    } else if let Some(filter) = request.filter.as_ref() {
+        let trimmed = filter.trim();
+        if !trimmed.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(trimmed);
+        }
+    }
+
+    Ok(sql)
+}
+
+/// The statement that reads one row back by primary key after an edit.
+fn row_by_pk_sql(
+    database: Option<&str>,
+    schema: &str,
+    table: &str,
+    pk_column: &str,
+    pk_value: &Value,
+) -> String {
+    let table = qualified_table_in(database, Some(schema), table);
+    format!(
+        "SELECT TOP 1 * FROM {table} WHERE {} = {}",
+        MSSQL_DIALECT.quote_identifier(pk_column),
+        MSSQL_DIALECT.value_to_literal(pk_value),
+    )
+}
+
+/// The statement that reads a batch of rows back by primary key.
+fn rows_by_pks_sql(
+    database: Option<&str>,
+    schema: &str,
+    table: &str,
+    pk_column: &str,
+    values: &[Value],
+    projection: Option<&[String]>,
+) -> String {
+    let select_list = match projection {
+        Some(columns) if !columns.is_empty() => columns
+            .iter()
+            .map(|column| MSSQL_DIALECT.quote_identifier(column))
+            .collect::<Vec<_>>()
+            .join(", "),
+        _ => "*".to_string(),
+    };
+    let literals = values
+        .iter()
+        .map(|value| MSSQL_DIALECT.value_to_literal(value))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let table = qualified_table_in(database, Some(schema), table);
+    format!(
+        "SELECT {select_list} FROM {table} WHERE {} IN ({literals})",
+        MSSQL_DIALECT.quote_identifier(pk_column),
+    )
+}
+
+/// Query listing the views and foreign-key child tables that depend on the
+/// table bound as `@P1` (schema) and `@P2` (name) in `database`.
+///
+/// Each row is `(kind, schema, name)` with `kind` either `V` or `F`. Only the
+/// database name is part of the text, as a bracket-quoted identifier.
+fn dependents_sql(database: &str) -> String {
+    let db = format!("[{}]", database.replace(']', "]]"));
+    format!(
+        "SELECT DISTINCT 'V', vs.name, v.name \
+         FROM {db}.sys.sql_expression_dependencies d \
+         JOIN {db}.sys.views v ON v.object_id = d.referencing_id \
+         JOIN {db}.sys.schemas vs ON vs.schema_id = v.schema_id \
+         JOIN {db}.sys.tables t ON t.object_id = d.referenced_id \
+         JOIN {db}.sys.schemas ts ON ts.schema_id = t.schema_id \
+         WHERE ts.name = @P1 AND t.name = @P2 \
+         UNION \
+         SELECT DISTINCT 'F', cs.name, ct.name \
+         FROM {db}.sys.foreign_keys fk \
+         JOIN {db}.sys.tables ct ON ct.object_id = fk.parent_object_id \
+         JOIN {db}.sys.schemas cs ON cs.schema_id = ct.schema_id \
+         JOIN {db}.sys.tables rt ON rt.object_id = fk.referenced_object_id \
+         JOIN {db}.sys.schemas rs ON rs.schema_id = rt.schema_id \
+         WHERE rs.name = @P1 AND rt.name = @P2 \
+         ORDER BY 1 DESC, 2, 3"
+    )
+}
+
+/// Map `(kind, schema, name)` rows from [`dependents_sql`] to relation
+/// references, skipping unknown kinds and duplicates.
+fn dependents_from_rows(rows: Vec<(String, String, String)>) -> Vec<datatab_core::RelationRef> {
+    use datatab_core::{RelationKind, RelationRef};
+
+    let mut dependents: Vec<RelationRef> = Vec::new();
+    for (kind, schema, name) in rows {
+        let kind = match kind.as_str() {
+            "V" => RelationKind::View,
+            "F" => RelationKind::ForeignKeyChild,
+            _ => continue,
+        };
+        let dependent = RelationRef {
+            kind,
+            qualified_name: format!("{schema}.{name}"),
+        };
+        if !dependents.contains(&dependent) {
+            dependents.push(dependent);
+        }
+    }
+    dependents
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datatab_core::{DefaultSpec, OrderByColumn};
+
+    #[tokio::test]
+    async fn enable_tcp_keepalive_sets_so_keepalive_on_the_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a local listener");
+        let address = listener.local_addr().expect("listener address");
+        let stream = TcpStream::connect(address)
+            .await
+            .expect("connect to the local listener");
+
+        let before = socket2::SockRef::from(&stream)
+            .keepalive()
+            .expect("read SO_KEEPALIVE before");
+        assert!(!before, "a new socket must start without TCP keepalive");
+
+        enable_tcp_keepalive(&stream).expect("enable keepalive");
+
+        let after = socket2::SockRef::from(&stream)
+            .keepalive()
+            .expect("read SO_KEEPALIVE after");
+        assert!(after, "enable_tcp_keepalive must turn on SO_KEEPALIVE");
+    }
+
+    #[test]
+    fn dependents_from_rows_maps_views_and_foreign_key_children() {
+        let rows = vec![
+            (
+                "V".to_string(),
+                "dbo".to_string(),
+                "orders_view".to_string(),
+            ),
+            (
+                "F".to_string(),
+                "sales".to_string(),
+                "order_items".to_string(),
+            ),
+            (
+                "F".to_string(),
+                "sales".to_string(),
+                "order_items".to_string(),
+            ),
+            ("X".to_string(), "dbo".to_string(), "ignored".to_string()),
+        ];
+
+        assert_eq!(
+            dependents_from_rows(rows),
+            vec![
+                datatab_core::RelationRef {
+                    kind: datatab_core::RelationKind::View,
+                    qualified_name: "dbo.orders_view".to_string(),
+                },
+                datatab_core::RelationRef {
+                    kind: datatab_core::RelationKind::ForeignKeyChild,
+                    qualified_name: "sales.order_items".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dependents_sql_binds_schema_and_table_and_quotes_the_database() {
+        let sql = dependents_sql("odd]db");
+        assert!(sql.contains("[odd]]db].sys.foreign_keys"), "got: {sql}");
+        assert!(sql.contains("ts.name = @P1 AND t.name = @P2"), "got: {sql}");
+        assert!(
+            sql.contains("rs.name = @P1 AND rt.name = @P2"),
+            "got: {sql}"
+        );
+    }
+
+    #[test]
+    fn browse_sql_qualifies_the_source_database() {
+        let scoped = TableBrowseRequest::new(datatab_core::TableRef::with_schema("dbo", "events"))
+            .with_database(Some("reporting".to_string()))
+            .with_order_by(vec![OrderByColumn::asc("id")]);
+        let sql = browse_sql(&scoped).unwrap();
+        assert!(
+            sql.starts_with("SELECT * FROM [reporting].[dbo].[events] "),
+            "browse must name the source database; got: {sql}"
+        );
+
+        let session_local =
+            TableBrowseRequest::new(datatab_core::TableRef::with_schema("dbo", "events"));
+        let sql = browse_sql(&session_local).unwrap();
+        assert!(
+            sql.starts_with("SELECT * FROM [dbo].[events] "),
+            "a request without a database must keep the two-part name; got: {sql}"
+        );
+    }
+
+    #[test]
+    fn count_sql_qualifies_the_source_database() {
+        let scoped = TableCountRequest::new(datatab_core::TableRef::with_schema("dbo", "events"))
+            .with_database(Some("reporting".to_string()));
+        assert_eq!(
+            count_sql(&scoped).unwrap(),
+            "SELECT COUNT(*) FROM [reporting].[dbo].[events]"
+        );
+
+        let session_local =
+            TableCountRequest::new(datatab_core::TableRef::with_schema("dbo", "events"));
+        assert_eq!(
+            count_sql(&session_local).unwrap(),
+            "SELECT COUNT(*) FROM [dbo].[events]"
+        );
+    }
+
+    #[test]
+    fn row_by_pk_sql_qualifies_the_source_database() {
+        assert_eq!(
+            row_by_pk_sql(Some("reporting"), "dbo", "events", "id", &Value::Int(7)),
+            "SELECT TOP 1 * FROM [reporting].[dbo].[events] WHERE [id] = 7"
+        );
+
+        assert_eq!(
+            row_by_pk_sql(None, "dbo", "events", "id", &Value::Int(7)),
+            "SELECT TOP 1 * FROM [dbo].[events] WHERE [id] = 7"
+        );
+    }
+
+    #[test]
+    fn rows_by_pks_sql_qualifies_projects_and_lists_keys() {
+        let values = vec![Value::Int(7), Value::Int(9)];
+        assert_eq!(
+            rows_by_pks_sql(
+                Some("reporting"),
+                "dbo",
+                "events",
+                "id",
+                &values,
+                Some(&["name".to_string(), "id".to_string()]),
+            ),
+            "SELECT [name], [id] FROM [reporting].[dbo].[events] WHERE [id] IN (7, 9)"
+        );
+
+        assert_eq!(
+            rows_by_pks_sql(None, "dbo", "events", "id", &values, None),
+            "SELECT * FROM [dbo].[events] WHERE [id] IN (7, 9)"
+        );
+    }
+
+    #[test]
+    fn time_type_is_not_classified_as_timestamp() {
+        use datatab_core::ColumnKind;
+        use tiberius::ColumnType;
+
+        // TIME emits Value::Time, which the chart engine cannot place on a time
+        // axis (no absolute instant), so it must not advertise Timestamp.
+        assert_eq!(
+            tiberius_column_to_kind(ColumnType::Timen),
+            ColumnKind::Unknown
+        );
+
+        // DATE (Value::Date) and the datetime types stay Timestamp — those plot.
+        assert_eq!(
+            tiberius_column_to_kind(ColumnType::Daten),
+            ColumnKind::Timestamp
+        );
+        assert_eq!(
+            tiberius_column_to_kind(ColumnType::Datetime2),
+            ColumnKind::Timestamp
+        );
+        assert_eq!(
+            tiberius_column_to_kind(ColumnType::DatetimeOffsetn),
+            ColumnKind::Timestamp
+        );
+    }
+
+    #[test]
+    fn mssql_type_to_routine_kind_mapping() {
+        use datatab_core::RoutineKind;
+
+        assert_eq!(
+            mssql_type_to_routine_kind("P"),
+            Some(RoutineKind::Procedure)
+        );
+        assert_eq!(
+            mssql_type_to_routine_kind("FN"),
+            Some(RoutineKind::Function)
+        );
+        assert_eq!(
+            mssql_type_to_routine_kind("IF"),
+            Some(RoutineKind::Function)
+        );
+        assert_eq!(
+            mssql_type_to_routine_kind("TF"),
+            Some(RoutineKind::Function)
+        );
+        assert_eq!(
+            mssql_type_to_routine_kind("AF"),
+            Some(RoutineKind::Aggregate)
+        );
+
+        // Codes that are not exposed in the routines folder.
+        assert_eq!(mssql_type_to_routine_kind("TR"), None);
+        assert_eq!(mssql_type_to_routine_kind("V"), None);
+        assert_eq!(mssql_type_to_routine_kind(""), None);
+
+        // Untrimmed codes (callers must trim; function does not trim itself).
+        assert_eq!(mssql_type_to_routine_kind("P "), None);
+        assert_eq!(mssql_type_to_routine_kind(" FN"), None);
+    }
+
+    #[test]
+    fn quote_identifier_brackets_and_escapes() {
+        assert_eq!(MSSQL_DIALECT.quote_identifier("users"), "[users]");
+        assert_eq!(MSSQL_DIALECT.quote_identifier("ev]il"), "[ev]]il]");
+    }
+
+    #[test]
+    fn bool_literal_uses_bit_zero_one() {
+        assert_eq!(MSSQL_DIALECT.value_to_literal(&Value::Bool(true)), "1");
+        assert_eq!(MSSQL_DIALECT.value_to_literal(&Value::Bool(false)), "0");
+    }
+
+    #[test]
+    fn text_literal_is_n_prefixed_and_escaped() {
+        assert_eq!(
+            MSSQL_DIALECT.value_to_literal(&Value::Text("d'argent".into())),
+            "N'd''argent'"
+        );
+    }
+
+    #[test]
+    fn bytes_literal_uses_uppercase_hex() {
+        assert_eq!(
+            MSSQL_DIALECT.value_to_literal(&Value::Bytes(vec![0x01, 0xAB, 0xCD])),
+            "0x01ABCD"
+        );
+    }
+
+    #[test]
+    fn insert_with_output_emits_output_inserted_star() {
+        let insert = RowInsert::new(
+            "users".into(),
+            Some("dbo".into()),
+            vec!["name".into(), "age".into()],
+            vec![Value::Text("alice".into()), Value::Int(30)],
+        );
+        let sql = build_insert_with_output(&insert).unwrap();
+        assert_eq!(
+            sql,
+            "INSERT INTO [dbo].[users] ([name], [age]) OUTPUT INSERTED.* VALUES (N'alice', 30)"
+        );
+    }
+
+    #[test]
+    fn update_with_output_emits_output_inserted_star() {
+        let patch = RowPatch::new(
+            RecordIdentity::composite(vec!["id".into()], vec![Value::Int(7)]),
+            "users".into(),
+            Some("dbo".into()),
+            vec![("name".into(), Value::Text("bob".into()))],
+        );
+        let sql = build_update_with_output(&patch).unwrap();
+        assert_eq!(
+            sql,
+            "UPDATE [dbo].[users] SET [name] = N'bob' OUTPUT INSERTED.* WHERE [id] = 7"
+        );
+    }
+
+    #[test]
+    fn delete_with_output_emits_output_deleted_star() {
+        let delete = RowDelete {
+            identity: RecordIdentity::composite(vec!["id".into()], vec![Value::Int(7)]),
+            table: "users".into(),
+            schema: Some("dbo".into()),
+        };
+        let sql = build_delete_with_output(&delete).unwrap();
+        assert_eq!(
+            sql,
+            "DELETE FROM [dbo].[users] OUTPUT DELETED.* WHERE [id] = 7"
+        );
+    }
+
+    #[test]
+    fn identity_where_clause_composite_uses_and() {
+        let identity = RecordIdentity::composite(
+            vec!["tenant_id".into(), "user_id".into()],
+            vec![Value::Int(1), Value::Int(42)],
+        );
+        assert_eq!(
+            identity_where_clause(&identity).unwrap(),
+            "[tenant_id] = 1 AND [user_id] = 42"
+        );
+    }
+
+    #[test]
+    fn identity_where_clause_rejects_non_composite() {
+        assert!(identity_where_clause(&RecordIdentity::ObjectId("x".into())).is_err());
+        assert!(identity_where_clause(&RecordIdentity::Key("x".into())).is_err());
+    }
+
+    #[test]
+    fn extract_location_finds_constraint_and_table() {
+        let msg = "Violation of PRIMARY KEY constraint 'PK_users'. \
+                   Cannot insert duplicate key in object 'dbo.users'. \
+                   The duplicate key value is (1).";
+        let loc = extract_location_from_message(msg);
+        assert_eq!(loc.constraint.as_deref(), Some("PK_users"));
+        assert_eq!(loc.schema.as_deref(), Some("dbo"));
+        assert_eq!(loc.table.as_deref(), Some("users"));
+    }
+
+    #[test]
+    fn extract_location_finds_fk_constraint_and_referenced_table_column() {
+        let msg = "The INSERT statement conflicted with the FOREIGN KEY \
+                   constraint 'FK_orders_user'. The conflict occurred in \
+                   database 'app', table 'dbo.users', column 'id'.";
+        let loc = extract_location_from_message(msg);
+        assert_eq!(loc.constraint.as_deref(), Some("FK_orders_user"));
+        assert_eq!(loc.schema.as_deref(), Some("dbo"));
+        assert_eq!(loc.table.as_deref(), Some("users"));
+        assert_eq!(loc.column.as_deref(), Some("id"));
+    }
+
+    #[test]
+    fn classify_mssql_code_routes_known_codes() {
+        assert_eq!(classify_mssql_code(18456), Some(MssqlErrorClass::Auth));
+        assert_eq!(classify_mssql_code(547), Some(MssqlErrorClass::Constraint));
+        assert_eq!(classify_mssql_code(2627), Some(MssqlErrorClass::Constraint));
+        assert_eq!(classify_mssql_code(334), Some(MssqlErrorClass::Constraint));
+        assert_eq!(classify_mssql_code(208), Some(MssqlErrorClass::NotFound));
+        assert_eq!(classify_mssql_code(229), Some(MssqlErrorClass::Permission));
+        assert_eq!(classify_mssql_code(102), Some(MssqlErrorClass::Syntax));
+        assert_eq!(classify_mssql_code(99999), None);
+    }
+
+    #[test]
+    fn is_numeric_literal_accepts_decimal_and_scientific() {
+        assert!(is_numeric_literal("0"));
+        assert!(is_numeric_literal("-42"));
+        assert!(is_numeric_literal("+3.14"));
+        assert!(is_numeric_literal("0.5"));
+        assert!(is_numeric_literal("1e10"));
+        assert!(is_numeric_literal("-1.5E-3"));
+    }
+
+    #[test]
+    fn is_numeric_literal_rejects_injection_attempts() {
+        assert!(!is_numeric_literal(""));
+        assert!(!is_numeric_literal("1; DROP TABLE users"));
+        assert!(!is_numeric_literal("1'or'1"));
+        assert!(!is_numeric_literal("NaN"));
+        assert!(!is_numeric_literal("1..2"));
+        assert!(!is_numeric_literal("1e"));
+        assert!(!is_numeric_literal("1.2.3"));
+        assert!(!is_numeric_literal(" 42"));
+        assert!(!is_numeric_literal("42 "));
+    }
+
+    #[test]
+    fn decimal_literal_emits_value_when_valid_and_null_otherwise() {
+        assert_eq!(
+            MSSQL_DIALECT.value_to_literal(&Value::Decimal("123.45".into())),
+            "123.45"
+        );
+        assert_eq!(
+            MSSQL_DIALECT.value_to_literal(&Value::Decimal("1; DROP TABLE x--".into())),
+            "NULL"
+        );
+    }
+
+    #[test]
+    fn inject_password_skips_when_already_present() {
+        let input = "sqlserver://sa:already@host:1433/db";
+        assert_eq!(
+            inject_password_into_mssql_uri(input, Some("override")),
+            input
+        );
+    }
+
+    #[test]
+    fn inject_password_adds_when_missing() {
+        let input = "sqlserver://sa@host:1433/db";
+        assert_eq!(
+            inject_password_into_mssql_uri(input, Some("p@ss")),
+            "sqlserver://sa:p%40ss@host:1433/db"
+        );
+    }
+
+    fn form_values(pairs: &[(&str, &str)]) -> FormValues {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn build_uri_appends_instance_as_query_param() {
+        let driver = MssqlDriver;
+        let values = form_values(&[
+            ("host", "localhost"),
+            ("port", "1433"),
+            ("user", "sa"),
+            ("database", ""),
+            ("instance", "MSSQLSERVER2019"),
+        ]);
+        let uri = driver.build_uri(&values, "pw").expect("uri");
+        assert_eq!(
+            uri,
+            "sqlserver://sa:pw@localhost:1433/?instance=MSSQLSERVER2019"
+        );
+    }
+
+    #[test]
+    fn build_uri_appends_instance_after_database() {
+        let driver = MssqlDriver;
+        let values = form_values(&[
+            ("host", "localhost"),
+            ("port", "1433"),
+            ("user", "sa"),
+            ("database", "tempdb"),
+            ("instance", "SQLEXPRESS"),
+        ]);
+        let uri = driver.build_uri(&values, "pw").expect("uri");
+        assert_eq!(
+            uri,
+            "sqlserver://sa:pw@localhost:1433/tempdb?instance=SQLEXPRESS"
+        );
+    }
+
+    #[test]
+    fn build_uri_omits_instance_when_empty() {
+        let driver = MssqlDriver;
+        let values = form_values(&[
+            ("host", "localhost"),
+            ("port", "1433"),
+            ("user", "sa"),
+            ("database", "tempdb"),
+            ("instance", ""),
+        ]);
+        let uri = driver.build_uri(&values, "pw").expect("uri");
+        assert_eq!(uri, "sqlserver://sa:pw@localhost:1433/tempdb");
+    }
+
+    #[test]
+    fn parse_uri_extracts_instance_from_backslash_form() {
+        let driver = MssqlDriver;
+        let parsed = driver
+            .parse_uri("sqlserver://sa:pw@localhost\\MSSQLSERVER2019:1433")
+            .expect("parsed");
+        assert_eq!(parsed.get("host").map(String::as_str), Some("localhost"));
+        assert_eq!(parsed.get("port").map(String::as_str), Some("1433"));
+        assert_eq!(
+            parsed.get("instance").map(String::as_str),
+            Some("MSSQLSERVER2019")
+        );
+    }
+
+    #[test]
+    fn parse_uri_extracts_instance_from_query_param() {
+        let driver = MssqlDriver;
+        let parsed = driver
+            .parse_uri("sqlserver://sa:pw@localhost:1433/?instance=SQLEXPRESS")
+            .expect("parsed");
+        assert_eq!(parsed.get("host").map(String::as_str), Some("localhost"));
+        assert_eq!(
+            parsed.get("instance").map(String::as_str),
+            Some("SQLEXPRESS")
+        );
+    }
+
+    #[test]
+    fn parse_uri_query_param_overrides_backslash_instance() {
+        let driver = MssqlDriver;
+        let parsed = driver
+            .parse_uri("sqlserver://sa:pw@localhost\\IGNORED:1433/?instance=WINS")
+            .expect("parsed");
+        assert_eq!(parsed.get("instance").map(String::as_str), Some("WINS"));
+    }
+
+    #[test]
+    fn parse_uri_decodes_password_with_percent_encoded_chars() {
+        // ws123456%21 -> ws123456!  ; without this, switching URI -> form
+        // leaves the password field empty/stale and the user saves a wrong
+        // credential (server returns 18456 / State 8).
+        let driver = MssqlDriver;
+        let parsed = driver
+            .parse_uri("sqlserver://sa:ws123456%21@localhost:1433/")
+            .expect("parsed");
+        assert_eq!(parsed.get("user").map(String::as_str), Some("sa"));
+        assert_eq!(
+            parsed.get("password").map(String::as_str),
+            Some("ws123456!")
+        );
+    }
+
+    #[test]
+    fn parse_uri_omits_password_when_credentials_have_no_colon() {
+        let driver = MssqlDriver;
+        let parsed = driver
+            .parse_uri("sqlserver://sa@localhost:1433/")
+            .expect("parsed");
+        assert_eq!(parsed.get("user").map(String::as_str), Some("sa"));
+        assert!(!parsed.contains_key("password"));
+    }
+
+    fn build_form_values_for_ssl(ssl_mode: Option<&str>) -> FormValues {
+        let mut v = form_values(&[("host", "localhost"), ("port", "1433"), ("user", "sa")]);
+        if let Some(mode) = ssl_mode {
+            v.insert("ssl_mode".to_string(), mode.to_string());
+        }
+        v
+    }
+
+    fn extract_ssl(values: FormValues) -> (String, bool) {
+        let driver = MssqlDriver;
+        match driver.build_config(&values).expect("config") {
+            DbConfig::SqlServer {
+                ssl_mode,
+                trust_server_certificate,
+                ..
+            } => (ssl_mode.unwrap_or_default(), trust_server_certificate),
+            _ => panic!("expected SqlServer config"),
+        }
+    }
+
+    #[test]
+    fn form_ssl_mode_off_disables_encryption() {
+        let (mode, trust) = extract_ssl(build_form_values_for_ssl(Some("off")));
+        assert_eq!(mode, "off");
+        // trust is irrelevant when encryption is off, but stays `true` so
+        // the value never represents "strict" silently.
+        assert!(trust);
+    }
+
+    #[test]
+    fn form_ssl_mode_on_trusts_self_signed() {
+        let (mode, trust) = extract_ssl(build_form_values_for_ssl(Some("on")));
+        assert_eq!(mode, "on");
+        assert!(trust);
+    }
+
+    #[test]
+    fn form_ssl_mode_required_validates_cert_chain() {
+        let (mode, trust) = extract_ssl(build_form_values_for_ssl(Some("required")));
+        assert_eq!(mode, "required");
+        assert!(!trust);
+    }
+
+    #[test]
+    fn form_ssl_mode_defaults_to_on_when_unset() {
+        let (mode, trust) = extract_ssl(build_form_values_for_ssl(None));
+        assert_eq!(mode, "on");
+        assert!(trust);
+    }
+
+    fn extract_root_cert(values: FormValues) -> Option<String> {
+        match MssqlDriver.build_config(&values).expect("config") {
+            DbConfig::SqlServer {
+                ssl_root_cert_path, ..
+            } => ssl_root_cert_path,
+            _ => panic!("expected SqlServer config"),
+        }
+    }
+
+    #[test]
+    fn form_ssl_root_cert_path_is_carried_into_config() {
+        let mut values = build_form_values_for_ssl(Some("required"));
+        values.insert(
+            "ssl_root_cert_path".to_string(),
+            "/etc/ssl/corp-ca.pem".to_string(),
+        );
+        assert_eq!(
+            extract_root_cert(values).as_deref(),
+            Some("/etc/ssl/corp-ca.pem")
+        );
+    }
+
+    #[test]
+    fn form_ssl_root_cert_path_blank_is_none() {
+        let mut values = build_form_values_for_ssl(Some("required"));
+        values.insert("ssl_root_cert_path".to_string(), "  ".to_string());
+        assert_eq!(extract_root_cert(values), None);
+    }
+
+    fn tiberius_debug(
+        ssl_mode: &str,
+        trust_server_certificate: bool,
+        ssl_root_cert_path: Option<&str>,
+    ) -> String {
+        format!(
+            "{:?}",
+            build_tiberius_config(&MssqlConnectParams {
+                host: "localhost",
+                port: 1433,
+                user: "sa",
+                password: "",
+                database: None,
+                instance: None,
+                ssl_mode,
+                trust_server_certificate,
+                ssl_root_cert_path,
+            })
+        )
+    }
+
+    #[test]
+    fn tiberius_off_mode_never_uses_ca() {
+        let debug = tiberius_debug("off", true, Some("/etc/ssl/corp-ca.pem"));
+        assert!(debug.contains("trust: TrustAll"), "{debug}");
+    }
+
+    #[test]
+    fn uri_mode_config_drops_root_cert_path() {
+        let mut values = FormValues::new();
+        values.insert("use_uri".into(), "true".into());
+        values.insert(
+            "uri".into(),
+            "sqlserver://sa@h:1433/db?encrypt=required".into(),
+        );
+        values.insert("ssl_root_cert_path".into(), "/etc/ssl/corp-ca.pem".into());
+        assert_eq!(extract_root_cert(values), None);
+    }
+
+    #[test]
+    fn extracted_config_carries_root_cert_path() {
+        let mut values = build_form_values_for_ssl(Some("required"));
+        values.insert("ssl_root_cert_path".into(), "/etc/ssl/corp-ca.pem".into());
+        let config = MssqlDriver.build_config(&values).expect("config");
+        let extracted = extract_mssql_config(&config).expect("extract");
+        assert_eq!(
+            extracted.ssl_root_cert_path.as_deref(),
+            Some("/etc/ssl/corp-ca.pem")
+        );
+        assert!(!extracted.trust_server_certificate);
+    }
+
+    #[test]
+    fn tiberius_on_mode_trusts_any_cert_even_with_ca() {
+        let debug = tiberius_debug("on", true, Some("/etc/ssl/corp-ca.pem"));
+        assert!(debug.contains("trust: TrustAll"), "{debug}");
+    }
+
+    #[test]
+    fn tiberius_required_without_ca_validates_against_system_roots() {
+        let debug = tiberius_debug("required", false, None);
+        assert!(debug.contains("trust: Default"), "{debug}");
+    }
+
+    #[test]
+    fn tiberius_required_with_ca_trusts_the_given_ca() {
+        let debug = tiberius_debug("required", false, Some("/etc/ssl/corp-ca.pem"));
+        assert!(
+            debug.contains("trust: CaCertificateLocation(\"/etc/ssl/corp-ca.pem\")"),
+            "{debug}"
+        );
+    }
+
+    #[test]
+    fn build_then_parse_uri_round_trips_instance() {
+        let driver = MssqlDriver;
+        let original = form_values(&[
+            ("host", "localhost"),
+            ("port", "1433"),
+            ("user", "sa"),
+            ("database", "appdb"),
+            ("instance", "MSSQLSERVER2019"),
+        ]);
+        let uri = driver.build_uri(&original, "pw").expect("uri");
+        let parsed = driver.parse_uri(&uri).expect("parsed");
+        assert_eq!(parsed.get("host").map(String::as_str), Some("localhost"));
+        assert_eq!(parsed.get("port").map(String::as_str), Some("1433"));
+        assert_eq!(parsed.get("database").map(String::as_str), Some("appdb"));
+        assert_eq!(
+            parsed.get("instance").map(String::as_str),
+            Some("MSSQLSERVER2019")
+        );
+    }
+
+    #[test]
+    fn parse_mssql_url_accepts_backslash_instance() {
+        // We can only assert that parsing succeeds; tiberius `Config` doesn't
+        // expose its internal instance/host fields publicly. A successful
+        // parse means tiberius will perform SQL Browser instance lookup.
+        let result = parse_mssql_url("sqlserver://sa:pw@localhost\\MSSQLSERVER2019:1433");
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+    }
+
+    #[test]
+    fn parse_mssql_url_accepts_instance_query_param() {
+        let result = parse_mssql_url("sqlserver://sa:pw@localhost:1433/?instance=SQLEXPRESS");
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+    }
+
+    #[test]
+    fn manual_mode_application_name_is_our_client_identity() {
+        // The manual connection form has no field for it, so our identity
+        // always applies — there is nothing for a user value to win over.
+        assert_eq!(
+            manual_mode_application_name(),
+            datatab_core::client_identity()
+        );
+    }
+
+    #[test]
+    fn ado_sets_application_name_detects_space_and_no_space_keys() {
+        assert!(ado_sets_application_name(
+            "Server=host;Application Name=Foo;User Id=sa"
+        ));
+        assert!(ado_sets_application_name("Server=host;ApplicationName=Foo"));
+        // Case-insensitive and tolerant of surrounding whitespace.
+        assert!(ado_sets_application_name(
+            "Server=host; APPLICATION NAME = Foo "
+        ));
+    }
+
+    #[test]
+    fn ado_sets_application_name_ignores_absent_key() {
+        assert!(!ado_sets_application_name("Server=host;User Id=sa"));
+    }
+
+    #[test]
+    fn ado_sets_application_name_does_not_match_value_substring() {
+        // A value that merely contains the text must not be mistaken for the
+        // key itself.
+        assert!(!ado_sets_application_name(
+            "Server=host;Description=Application Name lookalike"
+        ));
+    }
+
+    #[test]
+    fn parse_uri_query_params_captures_application_name() {
+        let query = parse_uri_query_params("applicationname=MyTool");
+        assert_eq!(query.application_name.as_deref(), Some("MyTool"));
+    }
+
+    #[test]
+    fn parse_uri_query_params_leaves_application_name_absent_without_param() {
+        let query = parse_uri_query_params("instance=SQLEXPRESS");
+        assert!(query.application_name.is_none());
+    }
+
+    #[test]
+    fn parse_mssql_url_accepts_applicationname_query_param() {
+        let result = parse_mssql_url("sqlserver://sa:pw@localhost:1433/?applicationname=MyTool");
+        assert!(result.is_ok(), "expected Ok, got {:?}", result.err());
+    }
+
+    fn fe_with_code(code: &str) -> FormattedError {
+        FormattedError::new("session terminated").with_code(code)
+    }
+
+    #[test]
+    fn is_kill_error_matches_known_kill_codes() {
+        assert!(is_kill_error(&DbError::QueryFailed(fe_with_code("596"))));
+        assert!(is_kill_error(&DbError::QueryFailed(fe_with_code("233"))));
+        assert!(is_kill_error(&DbError::QueryFailed(fe_with_code("6005"))));
+        // Same codes are also recognised when classified as connection errors,
+        // since the post-KILL read sometimes comes back as a transport failure.
+        assert!(is_kill_error(&DbError::ConnectionFailed(fe_with_code(
+            "596"
+        ))));
+    }
+
+    #[test]
+    fn is_kill_error_ignores_unrelated_codes() {
+        assert!(!is_kill_error(&DbError::QueryFailed(fe_with_code("547"))));
+        assert!(!is_kill_error(&DbError::ConstraintViolation(fe_with_code(
+            "2627"
+        ))));
+        assert!(!is_kill_error(&DbError::SyntaxError(fe_with_code("102"))));
+    }
+
+    #[test]
+    fn is_kill_error_ignores_errors_without_codes() {
+        assert!(!is_kill_error(&DbError::QueryFailed(FormattedError::new(
+            "no code"
+        ))));
+        assert!(!is_kill_error(&DbError::Cancelled));
+        assert!(!is_kill_error(&DbError::NotSupported("nope".to_string())));
+    }
+
+    #[test]
+    fn batch_can_open_transaction_detects_transaction_openers() {
+        for sql in [
+            "BEGIN TRAN",
+            "begin transaction t1",
+            "BEGIN DISTRIBUTED TRANSACTION",
+            "begin distributed tran",
+            "SET IMPLICIT_TRANSACTIONS ON",
+            "SET ANSI_NULLS, IMPLICIT_TRANSACTIONS ON",
+            "SET ANSI_DEFAULTS ON",
+            "-- move stock\nBEGIN TRAN\nINSERT INTO t VALUES (1)\nCOMMIT",
+            "SELECT 1 BEGIN TRANSACTION UPDATE t SET a = 1 COMMIT",
+            "/* setup */ BEGIN TRY BEGIN TRAN; SELECT 1; COMMIT; END TRY BEGIN CATCH ROLLBACK; END CATCH",
+        ] {
+            assert!(batch_can_open_transaction(sql), "should match: {sql}");
+        }
+    }
+
+    #[test]
+    fn batch_can_open_transaction_ignores_non_transaction_begin_and_quoted_text() {
+        for sql in [
+            "BEGIN TRY SELECT 1 END TRY",
+            "BEGIN CATCH SELECT ERROR_MESSAGE() END CATCH",
+            "IF 1 = 1 BEGIN SELECT 1 END",
+            "SELECT 'BEGIN TRAN'",
+            "SELECT N'it''s BEGIN TRAN'",
+            "SELECT 1 AS [BEGIN TRAN]",
+            "SELECT 1 AS \"BEGIN TRAN\"",
+            "/* BEGIN TRAN */ SELECT 1",
+            "/* outer /* BEGIN TRAN */ still comment */ SELECT 1",
+            "-- BEGIN TRAN\nSELECT 1",
+            "SET IMPLICIT_TRANSACTIONS OFF",
+            "SET NOCOUNT ON",
+            "SET @begin = 1",
+            "COMMIT TRAN",
+        ] {
+            assert!(!batch_can_open_transaction(sql), "should not match: {sql}");
+        }
+    }
+
+    #[test]
+    fn failed_batch_rolls_back_only_a_transaction_it_opened() {
+        assert_eq!(
+            failed_batch_transaction_action(Some(0), 1),
+            FailedBatchTransactionAction::RollBack
+        );
+        assert_eq!(
+            failed_batch_transaction_action(Some(1), 2),
+            FailedBatchTransactionAction::ReportStillOpen
+        );
+        assert_eq!(
+            failed_batch_transaction_action(None, 1),
+            FailedBatchTransactionAction::ReportStillOpen
+        );
+        assert_eq!(
+            failed_batch_transaction_action(Some(0), 0),
+            FailedBatchTransactionAction::None
+        );
+        assert_eq!(
+            failed_batch_transaction_action(None, 0),
+            FailedBatchTransactionAction::None
+        );
+    }
+
+    fn col(name: &str) -> ColumnMeta {
+        ColumnMeta {
+            name: name.to_string(),
+            type_name: "text".to_string(),
+            kind: datatab_core::ColumnKind::Unknown,
+            nullable: true,
+            is_primary_key: false,
+        }
+    }
+
+    fn one_row_set(label: &str) -> CollectedSet {
+        CollectedSet {
+            columns: vec![col(label)],
+            rows: vec![vec![Value::Text(label.to_string())]],
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn build_multi_result_empty_input_yields_empty_primary() {
+        let result = build_multi_result(Vec::new(), std::time::Duration::ZERO);
+        assert!(result.columns.is_empty());
+        assert!(result.rows.is_empty());
+        assert!(!result.has_additional_results());
+        assert_eq!(result.result_set_count(), 1);
+    }
+
+    #[test]
+    fn build_multi_result_single_set_has_no_extras() {
+        let result = build_multi_result(vec![one_row_set("first")], std::time::Duration::ZERO);
+        assert_eq!(result.columns.len(), 1);
+        assert_eq!(result.rows.len(), 1);
+        assert!(!result.has_additional_results());
+        assert_eq!(result.result_set_count(), 1);
+    }
+
+    #[test]
+    fn build_multi_result_multiple_sets_split_last_as_primary_rest_as_extras() {
+        let result = build_multi_result(
+            vec![one_row_set("a"), one_row_set("b"), one_row_set("c")],
+            std::time::Duration::ZERO,
+        );
+
+        // Last set becomes the primary (preserves "last statement wins" UX).
+        assert_eq!(result.columns[0].name, "c");
+        assert_eq!(result.rows[0][0], Value::Text("c".to_string()));
+
+        // Earlier sets land in additional_results in batch order.
+        assert_eq!(result.result_set_count(), 3);
+        assert_eq!(result.additional_results.len(), 2);
+        assert_eq!(result.additional_results[0].columns[0].name, "a");
+        assert_eq!(result.additional_results[1].columns[0].name, "b");
+
+        // iter_result_sets yields primary first, then the earlier sets in
+        // batch order.
+        let names: Vec<String> = result
+            .iter_result_sets()
+            .map(|r| r.columns[0].name.clone())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["c".to_string(), "a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn build_multi_result_carries_per_set_truncation_flags() {
+        let mut truncated_first = one_row_set("a");
+        truncated_first.truncated = true;
+        let complete_middle = one_row_set("b");
+        let mut truncated_last = one_row_set("c");
+        truncated_last.truncated = true;
+
+        let result = build_multi_result(
+            vec![truncated_first, complete_middle, truncated_last],
+            std::time::Duration::ZERO,
+        );
+
+        // The last set is primary and carries its own flag; earlier sets keep
+        // theirs as additional results in batch order.
+        assert!(result.rows_truncated());
+        assert_eq!(result.additional_results.len(), 2);
+        assert!(result.additional_results[0].rows_truncated());
+        assert!(!result.additional_results[1].rows_truncated());
+    }
+
+    #[test]
+    fn finalize_drops_only_sets_without_columns_and_rows() {
+        let empty_columned = CollectedSet {
+            columns: vec![col("id"), col("name")],
+            rows: Vec::new(),
+            truncated: false,
+        };
+        let metadata_less = CollectedSet {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            truncated: false,
+        };
+
+        let kept = finalize_result_sets(vec![metadata_less, empty_columned, one_row_set("data")]);
+
+        // The metadata-less set (no columns, no rows) is dropped; the
+        // empty-but-columned set and the populated set are retained.
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].columns.len(), 2);
+        assert!(kept[0].rows.is_empty());
+        assert_eq!(kept[1].columns[0].name, "data");
+    }
+
+    #[test]
+    fn finalize_keeps_a_set_that_observed_discarded_rows() {
+        // A zero-budget set whose rows were all observed and discarded keeps
+        // its columns (from METADATA) and its truncated flag.
+        let drained = CollectedSet {
+            columns: vec![col("id")],
+            rows: Vec::new(),
+            truncated: true,
+        };
+
+        let kept = finalize_result_sets(vec![drained]);
+        assert_eq!(kept.len(), 1);
+        assert!(kept[0].truncated);
+    }
+
+    #[test]
+    fn empty_but_columned_set_becomes_primary_with_columns() {
+        let empty_columned = CollectedSet {
+            columns: vec![col("user_id"), col("email")],
+            rows: Vec::new(),
+            truncated: false,
+        };
+
+        let collected = finalize_result_sets(vec![empty_columned]);
+        let result = build_multi_result(collected, std::time::Duration::ZERO);
+
+        // The regression guard: a zero-row SELECT keeps its column headers.
+        assert!(!result.columns.is_empty());
+        assert_eq!(result.columns.len(), 2);
+        assert_eq!(result.columns[0].name, "user_id");
+        assert_eq!(result.columns[1].name, "email");
+        assert!(result.rows.is_empty());
+    }
+
+    #[test]
+    fn mssql_metadata_advertises_chart_authoring() {
+        assert!(
+            METADATA
+                .capabilities
+                .contains(DriverCapabilities::CHART_AUTHORING),
+            "CHART_AUTHORING must be set: MSSQL advertises INSTANCE_METRICS and needs \
+             CHART_AUTHORING so the sidebar surfaces Dashboards / Saved Charts folders"
+        );
+    }
+
+    #[test]
+    fn mssql_metadata_advertises_instance_metrics() {
+        assert!(
+            METADATA
+                .capabilities
+                .contains(DriverCapabilities::INSTANCE_METRICS),
+            "INSTANCE_METRICS must remain set on MSSQL driver"
+        );
+    }
+
+    #[test]
+    fn mssql_metadata_declares_sql_transfer_family() {
+        assert_eq!(METADATA.category, DatabaseCategory::Relational);
+        assert_eq!(METADATA.transfer_family, TransferFamily::Sql);
+    }
+
+    #[test]
+    fn mssql_metadata_advertises_bulk_insert_and_truncate() {
+        assert!(
+            METADATA
+                .capabilities
+                .contains(DriverCapabilities::BULK_INSERT)
+        );
+        assert!(
+            METADATA
+                .capabilities
+                .contains(DriverCapabilities::TRUNCATE_TABLE)
+        );
+    }
+
+    #[test]
+    fn mssql_limits_report_the_1000_row_bulk_insert_cap() {
+        let limits = METADATA.limits.as_ref().expect("mssql must declare limits");
+        assert_eq!(limits.max_bulk_insert_rows, 1000);
+    }
+
+    #[test]
+    fn mssql_referential_integrity_toggle_stays_unsupported() {
+        // Per the design's flagged open question: T-SQL's per-table NOCHECK
+        // model does not fit the global set_referential_integrity signature,
+        // so MSSQL does not override the default and must not set the
+        // DISABLE_FK_CHECKS capability bit.
+        assert!(
+            !METADATA
+                .capabilities
+                .contains(DriverCapabilities::DISABLE_FK_CHECKS)
+        );
+    }
+
+    #[test]
+    fn mssql_generate_bulk_insert_emits_multi_row_values() {
+        use datatab_core::QueryGenerator;
+
+        let generator = SqlMutationGenerator::new(&MSSQL_DIALECT);
+        let columns = vec!["name".to_string(), "age".to_string()];
+        let owned_rows: Vec<Vec<datatab_core::Value>> = vec![
+            vec![
+                datatab_core::Value::Text("Alice".to_string()),
+                datatab_core::Value::Int(25),
+            ],
+            vec![
+                datatab_core::Value::Text("Bob".to_string()),
+                datatab_core::Value::Int(30),
+            ],
+        ];
+        let rows: Vec<&[datatab_core::Value]> = owned_rows.iter().map(|r| r.as_slice()).collect();
+
+        let generated = generator
+            .generate_bulk_insert(None, "users", &columns, &[], &rows)
+            .unwrap()
+            .expect("mssql generator must support native bulk insert");
+
+        assert!(generated.text.starts_with("INSERT INTO "));
+        assert!(generated.text.contains("VALUES"));
+        assert_eq!(generated.text.matches("), (").count() + 1, 2);
+    }
+
+    #[test]
+    fn mssql_generate_create_table_preserves_types_and_pk() {
+        use datatab_core::QueryGenerator;
+
+        let generator = SqlMutationGenerator::new(&MSSQL_DIALECT);
+        let spec = datatab_core::CreateTableSpec {
+            schema: None,
+            table: "users".to_string(),
+            columns: vec![datatab_core::TransferColumn {
+                name: "id".to_string(),
+                type_name: Some("INT".to_string()),
+                nullable: false,
+                is_primary_key: true,
+            }],
+            if_not_exists: false,
+        };
+
+        let generated = generator
+            .generate_create_table(&spec)
+            .unwrap()
+            .expect("mssql generator must support native CREATE TABLE");
+
+        assert!(generated.text.contains("PRIMARY KEY"));
+        assert!(generated.text.contains("NOT NULL"));
+    }
+
+    // F-R3-1: T-SQL limit_clause must use OFFSET/FETCH, not LIMIT.
+    #[test]
+    fn mssql_limit_clause_uses_offset_fetch() {
+        assert_eq!(
+            MSSQL_DIALECT.limit_clause(5),
+            "OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY",
+            "T-SQL must use OFFSET/FETCH syntax, not LIMIT"
+        );
+    }
+
+    // F-R3-1: T-SQL limit_clause with n=1000 (typical chunk size).
+    #[test]
+    fn mssql_limit_clause_uses_offset_fetch_thousand() {
+        let clause = MSSQL_DIALECT.limit_clause(1000);
+        assert!(
+            clause.contains("OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY"),
+            "got: {}",
+            clause
+        );
+        assert!(
+            !clause.to_ascii_uppercase().contains("LIMIT"),
+            "must not contain LIMIT; got: {}",
+            clause
+        );
+    }
+
+    // T15: the data-transfer engine's no-PK fallback pagination must use
+    // OFFSET/FETCH for MSSQL even for a non-zero offset, where plain
+    // `LIMIT n OFFSET m` (the trait's default) would be invalid T-SQL.
+    #[test]
+    fn mssql_limit_offset_clause_uses_offset_fetch_for_nonzero_offset() {
+        assert_eq!(
+            MSSQL_DIALECT.limit_offset_clause(5, 10),
+            "OFFSET 10 ROWS FETCH NEXT 5 ROWS ONLY"
+        );
+    }
+
+    #[test]
+    fn mssql_limit_offset_clause_uses_offset_fetch_for_zero_offset() {
+        assert_eq!(
+            MSSQL_DIALECT.limit_offset_clause(5, 0),
+            "OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY"
+        );
+    }
+
+    // F-R3-1: The PK SELECT built by run_chunked_tx for MSSQL must use OFFSET/FETCH.
+    // This tests the clause construction pattern directly so no live connection is needed.
+    #[test]
+    fn mssql_chunked_pk_select_uses_offset_fetch() {
+        use datatab_core::SqlDialect;
+        let chunk_size: u32 = 1000;
+        let limit = MSSQL_DIALECT.limit_clause(chunk_size);
+        let select_sql = format!("SELECT [id] FROM [orders] ORDER BY [id] {}", limit);
+        assert!(
+            select_sql.contains("OFFSET 0 ROWS FETCH NEXT 1000 ROWS ONLY"),
+            "chunked PK SELECT for MSSQL must use OFFSET/FETCH; got: {}",
+            select_sql
+        );
+        assert!(
+            !select_sql.to_ascii_uppercase().contains(" LIMIT "),
+            "chunked PK SELECT for MSSQL must not use LIMIT; got: {}",
+            select_sql
+        );
+    }
+
+    // F-R3-1: The sample rows SELECT for MSSQL must use OFFSET/FETCH.
+    #[test]
+    fn mssql_sample_rows_uses_offset_fetch() {
+        use datatab_core::SqlDialect;
+        let limit = MSSQL_DIALECT.limit_clause(5);
+        let sql = format!("SELECT * FROM [orders] {}", limit);
+        assert!(
+            sql.contains("OFFSET 0 ROWS FETCH NEXT 5 ROWS ONLY"),
+            "sample rows SELECT for MSSQL must use OFFSET/FETCH; got: {}",
+            sql
+        );
+        assert!(
+            !sql.to_ascii_uppercase().contains(" LIMIT "),
+            "sample rows SELECT for MSSQL must not use LIMIT; got: {}",
+            sql
+        );
+    }
+
+    fn visual_select_spec(limit: Option<u64>, offset: u64) -> datatab_core::VisualQuerySpec {
+        datatab_core::VisualQuerySpec {
+            source: datatab_core::SourceTable {
+                schema: None,
+                table: "users".to_string(),
+                alias: "users".to_string(),
+            },
+            projection: datatab_core::Projection::All,
+            joins: vec![],
+            filter: None,
+            group_by: vec![],
+            aggregates: vec![],
+            having: None,
+            sort: vec![],
+            limit,
+            offset,
+        }
+    }
+
+    fn visual_select_sql(spec: &datatab_core::VisualQuerySpec) -> String {
+        SqlMutationGenerator::new(&MSSQL_DIALECT)
+            .generate_select(spec)
+            .expect("spec must be valid")
+            .expect("mssql generator must render a SELECT")
+            .sql
+    }
+
+    fn sorted_visual_select_spec(limit: Option<u64>, offset: u64) -> datatab_core::VisualQuerySpec {
+        let mut spec = visual_select_spec(limit, offset);
+
+        spec.sort = vec![datatab_core::SortEntry {
+            source_alias: "users".to_string(),
+            column: "id".to_string(),
+            direction: datatab_core::VisualSortDirection::Desc,
+        }];
+
+        spec
+    }
+
+    #[test]
+    fn mssql_visual_select_without_sort_uses_order_neutral_order_by() {
+        assert_eq!(
+            visual_select_sql(&visual_select_spec(None, 0)),
+            "SELECT *\nFROM [users]"
+        );
+        assert_eq!(
+            visual_select_sql(&visual_select_spec(Some(100), 0)),
+            "SELECT *\nFROM [users]\nORDER BY (SELECT NULL)\nOFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY"
+        );
+        assert_eq!(
+            visual_select_sql(&visual_select_spec(None, 20)),
+            "SELECT *\nFROM [users]\nORDER BY (SELECT NULL)\nOFFSET 20 ROWS"
+        );
+        assert_eq!(
+            visual_select_sql(&visual_select_spec(Some(100), 20)),
+            "SELECT *\nFROM [users]\nORDER BY (SELECT NULL)\nOFFSET 20 ROWS FETCH NEXT 100 ROWS ONLY"
+        );
+    }
+
+    #[test]
+    fn mssql_visual_select_with_sort_appends_offset_fetch_after_order_by() {
+        let order_by = "SELECT *\nFROM [users]\nORDER BY [users].[id] DESC";
+
+        assert_eq!(
+            visual_select_sql(&sorted_visual_select_spec(None, 0)),
+            order_by
+        );
+        assert_eq!(
+            visual_select_sql(&sorted_visual_select_spec(Some(100), 0)),
+            format!("{order_by}\nOFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY")
+        );
+        assert_eq!(
+            visual_select_sql(&sorted_visual_select_spec(None, 20)),
+            format!("{order_by}\nOFFSET 20 ROWS")
+        );
+        assert_eq!(
+            visual_select_sql(&sorted_visual_select_spec(Some(100), 20)),
+            format!("{order_by}\nOFFSET 20 ROWS FETCH NEXT 100 ROWS ONLY")
+        );
+    }
+
+    #[test]
+    fn mssql_grouped_visual_select_places_order_neutral_order_by_after_group_by() {
+        let mut spec = visual_select_spec(Some(100), 0);
+
+        spec.group_by = vec![datatab_core::GroupByEntry {
+            source_alias: "users".to_string(),
+            column: "country".to_string(),
+        }];
+
+        assert_eq!(
+            visual_select_sql(&spec),
+            "SELECT [users].[country]\nFROM [users]\nGROUP BY [users].[country]\nORDER BY (SELECT NULL)\nOFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY"
+        );
+    }
+
+    #[test]
+    fn mssql_visual_select_limit_zero_is_unbounded() {
+        assert_eq!(
+            visual_select_sql(&visual_select_spec(Some(0), 0)),
+            "SELECT *\nFROM [users]"
+        );
+    }
+
+    #[test]
+    fn mssql_visual_select_keeps_limits_beyond_u32() {
+        let limit = u64::from(u32::MAX) + 1;
+
+        assert_eq!(
+            visual_select_sql(&visual_select_spec(Some(limit), 0)),
+            "SELECT *\nFROM [users]\nORDER BY (SELECT NULL)\nOFFSET 0 ROWS FETCH NEXT 4294967296 ROWS ONLY"
+        );
+    }
+
+    #[test]
+    fn mssql_visual_select_limit_uses_offset_fetch() {
+        let sql = visual_select_sql(&visual_select_spec(Some(100), 0));
+
+        assert!(
+            !sql.to_ascii_uppercase().contains("LIMIT"),
+            "builder SELECT for MSSQL must not use LIMIT; got: {}",
+            sql
+        );
+        assert!(
+            sql.contains("OFFSET 0 ROWS FETCH NEXT 100 ROWS ONLY"),
+            "builder SELECT for MSSQL must use OFFSET/FETCH; got: {}",
+            sql
+        );
+    }
+
+    // ===== Column ALTER seam (DBF-24) =====
+
+    #[test]
+    fn mssql_codegen_generates_add_column_without_column_keyword() {
+        let generator = MssqlCodeGenerator;
+        let request = AddColumnRequest {
+            table_name: "users",
+            schema_name: Some("dbo"),
+            column_name: "age",
+            type_name: "INT",
+            nullable: false,
+            default: Some("0"),
+        };
+
+        let statements = generator
+            .generate_add_column(&request)
+            .expect("mssql should generate add column sql");
+
+        assert_eq!(
+            statements,
+            vec!["ALTER TABLE [dbo].[users] ADD [age] INT NOT NULL DEFAULT 0;"]
+        );
+    }
+
+    #[test]
+    fn mssql_codegen_generates_drop_column_with_column_keyword() {
+        let generator = MssqlCodeGenerator;
+        let request = DropColumnRequest {
+            table_name: "users",
+            schema_name: Some("dbo"),
+            column_name: "age",
+        };
+
+        let statements = generator
+            .generate_drop_column(&request)
+            .expect("mssql should generate drop column sql");
+
+        assert_eq!(
+            statements,
+            vec!["ALTER TABLE [dbo].[users] DROP COLUMN [age];"]
+        );
+    }
+
+    #[test]
+    fn mssql_codegen_alter_column_requires_explicit_type_and_nullable_together() {
+        let generator = MssqlCodeGenerator;
+        let request = AlterColumnRequest {
+            table_name: "users",
+            schema_name: Some("dbo"),
+            column_name: "age",
+            new_type: Some("BIGINT"),
+            nullable: Some(true),
+            default: None,
+        };
+
+        let statements = generator
+            .generate_alter_column(&request)
+            .expect("mssql should generate alter column sql");
+
+        assert_eq!(
+            statements,
+            vec!["ALTER TABLE [dbo].[users] ALTER COLUMN [age] BIGINT NULL;"]
+        );
+    }
+
+    #[test]
+    fn mssql_codegen_alter_column_rejects_type_change_without_explicit_nullable() {
+        let generator = MssqlCodeGenerator;
+        let request = AlterColumnRequest {
+            table_name: "users",
+            schema_name: Some("dbo"),
+            column_name: "age",
+            new_type: Some("BIGINT"),
+            nullable: None,
+            default: None,
+        };
+
+        let result = generator.generate_alter_column(&request);
+
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().reason,
+            "SQL Server requires an explicit nullability together with a type change (ALTER COLUMN needs the full column definition)"
+        );
+    }
+
+    #[test]
+    fn mssql_codegen_alter_column_rejects_nullable_change_without_type() {
+        let generator = MssqlCodeGenerator;
+        let request = AlterColumnRequest {
+            table_name: "users",
+            schema_name: Some("dbo"),
+            column_name: "age",
+            new_type: None,
+            nullable: Some(false),
+            default: None,
+        };
+
+        let result = generator.generate_alter_column(&request);
+
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().reason,
+            "SQL Server requires the column type to change nullability (ALTER COLUMN needs the full column definition)"
+        );
+    }
+
+    #[test]
+    fn mssql_codegen_alter_column_rejects_default_changes() {
+        let generator = MssqlCodeGenerator;
+        let request = AlterColumnRequest {
+            table_name: "users",
+            schema_name: Some("dbo"),
+            column_name: "age",
+            new_type: None,
+            nullable: None,
+            default: Some(DefaultSpec::Set("0")),
+        };
+
+        let result = generator.generate_alter_column(&request);
+
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().reason,
+            "SQL Server default constraints must be dropped and re-added by name; not derivable from this request"
+        );
+    }
+
+    #[test]
+    fn mssql_codegen_alter_column_rejects_when_nothing_to_change() {
+        let generator = MssqlCodeGenerator;
+        let request = AlterColumnRequest {
+            table_name: "users",
+            schema_name: Some("dbo"),
+            column_name: "age",
+            new_type: None,
+            nullable: None,
+            default: None,
+        };
+
+        let result = generator.generate_alter_column(&request);
+
+        assert_eq!(
+            result,
+            Err(DdlRejection {
+                reason: "ALTER COLUMN requires at least one of: type, nullable, default"
+                    .to_string(),
+                followup: None,
+            })
+        );
+    }
+
+    // ── DBF-161: faithful CREATE TABLE generation ───────────────────────
+
+    use datatab_core::{
+        CreationBlocker, IdentitySpec, MetadataCompleteness, MissingCreationMetadata,
+        PrimaryKeySpec,
+    };
+
+    fn plain_column(
+        name: &str,
+        type_name: &str,
+        nullable: bool,
+        is_primary_key: bool,
+    ) -> ColumnInfo {
+        ColumnInfo {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            nullable,
+            is_primary_key,
+            default_value: None,
+            enum_values: None,
+        }
+    }
+
+    fn creation_table() -> TableInfo {
+        TableInfo {
+            name: "gen_users".to_string(),
+            schema: Some("dbo".to_string()),
+            columns: Some(vec![
+                plain_column("ID", "DECIMAL(38,0)", false, true),
+                plain_column("Name", "NVARCHAR(50)", false, true),
+                plain_column("Bio", "NVARCHAR(MAX)", true, false),
+                plain_column("Balance", "DECIMAL(12,4)", false, false),
+                plain_column("Stamp", "DATETIME2(3)", true, false),
+            ]),
+            indexes: None,
+            foreign_keys: None,
+            constraints: None,
+            sample_fields: None,
+            presentation: Default::default(),
+            child_items: None,
+            storage_hints: None,
+            pseudo_columns: Box::default(),
+        }
+    }
+
+    fn complete_metadata() -> TableCreationMetadata {
+        TableCreationMetadata {
+            schema: Some("dbo".to_string()),
+            table: "gen_users".to_string(),
+            completeness: MetadataCompleteness::Complete,
+            identity: Some(IdentitySpec {
+                column: "ID".to_string(),
+                seed: "99999999999999999999999999999999999990".to_string(),
+                increment: "3".to_string(),
+            }),
+            primary_key: Some(PrimaryKeySpec {
+                columns: vec!["Name".to_string(), "ID".to_string()],
+            }),
+            blockers: Vec::new(),
+        }
+    }
+
+    // ── Verifier blocker 3: bound/hidden default expressions ─────────────
+
+    #[test]
+    fn default_expression_availability_allows_absent_and_readable_defaults() {
+        // No defaults at all: nothing missing.
+        assert_eq!(default_expression_availability(0, 0), None);
+        // Every default's definition is readable (CREATE TABLE defaults):
+        // nothing missing.
+        assert_eq!(default_expression_availability(2, 0), None);
+    }
+
+    #[test]
+    fn default_expression_availability_blocks_known_defaults_without_definitions() {
+        // A known default (default_object_id <> 0) whose definition is not
+        // available (legacy bound default, permission-hidden definition)
+        // must not silently drop on generation.
+        assert_eq!(
+            default_expression_availability(1, 1),
+            Some(MissingCreationMetadata::ColumnDefaultExpressions)
+        );
+        assert_eq!(
+            default_expression_availability(3, 2),
+            Some(MissingCreationMetadata::ColumnDefaultExpressions)
+        );
+        assert_eq!(default_expression_availability(0, 0), None);
+    }
+
+    // ── Typed XML detection ──────────────────────────────────────────────
+
+    #[test]
+    fn typed_xml_blocker_fires_only_for_xml_bound_to_a_collection() {
+        // Typed xml: collection bound — must block.
+        assert!(typed_xml_blocker("xml", 5).is_some());
+        // Case-insensitive type match.
+        assert!(typed_xml_blocker("XML", 5).is_some());
+        // Untyped xml: no collection — plain xml is faithful, must not block.
+        assert_eq!(typed_xml_blocker("xml", 0), None);
+        // Non-xml types never block, even with a nonzero id.
+        assert_eq!(typed_xml_blocker("nvarchar", 5), None);
+        assert_eq!(typed_xml_blocker("", 0), None);
+    }
+
+    #[test]
+    fn resolve_session_database_prefers_actual_session_over_configured() {
+        // The session's actual database (DB_NAME()) is the source of truth.
+        assert_eq!(
+            resolve_session_database(Some("master".to_string()), Some("other".to_string())),
+            Some("master".to_string())
+        );
+        // No configured database (default login): the actual session
+        // database must surface instead of None.
+        assert_eq!(
+            resolve_session_database(Some("master".to_string()), None),
+            Some("master".to_string())
+        );
+        // Server reporting no database: fall back to the configured one
+        // rather than treating unknown as empty.
+        assert_eq!(
+            resolve_session_database(None, Some("appdb".to_string())),
+            Some("appdb".to_string())
+        );
+        assert_eq!(resolve_session_database(None, None), None);
+    }
+
+    // ── Type-dimension rendering ──────────────────────────────────────────────
+
+    #[test]
+    fn mssql_type_name_renders_unicode_length_in_characters_not_utf16_bytes() {
+        // sys.columns.max_length counts UTF-16 bytes (2 per character).
+        assert_eq!(mssql_column_type_name("nvarchar", 40, 0, 0), "nvarchar(20)");
+        assert_eq!(mssql_column_type_name("nchar", 20, 0, 0), "nchar(10)");
+        assert_eq!(
+            mssql_column_type_name("nvarchar", -1, 0, 0),
+            "nvarchar(max)"
+        );
+        assert_eq!(mssql_column_type_name("nchar", -1, 0, 0), "nchar(max)");
+    }
+
+    #[test]
+    fn mssql_type_name_renders_byte_lengths_and_max() {
+        assert_eq!(mssql_column_type_name("varchar", 50, 0, 0), "varchar(50)");
+        assert_eq!(mssql_column_type_name("char", 10, 0, 0), "char(10)");
+        assert_eq!(
+            mssql_column_type_name("varbinary", 16, 0, 0),
+            "varbinary(16)"
+        );
+        assert_eq!(mssql_column_type_name("binary", 32, 0, 0), "binary(32)");
+        assert_eq!(
+            mssql_column_type_name("varbinary", -1, 0, 0),
+            "varbinary(max)"
+        );
+        assert_eq!(mssql_column_type_name("varchar", -1, 0, 0), "varchar(max)");
+    }
+
+    #[test]
+    fn mssql_type_name_renders_decimal_and_temporal_scale() {
+        assert_eq!(mssql_column_type_name("decimal", 9, 12, 4), "decimal(12,4)");
+        assert_eq!(
+            mssql_column_type_name("numeric", 17, 38, 0),
+            "numeric(38,0)"
+        );
+        assert_eq!(
+            mssql_column_type_name("datetime2", 8, 27, 7),
+            "datetime2(7)"
+        );
+        assert_eq!(
+            mssql_column_type_name("datetimeoffset", 10, 34, 5),
+            "datetimeoffset(5)"
+        );
+        assert_eq!(mssql_column_type_name("time", 5, 16, 3), "time(3)");
+    }
+
+    #[test]
+    fn mssql_type_name_leaves_dimensionless_types_untouched() {
+        for base in [
+            "int",
+            "bigint",
+            "smallint",
+            "tinyint",
+            "bit",
+            "datetime",
+            "smalldatetime",
+            "money",
+            "smallmoney",
+            "uniqueidentifier",
+            "rowversion",
+            "text",
+            "ntext",
+            "image",
+            "xml",
+            "real",
+        ] {
+            assert_eq!(
+                mssql_column_type_name(base, 4, 10, 0),
+                base,
+                "type {base} must not gain dimensions"
+            );
+        }
+    }
+
+    #[test]
+    fn mssql_type_name_renders_float_precision_but_not_default_float53() {
+        // float defaults to float(53), which is written plainly; a narrower
+        // float(n) must keep its precision. `real` is its own base type.
+        assert_eq!(mssql_column_type_name("float", 8, 53, 0), "float");
+        assert_eq!(mssql_column_type_name("float", 8, 30, 0), "float(30)");
+        assert_eq!(mssql_column_type_name("real", 4, 24, 0), "real");
+    }
+
+    // ── Faithful DDL rendering ───────────────────────────────────────────
+
+    #[test]
+    fn mssql_create_table_renders_faithful_ddl_from_metadata() {
+        let table = creation_table();
+        let metadata = complete_metadata();
+
+        let ddl = mssql_create_table_ddl(&table, Some(&metadata)).expect("render");
+
+        assert!(ddl.contains("CREATE TABLE [dbo].[gen_users]"), "got: {ddl}");
+        // Exact identity text, seeded inside numeric(38,0) beyond i64, with
+        // the type rendered separately — identity never leaks into type_name.
+        assert!(
+            ddl.contains(
+                "[ID] DECIMAL(38,0) IDENTITY(99999999999999999999999999999999999990, 3) NOT NULL"
+            ),
+            "got: {ddl}"
+        );
+        assert!(ddl.contains("[Name] NVARCHAR(50) NOT NULL"), "got: {ddl}");
+        assert!(ddl.contains("[Bio] NVARCHAR(MAX) NULL"), "got: {ddl}");
+        assert!(ddl.contains("[Stamp] DATETIME2(3) NULL"), "got: {ddl}");
+        // Composite PK in declared key order (Name before ID).
+        assert!(ddl.contains("PRIMARY KEY ([Name], [ID])"), "got: {ddl}");
+    }
+
+    #[test]
+    fn mssql_create_table_renders_column_defaults() {
+        let mut table = creation_table();
+        table.columns.as_mut().expect("columns")[3].default_value = Some("((0))".to_string());
+        let metadata = complete_metadata();
+
+        let ddl = mssql_create_table_ddl(&table, Some(&metadata)).expect("render");
+
+        assert!(
+            ddl.contains("[Balance] DECIMAL(12,4) NOT NULL DEFAULT ((0))"),
+            "got: {ddl}"
+        );
+    }
+
+    #[test]
+    fn mssql_create_table_escapes_brackets_in_identifiers() {
+        let mut table = creation_table();
+        table.name = "we]ird".to_string();
+        table.columns.as_mut().expect("columns")[0].name = "col]x".to_string();
+        for col in table.columns.as_mut().expect("columns") {
+            col.is_primary_key = false;
+        }
+        let mut metadata = complete_metadata();
+        metadata.table = "we]ird".to_string();
+        metadata.identity = None;
+        metadata.primary_key = None;
+
+        let ddl = mssql_create_table_ddl(&table, Some(&metadata)).expect("render");
+
+        assert!(ddl.contains("[we]]ird]"), "got: {ddl}");
+        assert!(ddl.contains("[col]]x]"), "got: {ddl}");
+    }
+
+    #[test]
+    fn mssql_create_table_renders_plain_table_without_identity_or_pk() {
+        let mut table = creation_table();
+        for col in table.columns.as_mut().expect("columns") {
+            col.is_primary_key = false;
+        }
+        let metadata = TableCreationMetadata {
+            identity: None,
+            primary_key: None,
+            ..complete_metadata()
+        };
+
+        let ddl = mssql_create_table_ddl(&table, Some(&metadata)).expect("render");
+
+        assert!(!ddl.contains("IDENTITY"), "got: {ddl}");
+        assert!(!ddl.contains("PRIMARY KEY"), "got: {ddl}");
+    }
+
+    // ── Fail-closed refusals ───────────────────────────────────────────
+
+    #[test]
+    fn mssql_create_table_without_metadata_refuses_instead_of_dropping_identity() {
+        let error = mssql_create_table_ddl(&creation_table(), None).expect_err("must refuse");
+
+        assert!(matches!(error, DbError::NotSupported(_)), "got: {error:?}");
+        let message = error.to_string();
+        assert!(
+            message.to_lowercase().contains("recapture"),
+            "must name the recovery action, got: {message}"
+        );
+    }
+
+    #[test]
+    fn mssql_create_table_refuses_incomplete_metadata() {
+        let metadata = TableCreationMetadata {
+            completeness: MetadataCompleteness::Partial {
+                missing: vec![MissingCreationMetadata::IdentitySeedOrIncrement],
+            },
+            ..complete_metadata()
+        };
+
+        let error =
+            mssql_create_table_ddl(&creation_table(), Some(&metadata)).expect_err("must refuse");
+
+        let message = error.to_string();
+        assert!(
+            message.to_lowercase().contains("identity"),
+            "must name the missing property, got: {message}"
+        );
+    }
+
+    #[test]
+    fn mssql_create_table_refuses_blocked_creation_semantics() {
+        let metadata = TableCreationMetadata {
+            blockers: vec![CreationBlocker {
+                code: "computed_column".to_string(),
+                message: "column Bio is computed".to_string(),
+                column: Some("Bio".to_string()),
+            }],
+            ..complete_metadata()
+        };
+
+        let error =
+            mssql_create_table_ddl(&creation_table(), Some(&metadata)).expect_err("must refuse");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("computed_column"),
+            "must name the blocker code, got: {message}"
+        );
+    }
+
+    #[test]
+    fn mssql_create_table_refuses_metadata_bound_to_a_different_table() {
+        let metadata = TableCreationMetadata {
+            table: "other".to_string(),
+            ..complete_metadata()
+        };
+
+        assert!(
+            mssql_create_table_ddl(&creation_table(), Some(&metadata)).is_err(),
+            "table binding mismatch must refuse"
+        );
+
+        let metadata = TableCreationMetadata {
+            schema: Some("sales".to_string()),
+            ..complete_metadata()
+        };
+        assert!(
+            mssql_create_table_ddl(&creation_table(), Some(&metadata)).is_err(),
+            "schema binding mismatch must refuse"
+        );
+    }
+
+    #[test]
+    fn mssql_create_table_refuses_primary_key_columns_missing_from_the_table() {
+        let metadata = TableCreationMetadata {
+            primary_key: Some(PrimaryKeySpec {
+                columns: vec!["Name".to_string(), "Ghost".to_string()],
+            }),
+            ..complete_metadata()
+        };
+
+        assert!(
+            mssql_create_table_ddl(&creation_table(), Some(&metadata)).is_err(),
+            "unknown PK column must refuse"
+        );
+    }
+
+    #[test]
+    fn mssql_create_table_refuses_duplicate_primary_key_columns() {
+        let metadata = TableCreationMetadata {
+            primary_key: Some(PrimaryKeySpec {
+                columns: vec!["Name".to_string(), "Name".to_string()],
+            }),
+            ..complete_metadata()
+        };
+
+        assert!(
+            mssql_create_table_ddl(&creation_table(), Some(&metadata)).is_err(),
+            "duplicate PK column must refuse"
+        );
+    }
+
+    #[test]
+    fn mssql_create_table_refuses_metadata_disagreeing_with_column_pk_flags() {
+        let metadata = TableCreationMetadata {
+            primary_key: None,
+            ..complete_metadata()
+        };
+
+        assert!(
+            mssql_create_table_ddl(&creation_table(), Some(&metadata)).is_err(),
+            "a flagged PK column without a primary_key spec is inconsistent metadata"
+        );
+    }
+
+    #[test]
+    fn mssql_create_table_refuses_identity_on_a_missing_or_non_numeric_column() {
+        let metadata = TableCreationMetadata {
+            identity: Some(IdentitySpec {
+                column: "Bio".to_string(),
+                seed: "1".to_string(),
+                increment: "1".to_string(),
+            }),
+            ..complete_metadata()
+        };
+        assert!(
+            mssql_create_table_ddl(&creation_table(), Some(&metadata)).is_err(),
+            "identity on an NVARCHAR column must refuse"
+        );
+
+        let metadata = TableCreationMetadata {
+            identity: Some(IdentitySpec {
+                column: "Ghost".to_string(),
+                seed: "1".to_string(),
+                increment: "1".to_string(),
+            }),
+            ..complete_metadata()
+        };
+        assert!(
+            mssql_create_table_ddl(&creation_table(), Some(&metadata)).is_err(),
+            "identity on an unknown column must refuse"
+        );
+    }
+
+    #[test]
+    fn mssql_create_table_rejects_identity_values_outside_the_numeric38_grammar() {
+        for bad_seed in ["", "-", "+1", "--1", "1e5", "12.5", "12a", " 1", "1 "] {
+            let metadata = TableCreationMetadata {
+                identity: Some(IdentitySpec {
+                    seed: bad_seed.to_string(),
+                    ..complete_metadata().identity.expect("identity")
+                }),
+                ..complete_metadata()
+            };
+            assert!(
+                mssql_create_table_ddl(&creation_table(), Some(&metadata)).is_err(),
+                "seed {bad_seed:?} must refuse"
+            );
+        }
+
+        // A 39-digit seed exceeds numeric(38,0) and must refuse.
+        let metadata = TableCreationMetadata {
+            identity: Some(IdentitySpec {
+                seed: "9".repeat(39),
+                ..complete_metadata().identity.expect("identity")
+            }),
+            ..complete_metadata()
+        };
+        assert!(
+            mssql_create_table_ddl(&creation_table(), Some(&metadata)).is_err(),
+            "39-digit seed must refuse"
+        );
+
+        // A 38-digit negative seed is inside numeric(38,0) and must render.
+        let metadata = TableCreationMetadata {
+            identity: Some(IdentitySpec {
+                seed: format!("-{}", "9".repeat(37)),
+                ..complete_metadata().identity.expect("identity")
+            }),
+            ..complete_metadata()
+        };
+        assert!(
+            mssql_create_table_ddl(&creation_table(), Some(&metadata)).is_ok(),
+            "38-digit negative seed is representable"
+        );
+    }
+
+    #[test]
+    fn drop_table_statement_rejects_cascade() {
+        assert!(!MSSQL_DIALECT.supports_drop_cascade());
+        assert!(
+            MSSQL_DIALECT
+                .drop_table_statement(Some("dbo"), "orders", true, true)
+                .is_err()
+        );
+        assert_eq!(
+            MSSQL_DIALECT
+                .drop_table_statement(Some("dbo"), "orders", true, false)
+                .expect("a plain drop builds"),
+            "DROP TABLE IF EXISTS [dbo].[orders]"
+        );
+    }
+}
+
+#[cfg(test)]
+mod query_safety_tests {
+    use super::{
+        MssqlConnection, MssqlConnectionInner, TiberiusClient, build_runtime, collect_result_sets,
+        establish_tiberius, parse_mssql_url,
+    };
+    use datatab_core::{
+        Connection as _, DbError, ExecutionContext, ExecutionSourceContext, QueryRequest,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicI32};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::runtime::Runtime;
+
+    // Execution-safety order proofs (#671/#672).
+    //
+    // 1. A requested statement timeout must be rejected before the connection
+    //    lock is touched: the main thread holds the unpoisoned inner mutex and
+    //    the worker's `NotSupported` verdict must arrive while the lock is
+    //    still held. (With no client configured and the lock held, any path
+    //    that reaches the lock blocks the worker instead of answering.)
+    // 2. Bounded requests aimed at the internal metric/inspector dispatch
+    //    paths must be rejected before the lock or anything dispatches: the
+    //    poisoned mutex makes reaching it observable as the existing
+    //    poisoned-lock error instead of the expected `NotSupported` rejection.
+    //
+    // The connection is built with no client: only the preflight paths can
+    // succeed against it, which is exactly the observable seam this proof
+    // needs — no container required.
+    #[test]
+    fn mssql_refuses_read_only_enforcement_before_the_client_lock() {
+        let connection = lockless_connection();
+        connection
+            .poisoned
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(!connection.metadata().enforces_read_only());
+
+        let request = QueryRequest::new("SELECT 1")
+            .with_read_only(datatab_core::ReadOnlyEnforcement::Required);
+        let outcome = connection.execute(&request);
+
+        assert!(
+            matches!(outcome, Err(DbError::NotSupported(_))),
+            "expected NotSupported, got {outcome:?}"
+        );
+    }
+
+    /// The generated truncate, drop-index and version statements must stay
+    /// byte-for-byte identical while the trait defaults move to `Result`.
+    /// The lockless connection never opens a client, and these builders only
+    /// format text.
+    #[test]
+    fn truncate_drop_index_and_version_statements_match_the_driver_contract() {
+        use datatab_core::Connection;
+
+        let connection = lockless_connection();
+
+        assert_eq!(
+            connection
+                .build_truncate_sql("dbo.users")
+                .expect("MSSQL supports truncate"),
+            "TRUNCATE TABLE [dbo.users]"
+        );
+        assert_eq!(
+            connection
+                .build_drop_index_sql("idx_users_email", Some("dbo.users"), false)
+                .expect("MSSQL supports drop index"),
+            "DROP INDEX [idx_users_email] ON [dbo.users]"
+        );
+        assert_eq!(
+            connection
+                .build_drop_index_sql("idx_users_email", Some("dbo.users"), true)
+                .expect("MSSQL supports drop index"),
+            "DROP INDEX IF EXISTS [idx_users_email] ON [dbo.users]"
+        );
+        assert_eq!(
+            connection
+                .build_drop_index_sql("idx_users_email", None, false)
+                .expect("MSSQL supports drop index"),
+            "DROP INDEX [idx_users_email] ON [table_name]"
+        );
+        assert_eq!(
+            connection
+                .version_query()
+                .expect("MSSQL has a version query"),
+            "SELECT @@VERSION"
+        );
+    }
+
+    fn lockless_connection() -> MssqlConnection {
+        MssqlConnection {
+            inner: Arc::new(Mutex::new(MssqlConnectionInner {
+                client: None,
+                runtime: build_runtime().expect("test runtime must build"),
+            })),
+            current_database: Mutex::new(None),
+            ssh_tunnel: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            spid: Arc::new(AtomicI32::new(0)),
+            reconnect_config: Arc::new(tiberius::Config::new()),
+            poisoned: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    #[test]
+    fn mssql_query_safety_bounded_context_rejection_precedes_client_lock() {
+        let connection = lockless_connection();
+
+        // Timeout order proof: hold the unpoisoned inner lock while a scoped
+        // worker executes the timeout request. The worker's `NotSupported`
+        // verdict must arrive while the lock is still held; if the preflight
+        // ever moved behind the lock, the worker would block on the held
+        // mutex and the bounded wait would expire — a clean failure, never a
+        // hang, because the guard is released on every path before the
+        // scoped worker is joined.
+        let mut request = QueryRequest::new("SELECT 1");
+        request.statement_timeout = Some(Duration::from_secs(5));
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let mut timeout_outcome: Option<Result<datatab_core::QueryResult, DbError>> = None;
+        std::thread::scope(|scope| {
+            // The guard is acquired AND owned inside this closure: RAII (plus
+            // the explicit release below) drops it when the closure's frame
+            // unwinds — on the normal, timeout and panic paths alike —
+            // BEFORE the scope's automatic join of the worker, so the worker
+            // is never joined while the proof's own lock is still held.
+            let held_guard = connection
+                .inner
+                .lock()
+                .expect("main thread must hold the unpoisoned inner lock");
+            scope.spawn(|| {
+                result_tx
+                    .send(connection.execute(&request))
+                    .expect("worker must deliver the execution result");
+            });
+            if let Ok(result) = result_rx.recv_timeout(Duration::from_secs(30)) {
+                timeout_outcome = Some(result);
+            }
+            // Explicit release on the normal path; RAII covers the rest.
+            drop(held_guard);
+        });
+        match timeout_outcome {
+            Some(Err(DbError::NotSupported(reason))) => {
+                let lowered = reason.to_lowercase();
+                assert!(
+                    lowered.contains("timeout"),
+                    "expected the timeout preflight rejection while the lock was held, got: {reason}"
+                );
+            }
+            Some(other) => panic!(
+                "a requested statement timeout must be rejected without touching the held connection lock, got {other:?}"
+            ),
+            None => panic!(
+                "the timeout request blocked on the held connection lock: the preflight did not precede the lock"
+            ),
+        }
+
+        // Poison the inner mutex only now, for the metric/inspector order
+        // proofs: those dispatch arms report their existing poisoned-lock
+        // error, so reaching the lock is observable for them (unlike the
+        // ordinary SQL path, which the preflight guards before any lock).
+        let poison_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = connection
+                .inner
+                .lock()
+                .expect("poison step must acquire the inner lock");
+            panic!("deliberate mutex poison for the order proof");
+        }));
+        assert!(
+            poison_result.is_err(),
+            "the poison step must panic while holding the guard to poison the mutex"
+        );
+
+        // Bounded metric context: Some(0) and Some(1) on a valid supported
+        // metric id must be rejected before the lock is even attempted.
+        for limit in [0u32, 1] {
+            let mut request = QueryRequest::new("SELECT 1");
+            request.limit = Some(limit);
+            request.execution_context = Some(ExecutionContext {
+                source: Some(ExecutionSourceContext::InstanceMetricQuery {
+                    metric_id: "mssql.batch_requests_per_sec".to_string(),
+                    start_ms: 0,
+                    end_ms: 1,
+                }),
+                ..Default::default()
+            });
+            match connection.execute(&request) {
+                Err(DbError::NotSupported(reason)) => {
+                    let lowered = reason.to_lowercase();
+                    assert!(
+                        lowered.contains("instance metric") && lowered.contains("row limit"),
+                        "expected the bounded-context rejection before the lock, got: {reason}"
+                    );
+                }
+                other => panic!(
+                    "bounded metric context must be rejected before the connection lock, got {other:?}"
+                ),
+            }
+        }
+
+        // Bounded inspector context: same preflight, valid inspector id.
+        for limit in [0u32, 1] {
+            let mut request = QueryRequest::new("SELECT 1");
+            request.limit = Some(limit);
+            request.execution_context = Some(ExecutionContext {
+                source: Some(ExecutionSourceContext::InstanceInspectorQuery {
+                    metric_id: "mssql.active_sessions".to_string(),
+                }),
+                ..Default::default()
+            });
+            match connection.execute(&request) {
+                Err(DbError::NotSupported(reason)) => {
+                    let lowered = reason.to_lowercase();
+                    assert!(
+                        lowered.contains("instance inspector") && lowered.contains("row limit"),
+                        "expected the bounded-context rejection before the lock, got: {reason}"
+                    );
+                }
+                other => panic!(
+                    "bounded inspector context must be rejected before the connection lock, got {other:?}"
+                ),
+            }
+        }
+
+        // Uncapped control: the original dispatch path is taken, which
+        // reaches the poisoned inner lock and reports its existing error.
+        let mut request = QueryRequest::new("SELECT 1");
+        request.execution_context = Some(ExecutionContext {
+            source: Some(ExecutionSourceContext::InstanceMetricQuery {
+                metric_id: "mssql.batch_requests_per_sec".to_string(),
+                start_ms: 0,
+                end_ms: 1,
+            }),
+            ..Default::default()
+        });
+        match connection.execute(&request) {
+            Err(DbError::QueryFailed(formatted)) => {
+                let message = formatted.to_display_string();
+                assert!(
+                    message.contains("poisoned"),
+                    "uncapped metric context must reach the connection lock and hit the poison, got: {message}"
+                );
+            }
+            other => panic!(
+                "uncapped metric context must reach the existing dispatch lock error, got {other:?}"
+            ),
+        }
+    }
+
+    // Late-drain proof through the collector seam: the collector must observe
+    // a server-ordered error that arrives AFTER the budget is exhausted, and
+    // the exposed `remaining` budget must already be 0 when the error
+    // surfaces. The batch's first statement streams 3 rows and the second 1
+    // row before the RAISERROR, so with a budget of 1 the first row consumes
+    // the whole budget, the later rows are all observed and discarded, and
+    // the error still propagates. If the implementation returned early or
+    // dropped the stream once the cap was reached, the error would be
+    // swallowed by the stream's Drop and the collector would return sets
+    // instead of `Err`.
+    #[test]
+    #[ignore = "requires Docker daemon"]
+    fn mssql_query_safety_collector_consumes_budget_before_late_error() -> Result<(), DbError> {
+        datatab_test_support::containers::with_mssql_url(|uri| {
+            // The container reports readiness before its SA login works for
+            // client connections (same as the live suite's own connect
+            // helper), so the raw-client establish retries transient logins.
+            // Client and runtime are produced together: the client must be
+            // driven by the same runtime for every later block_on call.
+            let (mut client, runtime) = datatab_test_support::containers::retry_db_operation(
+                Duration::from_secs(60),
+                || -> Result<(TiberiusClient, Runtime), DbError> {
+                    let config = parse_mssql_url(&uri).map_err(|e| {
+                        DbError::connection_failed(format!("test container uri invalid: {e}"))
+                    })?;
+                    let runtime = build_runtime()?;
+                    let client = runtime.block_on(establish_tiberius(config)).map_err(|e| {
+                        DbError::connection_failed(format!("container connect failed: {e}"))
+                    })?;
+                    Ok((client, runtime))
+                },
+            )?;
+
+            let sql = "SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3; \
+                       SELECT 4 AS x; \
+                       RAISERROR('datatab late-drain deliberate failure', 16, 1)";
+            let mut remaining = Some(1usize);
+            {
+                let mut stream = runtime
+                    .block_on(client.simple_query(sql))
+                    .map_err(|e| DbError::query_failed(format!("batch dispatch failed: {e}")))?;
+                let outcome = runtime.block_on(collect_result_sets(&mut stream, &mut remaining));
+
+                match outcome {
+                    Err(err) => {
+                        let message = format!("{err}");
+                        assert!(
+                            message.contains("datatab late-drain deliberate failure"),
+                            "the returned error must carry the batch's deliberate late failure, got: {message}"
+                        );
+                    }
+                    Ok(sets) => panic!(
+                        "the late error must surface after the budget is exhausted instead of returning {} sets",
+                        sets.len()
+                    ),
+                }
+            }
+
+            // The budget was fully consumed by the first row BEFORE the error
+            // event: four rows streamed, one retained, and the server-ordered
+            // RAISERROR was still observed afterwards.
+            assert_eq!(
+                remaining,
+                Some(0),
+                "the first row must have consumed the whole budget before the late error arrived"
+            );
+
+            // Unbounded control through the same collector: a fresh batch
+            // keeps every row and reports no omission.
+            {
+                let mut stream = runtime
+                    .block_on(client.simple_query("SELECT 1 AS x UNION ALL SELECT 2 AS x"))
+                    .map_err(|e| {
+                        DbError::query_failed(format!("control batch dispatch failed: {e}"))
+                    })?;
+                let mut unbounded = None;
+                let sets = runtime.block_on(collect_result_sets(&mut stream, &mut unbounded))?;
+                assert_eq!(sets.len(), 1);
+                assert_eq!(sets[0].rows.len(), 2);
+                assert!(!sets[0].truncated);
+            }
+
+            // The connection stays usable afterwards.
+            {
+                let mut stream = runtime
+                    .block_on(client.simple_query("SELECT 42 AS reuse"))
+                    .map_err(|e| DbError::query_failed(format!("connection reuse failed: {e}")))?;
+                let mut probe = None;
+                let sets = runtime.block_on(collect_result_sets(&mut stream, &mut probe))?;
+                assert_eq!(sets[0].rows.len(), 1);
+            }
+
+            Ok(())
+        })
+    }
+}

@@ -1,0 +1,17 @@
+[package]
+name = "datatab_js"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+datatab_core = { path = "../datatab_core" }
+rquickjs.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]

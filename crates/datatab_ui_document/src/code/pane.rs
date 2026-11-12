@@ -1,0 +1,645 @@
+//! `PaneHandle` constructor for `CodeDocument`.
+//!
+//! `CodeDocument::into_pane` converts a typed `Entity<CodeDocument>` into the
+//! type-erased `PaneHandle` shell. All closures capture the entity by clone;
+//! `Window` and `App` are always passed as per-call parameters.
+
+use super::CodeDocument;
+use crate::dedup::DocumentKey;
+use crate::handle::DocumentEvent;
+use crate::pane::{BoxedDocEventCallback, CodeSessionTabSnapshot, PaneHandle, StatusSegment};
+use crate::types::{DocumentIcon, DocumentKind, DocumentMetaSnapshot};
+use gpui::{App, Entity, IntoElement};
+
+impl CodeDocument {
+    /// Status-bar segment of the editor: the text encoding and the cursor
+    /// position, 1-based ("UTF-8 · Ln 16, Col 23").
+    pub fn status_segments(&self, cx: &App) -> Vec<StatusSegment> {
+        let position = self.editor.input_state.read(cx).cursor_position();
+
+        vec![StatusSegment {
+            text: format!(
+                "UTF-8 \u{b7} {}",
+                crate::object_text::cursor_label(position)
+            )
+            .into(),
+            tooltip: None,
+        }]
+    }
+
+    /// Wrap a typed `Entity<CodeDocument>` in a `PaneHandle`.
+    ///
+    /// Reads the document ID synchronously from `cx` then seals all operations
+    /// behind `Box<dyn Fn>` closures capturing `entity` by clone.
+    ///
+    /// The optional `empty_script_cleanup` and `session_tab_snapshot` helpers
+    /// are populated so that `write_session_manifest` and the empty-script
+    /// cleanup in `actions/documents.rs` can operate without pattern-matching on
+    /// the `DocumentHandle::Code` variant.
+    pub fn into_pane(entity: Entity<Self>, cx: &App) -> PaneHandle {
+        let id = entity.read(cx).id();
+
+        let mut handle = PaneHandle::new_chart(
+            id,
+            DocumentKind::Script,
+            // render
+            {
+                let e = entity.clone();
+                Box::new(move |_w, _cx| e.clone().into_any_element())
+            },
+            // focus
+            {
+                let e = entity.clone();
+                Box::new(move |w, cx| e.update(cx, |d, cx| d.focus(w, cx)))
+            },
+            // dispatch_command
+            {
+                let e = entity.clone();
+                Box::new(move |cmd, w, cx| e.update(cx, |d, cx| d.dispatch_command(cmd, w, cx)))
+            },
+            // meta_snapshot
+            {
+                let e = entity.clone();
+                Box::new(move |cx| {
+                    let d = e.read(cx);
+                    let icon = if d.is_file_backed() {
+                        DocumentIcon::Script
+                    } else {
+                        DocumentIcon::Sql
+                    };
+                    DocumentMetaSnapshot {
+                        id,
+                        kind: DocumentKind::Script,
+                        title: d.title(),
+                        icon,
+                        state: d.state(),
+                        closable: true,
+                        connection_id: d.connection_id(),
+                    }
+                })
+            },
+            // tab_title
+            {
+                let e = entity.clone();
+                Box::new(move |cx| e.read(cx).title())
+            },
+            // can_close
+            {
+                let e = entity.clone();
+                Box::new(move |cx| e.read(cx).can_close(cx))
+            },
+            // connection_id
+            {
+                let e = entity.clone();
+                Box::new(move |cx| e.read(cx).connection_id())
+            },
+            // active_context
+            {
+                let e = entity.clone();
+                Box::new(move |cx| e.read(cx).active_context(cx))
+            },
+            // change_summary
+            {
+                let e = entity.clone();
+                Box::new(move |cx| e.read(cx).change_summary(cx))
+            },
+            // refresh_policy
+            {
+                let e = entity.clone();
+                Box::new(move |cx| e.read(cx).refresh_policy())
+            },
+            // flush_auto_save
+            {
+                let e = entity.clone();
+                Box::new(move |cx| e.read(cx).flush_auto_save(cx))
+            },
+            // set_active_tab
+            {
+                let e = entity.clone();
+                Box::new(move |active, cx| e.update(cx, |d, cx| d.set_active_tab(active, cx)))
+            },
+            // set_refresh_policy
+            {
+                let e = entity.clone();
+                Box::new(move |policy, cx| e.update(cx, |d, cx| d.set_refresh_policy(policy, cx)))
+            },
+            // matches_dedup_key
+            {
+                let e = entity.clone();
+                Box::new(move |key, cx| {
+                    let d = e.read(cx);
+                    match key {
+                        DocumentKey::File { path } => {
+                            d.path().map(|p| p.as_path()) == Some(path.as_path())
+                        }
+                        DocumentKey::Routine {
+                            profile_id,
+                            schema,
+                            specific_name,
+                        } => d.routine_dedup.as_ref().is_some_and(|(pid, s, sn)| {
+                            pid == profile_id && s == schema && sn == specific_name
+                        }),
+                        _ => false,
+                    }
+                })
+            },
+            // subscribe — CodeDocument emits DocumentEvent directly
+            {
+                let e = entity.clone();
+                Box::new(move |cx, cb: BoxedDocEventCallback| {
+                    cx.subscribe(&e, move |_, ev: &DocumentEvent, cx| cb(ev, cx))
+                })
+            },
+        );
+
+        handle.mark_inspector_closed = Some({
+            let e = entity.clone();
+            Box::new(move |cx| {
+                e.update(cx, |d, cx| d.mark_inspector_closed(cx));
+            })
+        });
+
+        handle.on_close = Some({
+            let entity = entity.clone();
+            Box::new(move |cx| {
+                entity.update(cx, |document, cx| document.invalidate_execution_session(cx));
+            })
+        });
+
+        // Populate optional helper: the interrupted-close save. The tab closes
+        // only when the document reports that the write landed.
+        handle.save_for_close = Some({
+            let e = entity.clone();
+            Box::new(move |w, cx| e.update(cx, |document, cx| document.save_for_close(w, cx)))
+        });
+
+        // Populate optional helper: the graceful-shutdown flush. It persists the
+        // pending edits without closing the tab, so quitting never drops the
+        // content typed inside the autosave debounce window.
+        handle.flush_for_shutdown = Some({
+            let e = entity.clone();
+            Box::new(move |cx| e.update(cx, |document, cx| document.flush_for_shutdown(cx)))
+        });
+
+        // Populate optional helper: the close policy. Every close route asks the
+        // document what closing means instead of removing the tab over pending
+        // edits: a clean, idle buffer closes now, a pending buffer flushes
+        // (conflict-checked on a file-backed script) and closes once the write
+        // lands, and a buffer that cannot be persisted keeps the tab open.
+        handle.resolve_close = Some({
+            let e = entity.clone();
+            Box::new(move |w, cx| e.update(cx, |document, cx| document.resolve_close(w, cx)))
+        });
+
+        // Populate optional helper: whether the close policy applies right now.
+        // A code document persists its pending edits on close only when it has
+        // a file to persist to; an untitled buffer has no save target short of
+        // Save As, so it keeps the unsaved-changes dialog instead.
+        handle.decides_own_close = Some({
+            let e = entity.clone();
+            Box::new(move |cx| e.read(cx).path().is_some())
+        });
+
+        // Populate optional helper: the only backing file the cleanup path in
+        // actions.rs may delete as it closes a tab — an empty, file-backed script
+        // whose file is expected to hold exactly the bytes this document last
+        // loaded or wrote. A missing or different-path baseline reports `None`, so
+        // cleanup keeps the file; whether the file still holds those bytes is
+        // verified away from the UI thread, together with the removal.
+        handle.status_segments = Some({
+            let e = entity.clone();
+            Box::new(move |cx| e.read(cx).status_segments(cx))
+        });
+
+        handle.key_context_entries = Some({
+            let e = entity.clone();
+            Box::new(move |cx| e.read(cx).key_context_entries(cx))
+        });
+
+        handle.tab_tooltip = Some({
+            let e = entity.clone();
+            Box::new(move |cx| {
+                e.read(cx)
+                    .editor
+                    .path
+                    .as_ref()
+                    .map(|path| path.display().to_string().into())
+            })
+        });
+
+        handle.empty_script_cleanup = Some({
+            let e = entity.clone();
+            Box::new(move |cx| e.read(cx).pending_empty_script_cleanup(cx))
+        });
+
+        // Populate optional helper: session manifest serialization data.
+        // Returns `None` for unsaved scratch tabs (no path or scratch_path), unless
+        // this is a routine document, which is always persisted as `"Routine"` kind
+        // so it can be reconstructed on next launch without a file backing.
+        handle.session_tab_snapshot = Some({
+            let e = entity.clone();
+            Box::new(move |cx| {
+                let d = e.read(cx);
+
+                // Routine documents: persisted with their descriptor encoded in
+                // exec_ctx (connection_id=profile_id, schema, container=specific_name).
+                if let Some((profile_id, schema, specific_name)) = d.routine_dedup.as_ref() {
+                    use datatab_core::ExecutionContext;
+
+                    let exec_ctx = ExecutionContext {
+                        connection_id: Some(*profile_id),
+                        schema: Some(schema.clone()),
+                        container: Some(specific_name.clone()),
+                        ..d.exec_ctx().clone()
+                    };
+
+                    return Some(CodeSessionTabSnapshot {
+                        kind: "Routine",
+                        id: d.id(),
+                        title: d.title(),
+                        language: d.query_language(),
+                        exec_ctx,
+                        file_path: None,
+                        scratch_path: None,
+                        shadow_path: None,
+                    });
+                }
+
+                let kind = if d.path().is_some() {
+                    "FileBacked"
+                } else if d.scratch_path().is_some() {
+                    "Scratch"
+                } else {
+                    // Tab has neither a file path nor a scratch path — skip.
+                    return None;
+                };
+
+                Some(CodeSessionTabSnapshot {
+                    kind,
+                    id: d.id(),
+                    title: d.title(),
+                    language: d.query_language(),
+                    exec_ctx: d.exec_ctx().clone(),
+                    file_path: d.path().cloned(),
+                    scratch_path: d.scratch_path().cloned(),
+                    shadow_path: d.shadow_path().cloned(),
+                })
+            })
+        });
+
+        handle.side_panels = Some({
+            let e = entity.clone();
+            Box::new(move |_window, cx| e.update(cx, |d, cx| d.side_panels(cx)))
+        });
+
+        handle.pane_actions = Some({
+            let e = entity.clone();
+            Box::new(move |cx| e.read(cx).pane_actions(&e))
+        });
+
+        handle
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::code::CodeDocument;
+    use crate::pane::{PaneAction, PaneActionRun};
+    use datatab_app::keymap::Command;
+    use datatab_components::theme;
+    use datatab_core::QueryLanguage;
+    use datatab_storage::bootstrap::StorageRuntime;
+    use datatab_ui_base::AppStateEntity;
+    use datatab_ui_base::keymap::init_keymap;
+    use datatab_ui_base::toast::{ToastGlobal, ToastHost};
+    use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn open_sql_document(
+        cx: &mut TestAppContext,
+    ) -> (Entity<CodeDocument>, &mut VisualTestContext) {
+        open_document(cx, QueryLanguage::Sql)
+    }
+
+    fn open_document(
+        cx: &mut TestAppContext,
+        language: QueryLanguage,
+    ) -> (Entity<CodeDocument>, &mut VisualTestContext) {
+        cx.update(gpui_component::init);
+        cx.update(theme::init);
+        cx.update(|cx| {
+            let host = cx.new(|_cx| ToastHost::new());
+            cx.set_global(ToastGlobal { host });
+            init_keymap(cx);
+        });
+
+        let app_state = cx.update(|cx| {
+            cx.new(|_| {
+                let runtime = StorageRuntime::in_memory().expect("isolated storage runtime");
+                AppStateEntity::new_with_storage_runtime(runtime).expect("test storage setup")
+            })
+        });
+
+        let slot: Rc<RefCell<Option<Entity<CodeDocument>>>> = Rc::default();
+        let (_, window) = cx.add_window_view({
+            let slot = slot.clone();
+            move |window, cx| {
+                let document = cx.new(|cx| {
+                    CodeDocument::new_with_language(app_state.clone(), None, language, window, cx)
+                });
+                slot.replace(Some(document.clone()));
+                gpui_component::Root::new(document, window, cx)
+            }
+        });
+        window.run_until_parked();
+
+        let document = slot.borrow().clone().expect("document created");
+        (document, window)
+    }
+
+    fn actions(document: &Entity<CodeDocument>, window: &mut VisualTestContext) -> Vec<PaneAction> {
+        let document = document.clone();
+        window.update(|_, cx| document.read(cx).pane_actions(&document))
+    }
+
+    fn command_of(action: &PaneAction) -> Option<Command> {
+        match action.run {
+            PaneActionRun::Command(command) => Some(command),
+            PaneActionRun::Callback(_) => None,
+        }
+    }
+
+    mod coverage {
+        use super::{actions, open_document, open_sql_document};
+        use crate::keyboard_coverage::CODE_EDITOR_CHROME;
+        use datatab_core::QueryLanguage;
+        use datatab_ui_base::keyboard_coverage::{Coverage, FrameCapture};
+        use gpui::TestAppContext;
+
+        #[gpui::test]
+        fn the_sql_editor_chrome_is_covered(cx: &mut TestAppContext) {
+            let (document, window) = open_sql_document(cx);
+            let menu: Vec<String> = actions(&document, window)
+                .iter()
+                .map(|action| action.id.to_string())
+                .collect();
+
+            let capture = FrameCapture::observe(window);
+            let frame = capture.frame(window);
+
+            let checked = Coverage::new(CODE_EDITOR_CHROME)
+                .with_menu_entries(menu)
+                .assert_covered(&frame);
+            assert!(
+                checked.iter().any(|id| id == "run-query-btn"),
+                "{checked:?}"
+            );
+        }
+
+        #[gpui::test]
+        fn the_script_editor_chrome_is_covered(cx: &mut TestAppContext) {
+            let (document, window) = open_document(cx, QueryLanguage::Python);
+            let menu: Vec<String> = actions(&document, window)
+                .iter()
+                .map(|action| action.id.to_string())
+                .collect();
+
+            let capture = FrameCapture::observe(window);
+            let frame = capture.frame(window);
+
+            let checked = Coverage::new(CODE_EDITOR_CHROME)
+                .with_menu_entries(menu)
+                .assert_covered(&frame);
+            assert!(
+                checked.iter().any(|id| id == "exec-context-pane-actions"),
+                "{checked:?}"
+            );
+        }
+    }
+
+    mod layout {
+        use super::{open_document, open_sql_document};
+        use datatab_components::tokens::EditorMetrics;
+        use datatab_core::QueryLanguage;
+
+        /// The actions sit in a 32 px column on the editor's left edge, on
+        /// the same row as the editor text and below the context bar, so the
+        /// context bar is the only row above the editor.
+        #[gpui::test]
+        fn the_editor_actions_sit_in_a_strip_left_of_the_editor(cx: &mut gpui::TestAppContext) {
+            let (_document, window) = open_sql_document(cx);
+
+            let context_bar = window
+                .debug_bounds("exec-context-bar")
+                .expect("the context bar is drawn");
+            let strip = window
+                .debug_bounds("editor-action-strip")
+                .expect("the action strip is drawn");
+            let editor = window
+                .debug_bounds("code-editor-area")
+                .expect("the editor is drawn");
+
+            assert_eq!(strip.size.width, EditorMetrics::ACTION_STRIP_WIDTH);
+            assert_eq!(strip.origin.y, editor.origin.y);
+            assert_eq!(strip.origin.y, context_bar.bottom());
+            assert!(
+                strip.right() <= editor.origin.x,
+                "the strip ends where the editor text starts: {strip:?} {editor:?}"
+            );
+        }
+
+        /// A script editor keeps the strip: Run, Save, History and Chart work
+        /// there too.
+        #[gpui::test]
+        fn a_script_editor_has_the_action_strip(cx: &mut gpui::TestAppContext) {
+            let (_document, window) = open_document(cx, QueryLanguage::Python);
+
+            assert!(window.debug_bounds("editor-action-strip").is_some());
+        }
+
+        #[gpui::test]
+        fn a_read_only_editor_has_no_action_strip(cx: &mut gpui::TestAppContext) {
+            let (document, window) = open_sql_document(cx);
+
+            window.update(|_, cx| {
+                document.update(cx, |document, cx| {
+                    document.read_only = true;
+                    cx.notify();
+                });
+            });
+            window.run_until_parked();
+
+            assert!(window.debug_bounds("editor-action-strip").is_none());
+            assert!(window.debug_bounds("code-editor-area").is_some());
+        }
+
+        /// The statement count moved from the toolbar row into the context
+        /// bar.
+        #[gpui::test]
+        fn the_statement_count_sits_in_the_context_bar(cx: &mut gpui::TestAppContext) {
+            let (document, window) = open_sql_document(cx);
+
+            window.update(|window, cx| {
+                document.update(cx, |document, cx| {
+                    document.set_content("SELECT 1;\nSELECT 2;", window, cx);
+                });
+            });
+            window.run_until_parked();
+
+            let context_bar = window
+                .debug_bounds("exec-context-bar")
+                .expect("the context bar is drawn");
+            let summary = window
+                .debug_bounds("context-run-summary")
+                .expect("a SQL buffer with statements shows their count");
+
+            assert!(
+                context_bar.contains(&summary.origin) && summary.bottom() <= context_bar.bottom(),
+                "the count is inside the context bar: {summary:?} {context_bar:?}"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn the_pane_actions_list_every_sql_toolbar_button(cx: &mut TestAppContext) {
+        let (document, window) = open_sql_document(cx);
+        let actions = actions(&document, window);
+
+        let ids: Vec<&str> = actions.iter().map(|action| action.id.as_ref()).collect();
+        assert_eq!(
+            ids,
+            [
+                "run",
+                "run-in-new-tab",
+                "save",
+                "format",
+                "history",
+                "explain",
+                "chart",
+            ]
+        );
+
+        let command = |id: &str| {
+            actions
+                .iter()
+                .find(|action| action.id == id)
+                .and_then(command_of)
+        };
+        assert_eq!(command("run"), Some(Command::RunQuery));
+        assert_eq!(command("run-in-new-tab"), Some(Command::RunQueryInNewTab));
+        assert_eq!(command("save"), Some(Command::SaveQuery));
+        assert_eq!(command("history"), Some(Command::ToggleHistoryDropdown));
+
+        let format = actions.iter().find(|action| action.id == "format");
+        assert!(
+            format.is_some_and(|action| !action.enabled),
+            "the formatter is unavailable, as on the toolbar"
+        );
+
+        let run = actions.iter().find(|action| action.id == "run");
+        assert!(
+            run.is_some_and(|action| action.shortcut.is_some()),
+            "an entry with a key binding shows its keys"
+        );
+    }
+
+    /// Enter on the target list of the context bar opens it with keyboard
+    /// focus, so its own keys drive it: j / k move, Space toggles and Escape
+    /// hands focus back to the ring (see the multi-select's own tests).
+    #[gpui::test]
+    fn enter_on_the_target_list_hands_it_the_keyboard(cx: &mut TestAppContext) {
+        use crate::code::{ContextBarSlot, SqlQueryFocus};
+        use datatab_components::controls::DropdownItem;
+
+        let (document, window) = open_sql_document(cx);
+
+        let targets = window.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.focus_mode = SqlQueryFocus::ContextBar;
+                document.context_bar_slot = ContextBarSlot::SourceTargets;
+                document.focus_handle.focus(window, cx);
+
+                let targets = document.source.source_targets.clone();
+                targets.update(cx, |targets, cx| {
+                    targets.set_items(
+                        vec![DropdownItem::new("orders"), DropdownItem::new("payments")],
+                        cx,
+                    );
+                });
+                targets
+            })
+        });
+
+        let handled = window.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.dispatch_command(Command::Execute, window, cx)
+            })
+        });
+        assert!(handled);
+
+        let (open, focused) = window.update(|window, cx| {
+            let targets = targets.read(cx);
+            (targets.is_open(), targets.is_focused(window))
+        });
+        assert!(open && focused, "the target list opens with keyboard focus");
+
+        let (focus_mode, return_target) = window.update(|window, cx| {
+            let document = document.read(cx);
+            (
+                document.focus_mode,
+                document.focus_handle.is_focused(window),
+            )
+        });
+        assert_eq!(
+            focus_mode,
+            SqlQueryFocus::ContextBar,
+            "the ring stays active"
+        );
+        assert!(!return_target, "the list, not the ring, has the keys now");
+    }
+
+    /// Inside the dangerous-query dialog, Tab moves from the close button to
+    /// the "Don't ask again" box, and Space checks it (a keyboard click, on
+    /// key release) without running or closing anything.
+    #[gpui::test]
+    fn tab_and_space_check_dont_ask_again(cx: &mut TestAppContext) {
+        use crate::code::PendingDangerousQuery;
+        use datatab_core::DangerousQueryKind;
+
+        let (document, window) = open_sql_document(cx);
+
+        window.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.focus(window, cx);
+                document.ask_dangerous_query_confirm(
+                    PendingDangerousQuery {
+                        query: "DELETE FROM orders".to_string(),
+                        kind: DangerousQueryKind::DeleteNoWhere,
+                        in_new_tab: false,
+                        suppress: false,
+                    },
+                    window,
+                    cx,
+                );
+            });
+        });
+        window.run_until_parked();
+
+        window.simulate_keystrokes("tab tab space");
+        window.simulate_event(gpui::KeyUpEvent {
+            keystroke: gpui::Keystroke::parse("space").expect("valid keystroke"),
+        });
+        window.run_until_parked();
+
+        let suppress = window.update(|_, cx| {
+            document
+                .read(cx)
+                .pending
+                .dangerous_query
+                .as_ref()
+                .map(|pending| pending.suppress)
+        });
+        assert_eq!(suppress, Some(true), "the dialog stays open, box checked");
+    }
+}

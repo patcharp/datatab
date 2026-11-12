@@ -1,0 +1,357 @@
+use super::*;
+use crate::ui::document::FileDocumentKey;
+use crate::ui::document::file_format::{FileDocumentFormat, file_document_format};
+use crate::ui::labels::{
+    documents_default_title, scripts_filter_all_files_label, scripts_filter_delimited_label,
+    scripts_filter_javascript_mongodb_label, scripts_filter_redis_label,
+    scripts_filter_spreadsheet_label, scripts_filter_sql_label, scripts_open_dialog_title,
+    scripts_read_file_failed_message,
+};
+
+impl Workspace {
+    /// Opens a file dialog to pick a script, CSV, TSV, Parquet or spreadsheet
+    /// file and opens it through [`Self::open_script_from_path`].
+    pub(in crate::ui::views::workspace) fn open_script_file(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.spawn(async move |this, cx| {
+            let dialog_title = scripts_open_dialog_title();
+            let sql_filter_label = scripts_filter_sql_label();
+            let javascript_mongodb_filter_label = scripts_filter_javascript_mongodb_label();
+            let redis_filter_label = scripts_filter_redis_label();
+            let delimited_filter_label = scripts_filter_delimited_label();
+            let parquet_filter_label = datatab_i18n::t!("scripts.dialog.filter.parquet");
+            let spreadsheet_filter_label = scripts_filter_spreadsheet_label();
+            let all_files_filter_label = scripts_filter_all_files_label();
+
+            let picked = datatab_ui_base::file_dialog::pick_existing_file(cx, async {
+                rfd::AsyncFileDialog::new()
+                    .set_title(&dialog_title)
+                    .add_filter(&sql_filter_label, &["sql"])
+                    .add_filter(&javascript_mongodb_filter_label, &["js", "mongodb"])
+                    .add_filter(&redis_filter_label, &["redis", "red"])
+                    .add_filter(
+                        &delimited_filter_label,
+                        FileDocumentFormat::Delimited.extensions(),
+                    )
+                    .add_filter(
+                        &parquet_filter_label,
+                        FileDocumentFormat::Parquet.extensions(),
+                    )
+                    .add_filter(
+                        &spreadsheet_filter_label,
+                        FileDocumentFormat::Spreadsheet.extensions(),
+                    )
+                    .add_filter(&all_files_filter_label, &["*"])
+                    .pick_file()
+                    .await
+                    .map(|handle| handle.path().to_path_buf())
+            })
+            .await;
+
+            let Some(path) = picked else {
+                return;
+            };
+
+            cx.update(|cx| {
+                this.update(cx, |ws, cx| {
+                    ws.open_script_from_path(path, cx);
+                })
+                .unwrap_or_else(|inner_error| {
+                    log::warn!(
+                        "Failed to update workspace while opening selected script: {:?}",
+                        inner_error
+                    );
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Opens a file from a known path: the file dialog, recent files, the
+    /// command palette, the scripts sidebar, the settings window and IPC all
+    /// come through here.
+    ///
+    /// A `.csv` or `.tsv` file, in any letter case, opens as a table in the
+    /// delimited document, and a `.parquet` file in the Parquet document.
+    /// Every other file opens in the code editor, or focuses the tab that
+    /// already shows it.
+    pub fn open_script_from_path(&mut self, path: std::path::PathBuf, cx: &mut Context<Self>) {
+        if file_document_format(&path).is_some() {
+            self.open_file_document(FileDocumentKey::Local { path }, None, cx);
+            return;
+        }
+
+        let tab_manager = self.tab_manager.clone();
+
+        // Check if already open
+        let already_open = tab_manager.read(cx).find_by_key(
+            &crate::ui::document::DocumentKey::File { path: path.clone() },
+            cx,
+        );
+
+        if let Some(id) = already_open {
+            tab_manager.update(cx, |mgr, cx| {
+                mgr.activate(id, cx);
+            });
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            let read_path = path.clone();
+            let content = cx
+                .background_executor()
+                .spawn(async move { std::fs::read_to_string(&read_path) })
+                .await;
+
+            let content = match content {
+                Ok(c) => c,
+                Err(e) => {
+                    report_error_async(
+                        UserFacingError::new(
+                            ErrorKind::Storage,
+                            scripts_read_file_failed_message(path.display(), e),
+                        ),
+                        cx,
+                    );
+                    return;
+                }
+            };
+
+            cx.update(|cx| {
+                this.update(cx, |ws, cx| {
+                    ws.open_script_with_content(path, content, cx);
+                })
+                .unwrap_or_else(|inner_error| {
+                    log::warn!(
+                        "Failed to update workspace while opening script path: {:?}",
+                        inner_error
+                    );
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Opens a read-only code document showing a routine's definition.
+    ///
+    /// Fetches the definition in the background (via `routine_definition`) and
+    /// defers creation to the next render cycle where `Window` is available.
+    /// Focuses the existing tab when already open.
+    pub fn open_routine_definition(
+        &mut self,
+        profile_id: uuid::Uuid,
+        schema: String,
+        specific_name: String,
+        title: String,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::ui::document::DocumentKey;
+
+        let dedup_key = DocumentKey::Routine {
+            profile_id,
+            schema: schema.clone(),
+            specific_name: specific_name.clone(),
+        };
+
+        if let Some(existing_id) = self.tab_manager.read(cx).find_by_key(&dedup_key, cx) {
+            self.tab_manager.update(cx, |mgr, cx| {
+                mgr.activate(existing_id, cx);
+            });
+            return;
+        }
+
+        let connections = self.app_state.read(cx).connections();
+        let connected = match connections.get(&profile_id) {
+            Some(c) => c,
+            None => return,
+        };
+
+        let database = connected
+            .active_database
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        let connection = connected.connection.clone();
+
+        let schema_fetch = schema.clone();
+        let specific_name_fetch = specific_name.clone();
+
+        cx.spawn(async move |this, cx| {
+            let definition = cx
+                .background_executor()
+                .spawn(async move {
+                    connection.routine_definition(&database, &schema_fetch, &specific_name_fetch)
+                })
+                .await;
+
+            let body = match definition {
+                Ok(def) => def,
+                Err(e) => {
+                    log::warn!(
+                        "Failed to fetch routine definition for {}: {}",
+                        specific_name,
+                        e
+                    );
+                    format!("-- Failed to load routine definition:\n-- {}", e)
+                }
+            };
+
+            cx.update(|cx| {
+                this.update(cx, |ws, cx| {
+                    ws.pending_open_routine = Some(PendingOpenRoutine {
+                        profile_id,
+                        schema,
+                        specific_name,
+                        title,
+                        body,
+                    });
+                    cx.notify();
+                })
+                .ok();
+            });
+        })
+        .detach();
+    }
+
+    pub(in crate::ui::views::workspace) fn finalize_open_routine(
+        &mut self,
+        pending: PendingOpenRoutine,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let doc = cx.new(|cx| {
+            let connection_id = Some(pending.profile_id);
+            let mut doc = CodeDocument::new_with_language(
+                self.app_state.clone(),
+                connection_id,
+                datatab_core::QueryLanguage::Sql,
+                window,
+                cx,
+            )
+            .with_title(pending.title)
+            .with_read_only(cx)
+            .with_routine_dedup(
+                pending.profile_id,
+                pending.schema,
+                pending.specific_name,
+            );
+
+            doc.set_content(&pending.body, window, cx);
+            doc
+        });
+
+        let pane = CodeDocument::into_pane(doc, cx);
+
+        self.tab_manager.update(cx, |mgr, cx| {
+            mgr.open(Tab::Pane(Box::new(pane)), cx);
+        });
+
+        self.set_focus(FocusTarget::Document, window, cx);
+    }
+
+    /// Opens a script file from a known path and content (called after file read).
+    fn open_script_with_content(
+        &mut self,
+        path: std::path::PathBuf,
+        content: String,
+        cx: &mut Context<Self>,
+    ) {
+        use datatab_core::{ExecutionContext, QueryLanguage};
+
+        let language = QueryLanguage::from_path(&path).unwrap_or(QueryLanguage::Sql);
+        let uses_connection_context = language.supports_connection_context();
+
+        let exec_ctx = if uses_connection_context {
+            ExecutionContext::parse_from_content(&content, language.clone())
+        } else {
+            ExecutionContext::default()
+        };
+
+        let connection_id = if uses_connection_context {
+            exec_ctx
+                .connection_id
+                .filter(|id| self.app_state.read(cx).connections().contains_key(id))
+                .or_else(|| self.app_state.read(cx).active_connection_id())
+        } else {
+            None
+        };
+
+        let body = if uses_connection_context {
+            Self::strip_annotation_header(&content, &language).to_string()
+        } else {
+            content.clone()
+        };
+
+        // Track in recent files
+        self.app_state.update(cx, |state, cx| {
+            state.record_recent_file(path.clone());
+            cx.emit(AppStateChanged);
+        });
+
+        // We need window access; use pending_open_script pattern
+        self.pending_open_script = Some(PendingOpenScript {
+            title: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+                .unwrap_or_else(documents_default_title),
+            path: Some(path),
+            body,
+            raw: content,
+            language,
+            connection_id,
+            exec_ctx,
+        });
+        cx.notify();
+    }
+
+    pub(in crate::ui::views::workspace) fn finalize_open_script(
+        &mut self,
+        pending: PendingOpenScript,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let PendingOpenScript {
+            path,
+            title,
+            body,
+            raw,
+            language,
+            connection_id,
+            exec_ctx,
+        } = pending;
+
+        let doc = cx.new(|cx| {
+            let mut doc = CodeDocument::new_with_language(
+                self.app_state.clone(),
+                connection_id,
+                language,
+                window,
+                cx,
+            )
+            .with_exec_ctx(exec_ctx, cx);
+            doc = doc.with_title(title);
+
+            if let Some(path) = path {
+                doc = doc.with_path(path.clone());
+                // The editor shows the stripped body, but the file's raw bytes —
+                // annotation header included — are the physical baseline, so the
+                // first autosave compares against exactly what is on disk.
+                doc.seed_file_baseline(path, raw);
+            }
+
+            doc.set_content(&body, window, cx);
+            doc
+        });
+
+        let pane = CodeDocument::into_pane(doc, cx);
+
+        self.tab_manager.update(cx, |mgr, cx| {
+            mgr.open(Tab::Pane(Box::new(pane)), cx);
+        });
+
+        self.set_focus(FocusTarget::Document, window, cx);
+    }
+}

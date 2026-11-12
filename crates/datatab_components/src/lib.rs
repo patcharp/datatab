@@ -1,0 +1,47 @@
+//! Pure UI components and design tokens for DataTab.
+//!
+//! This crate contains UI primitives, controls, and composites that depend
+//! only on `gpui` and `gpui_component`. It has zero domain dependencies.
+
+#![allow(clippy::type_complexity)]
+// Required by the `#[gpui::test]` attribute macro expansion in test modules.
+#![recursion_limit = "512"]
+
+pub mod actions;
+pub mod density;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod accessibility;
+pub mod font_settings;
+pub mod helpers;
+// Moved to `bolt`; re-exported at these paths so call sites keep compiling.
+pub use bolt::{command_palette, icon, keymap};
+pub mod semantic;
+// Moved to `bolt`; re-exported at these paths so call sites keep compiling.
+pub use bolt::{colors, fonts, tokens, typography};
+
+pub mod category;
+pub mod chart;
+pub mod common;
+pub mod components;
+pub mod composites;
+pub mod controls;
+pub mod highlighting;
+pub mod icons;
+pub mod key_contexts;
+pub mod modals;
+pub mod primitives;
+pub mod result_panel;
+pub mod result_view;
+pub mod saved_chart;
+pub mod theme;
+pub mod vim;
+
+pub mod sql_preview;
+
+#[cfg(test)]
+mod style_guardrails;
+
+pub use composites::refresh_split_button;
+pub use saved_chart::{SavedChart, SavedChartRefreshPolicy, SavedChartSource, TimeRangePreset};
+pub use sql_preview::{SqlGenerationType, SqlPreviewContext};

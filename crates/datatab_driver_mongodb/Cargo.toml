@@ -1,0 +1,40 @@
+[package]
+name = "datatab_driver_mongodb"
+version.workspace = true
+edition.workspace = true
+publish = false
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+datatab_core.workspace = true
+datatab_js.workspace = true
+datatab_ssh.workspace = true
+mongodb = { version = "3", default-features = false, features = ["sync", "rustls-tls", "bson-3", "compat-3-3-0", "dns-resolver"] }
+bson = { version = "3.1", features = ["serde", "serde_json-1"] }
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono = { workspace = true }
+tokio = { workspace = true }
+base64 = "0.22"
+urlencoding = "2"
+uuid.workspace = true
+
+[dev-dependencies]
+datatab_test_support.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-machete]
+# tokio is declared to ensure the rt-multi-thread runtime feature is active for
+# the mongodb async client; the driver itself does not call tokio:: directly.
+ignored = ["tokio"]

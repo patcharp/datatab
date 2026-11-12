@@ -1,0 +1,23 @@
+[package]
+name = "datatab_ssm"
+version.workspace = true
+publish = false
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+datatab_core = { path = "../datatab_core" }
+log = "0.4"
+
+[dev-dependencies]
+env_logger.workspace = true

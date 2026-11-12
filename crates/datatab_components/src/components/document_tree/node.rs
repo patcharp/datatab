@@ -1,0 +1,389 @@
+pub use bolt::components::document_tree::NodeId;
+use bolt::components::document_tree::ValueTypeClass;
+use datatab_core::Value;
+use datatab_core::chrono::{DateTime, NaiveDate, Utc};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+/// Value stored in a tree node.
+#[derive(Debug, Clone)]
+pub enum NodeValue {
+    /// Primitive scalar value.
+    Scalar(Value),
+    /// Object/document with fields.
+    Document(BTreeMap<String, Value>),
+    /// Array with elements.
+    Array(Vec<Value>),
+}
+
+impl NodeValue {
+    pub fn from_value(value: &Value) -> Self {
+        match value {
+            Value::Document(fields) => NodeValue::Document(fields.clone()),
+            Value::Array(items) => NodeValue::Array(items.clone()),
+            _ => NodeValue::Scalar(value.clone()),
+        }
+    }
+
+    pub fn is_expandable(&self) -> bool {
+        match self {
+            NodeValue::Scalar(_) => false,
+            NodeValue::Document(fields) => !fields.is_empty(),
+            NodeValue::Array(items) => !items.is_empty(),
+        }
+    }
+
+    /// Get a preview string for the value (truncated for display).
+    pub fn preview(&self) -> Arc<str> {
+        match self {
+            NodeValue::Scalar(v) => format_value_preview(v, true).into(),
+            NodeValue::Document(fields) => format!("{{{} fields}}", fields.len()).into(),
+            NodeValue::Array(items) => format!("[{} items]", items.len()).into(),
+        }
+    }
+
+    /// Get the full value string (not truncated).
+    pub fn full_preview(&self) -> Arc<str> {
+        match self {
+            NodeValue::Scalar(v) => format_value_preview(v, false).into(),
+            NodeValue::Document(fields) => format!("{{{} fields}}", fields.len()).into(),
+            NodeValue::Array(items) => format!("[{} items]", items.len()).into(),
+        }
+    }
+
+    /// Get the type label for display.
+    pub fn type_label(&self) -> &'static str {
+        match self {
+            NodeValue::Scalar(v) => match v {
+                Value::Null => "null",
+                Value::Bool(_) => "bool",
+                Value::Int(_) => "int",
+                Value::Float(_) => "float",
+                Value::Text(_) => "string",
+                Value::ObjectId(_) => "ObjectId",
+                Value::DateTime(_) => "datetime",
+                Value::Date(_) => "date",
+                Value::Time(_) => "time",
+                Value::Bytes(_) => "bytes",
+                Value::Decimal(_) => "decimal",
+                Value::Json(_) => "json",
+                Value::Unsupported(_) => "unsupported",
+                Value::Document(_) | Value::Array(_) => unreachable!(),
+            },
+            NodeValue::Document(_) => "object",
+            NodeValue::Array(_) => "array",
+        }
+    }
+
+    /// The coarse class the row painter paints this value with: the value's
+    /// type colors follow it (`bolt::document_tree::value_type_color`).
+    pub fn type_class(&self) -> ValueTypeClass {
+        match self {
+            NodeValue::Scalar(v) => match v {
+                Value::Null => ValueTypeClass::Null,
+                Value::Bool(_) => ValueTypeClass::Boolean,
+                Value::Int(_) => ValueTypeClass::Integer,
+                Value::Float(_) | Value::Decimal(_) => ValueTypeClass::Float,
+                Value::Text(_) => ValueTypeClass::Text,
+                Value::ObjectId(_) => ValueTypeClass::ObjectId,
+                Value::DateTime(_) | Value::Date(_) | Value::Time(_) => ValueTypeClass::Temporal,
+                Value::Bytes(_) => ValueTypeClass::Bytes,
+                Value::Json(_) => ValueTypeClass::Json,
+                Value::Unsupported(_) => ValueTypeClass::Other,
+                Value::Document(_) | Value::Array(_) => unreachable!(),
+            },
+            NodeValue::Document(_) | NodeValue::Array(_) => ValueTypeClass::Container,
+        }
+    }
+}
+
+/// A node in the document tree.
+#[derive(Debug, Clone)]
+pub struct TreeNode {
+    pub id: NodeId,
+    pub key: Arc<str>,
+    pub value: NodeValue,
+    pub depth: usize,
+    pub parent_id: Option<NodeId>,
+    /// Order of this document's fields as the source returned them. Fields
+    /// not listed follow in key order.
+    pub field_order: Option<Arc<[String]>>,
+    /// Text shown instead of the field count while the node is collapsed,
+    /// naming the fields that identify the document.
+    pub summary: Option<Arc<str>>,
+}
+
+impl TreeNode {
+    pub fn new(id: NodeId, key: &str, value: NodeValue, parent_id: Option<NodeId>) -> Self {
+        let depth = id.depth();
+        Self {
+            id,
+            key: key.into(),
+            value,
+            depth,
+            parent_id,
+            field_order: None,
+            summary: None,
+        }
+    }
+
+    pub fn with_field_order(mut self, order: Arc<[String]>) -> Self {
+        self.field_order = Some(order);
+        self
+    }
+
+    pub fn with_summary(mut self, summary: Option<String>) -> Self {
+        self.summary = summary.map(Arc::from);
+        self
+    }
+
+    pub fn is_expandable(&self) -> bool {
+        self.value.is_expandable()
+    }
+
+    /// Generate child nodes for this node.
+    pub fn children(&self) -> Vec<TreeNode> {
+        match &self.value {
+            NodeValue::Scalar(_) => Vec::new(),
+            NodeValue::Document(fields) => ordered_fields(fields, self.field_order.as_deref())
+                .into_iter()
+                .map(|(k, v)| {
+                    let child_id = self.id.child(k);
+                    TreeNode::new(child_id, k, NodeValue::from_value(v), Some(self.id.clone()))
+                })
+                .collect(),
+            NodeValue::Array(items) => items
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let key = i.to_string();
+                    let child_id = self.id.child(&key);
+                    TreeNode::new(
+                        child_id,
+                        &key,
+                        NodeValue::from_value(v),
+                        Some(self.id.clone()),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The fields of a document in `order` first, then every other field by key.
+pub(super) fn ordered_fields<'a>(
+    fields: &'a BTreeMap<String, Value>,
+    order: Option<&[String]>,
+) -> Vec<(&'a String, &'a Value)> {
+    let Some(order) = order else {
+        return fields.iter().collect();
+    };
+
+    let mut ordered: Vec<(&String, &Value)> = order
+        .iter()
+        .filter_map(|key| fields.get_key_value(key))
+        .collect();
+
+    ordered.extend(fields.iter().filter(|(key, _)| !order.contains(key)));
+    ordered
+}
+
+/// Up to `limit` fields that identify a document at a glance: the first short
+/// text or integer fields in document order, `_id` excluded. Rendered as
+/// `{ sku: "CAT-00335", name: "Walnut lamp 335" }`.
+pub(super) fn identifying_summary(
+    fields: &BTreeMap<String, Value>,
+    order: Option<&[String]>,
+    limit: usize,
+) -> Option<String> {
+    const MAX_VALUE_CHARS: usize = 40;
+
+    let parts: Vec<String> = ordered_fields(fields, order)
+        .into_iter()
+        .filter(|(key, _)| key.as_str() != "_id")
+        .filter_map(|(key, value)| match value {
+            Value::Text(text) if !text.is_empty() && text.chars().count() <= MAX_VALUE_CHARS => {
+                Some(format!("{key}: \"{text}\""))
+            }
+            Value::Int(integer) => Some(format!("{key}: {integer}")),
+            _ => None,
+        })
+        .take(limit)
+        .collect();
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    let more = if fields.len() > parts.len() + 1 {
+        ", \u{2026}"
+    } else {
+        ""
+    };
+
+    Some(format!("{{ {}{} }}", parts.join(", "), more))
+}
+
+const MAX_PREVIEW_LEN: usize = 80;
+
+fn format_value_preview(value: &Value, truncate: bool) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => {
+            if f.fract() == 0.0 && f.abs() < 1e15 {
+                format!("{:.1}", f)
+            } else {
+                f.to_string()
+            }
+        }
+        Value::Text(s) => {
+            let escaped: String = s
+                .chars()
+                .flat_map(|c| match c {
+                    '\n' => vec!['\\', 'n'],
+                    '\r' => vec!['\\', 'r'],
+                    '\t' => vec!['\\', 't'],
+                    c => vec![c],
+                })
+                .collect();
+
+            if truncate && (escaped.len() > MAX_PREVIEW_LEN || s.len() > MAX_PREVIEW_LEN) {
+                format!("\"{}...\"", &escaped[..MAX_PREVIEW_LEN.min(escaped.len())])
+            } else {
+                format!("\"{}\"", escaped)
+            }
+        }
+        Value::ObjectId(id) => format!("ObjectId(\"{}\")", id),
+        Value::DateTime(dt) => format_datetime_relative(dt),
+        Value::Date(d) => format_date_relative(d),
+        Value::Time(t) => t.format("%H:%M:%S").to_string(),
+        Value::Bytes(b) => format!("<{} bytes>", b.len()),
+        Value::Decimal(d) => d.to_string(),
+        Value::Unsupported(type_name) => format!("UNSUPPORTED<{}>", type_name),
+        Value::Json(j) => {
+            let escaped: String = j
+                .chars()
+                .flat_map(|c| match c {
+                    '\n' => vec!['\\', 'n'],
+                    '\r' => vec!['\\', 'r'],
+                    '\t' => vec!['\\', 't'],
+                    c => vec![c],
+                })
+                .collect();
+
+            if truncate && escaped.len() > MAX_PREVIEW_LEN {
+                format!("{}...", &escaped[..MAX_PREVIEW_LEN.min(escaped.len())])
+            } else {
+                escaped
+            }
+        }
+        Value::Document(fields) => format!("{{{} fields}}", fields.len()),
+        Value::Array(items) => format!("[{} items]", items.len()),
+    }
+}
+
+/// Format a datetime with relative format for recent dates.
+fn format_datetime_relative(dt: &DateTime<Utc>) -> String {
+    let now = Utc::now();
+    let diff = now.signed_duration_since(*dt);
+
+    // For dates in the future or very far in the past, use absolute format
+    if diff.num_seconds() < 0 || diff.num_days() > 30 {
+        return dt.format("%Y-%m-%d %H:%M:%S").to_string();
+    }
+
+    let seconds = diff.num_seconds();
+    let minutes = diff.num_minutes();
+    let hours = diff.num_hours();
+    let days = diff.num_days();
+
+    if seconds < 60 {
+        "just now".to_string()
+    } else if minutes < 60 {
+        format!("{} min ago", minutes)
+    } else if hours < 24 {
+        format!("{} hr ago", hours)
+    } else if days == 1 {
+        "yesterday".to_string()
+    } else {
+        format!("{} days ago", days)
+    }
+}
+
+/// Format a date with relative format for recent dates.
+fn format_date_relative(d: &NaiveDate) -> String {
+    let today = Utc::now().date_naive();
+    let diff = today.signed_duration_since(*d);
+    let days = diff.num_days();
+
+    // For dates in the future or very far in the past, use absolute format
+    if !(0..=30).contains(&days) {
+        return d.format("%Y-%m-%d").to_string();
+    }
+
+    if days == 0 {
+        "today".to_string()
+    } else if days == 1 {
+        "yesterday".to_string()
+    } else {
+        format!("{} days ago", days)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fields(entries: &[(&str, Value)]) -> BTreeMap<String, Value> {
+        entries
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn ordered_fields_follow_the_given_order_then_the_rest() {
+        let document = fields(&[
+            ("a", Value::Int(1)),
+            ("sku", Value::Int(2)),
+            ("_id", Value::Int(3)),
+        ]);
+        let order = vec!["_id".to_string(), "sku".to_string()];
+
+        let keys: Vec<&str> = ordered_fields(&document, Some(&order))
+            .into_iter()
+            .map(|(key, _)| key.as_str())
+            .collect();
+
+        assert_eq!(keys, vec!["_id", "sku", "a"]);
+    }
+
+    #[test]
+    fn identifying_summary_names_the_first_short_text_fields() {
+        let document = fields(&[
+            ("_id", Value::ObjectId("a".repeat(24))),
+            ("sku", Value::Text("CAT-00335".into())),
+            ("name", Value::Text("Walnut lamp 335".into())),
+            ("price", Value::Document(BTreeMap::new())),
+            ("zone", Value::Text("north".into())),
+        ]);
+        let order: Vec<String> = ["_id", "sku", "name", "price", "zone"]
+            .iter()
+            .map(|key| key.to_string())
+            .collect();
+
+        assert_eq!(
+            identifying_summary(&document, Some(&order), 2).as_deref(),
+            Some("{ sku: \"CAT-00335\", name: \"Walnut lamp 335\", \u{2026} }")
+        );
+    }
+
+    #[test]
+    fn identifying_summary_is_none_without_scalar_fields() {
+        let document = fields(&[("_id", Value::Int(1)), ("items", Value::Array(Vec::new()))]);
+
+        assert_eq!(identifying_summary(&document, None, 2), None);
+    }
+}

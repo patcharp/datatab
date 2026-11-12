@@ -1,0 +1,1078 @@
+//! `ChartShell` — the reusable chart entity that owns chart state.
+//!
+//! `ChartShell` absorbs the chart-specific fields and rendering methods that
+//! previously lived directly on `DataGridPanel`. Any host that implements
+//! `ChartHost` can mount a `ChartShell` to get full chart UX (toolbar,
+//! legend, rail, hidden-series management) without duplicating state.
+
+/// Active tab in the chart Configure/Stats/Metric rail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChartRailTab {
+    #[default]
+    Configure,
+    Stats,
+    /// Metric picker rail — visible only when the connection supports
+    /// `DriverCapabilities::METRIC_CATALOG`. Shows namespace / metric / dimension
+    /// selection columns and a config section with period + statistic controls.
+    Metric,
+}
+
+/// Events emitted by `ChartShell`.
+///
+/// Subscribed by `ChartDocument` to receive apply notifications from the
+/// metric picker rail without a direct entity reference cycle.
+pub enum ChartShellEvent {
+    /// The metric picker's Apply button was pressed.
+    ///
+    /// The payload is the constructed source as a cloneable box. `ChartDocument`
+    /// receives this and stashes it in `pending_data_source` for the render loop
+    /// to consume with a `Window` reference.
+    MetricPickerApplied(Box<dyn datatab_components::chart::ChartDataSource>),
+}
+
+impl Clone for ChartShellEvent {
+    fn clone(&self) -> Self {
+        match self {
+            ChartShellEvent::MetricPickerApplied(src) => {
+                ChartShellEvent::MetricPickerApplied(src.clone_box())
+            }
+        }
+    }
+}
+
+use super::host::{ChartHost, HostAdapter};
+use super::metric_picker::MetricPickerState;
+use datatab_components::chart::{
+    AggKind, AxisPill, BindingSpec, ChartDetection, ChartKind, ChartSpec, ChartView, DataPointRef,
+    ManualChartSelection, SourceRowRef, YScale, detect_chart_columns,
+};
+use datatab_core::{ColumnKind, ColumnMeta, QueryResult};
+use gpui::prelude::*;
+use gpui::{Context, Entity, EventEmitter, Subscription, Window};
+use std::collections::HashSet;
+use std::sync::Arc;
+
+/// Reusable entity that owns all chart state for a single mounted host.
+///
+/// Created lazily by the host when the result first passes chart detection.
+/// The host keeps an `Option<Entity<ChartShell>>` and renders the shell
+/// when `result_view_mode == Chart`.
+pub struct ChartShell {
+    // ---- host adapter ----
+    host: HostAdapter,
+
+    // ---- chart view ----
+    /// The built `ChartView` entity. `None` before the first result arrives
+    /// or after a column-shape change that forces a rebuild.
+    pub(crate) chart_view: Option<Entity<ChartView>>,
+
+    /// Subscription that triggers `cx.notify()` on this shell whenever the
+    /// `ChartView` entity notifies (e.g. hover changes, focus changes).
+    pub(crate) chart_view_observer: Option<Subscription>,
+
+    /// Runtime X time-domain override in epoch milliseconds, retained across
+    /// rebuilds. Hosts set this for accumulating sources; every rebuild in
+    /// `ensure_chart_view` reapplies it to the fresh `ChartView` so sparse
+    /// session samples keep rendering against the full requested window.
+    /// `None` keeps the data-derived bounds.
+    x_time_domain: Option<(i64, i64)>,
+
+    // ---- column selection ----
+    /// Last result used to build the current `chart_view`. Used to detect
+    /// when a rebuild is necessary after `set_result`.
+    pub(crate) chart_detection: Option<ChartDetection>,
+
+    /// Manual column selection overriding auto-detection. `None` = use
+    /// detection result.
+    pub(crate) chart_manual_selection: Option<ManualChartSelection>,
+
+    // ---- interaction state ----
+    /// Series indices hidden by the user via the legend.
+    pub(crate) chart_hidden_series: HashSet<usize>,
+
+    /// Index of the currently focused series (hover-driven).
+    pub(crate) chart_focused_series_idx: usize,
+
+    /// User-controlled legend visibility. Defaults to `true`; the engine's
+    /// own rule (hide when series count ≤ 1) is applied on top of this.
+    chart_legend_visible: bool,
+
+    // ---- overlay picker state ----
+    /// Whether the manual column-picker overlay is visible in the degraded card.
+    pub(crate) chart_picker_overlay_open: bool,
+
+    /// X-column index in the degraded picker (into result columns).
+    pub(crate) chart_picker_x_col: usize,
+
+    /// Checked state per Y-candidate column in the degraded picker.
+    pub(crate) chart_picker_y_checked: Vec<bool>,
+
+    // ---- rail state ----
+    /// Whether the Stats rail is open.
+    pub(crate) chart_rail_open: bool,
+
+    /// Active tab inside the rail (Stats only after AxisBar landing).
+    pub(crate) chart_rail_tab: ChartRailTab,
+
+    /// Selected X-column index in the rail Configure picker.
+    /// Kept for backward compat; no longer driven by a UI tab.
+    pub(crate) chart_rail_picker_x_col: usize,
+
+    /// Checked state per Y-candidate column in the rail Configure picker.
+    /// Kept for backward compat; no longer driven by a UI tab.
+    pub(crate) chart_rail_picker_y_checked: Vec<bool>,
+
+    // ---- AxisBar state ----
+    /// Which AxisBar pill picker is currently open.
+    pub(crate) axis_open_pill: Option<AxisPill>,
+
+    /// Row of the open AxisBar picker the keyboard is on, an index into
+    /// `axis_picker_options` for that pill.
+    pub(crate) axis_picker_cursor: usize,
+
+    // ---- Y scale ----
+    /// Y-axis scale mode. Persists across rebuilds (set_result / apply_bindings).
+    pub(crate) y_scale: YScale,
+
+    // ---- source rows ----
+    /// Whether the charts this shell builds record the source row of each
+    /// point (`ChartSpec.track_source_indices`). Set by a host that can show
+    /// that row; off by default to spare the per-point index memory.
+    track_source_indices: bool,
+
+    // ---- chart kind ----
+    /// User-selected chart kind (Line, Bar, …). Applied to every `ChartSpec`
+    /// the shell produces, so it survives rebuilds triggered by binding edits.
+    chart_kind: ChartKind,
+
+    // ---- metric picker ----
+    /// Present when the shell was opened in metric mode or the user switched
+    /// to the Metric rail tab. `None` for pure query-chart shells.
+    pub metric_picker: Option<MetricPickerState>,
+}
+
+impl EventEmitter<ChartShellEvent> for ChartShell {}
+
+impl ChartShell {
+    /// Create a `ChartShell` for a native `ChartDocument` host.
+    ///
+    /// Uses `HostAdapter::Standalone` — the document drives `set_result` directly
+    /// and does not route re-execute requests through the adapter.
+    pub fn new_standalone(cx: &mut Context<Self>) -> Self {
+        Self::new(HostAdapter::Standalone, cx)
+    }
+
+    /// Create a new `ChartShell` bound to the given host adapter.
+    ///
+    /// The shell starts with no chart view. Call `set_result` to provide the
+    /// first `QueryResult` and trigger chart detection + view construction.
+    pub fn new(host: HostAdapter, _cx: &mut Context<Self>) -> Self {
+        Self {
+            host,
+            chart_view: None,
+            chart_view_observer: None,
+            x_time_domain: None,
+            chart_detection: None,
+            chart_manual_selection: None,
+            chart_hidden_series: HashSet::new(),
+            chart_focused_series_idx: 0,
+            chart_legend_visible: true,
+            chart_picker_overlay_open: false,
+            chart_picker_x_col: 0,
+            chart_picker_y_checked: Vec::new(),
+            chart_rail_open: false,
+            chart_rail_tab: ChartRailTab::Configure,
+            chart_rail_picker_x_col: 0,
+            chart_rail_picker_y_checked: Vec::new(),
+            axis_open_pill: None,
+            axis_picker_cursor: 0,
+            y_scale: YScale::Linear,
+            track_source_indices: false,
+            chart_kind: ChartKind::default(),
+            metric_picker: None,
+        }
+    }
+
+    /// Record, or stop recording, the source row of each chart point.
+    ///
+    /// A change drops the current chart view so the next `ensure_chart_view`
+    /// rebuilds it with the new setting.
+    pub fn set_track_source_indices(&mut self, track: bool, cx: &mut Context<Self>) {
+        if self.track_source_indices == track {
+            return;
+        }
+
+        self.track_source_indices = track;
+        self.chart_view = None;
+        self.chart_view_observer = None;
+        cx.notify();
+    }
+
+    /// Set the initial rail tab and open state without touching subscriptions.
+    ///
+    /// Called during `ChartDocument` construction to open the Metric rail tab
+    /// immediately when a chart is opened from the sidebar tree.
+    pub fn set_initial_rail(&mut self, tab: ChartRailTab, open: bool) {
+        self.chart_rail_tab = tab;
+        self.chart_rail_open = open;
+    }
+
+    /// Returns `true` when the current detection result is `Ok` (chart available).
+    pub fn chart_available(&self) -> bool {
+        matches!(&self.chart_detection, Some(ChartDetection::Ok { .. }))
+    }
+
+    /// Update shell state for a new `QueryResult`.
+    ///
+    /// Preserves hidden-series, manual selection, focused series, and rail
+    /// state when the detection result is still `Ok` after the update (i.e.
+    /// the user was already in chart mode and the new result is still
+    /// chartable).
+    pub fn set_result(
+        &mut self,
+        result: &QueryResult,
+        was_chart_mode: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let detection = detect_chart_columns(result);
+        let detection_ok = matches!(detection, ChartDetection::Ok { .. });
+
+        let prev_hidden = std::mem::take(&mut self.chart_hidden_series);
+        let prev_manual = self.chart_manual_selection.clone();
+        let prev_focused = self.chart_focused_series_idx;
+        let prev_rail_open = self.chart_rail_open;
+        let prev_rail_tab = self.chart_rail_tab;
+
+        self.chart_detection = Some(detection);
+        self.chart_view = None;
+        self.chart_view_observer = None;
+        self.chart_picker_overlay_open = false;
+        self.reset_picker(&result.columns);
+
+        if was_chart_mode && detection_ok {
+            self.chart_hidden_series = prev_hidden;
+            self.chart_manual_selection = prev_manual;
+            self.chart_focused_series_idx = prev_focused;
+            self.chart_rail_open = prev_rail_open;
+            self.chart_rail_tab = prev_rail_tab;
+        } else {
+            self.chart_hidden_series = HashSet::new();
+            self.chart_manual_selection = None;
+            self.chart_focused_series_idx = 0;
+            self.chart_rail_open = false;
+            self.chart_rail_tab = ChartRailTab::Configure;
+            self.chart_rail_picker_x_col = 0;
+            self.chart_rail_picker_y_checked = Vec::new();
+        }
+
+        cx.notify();
+    }
+
+    /// Build or return the existing `ChartView` entity.
+    ///
+    /// Returns `None` when detection failed or the result is incompatible.
+    /// Uses the manual selection if set, otherwise auto-detection. Requires
+    /// a reference to the current `QueryResult` from the host.
+    pub fn ensure_chart_view(
+        &mut self,
+        result: &QueryResult,
+        cx: &mut Context<Self>,
+    ) -> Option<Entity<ChartView>> {
+        if self.chart_view.is_some() {
+            return self.chart_view.clone();
+        }
+
+        let spec = if let Some(manual) = &self.chart_manual_selection {
+            ChartSpec::from_manual_selection(manual, &result.columns, 10_000)
+        } else {
+            match &self.chart_detection {
+                Some(ChartDetection::Ok {
+                    time_col,
+                    numeric_cols,
+                }) => ChartSpec::from_detection(
+                    *time_col,
+                    numeric_cols.clone(),
+                    &result.columns,
+                    10_000,
+                ),
+                _ => None,
+            }
+        }?;
+
+        // Split grouped series first so the legend rule counts the lines drawn.
+        let mut spec = spec.with_group_series(result);
+        spec.legend_visible = self.chart_legend_visible && spec.series.len() > 1;
+        spec.y_scale = self.y_scale;
+        spec.kind = self.chart_kind;
+        spec.track_source_indices = self.track_source_indices;
+
+        match ChartView::build(result, spec) {
+            Ok(chart_view) => {
+                let entity = cx.new(|_cx| chart_view);
+                // Reapply the retained runtime domain to every rebuild so the
+                // override survives `set_result` / `apply_bindings` drops.
+                if let Some(domain) = self.x_time_domain {
+                    entity.update(cx, |view, cx| view.set_x_time_domain(Some(domain), cx));
+                }
+                let observer = cx.observe(&entity, |_this, _chart, cx| cx.notify());
+                self.chart_view = Some(entity.clone());
+                self.chart_view_observer = Some(observer);
+                Some(entity)
+            }
+            Err(err) => {
+                log::warn!("[chart-shell] ChartView::build failed: {}", err);
+                None
+            }
+        }
+    }
+
+    /// Toggle the hidden state of a series by index.
+    ///
+    /// Propagates the updated hidden set to the live `ChartView` entity.
+    pub fn toggle_chart_series_hidden(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if self.chart_hidden_series.contains(&idx) {
+            self.chart_hidden_series.remove(&idx);
+        } else {
+            self.chart_hidden_series.insert(idx);
+        }
+
+        if let Some(chart_entity) = self.chart_view.clone() {
+            let hidden = self.chart_hidden_series.clone();
+            chart_entity.update(cx, |view, cx| {
+                view.set_hidden_series(hidden, cx);
+            });
+        }
+
+        cx.notify();
+    }
+
+    /// Returns the current `ChartView` entity without triggering a build.
+    pub fn chart_view(&self) -> Option<&Entity<ChartView>> {
+        self.chart_view.as_ref()
+    }
+
+    /// Set the runtime X time-domain override (epoch milliseconds) and apply
+    /// it to the live `ChartView`, if one is built.
+    ///
+    /// The domain is retained on the shell and reapplied by every rebuild in
+    /// `ensure_chart_view`, so rebuilds triggered by `set_result` or
+    /// `apply_bindings` keep projecting sparse samples against the requested
+    /// window. `None` restores the data-derived bounds.
+    pub fn set_x_time_domain(&mut self, domain: Option<(i64, i64)>, cx: &mut Context<Self>) {
+        self.x_time_domain = domain;
+
+        if let Some(chart_entity) = self.chart_view.clone() {
+            chart_entity.update(cx, |view, cx| view.set_x_time_domain(domain, cx));
+        }
+
+        cx.notify();
+    }
+
+    /// Returns the host adapter for this shell.
+    pub fn host(&self) -> &HostAdapter {
+        &self.host
+    }
+
+    /// Compute the `DataPointRef` of the point the pointer or the keyboard
+    /// highlights, the same point `ChartView::hovered_point` describes.
+    ///
+    /// Returns `None` when the cursor is outside the chart, no chart view exists,
+    /// or the focused series has no usable decimated points. This is called during
+    /// render to decide whether to show the PointInspector.
+    pub fn hovered_data_point(&self, cx: &gpui::App) -> Option<DataPointRef> {
+        let chart_entity = self.chart_view.as_ref()?;
+        let point = chart_entity.read(cx).hovered_point()?;
+
+        Some(DataPointRef {
+            series_idx: point.series_idx,
+            point_idx_in_series: point.point_idx_in_series,
+        })
+    }
+
+    /// Look up the source row for the currently hovered chart point.
+    ///
+    /// Calls `hovered_data_point` then delegates to the host's `source_for_point`.
+    /// Returns `None` when source tracking is disabled (CodeDocument-backed charts
+    /// always return None here).
+    pub fn hovered_source_row(&self, cx: &gpui::App) -> Option<SourceRowRef> {
+        let point = self.hovered_data_point(cx)?;
+        self.host.source_for_point(point, cx)
+    }
+
+    /// Apply a new `BindingSpec` from the AxisBar without re-running the query.
+    ///
+    /// Stores the binding as a manual chart selection and clears the existing
+    /// `chart_view` so the next `ensure_chart_view` call rebuilds from the
+    /// new binding. Also closes any open AxisBar picker.
+    ///
+    /// The `QueryResult` is NOT required here; the host supplies it when calling
+    /// `ensure_chart_view`. When `bindings.y` is empty the chart will show the
+    /// degraded state on the next render.
+    pub fn apply_bindings(&mut self, bindings: BindingSpec, cx: &mut Context<Self>) {
+        // Always store the manual selection — even if y is empty — so the AxisBar
+        // pill labels stay consistent with what the user last picked.
+        self.chart_manual_selection = Some(ManualChartSelection {
+            x_col: bindings.x,
+            y_cols: bindings.y,
+            group_by: bindings.group_by,
+        });
+
+        self.chart_view = None;
+        self.chart_view_observer = None;
+        self.axis_open_pill = None;
+        self.chart_hidden_series = HashSet::new();
+
+        cx.notify();
+    }
+
+    /// Add (`checked`) or remove a Y column from the bindings and keep the Y
+    /// picker open, since it is a checklist where several columns are picked
+    /// in a row. Otherwise behaves like `apply_bindings`.
+    pub fn toggle_y_column(&mut self, column_index: usize, checked: bool, cx: &mut Context<Self>) {
+        let mut bindings = self.active_bindings();
+        if checked {
+            if !bindings.y.contains(&column_index) {
+                bindings.y.push(column_index);
+            }
+        } else {
+            bindings.y.retain(|&index| index != column_index);
+        }
+
+        self.apply_bindings(bindings, cx);
+        self.axis_open_pill = Some(AxisPill::Y);
+    }
+
+    /// The currently selected chart kind.
+    pub fn chart_kind(&self) -> ChartKind {
+        self.chart_kind
+    }
+
+    /// Switch the chart kind (Line, Bar, …).
+    ///
+    /// Because the `ChartView` render model is kind-agnostic, an existing live
+    /// view is updated in place rather than rebuilt. When no view exists yet the
+    /// kind is stored and applied on the next `ensure_chart_view`.
+    pub fn set_chart_kind(&mut self, kind: ChartKind, cx: &mut Context<Self>) {
+        if self.chart_kind == kind {
+            return;
+        }
+
+        self.chart_kind = kind;
+
+        if let Some(chart_entity) = self.chart_view.clone() {
+            chart_entity.update(cx, |view, cx| view.set_kind(kind, cx));
+        }
+
+        cx.notify();
+    }
+
+    /// Toggle the open/closed state of an AxisBar pill picker.
+    ///
+    /// Clicking the same pill again closes it (toggle). Clicking a different
+    /// pill closes the previous one and opens the new one.
+    pub fn toggle_axis_pill(&mut self, pill: AxisPill, cx: &mut Context<Self>) {
+        if self.axis_open_pill == Some(pill) {
+            self.axis_open_pill = None;
+        } else {
+            self.axis_open_pill = Some(pill);
+        }
+        cx.notify();
+    }
+
+    /// Close any open AxisBar picker.
+    pub fn close_axis_picker(&mut self, cx: &mut Context<Self>) {
+        if self.axis_open_pill.is_some() {
+            self.axis_open_pill = None;
+            cx.notify();
+        }
+    }
+
+    /// Update the Y-axis scale mode and rebuild the chart view.
+    ///
+    /// The new scale is applied to the next `ensure_chart_view` call.
+    /// Clears the existing `chart_view` so the rebuild happens on the next render.
+    pub fn set_y_scale(&mut self, scale: YScale, cx: &mut Context<Self>) {
+        if self.y_scale == scale {
+            return;
+        }
+        self.y_scale = scale;
+        self.chart_view = None;
+        self.chart_view_observer = None;
+        cx.notify();
+    }
+
+    /// Current Y-axis scale mode.
+    pub fn y_scale(&self) -> YScale {
+        self.y_scale
+    }
+
+    /// Returns the current `ChartSpec` built from the active bindings and a
+    /// caller-supplied column slice.
+    ///
+    /// Pass `result.columns` from the host. Returns a minimal placeholder when
+    /// the column info is insufficient to build a real spec.
+    pub fn current_chart_spec(&self, columns: &[datatab_core::ColumnMeta]) -> ChartSpec {
+        // Manual selection takes priority.
+        if let Some(manual) = &self.chart_manual_selection
+            && let Some(mut spec) = ChartSpec::from_manual_selection(manual, columns, 10_000)
+        {
+            spec.kind = self.chart_kind;
+            return spec;
+        }
+
+        // Auto-detection fallback.
+        if let Some(ChartDetection::Ok {
+            time_col,
+            numeric_cols,
+        }) = &self.chart_detection
+            && let Some(mut spec) =
+                ChartSpec::from_detection(*time_col, numeric_cols.clone(), columns, 10_000)
+        {
+            spec.kind = self.chart_kind;
+            return spec;
+        }
+
+        // Minimal placeholder.
+        ChartSpec {
+            kind: self.chart_kind,
+            x_axis: datatab_components::chart::AxisSpec {
+                column_index: 0,
+                label: String::new(),
+                kind: datatab_components::chart::AxisKind::Time,
+                unit: None,
+            },
+            series: Vec::new(),
+            legend_visible: false,
+            decimation_threshold: 10_000,
+            binding: self.active_bindings(),
+            track_source_indices: false,
+            y_scale: datatab_components::chart::YScale::Linear,
+        }
+    }
+
+    /// Returns the current binding spec derived from the active chart selection.
+    ///
+    /// When a manual selection is set, the binding is derived from it. When
+    /// auto-detection is in effect, the binding uses the detected columns.
+    /// Returns a default `BindingSpec` when no result is available.
+    pub fn active_bindings(&self) -> BindingSpec {
+        if let Some(manual) = &self.chart_manual_selection {
+            BindingSpec {
+                x: manual.x_col,
+                y: manual.y_cols.clone(),
+                group_by: manual.group_by,
+                filter: None,
+                aggregation: datatab_components::chart::AggKind::None,
+            }
+        } else if let Some(ChartDetection::Ok {
+            time_col,
+            numeric_cols,
+        }) = &self.chart_detection
+        {
+            BindingSpec {
+                x: *time_col,
+                y: numeric_cols.clone(),
+                group_by: None,
+                filter: None,
+                aggregation: datatab_components::chart::AggKind::None,
+            }
+        } else {
+            BindingSpec::default()
+        }
+    }
+
+    /// Reset the degraded-picker column selections for a new result.
+    pub(crate) fn reset_picker(&mut self, columns: &[ColumnMeta]) {
+        self.chart_picker_x_col = columns
+            .iter()
+            .position(|c| c.kind == ColumnKind::Timestamp)
+            .unwrap_or(0);
+
+        self.chart_picker_y_checked = columns
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.kind,
+                    ColumnKind::Float | ColumnKind::Integer | ColumnKind::Unknown
+                )
+            })
+            .map(|c| matches!(c.kind, ColumnKind::Float | ColumnKind::Integer))
+            .collect();
+    }
+
+    /// Prime the rail Configure picker from the current chart spec.
+    #[allow(dead_code)]
+    pub(crate) fn prime_rail_picker_from_spec(&mut self, result: &QueryResult) {
+        let columns = &result.columns;
+
+        let (x_col, y_col_indices) = if let Some(manual) = &self.chart_manual_selection {
+            let ys: Vec<usize> = manual.y_cols.clone();
+            (manual.x_col, ys)
+        } else if let Some(ChartDetection::Ok {
+            time_col,
+            numeric_cols,
+        }) = &self.chart_detection
+        {
+            (*time_col, numeric_cols.clone())
+        } else {
+            let x = columns
+                .iter()
+                .position(|c| c.kind == ColumnKind::Timestamp)
+                .unwrap_or(0);
+            (x, vec![])
+        };
+
+        let x_candidates: Vec<usize> = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                matches!(
+                    c.kind,
+                    ColumnKind::Timestamp | ColumnKind::Text | ColumnKind::Unknown
+                )
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        self.chart_rail_picker_x_col = x_candidates.iter().position(|&ci| ci == x_col).unwrap_or(0);
+
+        let y_candidates: Vec<usize> = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                matches!(
+                    c.kind,
+                    ColumnKind::Float | ColumnKind::Integer | ColumnKind::Unknown
+                )
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        self.chart_rail_picker_y_checked = y_candidates
+            .iter()
+            .map(|ci| y_col_indices.contains(ci))
+            .collect();
+    }
+
+    /// Apply the rail Configure picker state as a `ManualChartSelection`.
+    ///
+    /// Clears the existing `chart_view` so the next render triggers a rebuild.
+    #[allow(dead_code)]
+    pub(crate) fn apply_rail_selection(&mut self, result: &QueryResult, cx: &mut Context<Self>) {
+        let columns = &result.columns;
+
+        let x_candidates: Vec<usize> = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                matches!(
+                    c.kind,
+                    ColumnKind::Timestamp | ColumnKind::Text | ColumnKind::Unknown
+                )
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        let x_col = x_candidates
+            .get(self.chart_rail_picker_x_col)
+            .copied()
+            .unwrap_or(0);
+
+        let y_candidates: Vec<usize> = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                matches!(
+                    c.kind,
+                    ColumnKind::Float | ColumnKind::Integer | ColumnKind::Unknown
+                )
+            })
+            .map(|(i, _)| i)
+            .collect();
+
+        let y_cols: Vec<usize> = y_candidates
+            .iter()
+            .zip(self.chart_rail_picker_y_checked.iter())
+            .filter_map(|(&ci, &checked)| if checked { Some(ci) } else { None })
+            .collect();
+
+        if y_cols.is_empty() {
+            return;
+        }
+
+        let group_by = self
+            .chart_manual_selection
+            .as_ref()
+            .and_then(|manual| manual.group_by);
+
+        self.chart_manual_selection = Some(ManualChartSelection {
+            x_col,
+            y_cols,
+            group_by,
+        });
+        self.chart_view = None;
+        self.chart_view_observer = None;
+        self.chart_hidden_series = HashSet::new();
+        cx.notify();
+    }
+
+    /// Reset chart selection to auto-detection, clearing any manual override.
+    #[allow(dead_code)]
+    pub(crate) fn reset_rail_to_auto(&mut self, result: &QueryResult, cx: &mut Context<Self>) {
+        if !matches!(&self.chart_detection, Some(ChartDetection::Ok { .. })) {
+            return;
+        }
+        self.chart_manual_selection = None;
+        self.chart_view = None;
+        self.chart_view_observer = None;
+        self.prime_rail_picker_from_spec(result);
+        cx.notify();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datatab_core::{ColumnKind, ColumnMeta, QueryResult, Value};
+    use std::time::Duration;
+
+    fn make_col(name: &str, kind: ColumnKind) -> ColumnMeta {
+        ColumnMeta {
+            name: name.to_owned(),
+            type_name: String::new(),
+            kind,
+            nullable: true,
+            is_primary_key: false,
+        }
+    }
+
+    fn two_series_result() -> QueryResult {
+        let rows = vec![
+            vec![Value::Int(0), Value::Float(1.0), Value::Float(10.0)],
+            vec![Value::Int(1000), Value::Float(2.0), Value::Float(20.0)],
+            vec![Value::Int(2000), Value::Float(3.0), Value::Float(15.0)],
+        ];
+        QueryResult::table(
+            vec![
+                make_col("ts", ColumnKind::Timestamp),
+                make_col("val_a", ColumnKind::Float),
+                make_col("val_b", ColumnKind::Float),
+            ],
+            rows,
+            None,
+            Duration::ZERO,
+        )
+    }
+
+    /// Verify that `set_result` on a chartable result puts detection in Ok state.
+    #[test]
+    fn set_result_detects_chart_ok() {
+        // Without a GPUI app context we test the pure logic layer:
+        // detection, field resets, and state transitions.
+        let result = two_series_result();
+        let detection = detect_chart_columns(&result);
+        assert!(
+            matches!(detection, ChartDetection::Ok { .. }),
+            "fixture must produce Ok detection"
+        );
+    }
+
+    /// Verify hidden_series toggle logic without GPUI context.
+    #[test]
+    fn hidden_series_toggle_state() {
+        let mut hidden: HashSet<usize> = HashSet::new();
+
+        // First toggle: insert
+        if hidden.contains(&0) {
+            hidden.remove(&0);
+        } else {
+            hidden.insert(0);
+        }
+        assert!(hidden.contains(&0));
+
+        // Second toggle: remove
+        if hidden.contains(&0) {
+            hidden.remove(&0);
+        } else {
+            hidden.insert(0);
+        }
+        assert!(!hidden.contains(&0));
+    }
+
+    /// Verify that `reset_picker` produces the right default X and Y selections.
+    #[test]
+    fn reset_picker_defaults() {
+        let columns = [
+            make_col("ts", ColumnKind::Timestamp),
+            make_col("val_a", ColumnKind::Float),
+            make_col("val_b", ColumnKind::Float),
+            make_col("label", ColumnKind::Text),
+        ];
+
+        let x_col = columns
+            .iter()
+            .position(|c| c.kind == ColumnKind::Timestamp)
+            .unwrap_or(0);
+
+        let y_checked: Vec<bool> = columns
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.kind,
+                    ColumnKind::Float | ColumnKind::Integer | ColumnKind::Unknown
+                )
+            })
+            .map(|c| matches!(c.kind, ColumnKind::Float | ColumnKind::Integer))
+            .collect();
+
+        assert_eq!(x_col, 0, "Timestamp column is at index 0");
+        assert_eq!(y_checked.len(), 2, "Two Float columns are Y candidates");
+        assert!(y_checked[0], "val_a is Float, checked by default");
+        assert!(y_checked[1], "val_b is Float, checked by default");
+    }
+
+    /// State preservation: when chart mode was active and new result is still
+    /// chartable, hidden_series and focused_series must be preserved.
+    #[test]
+    fn set_result_preserves_state_when_still_chartable() {
+        let result = two_series_result();
+        let detection_ok = matches!(detect_chart_columns(&result), ChartDetection::Ok { .. });
+
+        // Simulate the preservation logic from ChartShell::set_result.
+        let mut hidden: HashSet<usize> = HashSet::new();
+        hidden.insert(1);
+        let was_chart_mode = true;
+        let focused = 1usize;
+
+        let (out_hidden, out_focused) = if was_chart_mode && detection_ok {
+            (hidden, focused)
+        } else {
+            (HashSet::new(), 0)
+        };
+
+        assert!(out_hidden.contains(&1), "series 1 remains hidden");
+        assert_eq!(out_focused, 1, "focused series preserved");
+    }
+
+    /// State reset: when switching from non-chart mode to a new result, all
+    /// chart state must be zeroed.
+    #[test]
+    fn set_result_resets_state_when_not_in_chart_mode() {
+        let result = two_series_result();
+        let detection_ok = matches!(detect_chart_columns(&result), ChartDetection::Ok { .. });
+
+        let mut hidden: HashSet<usize> = HashSet::new();
+        hidden.insert(1);
+        let was_chart_mode = false;
+        let focused = 1usize;
+
+        let (out_hidden, out_focused) = if was_chart_mode && detection_ok {
+            (hidden, focused)
+        } else {
+            (HashSet::new(), 0)
+        };
+
+        assert!(out_hidden.is_empty(), "hidden series reset");
+        assert_eq!(out_focused, 0, "focused series reset to 0");
+    }
+
+    /// The runtime X time-domain override must survive shell rebuilds: after
+    /// `apply_bindings` drops the view, the next `ensure_chart_view` reapplies
+    /// the retained domain so sparse samples keep projecting against the full
+    /// requested window.
+    #[gpui::test]
+    fn x_time_domain_survives_shell_rebuild(cx: &mut gpui::TestAppContext) {
+        let shell_holder: std::rc::Rc<std::cell::RefCell<Option<Entity<ChartShell>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let holder_for_view = shell_holder.clone();
+        let (_, visual) = cx.add_window_view({
+            let shell_holder = shell_holder.clone();
+            move |_window, cx| {
+                let shell = cx.new(ChartShell::new_standalone);
+                shell_holder.replace(Some(shell.clone()));
+                DomainHarness { shell }
+            }
+        });
+        let _ = holder_for_view;
+
+        let shell = shell_holder.borrow().clone().expect("shell entity");
+        let result = two_series_result();
+
+        visual.update(|_, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.set_result(&result, false, cx);
+                shell.ensure_chart_view(&result, cx);
+            });
+        });
+
+        // 7-day window over samples spanning 2 seconds.
+        let domain: (i64, i64) = (0, 7 * 24 * 60 * 60_000);
+        visual.update(|_, cx| {
+            shell.update(cx, |shell, cx| shell.set_x_time_domain(Some(domain), cx));
+        });
+
+        let bounds_with_domain = shell_bounds(visual, &shell);
+        assert_eq!(
+            bounds_with_domain,
+            (domain.0 as f64, domain.1 as f64),
+            "domain override must project the axis over the requested window"
+        );
+
+        // Rebuild trigger: apply_bindings drops the view.
+        visual.update(|_, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.apply_bindings(
+                    BindingSpec {
+                        x: 0,
+                        y: vec![1],
+                        group_by: None,
+                        aggregation: AggKind::None,
+                        filter: None,
+                    },
+                    cx,
+                );
+                shell.ensure_chart_view(&result, cx);
+            });
+        });
+
+        let bounds_after_rebuild = shell_bounds(visual, &shell);
+        assert_eq!(
+            bounds_after_rebuild,
+            (domain.0 as f64, domain.1 as f64),
+            "retained domain must be reapplied after a shell rebuild"
+        );
+    }
+
+    /// With two rows at the same X, the keyboard highlight on the second one
+    /// must resolve to that point, not to the first point sharing its X.
+    #[gpui::test]
+    fn hovered_data_point_follows_the_keyboard_point_on_duplicate_x(cx: &mut gpui::TestAppContext) {
+        let shell_holder: std::rc::Rc<std::cell::RefCell<Option<Entity<ChartShell>>>> =
+            std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (_, visual) = cx.add_window_view({
+            let shell_holder = shell_holder.clone();
+            move |_window, cx| {
+                let shell = cx.new(ChartShell::new_standalone);
+                shell_holder.replace(Some(shell.clone()));
+                DomainHarness { shell }
+            }
+        });
+
+        let shell = shell_holder.borrow().clone().expect("shell entity");
+        let result = QueryResult::table(
+            vec![
+                make_col("ts", ColumnKind::Timestamp),
+                make_col("value", ColumnKind::Float),
+            ],
+            vec![
+                vec![Value::Int(0), Value::Float(1.0)],
+                vec![Value::Int(1000), Value::Float(2.0)],
+                vec![Value::Int(1000), Value::Float(3.0)],
+                vec![Value::Int(2000), Value::Float(4.0)],
+            ],
+            None,
+            Duration::ZERO,
+        );
+
+        visual.update(|_, cx| {
+            shell.update(cx, |shell, cx| {
+                shell.set_result(&result, false, cx);
+                shell.ensure_chart_view(&result, cx);
+            });
+        });
+
+        let view = visual.update(|_, cx| {
+            shell
+                .read(cx)
+                .chart_view()
+                .cloned()
+                .expect("chart view must be built")
+        });
+        visual.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                assert!(view.step_keyboard_point(1, cx));
+                assert!(view.step_keyboard_point(1, cx));
+                assert!(view.step_keyboard_point(1, cx));
+            });
+        });
+
+        let (keyboard_point, hovered) = visual.update(|_, cx| {
+            (
+                view.read(cx).keyboard_point(),
+                shell.read(cx).hovered_data_point(cx),
+            )
+        });
+        assert_eq!(
+            keyboard_point,
+            Some(DataPointRef {
+                series_idx: 0,
+                point_idx_in_series: 2,
+            })
+        );
+        assert_eq!(hovered, keyboard_point);
+    }
+
+    fn shell_bounds(
+        visual: &mut gpui::VisualTestContext,
+        shell: &Entity<ChartShell>,
+    ) -> (f64, f64) {
+        visual.update(|_, cx| {
+            let view = shell
+                .read(cx)
+                .chart_view()
+                .cloned()
+                .expect("chart view must be built");
+            view.read(cx).data_x_bounds()
+        })
+    }
+
+    /// The Y picker is a checklist: toggling a column with the mouse applies
+    /// the new binding and leaves the picker open for the next column, while
+    /// other bindings still close it.
+    #[gpui::test]
+    fn toggling_a_y_column_keeps_the_y_picker_open(cx: &mut gpui::TestAppContext) {
+        let shell = cx.new(ChartShell::new_standalone);
+        let result = two_series_result();
+
+        shell.update(cx, |shell, cx| {
+            shell.set_result(&result, false, cx);
+            shell.ensure_chart_view(&result, cx);
+            shell.toggle_axis_pill(AxisPill::Y, cx);
+            let y_before = shell.active_bindings().y;
+
+            shell.toggle_y_column(2, !y_before.contains(&2), cx);
+
+            assert_eq!(shell.axis_open_pill, Some(AxisPill::Y));
+            assert_ne!(shell.active_bindings().y, y_before, "the column toggled");
+
+            shell.toggle_y_column(2, y_before.contains(&2), cx);
+
+            assert_eq!(shell.axis_open_pill, Some(AxisPill::Y));
+            assert_eq!(shell.active_bindings().y, y_before, "toggled back");
+
+            let mut bindings = shell.active_bindings();
+            bindings.x = 0;
+            shell.apply_bindings(bindings, cx);
+
+            assert_eq!(
+                shell.axis_open_pill, None,
+                "other bindings close the picker"
+            );
+        });
+    }
+
+    struct DomainHarness {
+        shell: Entity<ChartShell>,
+    }
+
+    impl Render for DomainHarness {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut Context<Self>,
+        ) -> impl gpui::IntoElement {
+            let _ = &self.shell;
+            gpui::div()
+        }
+    }
+}

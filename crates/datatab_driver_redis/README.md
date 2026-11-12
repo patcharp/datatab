@@ -1,0 +1,108 @@
+# Redis
+
+In-memory key-value database.
+
+## At a glance
+
+- **Category** — Key-value
+- **Query language** — Redis commands
+- **Default port** — 6379
+- **URI scheme** — `redis`
+
+Redis key-value driver for DataTab, built on the [`redis`](https://crates.io/crates/redis) crate.
+
+## Features
+
+- Key-value driver classified as `DatabaseCategory::KeyValue` with the `RedisCommands` query language; the editor uses Redis command syntax, not SQL.
+- Connection modes: manual (host/port/user/password/database) and URI mode. URI mode accepts `redis://` and `rediss://` connection strings; the `#insecure` fragment on a `rediss://` URI skips the certificate checks, like TLS mode `on`.
+- Multiple logical databases via `SELECT <db>` (`MULTIPLE_DATABASES`). The active database index is tracked on the connection.
+- Authentication with optional username + password (`AUTHENTICATION`).
+- Native command console (`NATIVE_CONSOLE`): the key browser docks a console, and a database's sidebar menu opens one in its own tab, that runs one command at a time through `Connection::execute` against the open database, with the language service's validation and dangerous-command detection, the audit rows and the query history the editor uses. The driver enforces `QueryRequest::limit` (`REQUEST_ROW_LIMIT`), so console commands carry the editor row limit.
+- Reports its client identity to the server via `CLIENT SETNAME` on connect (`datatab/<version>`, visible in `CLIENT LIST`); best-effort, since some managed providers restrict `CLIENT` commands.
+- Best-effort write-privilege probe on connect (`probe_write_privilege`): tries `ACL WHOAMI` + `ACL DRYRUN` first, and falls back to a short-TTL namespaced `SET ... NX` / `DEL` when `ACL` is unavailable (older server or restricted managed provider); a replica's `READONLY` reply or a `NOPERM` denial resolves to a read-only connection.
+- TLS/SSL with three modes (`off`, `on`, `verify`):
+  - `off` — plain `redis://` connection.
+  - `on` — `rediss://`, encrypted, with no check of the certificate chain or name, so it does not protect against a man in the middle. Refused with the Sentinel topology (see Limitations).
+  - `verify` — `rediss://` with a supplied root certificate and optional client certificate/key, built through `Client::build_with_tls`. Refused with the Sentinel topology (see Limitations).
+- SSH tunnel support for reaching Redis through a bastion host (manual mode only; see Limitations).
+- Deployment topology can be detected automatically or set explicitly (`standalone`, `cluster`, `sentinel`):
+  - Automatic detection probes `ROLE` and `INFO cluster` at connect time and routes to standalone or Cluster handling.
+  - `cluster` skips detection and connects directly via `ClusterClient`, using the primary host/port plus any configured additional seed nodes. A Cluster connection only ever exposes database 0; a nonzero database on a Cluster profile is rejected at connect time instead of being silently applied to db 0.
+  - `sentinel` connects through `SentinelClient`, without TLS, resolving the named master from one or more Sentinel nodes (primary host/port plus any configured additional nodes). After resolving, the driver runs `CLIENT SETNAME`, `PING`, and a `ROLE` sanity check that the resolved node is actually a master.
+  - Sentinel failover recovery: a connection-class failure (dropped connection, IO error) on a Sentinel-backed connection triggers exactly one re-resolve through Sentinel and one retry of the failed command before the error is surfaced.
+- Key browsing and discovery:
+  - Cursor-based key scanning (`KV_SCAN`, `PaginationStyle::Cursor`). One page request keeps issuing `SCAN` until the page holds the requested number of keys or the scan completes, so a sparse `MATCH` filter does not produce empty pages. Each page is bounded to 1000 `SCAN` round trips and 500 ms; when the bound is reached, the page returns the keys found so far with a pending cursor. A key that `SCAN` repeats is listed once per page, and a page can exceed the requested size by at most one `SCAN` batch. The page's key types are fetched in one pipeline. On a Cluster connection, a plain `SCAN` has no single-node meaning, so the driver scans the pending masters in turn under the same page bound: each node's cursor is tracked independently, and the aggregated cursor round-trips as an opaque JSON object mapping `"<host>:<port>"` to its pending `SCAN` cursor. The overall scan is exhausted once every master reports cursor 0. Cancelling a key scan stops the page before its next `SCAN` round trip (`KeyValueApi::scan_keys_with_cancel`); a round trip already sent finishes first.
+  - Keyspace key total (`key_count`): `DBSIZE` on the selected database; on a Cluster connection, the sum of `DBSIZE` over every master. The key browser shows it in its header and as the "Loaded N of total" figure in the key list footer.
+  - Server-side type filter (`KeyValueFeatures::SCAN_TYPE_FILTER`): a scan request with a type sends `SCAN ... TYPE <type>`, so the filter covers the whole keyspace rather than the keys already loaded. JSON keys filter on the `ReJSON-RL` module type. Each page reports an estimate of the keys the server examined (`COUNT` per round trip), which the key browser shows while a filtered search runs.
+  - Key metadata in batches (`KeyValueFeatures::KEY_METADATA`): expiry (`PTTL`) and memory size (`MEMORY USAGE`) of many keys in one pipeline (a cluster pipeline on Cluster connections), plus `OBJECT ENCODING` for the key that is open. The key browser asks only for the rows on screen. When the server refuses `MEMORY USAGE` or `OBJECT ENCODING`, the batch is retried with `PTTL` alone.
+  - Namespace delimiter: the per-connection `key_delimiter` driver setting (default `:`) tells the key browser how to group keys into folders.
+  - Per-key type discovery (`KV_KEY_TYPES`) across string, hash, list, set, sorted set, and stream.
+  - TTL inspection (`KV_TTL`) and value size reporting (`KV_VALUE_SIZE`).
+  - Existence checks (`KV_GET`/`KV_EXISTS`), key rename (`KV_RENAME`), and bulk get of multiple keys (`KV_BULK_GET`).
+- Value type coverage: strings, hashes, lists, sets, sorted sets, and streams, including stream range reads, stream entry add, and stream entry delete (`KV_STREAM_RANGE`, `KV_STREAM_ADD`, `KV_STREAM_DELETE`).
+- Ranged reads for large collections: sorted sets page by rank with `ZRANGE`/`ZREVRANGE ... WITHSCORES` plus `ZCARD` (`KeyValueFeatures::SORTED_SET_RANGE`), and streams page between two entry IDs with `XRANGE`/`XREVRANGE ... COUNT` plus `XLEN` (`KeyValueFeatures::STREAM_RANGE`); the next page continues past the last entry with an exclusive `(id` bound.
+- Stream consumer groups (`KeyValueFeatures::STREAM_GROUPS`): `XINFO GROUPS` and `XINFO CONSUMERS` list each group's readers, pending count and last delivered ID; `XPENDING` gives the idle time of the oldest pending entry and lists pending entries; `XCLAIM ... JUSTID` moves pending entries to another reader.
+- Expiry edits keep working on existing keys through `EXPIRE` and `PERSIST`, and value writes keep the key's expiry (`KeyValueFeatures::KEEP_TTL_ON_WRITE`): an edited string is written with `SET ... KEEPTTL`; on servers older than 6.0, which reject `KEEPTTL`, the driver reads `PTTL` first and restores it with `PEXPIRE` after the write.
+- Bulk delete (`KeyValueFeatures::BULK_DELETE`): `UNLINK` of a batch of keys, freed by the server in the background. On a Cluster connection each key is unlinked on its own inside a cluster pipeline, since a batch spans hash slots.
+- Value prefix (`KeyValueFeatures::VALUE_PREFIX`): `GETRANGE` reads the first bytes of a string that is over the preview limit, reported as a truncated value.
+- Configurable stream preview limit exposed as a connection setting.
+- Mutations: insert, update, delete, batch operations, and bulk delete. The `RedisCommandGenerator` emits Redis commands for set/delete, hash set/delete, list push/set/remove, set add/remove, sorted-set add/remove, and stream add/delete, for use in previews and copy-as-command.
+- JSON export of results (`EXPORT_JSON`).
+- Size gate on whole-payload reads: when the request carries a byte budget, string/JSON values are probed with `STRLEN` before `GET` and oversized values return a placeholder with the real size instead of transferring the payload; collection types are unaffected, and stream reads that hit the fetch cap report themselves as truncated.
+- Offline RDB dump analysis (`DumpAnalyzer`): a `.rdb` file is scanned key-by-key without connecting to a server, streaming the file at I/O speed with flat memory (key values are never decoded, only key names and value types). Reports total key count, a per-type breakdown, the 500 largest keys, and a by-prefix size rollup. Reported sizes are each key's **serialized size on disk**, not its footprint in live Redis memory — allocator overhead and in-memory encodings mean the two numbers diverge.
+
+Schema introspection reports a key count for every logical database; a database missing from `INFO keyspace` holds no keys and reports 0, which lets the sidebar fold empty databases into one row. It reports a single aggregated `db0` keyspace on a Cluster connection: the key count and average TTL are summed/averaged across every master's `DBSIZE`/keyspace stats rather than reported per-node.
+
+### Instance Metrics
+
+Exposes a curated set of live server metrics sourced from the `INFO` command output. Not available on a Cluster connection — there is no single node to sample `INFO` against, so `instance_catalog()` returns `None` and Instance Overview/metrics/inspectors are unavailable for Cluster profiles.
+
+- `redis.connected_clients` — currently connected clients
+- `redis.blocked_clients` — clients waiting on a blocking command
+- `redis.used_memory` — bytes allocated by Redis allocator
+- `redis.used_memory_rss` — bytes allocated by the OS (resident set size)
+- `redis.total_commands_processed` — cumulative commands processed
+- `redis.total_connections_received` — cumulative connections accepted
+- `redis.instantaneous_ops_per_sec` — commands processed per second (server-side rate)
+- `redis.keyspace_hits` — cache hits against key lookups
+- `redis.keyspace_misses` — cache misses against key lookups
+- `redis.evicted_keys` — keys evicted due to `maxmemory` policy
+- `redis.expired_keys` — keys expired by TTL
+- `redis.rdb_changes_since_last_save` — changes since last RDB snapshot
+- `redis.connected_slaves` — attached replica count
+
+Each metric is returned as a single `(timestamp_ms, value)` row for live charting.
+
+### Instance Inspector
+
+Exposes tabular snapshots of running server state:
+
+- `redis.client_list` — active clients from `CLIENT LIST` (id, cmd, age, idle, flags, db, sub, multi)
+
+Sensitive fields (`addr`, `laddr`, `name`) are redacted to `[redacted]` to avoid exposing client IP addresses and hostnames.
+
+## Limitations
+
+- `execute()` rejects a requested statement timeout, and a row limit on instance metric or inspector queries, with `NotSupported` before dispatching a command.
+- The editor row limit bounds only replies shown as a table (an array, set or push reply of scalar values). Nested arrays and map replies render as text and are not bounded; the full reply is still read from the server before it is cut.
+
+- SQL is not supported; queries must be written as Redis commands.
+
+- Instance metrics return a single data point per call (current snapshot from `INFO`), not a historical time series. Cumulative counters (e.g. `redis.total_commands_processed`) grow monotonically — interpret them as deltas between samples rather than absolute rates.
+
+- The `CLIENT LIST` inspector redacts the `addr`, `laddr`, and `name` fields in every row to avoid exposing client IP addresses and user-supplied names to the UI.
+
+- Query cancellation is not supported (`QUERY_CANCELLATION` is not set); long-running commands cannot be aborted from the UI.
+- No upsert (`supports_upsert: false`), no `RETURNING`, and no bulk update (`supports_bulk_update: false`).
+- DDL capabilities are all disabled (no tables, views, indexes, schemas) — this is a key-value store, not relational.
+- Transactions are advertised at the capability level (`supports_transactions: true`) but without isolation levels, savepoints, nested transactions, or deferrable support.
+- Read-only requests (`ReadOnlyEnforcement::Required`, used by MCP read scripts and editor auto-refresh) are enforced by DataTab, not by the server. Before the command is sent, the driver asks the server for its flags with `COMMAND INFO` and refuses it unless the server flags it `readonly` (or it is `PING`, `ECHO`, `TIME` or `INFO`) and reports no other flag, such as `write`, `admin`, `blocking`, `pubsub` or `may_replicate`; a flag the driver does not know also refuses the command. Transactions, `SELECT`, subscriptions, `MONITOR`, every script command (`EVAL`, `EVALSHA`, `FCALL` and their read-only forms `EVAL_RO`, `EVALSHA_RO` and `FCALL_RO`), `PFCOUNT` (which rewrites a cached value on Redis 6.0 and earlier), module commands and commands the server does not describe are refused, and so are `SRANDMEMBER`, `HRANDFIELD` and `ZRANDMEMBER` with a negative count. Read-only mode protects data, not availability: expensive reads such as `KEYS *` or a large `SMEMBERS` or `HGETALL` still run, and DataTab sets no Redis read timeout, so a slow command holds the connection until the server answers. Commands with subcommands, such as `CONFIG`, `CLIENT` or `OBJECT`, are judged by the subcommand's own entry, which only Redis 7 and later describe, so on older servers they are refused. Redis Cluster connections and servers that cannot answer `COMMAND INFO` refuse read-only requests with `NotSupported`. Compatible servers (Valkey, KeyDB, DragonflyDB) are trusted as far as the flags they report. A Redis ACL user without write permissions remains the real boundary.
+- Pub/Sub is not exposed (`PUBSUB` capability is not set).
+- SSH tunneling is not available when URI mode is enabled; the tunnel path is wired only for manual connection mode. Combining an SSH tunnel with Cluster or Sentinel additional seed nodes is not supported: the tunnel forwards only the primary host/port, so additional nodes are unreachable through it.
+- Stream consumer groups can be listed, inspected and claimed from, but not created, deleted or reset through the key-value API; use `XGROUP` commands in the console or the editor.
+- The type filter needs Redis 6.0 or later (`SCAN ... TYPE`). Paging a stream past its first page needs Redis 6.2 or later (exclusive range bounds); consumer groups need Redis 5.0 or later.
+- Key sizes come from `MEMORY USAGE`, which some managed providers disable; the size column then stays empty while the expiry column still fills in.
+- Bulk delete counts matches with a full `SCAN` of the database before anything is deleted, which reads the whole keyspace once.
+- Sentinel does not support TLS. DataTab cannot reach the resolved Sentinel master over TLS yet, so TLS modes `on` and `verify` and every `rediss://` URI are refused with the Sentinel topology, before any network access. The check reads the address as the `redis` crate parses it, so a trailing space or an upper-case scheme does not get past it. Use TLS mode `off` or a `redis://` URI with Sentinel; the password then travels unencrypted to the Sentinel master.
+- Cluster additional seed nodes are always contacted over plain `redis://`; per-node TLS configuration for those extra nodes is not supported.
+- Sentinel authentication applies only to the resolved master connection (via the configured username/password); the Sentinel nodes themselves are contacted without authentication.

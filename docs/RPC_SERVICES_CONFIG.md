@@ -1,0 +1,114 @@
+# RPC Services UI Reference
+
+This file documents the storage and management of RPC services in DataTab.
+
+DataTab now persists a first-class RPC services foundation through `RpcServiceKind`:
+
+- `Driver` — adapted into runtime database drivers
+- `AuthProvider` — adapted into runtime auth-provider registries in both the app and the MCP server
+- `SecretProvider` — adapted into runtime secret providers registered into every connection's value resolver; see [Secret Provider RPC Protocol](SECRET_PROVIDER_RPC_PROTOCOL.md)
+
+## Storage
+
+RPC services are stored in SQLite at `~/.local/share/datatab/datatab.db`, not in a JSON file.
+
+**Tables:**
+
+- `cfg_services` — main service record (socket_id, service_kind, command, startup_timeout_ms, enabled)
+- `cfg_services.api_family`, `cfg_services.api_major`, `cfg_services.api_minor` — optional RPC API contract metadata
+- `cfg_service_args` — ordered process arguments
+- `cfg_service_env` — environment variables
+
+## Schema
+
+```sql
+-- Base table (migration 001). `service_kind` is added by migration 005 and
+-- `api_family`/`api_major`/`api_minor` by migration 006; they are shown here
+-- inline for reference but are not part of the base DDL.
+CREATE TABLE cfg_services (
+    socket_id TEXT PRIMARY KEY,
+    enabled INTEGER DEFAULT 1,
+    command TEXT,
+    startup_timeout_ms INTEGER,        -- no SQL-level default; the 5000ms
+                                       -- fallback (DEFAULT_STARTUP_TIMEOUT_MS)
+                                       -- is applied in app code
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    service_kind TEXT NOT NULL DEFAULT 'driver',  -- added by migration 005
+    api_family TEXT,                              -- added by migration 006
+    api_major INTEGER,                            -- added by migration 006
+    api_minor INTEGER                             -- added by migration 006
+);
+
+CREATE TABLE cfg_service_args (
+    id TEXT PRIMARY KEY,
+    service_id TEXT NOT NULL REFERENCES cfg_services(socket_id),
+    position INTEGER NOT NULL,
+    value TEXT NOT NULL
+);
+
+CREATE TABLE cfg_service_env (
+    id TEXT PRIMARY KEY,
+    service_id TEXT NOT NULL REFERENCES cfg_services(socket_id),
+    key TEXT NOT NULL,
+    value TEXT NOT NULL
+);
+```
+
+## Managing Services
+
+Services are managed through the Settings UI under the **RPC Services** section, not by editing files directly.
+
+To add or edit a service:
+1. Open Settings → RPC Services
+2. Add a new service or select an existing one
+3. Choose the service kind (`Driver`, `Auth provider` or `Secret provider`)
+4. Configure socket ID, command path, arguments, environment variables, and timeout
+5. Save changes
+
+Notes:
+
+- `Driver` services are active in the runtime and keep the existing `rpc:<socket_id>` driver identity.
+- `Auth Provider` services are active in runtime auth-provider registries only; they never appear as drivers.
+- DataTab preserves compatibility for driver registration IDs as `rpc:<socket_id>`.
+- If API metadata is missing on an existing driver row, DataTab defaults it to the current `driver_rpc` contract at version `1.1`.
+- If API metadata is missing on an auth-provider row, DataTab defaults it to the current `auth_provider_rpc` contract at version `1.2`.
+- If API metadata is missing on a secret-provider row, DataTab defaults it to the `secret_provider_rpc` contract at version `1.0`.
+- `Secret provider` services (storage value `secret_provider`) are active only as value sources for connection, proxy, SSH tunnel and auth-profile fields; they never appear as drivers or auth providers.
+- `api_family` / `api_major` are used as startup preflight for auth providers and secret providers before DataTab probes the socket.
+
+## Semantics
+
+- `socket_id` is used literally as the socket filename
+- DataTab internally identifies each service as `rpc:<socket_id>`
+- DataTab classifies each service by `service_kind` before runtime adaptation
+- Driver name/icon/category/form come from the service's `Hello` response (`driver_metadata`, `form_definition`), not from configuration
+- Services with `service_kind='driver'` that fail to complete the RPC handshake (`Hello`) during startup are not registered
+- Services with `service_kind='auth_provider'` are loaded into auth-provider registries when they pass compatibility checks and probe successfully
+- Driver-path negotiation selects the highest mutually supported compatible minor version during `Hello`, then requires every later envelope to use that exact negotiated version
+- Auth-provider negotiation follows the same family/major/minor scheme under `auth_provider_rpc`; incompatible family or major versions are skipped before registration
+- Services with `service_kind='secret_provider'` negotiate under `secret_provider_rpc`, must announce a valid manifest in `Hello`, and are skipped when their `provider_id` is reserved (`aws-secrets-manager`, `aws-ssm`) or already registered
+
+## Fields
+
+- `socket_id` (required): local socket name used by DataTab and the service.
+  - Allowed characters: ASCII letters, numbers, `.`, `_`, `-`
+  - Path separators, spaces, and other punctuation are rejected.
+  - The value is passed to the platform socket namespace as-is, so keep it short and stable.
+- `command` (optional): executable to run when DataTab needs to start the service.
+  - If omitted and `args` is also empty, DataTab treats the service as already running and does not spawn anything.
+  - For `driver`, if omitted and `args` is non-empty, DataTab launches `datatab-driver-host`.
+  - For `auth_provider` and `secret_provider`, if DataTab must launch the service, `command` must be set explicitly.
+- `args` (optional): process arguments.
+- `env` (optional): environment variables for the spawned process.
+- `startup_timeout_ms` (optional): max wait time for socket readiness after spawn.
+  - Default: `5000`
+
+## Common Mistakes
+
+- Mismatched socket names between the service configuration and service args
+- Relative `command` path that does not resolve under the DataTab process environment
+- Editing the database directly instead of through the Settings UI
+- Service not implementing required `Hello` fields for the current RPC protocol version
+- Omitting `command` while providing partial `args`; if you want DataTab to launch the default host, `args` must include both `--driver` and `--socket`.
+- Configuring an auth-provider service with `args` but no `command`; DataTab will reject that launch config instead of assuming the driver host

@@ -1,0 +1,38 @@
+[package]
+name = "datatab_storage"
+publish = false
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+datatab_approval.workspace = true
+datatab_core.workspace = true
+dirs.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+
+chrono = { workspace = true }
+
+[dev-dependencies]
+datatab_policy.workspace = true
+tempfile = "3"
+uuid.workspace = true
+
+[dev-dependencies.rusqlite]
+workspace = true
+features = ["trace"]

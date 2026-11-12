@@ -1,0 +1,1143 @@
+use crate::app_state_entity::AppStateEntity;
+use datatab_components::actions as component_actions;
+use datatab_components::icons::AppIcon;
+use datatab_components::modals::Modal;
+use datatab_components::primitives::{Icon, Text};
+use datatab_components::tokens::{FontSizes, Heights, Radii, Spacing};
+use datatab_components::vim::{VimBinding, VimHost};
+use datatab_core::LogErr;
+use datatab_core::keymap_types::ContextId;
+// SqlGenerationType and SqlPreviewContext now live in datatab_components;
+// re-export here so existing call-sites via this module path are unchanged.
+pub use datatab_components::{SqlGenerationType, SqlPreviewContext};
+use datatab_core::{
+    ColumnInfo, MutationRequest, MutationTemplateOperation, MutationTemplateRequest, QueryLanguage,
+    ReadTemplateOperation, ReadTemplateRequest, SqlGenerationOptions, SqlGenerationRequest,
+    SqlOperation, SqlValueMode, TableInfo, Value,
+};
+use gpui::*;
+use gpui_component::ActiveTheme;
+use gpui_component::Sizable;
+use gpui_component::checkbox::Checkbox;
+use gpui_component::input::EditorState;
+use uuid::Uuid;
+
+actions!(
+    sql_preview_modal,
+    [
+        /// Copies the previewed query text to the clipboard and closes the preview.
+        CopyPreview
+    ]
+);
+
+/// How far one scroll key moves the previewed query.
+#[derive(Clone, Copy)]
+enum ScrollStep {
+    LineUp,
+    LineDown,
+    PageUp,
+    PageDown,
+}
+
+/// Settings for SQL generation.
+#[derive(Clone)]
+pub struct SqlPreviewSettings {
+    pub use_fully_qualified_names: bool,
+    pub compact_sql: bool,
+}
+
+impl Default for SqlPreviewSettings {
+    fn default() -> Self {
+        Self {
+            use_fully_qualified_names: true,
+            compact_sql: false,
+        }
+    }
+}
+
+/// SQL mode: regeneration + options panel.
+/// Generic mode (`query_language` set): static text, no options.
+pub struct SqlPreviewModal {
+    app_state: Entity<AppStateEntity>,
+    visible: bool,
+    context: Option<SqlPreviewContext>,
+    generation_type: SqlGenerationType,
+    settings: SqlPreviewSettings,
+    sql_display: Entity<EditorState>,
+    /// Vim motions in the query; replaced with `sql_display`.
+    sql_display_vim: VimBinding,
+    generated_sql: String,
+    focus_handle: FocusHandle,
+
+    query_language: Option<QueryLanguage>,
+    badge_label: Option<String>,
+}
+
+/// The query is generated text, copied as generated: Vim moves, selects and
+/// yanks in it.
+impl VimHost for SqlPreviewModal {
+    fn vim(&self, input: EntityId) -> Option<&VimBinding> {
+        self.sql_display_vim.for_input(input)
+    }
+
+    fn vim_mut(&mut self, input: EntityId) -> Option<&mut VimBinding> {
+        self.sql_display_vim.for_input_mut(input)
+    }
+
+    fn vim_read_only(&self, _input: EntityId, _cx: &App) -> bool {
+        true
+    }
+}
+
+impl SqlPreviewModal {
+    pub fn new(
+        app_state: Entity<AppStateEntity>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let sql_display = cx.new(|cx| {
+            // soft_wrap defaults to true in 0.6.1, so the old explicit builder is gone.
+            EditorState::new(window, cx)
+                .language("sql")
+                .line_number(true)
+        });
+        let sql_display_vim = VimBinding::new(sql_display.clone(), window, cx);
+        let input = sql_display_vim.input_id();
+
+        let mut modal = Self {
+            app_state,
+            visible: false,
+            context: None,
+            generation_type: SqlGenerationType::SelectWhere,
+            settings: SqlPreviewSettings::default(),
+            sql_display,
+            sql_display_vim,
+            generated_sql: String::new(),
+            focus_handle: cx.focus_handle(),
+            query_language: None,
+            badge_label: None,
+        };
+
+        VimBinding::follow_setting(&mut modal, input, cx);
+        modal
+    }
+
+    /// Shows `display` as the query, with a fresh Vim binding for it.
+    fn install_display(
+        &mut self,
+        display: Entity<EditorState>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.sql_display_vim = VimBinding::new(display.clone(), window, cx);
+        self.sql_display = display;
+        let input = self.sql_display_vim.input_id();
+        VimBinding::follow_setting(self, input, cx);
+    }
+
+    /// Gives the keyboard to the dialog, or to the query itself while Vim mode
+    /// is on, where j / k and the other Vim keys move through it.
+    fn focus_on_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sql_display_vim.enabled() {
+            let display = self.sql_display.clone();
+            display.update(cx, |state, cx| state.focus(window, cx));
+        } else {
+            self.focus_handle.focus(window, cx);
+        }
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    /// Open in SQL mode with the given context and generation type.
+    pub fn open(
+        &mut self,
+        context: SqlPreviewContext,
+        generation_type: SqlGenerationType,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.query_language.is_some() {
+            self.query_language = None;
+            self.badge_label = None;
+            let display = cx.new(|cx| {
+                EditorState::new(window, cx)
+                    .language("sql")
+                    .line_number(true)
+            });
+            self.install_display(display, window, cx);
+        }
+
+        self.context = Some(context);
+        self.generation_type = generation_type;
+        self.visible = true;
+        self.regenerate_sql(window, cx);
+        self.focus_on_open(window, cx);
+        cx.notify();
+    }
+
+    /// Open in generic mode with static query text.
+    pub fn open_query_preview(
+        &mut self,
+        language: QueryLanguage,
+        badge: &str,
+        query: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.context = None;
+        let editor_mode = language.editor_mode();
+        self.query_language = Some(language);
+        self.badge_label = Some(badge.to_string());
+        self.visible = true;
+
+        self.generated_sql = query.clone();
+
+        let display = cx.new(|cx| {
+            let mut state = EditorState::new(window, cx)
+                .language(editor_mode)
+                .line_number(true);
+            state.set_value(&query, window, cx);
+            state
+        });
+        self.install_display(display, window, cx);
+
+        self.focus_on_open(window, cx);
+        cx.notify();
+    }
+
+    pub fn close(&mut self, cx: &mut Context<Self>) {
+        self.visible = false;
+        self.context = None;
+        self.query_language = None;
+        self.badge_label = None;
+        self.generated_sql.clear();
+        cx.notify();
+    }
+
+    fn regenerate_sql(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(context) = &self.context else {
+            return;
+        };
+
+        let sql = match context {
+            SqlPreviewContext::DataTableRow {
+                profile_id,
+                schema_name,
+                table_name,
+                column_names,
+                row_values,
+                pk_indices,
+            } => self.generate_from_row_data(
+                *profile_id,
+                schema_name.as_deref(),
+                table_name,
+                column_names,
+                row_values,
+                pk_indices,
+                cx,
+            ),
+            SqlPreviewContext::DataMutation {
+                profile_id,
+                mutation,
+            } => self.generate_from_mutation(*profile_id, mutation, cx),
+            SqlPreviewContext::SidebarTable {
+                profile_id,
+                table_info,
+            } => self.generate_from_table_info(*profile_id, table_info, cx),
+        };
+
+        self.generated_sql = sql.clone();
+        self.sql_display.update(cx, |state, cx| {
+            state.set_value(&sql, window, cx);
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn generate_from_row_data(
+        &self,
+        profile_id: Uuid,
+        schema_name: Option<&str>,
+        table_name: &str,
+        column_names: &[String],
+        row_values: &[Value],
+        pk_indices: &[usize],
+        cx: &App,
+    ) -> String {
+        let connection = self.app_state.read(cx).get_connection(profile_id);
+
+        let columns: Vec<ColumnInfo> = column_names
+            .iter()
+            .enumerate()
+            .map(|(idx, name)| ColumnInfo {
+                name: name.clone(),
+                type_name: String::new(),
+                nullable: true,
+                is_primary_key: pk_indices.contains(&idx),
+                default_value: None,
+                enum_values: None,
+            })
+            .collect();
+
+        let operation = match self.generation_type {
+            SqlGenerationType::SelectAll => {
+                return "-- SELECT * is not supported from row context".to_string();
+            }
+            SqlGenerationType::SelectWhere => SqlOperation::SelectWhere,
+            SqlGenerationType::Insert => SqlOperation::Insert,
+            SqlGenerationType::Update => SqlOperation::Update,
+            SqlGenerationType::Delete => SqlOperation::Delete,
+            // DDL operations are not supported from row data context
+            SqlGenerationType::CreateTable
+            | SqlGenerationType::Truncate
+            | SqlGenerationType::DropTable => {
+                return format!(
+                    "-- {} is not supported from row context",
+                    self.generation_type.label()
+                );
+            }
+        };
+
+        let request = SqlGenerationRequest {
+            operation,
+            schema: schema_name,
+            table: table_name,
+            columns: &columns,
+            values: SqlValueMode::WithValues(row_values),
+            pk_indices,
+            options: SqlGenerationOptions {
+                fully_qualified: self.settings.use_fully_qualified_names,
+                compact: self.settings.compact_sql,
+            },
+        };
+
+        if let Some(conn) = connection {
+            match conn.generate_sql(&request) {
+                Ok(sql) => sql,
+                Err(e) => format!("-- Error generating SQL: {}", e),
+            }
+        } else {
+            datatab_core::generate_sql(&datatab_core::DefaultSqlDialect, &request)
+        }
+    }
+
+    fn generate_from_table_info(
+        &self,
+        profile_id: Uuid,
+        table_info: &TableInfo,
+        cx: &App,
+    ) -> String {
+        let connection = self.app_state.read(cx).get_connection(profile_id);
+
+        // DDL operations use the driver directly
+        if let Some(generator_id) = self.generation_type.driver_generator_id() {
+            if let Some(conn) = connection {
+                match conn.generate_code(generator_id, table_info) {
+                    Ok(sql) => return sql,
+                    Err(e) => return format!("-- Error generating SQL: {}", e),
+                }
+            } else {
+                return format!(
+                    "-- Error: DDL generation requires an active connection for {}",
+                    self.generation_type.label()
+                );
+            }
+        }
+
+        if matches!(
+            self.generation_type,
+            SqlGenerationType::Insert | SqlGenerationType::Update | SqlGenerationType::Delete
+        ) {
+            let Some(conn) = connection else {
+                return "-- Error: DML preview requires an active connection".to_string();
+            };
+
+            let Some(generator) = conn.query_generator() else {
+                return "-- Error: query generation is not supported for this driver".to_string();
+            };
+
+            let Some(columns) = table_info.columns.as_deref() else {
+                return "-- Error: table columns are required for mutation preview".to_string();
+            };
+
+            let operation = match self.generation_type {
+                SqlGenerationType::Insert => MutationTemplateOperation::Insert,
+                SqlGenerationType::Update => MutationTemplateOperation::Update,
+                SqlGenerationType::Delete => MutationTemplateOperation::Delete,
+                _ => unreachable!(),
+            };
+
+            return match generator.generate_template(&MutationTemplateRequest {
+                operation,
+                schema: table_info.schema.as_deref(),
+                table: &table_info.name,
+                columns,
+                options: SqlGenerationOptions {
+                    fully_qualified: self.settings.use_fully_qualified_names,
+                    compact: self.settings.compact_sql,
+                },
+            }) {
+                Some(generated) => generated.text,
+                None => "-- Error: driver could not generate this mutation preview".to_string(),
+            };
+        }
+
+        if self.generation_type == SqlGenerationType::SelectWhere {
+            let Some(conn) = connection else {
+                return "-- Error: query preview requires an active connection".to_string();
+            };
+
+            let Some(generator) = conn.query_generator() else {
+                return "-- Error: query generation is not supported for this driver".to_string();
+            };
+
+            let Some(columns) = table_info.columns.as_deref() else {
+                return "-- Error: table columns are required for query preview".to_string();
+            };
+
+            return match generator.generate_read_template(&ReadTemplateRequest {
+                operation: ReadTemplateOperation::SelectWhere,
+                schema: table_info.schema.as_deref(),
+                table: &table_info.name,
+                columns,
+                options: SqlGenerationOptions {
+                    fully_qualified: self.settings.use_fully_qualified_names,
+                    compact: self.settings.compact_sql,
+                },
+            }) {
+                Some(generated) => generated.text,
+                None => "-- Error: driver could not generate this query preview".to_string(),
+            };
+        }
+
+        if self.generation_type == SqlGenerationType::SelectAll {
+            let Some(conn) = connection else {
+                return "-- Error: query preview requires an active connection".to_string();
+            };
+
+            let Some(generator) = conn.query_generator() else {
+                return "-- Error: query generation is not supported for this driver".to_string();
+            };
+
+            let columns = table_info.columns.as_deref().unwrap_or(&[]);
+
+            return match generator.generate_read_template(&ReadTemplateRequest {
+                operation: ReadTemplateOperation::SelectAll,
+                schema: table_info.schema.as_deref(),
+                table: &table_info.name,
+                columns,
+                options: SqlGenerationOptions {
+                    fully_qualified: self.settings.use_fully_qualified_names,
+                    compact: self.settings.compact_sql,
+                },
+            }) {
+                Some(generated) => generated.text,
+                None => "-- Error: driver could not generate this query preview".to_string(),
+            };
+        }
+
+        // Legacy fallback path for non-DML/non-DDL SQL preview types.
+        let columns: Vec<ColumnInfo> = table_info.columns.clone().unwrap_or_else(|| {
+            vec![
+                ColumnInfo {
+                    name: "column1".to_string(),
+                    type_name: String::new(),
+                    nullable: true,
+                    is_primary_key: true,
+                    default_value: None,
+                    enum_values: None,
+                },
+                ColumnInfo {
+                    name: "column2".to_string(),
+                    type_name: String::new(),
+                    nullable: true,
+                    is_primary_key: false,
+                    default_value: None,
+                    enum_values: None,
+                },
+            ]
+        });
+
+        let pk_indices: Vec<usize> = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.is_primary_key)
+            .map(|(idx, _)| idx)
+            .collect();
+
+        let operation = match self.generation_type {
+            SqlGenerationType::SelectAll => {
+                log::error!(
+                    "[SQL Preview] Unexpected SelectAll generation type in legacy generator path"
+                );
+                return "-- Error: unsupported SQL generation type for this preview".to_string();
+            }
+            SqlGenerationType::SelectWhere => SqlOperation::SelectWhere,
+            SqlGenerationType::Insert => SqlOperation::Insert,
+            SqlGenerationType::Update => SqlOperation::Update,
+            SqlGenerationType::Delete => SqlOperation::Delete,
+            // DDL operations are handled above
+            SqlGenerationType::CreateTable
+            | SqlGenerationType::Truncate
+            | SqlGenerationType::DropTable => {
+                log::error!(
+                    "[SQL Preview] Unexpected DDL generation type in DML generator path: {:?}",
+                    self.generation_type
+                );
+                return "-- Error: unsupported SQL generation type for this preview".to_string();
+            }
+        };
+
+        let request = SqlGenerationRequest {
+            operation,
+            schema: table_info.schema.as_deref(),
+            table: &table_info.name,
+            columns: &columns,
+            values: SqlValueMode::WithPlaceholders,
+            pk_indices: &pk_indices,
+            options: SqlGenerationOptions {
+                fully_qualified: self.settings.use_fully_qualified_names,
+                compact: self.settings.compact_sql,
+            },
+        };
+
+        if let Some(conn) = connection {
+            match conn.generate_sql(&request) {
+                Ok(sql) => sql,
+                Err(e) => format!("-- Error generating SQL: {}", e),
+            }
+        } else {
+            datatab_core::generate_sql(&datatab_core::DefaultSqlDialect, &request)
+        }
+    }
+
+    fn generate_from_mutation(
+        &self,
+        profile_id: Uuid,
+        mutation: &MutationRequest,
+        cx: &App,
+    ) -> String {
+        let connection = self.app_state.read(cx).get_connection(profile_id);
+
+        let Some(conn) = connection else {
+            return "-- Error: DML preview requires an active connection".to_string();
+        };
+
+        let Some(generator) = conn.query_generator() else {
+            return "-- Error: query generation is not supported for this driver".to_string();
+        };
+
+        match generator.generate_mutation(mutation) {
+            Some(generated) => generated.text,
+            None => "-- Error: driver could not generate this mutation preview".to_string(),
+        }
+    }
+
+    fn copy_to_clipboard(&self, cx: &mut Context<Self>) {
+        if !self.generated_sql.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(self.generated_sql.clone()));
+        }
+    }
+
+    fn copy_and_close(&mut self, cx: &mut Context<Self>) {
+        self.copy_to_clipboard(cx);
+        self.close(cx);
+    }
+
+    /// Scrolls the previewed query by a line or a page. The editor clamps the
+    /// offset to its content when it lays out.
+    fn scroll_display(&mut self, step: ScrollStep, cx: &mut Context<Self>) {
+        self.sql_display.update(cx, |state, cx| {
+            let Some(line_height) = state.line_height() else {
+                return;
+            };
+
+            let viewport = state.input_bounds().size.height;
+            let page = (viewport - line_height).max(line_height);
+
+            let delta = match step {
+                ScrollStep::LineUp => line_height,
+                ScrollStep::LineDown => -line_height,
+                ScrollStep::PageUp => page,
+                ScrollStep::PageDown => -page,
+            };
+
+            let offset = state.scroll_offset();
+            let target = (offset.y + delta).min(Pixels::ZERO);
+            state.set_scroll_offset(point(offset.x, target), cx);
+        });
+    }
+
+    fn toggle_fully_qualified(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.use_fully_qualified_names = !self.settings.use_fully_qualified_names;
+        self.regenerate_sql(window, cx);
+    }
+
+    fn toggle_compact(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.compact_sql = !self.settings.compact_sql;
+        self.regenerate_sql(window, cx);
+    }
+}
+
+impl Render for SqlPreviewModal {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.visible {
+            return div().into_any_element();
+        }
+
+        let is_generic = self.query_language.is_some();
+
+        // Vim's listeners on the query. In Insert mode the dialog's Escape
+        // leaves Insert mode instead of closing, and in Normal mode Enter
+        // moves down instead of copying.
+        let vim_input = self.sql_display_vim.input_id();
+        let query_container =
+            VimBinding::wire(self.sql_display_vim.leader_scope(div(), cx), vim_input, cx);
+        let query_container = VimBinding::capture_action::<component_actions::Cancel, _>(
+            query_container,
+            vim_input,
+            cx,
+        );
+        let query_container = VimBinding::capture_action::<component_actions::Execute, _>(
+            query_container,
+            vim_input,
+            cx,
+        );
+        let vim_indicator = self.sql_display_vim.render_indicator(cx);
+        let theme = cx.theme();
+
+        let entity = cx.entity().downgrade();
+        let close = {
+            let entity = entity.clone();
+            move |_window: &mut Window, cx: &mut App| {
+                entity.update(cx, |this, cx| this.close(cx)).log_err();
+            }
+        };
+        let copy = move |_window: &mut Window, cx: &mut App| {
+            entity
+                .update(cx, |this, cx| this.copy_and_close(cx))
+                .log_err();
+        };
+
+        // -- Title & badge --
+
+        let title = if is_generic {
+            datatab_i18n::t!("sql_preview.title.query")
+        } else {
+            datatab_i18n::t!("sql_preview.title.sql")
+        };
+
+        let badge_text: SharedString = if let Some(label) = &self.badge_label {
+            label.clone().into()
+        } else {
+            self.generation_type.label().into()
+        };
+
+        let type_badge = div()
+            .px(Spacing::SM)
+            .py(Spacing::XS)
+            .rounded(Radii::SM)
+            .bg(theme.secondary)
+            .child(Text::caption(badge_text).font_size(FontSizes::XS));
+
+        let mut frame = Modal::new(title)
+            .id("sql-preview-modal")
+            .focus_handle(&self.focus_handle)
+            .on_close(close)
+            .on_confirm(copy)
+            .key_context(ContextId::SqlPreviewModal.as_gpui_context())
+            .icon(AppIcon::Code)
+            .width(px(1000.0))
+            .max_height(px(800.0))
+            .header_extra(type_badge)
+            .child(
+                query_container
+                    .flex_1()
+                    .p(Spacing::MD)
+                    .min_h(px(200.0))
+                    .max_h(px(300.0))
+                    .overflow_hidden()
+                    .child(
+                        self.sql_display_vim
+                            .editor(false)
+                            .w_full()
+                            .h_full()
+                            .font_family(datatab_components::fonts::editor_family(cx))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_size(FontSizes::BASE),
+                    ),
+            )
+            .top_offset(px(80.0));
+
+        if let Some(indicator) = vim_indicator {
+            frame = frame.child(indicator);
+        }
+
+        // -- Options (SQL mode, DML only) --
+
+        let supports_sql_options = matches!(
+            self.context,
+            Some(SqlPreviewContext::DataTableRow { .. } | SqlPreviewContext::SidebarTable { .. })
+        );
+
+        if !is_generic && !self.generation_type.is_ddl() && supports_sql_options {
+            let use_fqn = self.settings.use_fully_qualified_names;
+            let compact = self.settings.compact_sql;
+
+            frame = frame.child(
+                div()
+                    .px(Spacing::MD)
+                    .py(Spacing::SM)
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .flex()
+                    .items_center()
+                    .gap(Spacing::LG)
+                    .child(
+                        Text::body_sm(datatab_i18n::t!("sql_preview.options.label"))
+                            .muted_foreground(),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(Spacing::SM)
+                            .child(
+                                Checkbox::new("fqn-checkbox")
+                                    .checked(use_fqn)
+                                    .small()
+                                    .aria_label(datatab_i18n::t!(
+                                        "sql_preview.options.fully_qualified"
+                                    ))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_fully_qualified(window, cx);
+                                    })),
+                            )
+                            .child(Text::body(datatab_i18n::t!(
+                                "sql_preview.options.fully_qualified"
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(Spacing::SM)
+                            .child(
+                                Checkbox::new("compact-checkbox")
+                                    .checked(compact)
+                                    .small()
+                                    .aria_label(datatab_i18n::t!("sql_preview.options.compact"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.toggle_compact(window, cx);
+                                    })),
+                            )
+                            .child(Text::body(datatab_i18n::t!("sql_preview.options.compact"))),
+                    ),
+            );
+        }
+
+        // -- Footer --
+
+        let mut footer = div()
+            .px(Spacing::MD)
+            .py(Spacing::SM)
+            .border_t_1()
+            .border_color(theme.border)
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap(Spacing::SM);
+
+        if !is_generic {
+            footer = footer.child(
+                div()
+                    .id("refresh-btn")
+                    .flex()
+                    .items_center()
+                    .gap(Spacing::XS)
+                    .px(Spacing::MD)
+                    .py(Spacing::SM)
+                    .rounded(Radii::SM)
+                    .cursor_pointer()
+                    .bg(theme.secondary)
+                    .hover(|d| d.bg(theme.muted))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.regenerate_sql(window, cx);
+                    }))
+                    .child(
+                        Icon::new(AppIcon::RefreshCcw)
+                            .size(Heights::ICON_SM)
+                            .muted(),
+                    )
+                    .child(
+                        Text::body(datatab_i18n::t!("sql_preview.action.refresh"))
+                            .font_size(FontSizes::SM),
+                    ),
+            );
+        }
+
+        footer = footer
+            .child(
+                div()
+                    .id("copy-btn")
+                    .flex()
+                    .items_center()
+                    .gap(Spacing::XS)
+                    .px(Spacing::MD)
+                    .py(Spacing::SM)
+                    .rounded(Radii::SM)
+                    .cursor_pointer()
+                    .bg(theme.primary)
+                    .hover(|d| d.opacity(0.9))
+                    .text_size(FontSizes::SM)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.copy_and_close(cx);
+                    }))
+                    .child(
+                        Icon::new(AppIcon::Layers)
+                            .size(Heights::ICON_SM)
+                            .color(theme.primary_foreground),
+                    )
+                    .child(
+                        Text::caption(datatab_i18n::t!("sql_preview.action.copy"))
+                            .color(theme.primary_foreground),
+                    ),
+            )
+            .child(
+                div()
+                    .id("close-footer-btn")
+                    .flex()
+                    .items_center()
+                    .gap(Spacing::XS)
+                    .px(Spacing::MD)
+                    .py(Spacing::SM)
+                    .rounded(Radii::SM)
+                    .cursor_pointer()
+                    .bg(theme.secondary)
+                    .hover(|d| d.bg(theme.muted))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.close(cx);
+                    }))
+                    .child(
+                        Text::body(datatab_i18n::t!("sql_preview.action.close"))
+                            .font_size(FontSizes::SM),
+                    ),
+            );
+
+        frame = frame.child(footer);
+
+        // The modal propagates its scroll actions when it has no scroll
+        // region of its own; the query scrolls inside its editor instead.
+        div()
+            .absolute()
+            .inset_0()
+            .on_action(cx.listener(|this, _: &component_actions::ScrollUp, _, cx| {
+                this.scroll_display(ScrollStep::LineUp, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &component_actions::ScrollDown, _, cx| {
+                    this.scroll_display(ScrollStep::LineDown, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &component_actions::ScrollPageUp, _, cx| {
+                    this.scroll_display(ScrollStep::PageUp, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &component_actions::ScrollPageDown, _, cx| {
+                    this.scroll_display(ScrollStep::PageDown, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &CopyPreview, _, cx| {
+                this.copy_and_close(cx);
+            }))
+            .child(frame)
+            .into_any_element()
+    }
+}
+
+impl EventEmitter<()> for SqlPreviewModal {}
+
+#[cfg(test)]
+mod tests {
+    const SQL_PREVIEW_KEYS: &[&str] = &[
+        "sql_preview.title.sql",
+        "sql_preview.title.query",
+        "sql_preview.options.label",
+        "sql_preview.options.fully_qualified",
+        "sql_preview.options.compact",
+        "sql_preview.action.refresh",
+        "sql_preview.action.copy",
+        "sql_preview.action.close",
+    ];
+
+    #[test]
+    fn sql_preview_catalog_keys_resolve() {
+        for key in SQL_PREVIEW_KEYS.iter().copied() {
+            let english = datatab_i18n::t!(key);
+
+            assert!(!english.is_empty(), "empty English translation for {key}");
+            assert_ne!(english, key, "missing English translation for {key}");
+        }
+    }
+
+    mod keyboard {
+        // Explicit imports rather than the parent glob: combining `use
+        // super::*` with `#[gpui::test]` sends the gpui_macros expansion into
+        // unbounded recursion.
+        use crate::sql_preview_modal::SqlPreviewModal;
+        use datatab_core::QueryLanguage;
+        use gpui::{
+            AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
+            TestAppContext, VisualTestContext, Window, div,
+        };
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        struct Harness {
+            preview: Entity<SqlPreviewModal>,
+        }
+
+        impl Render for Harness {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div().size_full().child(self.preview.clone())
+            }
+        }
+
+        fn long_query() -> String {
+            (0..200)
+                .map(|line| format!("SELECT {line} AS value;"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        fn open_preview(
+            cx: &mut TestAppContext,
+        ) -> (Entity<SqlPreviewModal>, &mut VisualTestContext) {
+            cx.update(gpui_component::init);
+            cx.update(datatab_components::theme::init);
+            cx.update(crate::keymap::init_keymap);
+            let app_state = crate::object_tree::test_support::test_app_state(cx);
+
+            let slot: Rc<RefCell<Option<Entity<SqlPreviewModal>>>> = Rc::default();
+            let (_, window) = cx.add_window_view({
+                let slot = slot.clone();
+                move |window, cx| {
+                    let preview = cx.new(|cx| SqlPreviewModal::new(app_state, window, cx));
+                    slot.replace(Some(preview.clone()));
+                    let harness = cx.new(|_| Harness { preview });
+                    gpui_component::Root::new(harness, window, cx)
+                }
+            });
+            let preview = slot.borrow().clone().expect("preview entity");
+
+            window.update(|window, cx| {
+                preview.update(cx, |preview, cx| {
+                    preview.open_query_preview(QueryLanguage::Sql, "SQL", long_query(), window, cx);
+                });
+            });
+            window.run_until_parked();
+
+            (preview, window)
+        }
+
+        fn scroll_top(window: &mut VisualTestContext, preview: &Entity<SqlPreviewModal>) -> f32 {
+            window.run_until_parked();
+            window
+                .update(|_, cx| f32::from(preview.read(cx).sql_display.read(cx).scroll_offset().y))
+        }
+
+        fn visible(window: &mut VisualTestContext, preview: &Entity<SqlPreviewModal>) -> bool {
+            window.update(|_, cx| preview.read(cx).is_visible())
+        }
+
+        #[gpui::test]
+        fn j_k_and_the_paging_keys_scroll_the_preview(cx: &mut TestAppContext) {
+            let (preview, window) = open_preview(cx);
+            assert_eq!(scroll_top(window, &preview), 0.0);
+
+            window.simulate_keystrokes("j");
+            let one_line = scroll_top(window, &preview);
+            assert!(one_line < 0.0, "j scrolls down, got {one_line}");
+
+            window.simulate_keystrokes("pagedown");
+            let one_page = scroll_top(window, &preview);
+            assert!(
+                one_page < one_line,
+                "Page Down scrolls further, got {one_page}"
+            );
+
+            window.simulate_keystrokes("pageup k");
+            assert_eq!(
+                scroll_top(window, &preview),
+                0.0,
+                "k and Page Up scroll back"
+            );
+            assert!(visible(window, &preview));
+        }
+
+        #[gpui::test]
+        fn the_copy_shortcut_copies_the_query_and_closes(cx: &mut TestAppContext) {
+            let (preview, window) = open_preview(cx);
+
+            #[cfg(target_os = "macos")]
+            window.simulate_keystrokes("cmd-c");
+            #[cfg(not(target_os = "macos"))]
+            window.simulate_keystrokes("ctrl-c");
+
+            let copied =
+                window.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+            assert_eq!(copied, Some(long_query()));
+            assert!(!visible(window, &preview));
+        }
+
+        #[gpui::test]
+        fn enter_runs_the_copy_action(cx: &mut TestAppContext) {
+            let (preview, window) = open_preview(cx);
+
+            window.simulate_keystrokes("enter");
+
+            let copied =
+                window.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+            assert_eq!(copied, Some(long_query()));
+            assert!(!visible(window, &preview));
+        }
+
+        /// With Vim mode on, the query takes the keyboard: `j` moves the
+        /// cursor a line instead of scrolling the dialog, Enter in Normal
+        /// mode moves too instead of copying, and Escape still closes.
+        #[gpui::test]
+        fn vim_mode_moves_in_the_query_and_enter_does_not_copy(cx: &mut TestAppContext) {
+            cx.update(|cx| datatab_components::vim::set_vim_enabled(cx, true));
+            let (preview, window) = open_preview(cx);
+            let cursor = |window: &mut VisualTestContext| {
+                window.update(|_, cx| preview.read(cx).sql_display.read(cx).cursor())
+            };
+
+            window.simulate_keystrokes("j");
+            window.run_until_parked();
+            assert_eq!(cursor(window), "SELECT 0 AS value;\n".len());
+
+            window.simulate_keystrokes("enter");
+            window.run_until_parked();
+            assert_eq!(cursor(window), 2 * "SELECT 0 AS value;\n".len());
+            assert!(visible(window, &preview), "Enter in Normal mode copied");
+            let copied =
+                window.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+            assert_eq!(copied, None);
+
+            window.simulate_keystrokes("escape");
+            assert!(!visible(window, &preview));
+        }
+
+        #[gpui::test]
+        fn escape_closes_without_copying(cx: &mut TestAppContext) {
+            let (preview, window) = open_preview(cx);
+
+            window.simulate_keystrokes("escape");
+
+            let copied =
+                window.update(|_, cx| cx.read_from_clipboard().and_then(|item| item.text()));
+            assert_eq!(copied, None);
+            assert!(!visible(window, &preview));
+        }
+    }
+
+    mod accessibility {
+        // Explicit imports rather than the parent glob; see the note in
+        // `keyboard` above.
+        use crate::sql_preview_modal::SqlPreviewModal;
+        use datatab_components::accessibility::{FrameCapture, accessible_name};
+        use datatab_components::{SqlGenerationType, SqlPreviewContext};
+        use datatab_core::Value;
+        use gpui::{
+            AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _,
+            TestAppContext, VisualTestContext, Window, div,
+        };
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        use uuid::Uuid;
+
+        struct Harness {
+            preview: Entity<SqlPreviewModal>,
+        }
+
+        impl Render for Harness {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                div().size_full().child(self.preview.clone())
+            }
+        }
+
+        /// Opens the preview the way a table row does: the options row is drawn
+        /// only for a concrete context and a non-DDL generation.
+        fn open_preview(
+            cx: &mut TestAppContext,
+        ) -> (Entity<SqlPreviewModal>, &mut VisualTestContext) {
+            cx.update(gpui_component::init);
+            cx.update(datatab_components::theme::init);
+            cx.update(crate::keymap::init_keymap);
+            let app_state = crate::object_tree::test_support::test_app_state(cx);
+
+            let slot: Rc<RefCell<Option<Entity<SqlPreviewModal>>>> = Rc::default();
+            let (_, window) = cx.add_window_view({
+                let slot = slot.clone();
+                move |window, cx| {
+                    let preview = cx.new(|cx| SqlPreviewModal::new(app_state, window, cx));
+                    slot.replace(Some(preview.clone()));
+                    let harness = cx.new(|_| Harness { preview });
+                    gpui_component::Root::new(harness, window, cx)
+                }
+            });
+            let preview = slot.borrow().clone().expect("preview entity");
+
+            window.update(|window, cx| {
+                preview.update(cx, |preview, cx| {
+                    preview.open(
+                        SqlPreviewContext::DataTableRow {
+                            profile_id: Uuid::nil(),
+                            schema_name: None,
+                            table_name: "users".to_string(),
+                            column_names: vec!["id".to_string()],
+                            row_values: vec![Value::Int(1)],
+                            pk_indices: vec![0],
+                        },
+                        SqlGenerationType::Insert,
+                        window,
+                        cx,
+                    );
+                });
+            });
+            window.run_until_parked();
+
+            (preview, window)
+        }
+
+        /// Each box sets an explicit label mirroring the visible option text,
+        /// because the dialog draws that text outside the control.
+        #[gpui::test]
+        fn the_dialog_options_are_named_by_the_text_beside_them(cx: &mut TestAppContext) {
+            let (_preview, window) = open_preview(cx);
+            let capture = FrameCapture::observe(window);
+            let frame = capture.frame(window);
+            let fully_qualified =
+                datatab_i18n::t!("sql_preview.options.fully_qualified").to_string();
+            let compact = datatab_i18n::t!("sql_preview.options.compact").to_string();
+
+            assert_eq!(
+                accessible_name(&frame, "fqn-checkbox"),
+                Some(fully_qualified)
+            );
+            assert_eq!(accessible_name(&frame, "compact-checkbox"), Some(compact));
+        }
+    }
+}

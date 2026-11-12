@@ -1,0 +1,549 @@
+use crate::controls::{Button, ButtonVariant, Checkbox, InputEvent, InputState};
+use crate::icons::AppIcon;
+use crate::modals::modal::{Modal, ModalFocus, ModalVariant};
+use crate::modals::parts::{modal_code, modal_field, modal_lead};
+use crate::primitives::{SurfaceRole, surface};
+use crate::tokens::{FontSizes, ModalMetrics, Spacing};
+use datatab_core::LogErr;
+use gpui::prelude::*;
+use gpui::{Context, Entity, EventEmitter, Focusable, SharedString, Subscription, Window, div, px};
+use gpui_component::ActiveTheme;
+
+/// Width of the hard (type-to-confirm) mutation dialog.
+const HARD_CONFIRM_WIDTH: gpui::Pixels = px(520.0);
+
+/// Outcome emitted by both mutation confirmation modals when resolved.
+#[derive(Clone, Debug)]
+pub enum MutationConfirmOutcome {
+    Confirmed,
+    Cancelled,
+}
+
+// =============================================================================
+// ModalMutationConfirm (Default / light confirmation — E-1)
+// =============================================================================
+
+/// Request payload for the light mutation confirmation modal.
+#[derive(Clone, Debug)]
+pub struct MutationConfirmRequest {
+    /// Short description of the operation, shown in the body (e.g. "Delete 42 rows from users").
+    pub summary: String,
+    /// SQL preview text displayed in the code block.
+    pub sql_preview: String,
+    /// Optional pre-fetched sample rows shown below the SQL preview.
+    ///
+    /// Each item is a `Vec<String>` — one string per column value.
+    pub sample_rows: Option<Vec<Vec<String>>>,
+    /// Column headers for the sample-rows table.
+    pub sample_columns: Vec<String>,
+}
+
+/// Light mutation confirmation modal (E-1).
+///
+/// Shows summary, SQL preview, and optional sample rows. No type-to-confirm
+/// or opt-in checkbox. Used for UPDATE/DELETE where the row count is small
+/// and the driver does not require extra confirmation.
+pub struct ModalMutationConfirm {
+    request: Option<MutationConfirmRequest>,
+    visible: bool,
+    focus: ModalFocus,
+}
+
+impl ModalMutationConfirm {
+    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self {
+            request: None,
+            visible: false,
+            focus: ModalFocus::new(cx),
+        }
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    pub fn open(&mut self, request: MutationConfirmRequest, cx: &mut Context<Self>) {
+        self.request = Some(request);
+        self.visible = true;
+        self.focus.focus_on_next_render();
+        cx.notify();
+    }
+
+    pub fn close(&mut self, cx: &mut Context<Self>) {
+        self.visible = false;
+        self.request = None;
+        self.focus.restore(cx);
+        cx.notify();
+    }
+
+    /// Run the mutation, as the Confirm button does.
+    pub fn confirm(&mut self, cx: &mut Context<Self>) {
+        cx.emit(MutationConfirmOutcome::Confirmed);
+        self.close(cx);
+    }
+
+    /// Dismiss the modal without running the mutation.
+    pub fn cancel(&mut self, cx: &mut Context<Self>) {
+        cx.emit(MutationConfirmOutcome::Cancelled);
+        self.close(cx);
+    }
+}
+
+impl EventEmitter<MutationConfirmOutcome> for ModalMutationConfirm {}
+
+impl Render for ModalMutationConfirm {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.visible {
+            return div().into_any_element();
+        }
+
+        self.focus.apply_pending(window, cx);
+
+        let Some(ref request) = self.request else {
+            return div().into_any_element();
+        };
+
+        let theme = cx.theme();
+        let summary = request.summary.clone();
+        let sql = request.sql_preview.trim().to_string();
+        let sample_rows = request.sample_rows.clone();
+        let sample_columns = request.sample_columns.clone();
+
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(ModalMetrics::BODY_GAP)
+            .child(modal_lead(summary, cx))
+            .child(modal_code(sql, cx));
+
+        // Sample rows preview
+        match sample_rows {
+            Some(rows) if !rows.is_empty() => {
+                let mut table = div().flex().flex_col().gap(Spacing::XS);
+
+                // Header row
+                let mut header_row = div().flex().flex_row().gap(Spacing::SM);
+                for col in &sample_columns {
+                    header_row = header_row.child(
+                        div()
+                            .flex_1()
+                            .text_size(FontSizes::XS)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(col.clone())),
+                    );
+                }
+                table = table.child(header_row);
+
+                for row_vals in rows.iter().take(5) {
+                    let mut data_row = div().flex().flex_row().gap(Spacing::SM);
+                    for val in row_vals {
+                        data_row = data_row.child(
+                            div()
+                                .flex_1()
+                                .text_size(FontSizes::XS)
+                                .font_family(crate::fonts::editor_family(cx))
+                                .text_color(theme.foreground)
+                                .child(SharedString::from(val.clone())),
+                        );
+                    }
+                    table = table.child(data_row);
+                }
+
+                body = body.child(
+                    surface(SurfaceRole::Raised, cx)
+                        .w_full()
+                        .p(Spacing::SM)
+                        .child(table),
+                );
+            }
+            Some(_) | None => {
+                body = body.child(
+                    div()
+                        .text_size(FontSizes::XS)
+                        .text_color(theme.muted_foreground)
+                        .child(datatab_i18n::t!(
+                            "modals.mutation_confirm.sample_unavailable"
+                        )),
+                );
+            }
+        }
+
+        let footer = div()
+            .flex()
+            .items_center()
+            .gap(ModalMetrics::FOOTER_GAP)
+            .child(
+                Button::new(
+                    "mutation-confirm-cancel",
+                    datatab_i18n::t!("modals.mutation_confirm.cancel"),
+                )
+                .variant(ButtonVariant::Secondary)
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.cancel(cx);
+                })),
+            )
+            .child(
+                Button::new(
+                    "mutation-confirm-ok",
+                    datatab_i18n::t!("modals.mutation_confirm.confirm"),
+                )
+                .variant(ButtonVariant::Primary)
+                .icon(AppIcon::Play)
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.confirm(cx);
+                })),
+            );
+
+        Modal::new(datatab_i18n::t!("modals.mutation_confirm.title"))
+            .body(body)
+            .footer(footer)
+            .icon(AppIcon::TriangleAlert)
+            .variant(ModalVariant::Default)
+            .width(ModalMetrics::WIDTH)
+            .focus_handle(self.focus.handle())
+            .on_close({
+                let entity = cx.entity().downgrade();
+                move |_, cx| {
+                    entity.update(cx, |this, cx| this.cancel(cx)).log_err();
+                }
+            })
+            .on_confirm({
+                let entity = cx.entity().downgrade();
+                move |_, cx| {
+                    entity.update(cx, |this, cx| this.confirm(cx)).log_err();
+                }
+            })
+            .into_any_element()
+    }
+}
+
+// =============================================================================
+// ModalMutationConfirmHard (Danger + TypeToConfirm + opt-in checkbox — E-2/E-3/E-4/E-6)
+// =============================================================================
+
+/// Request payload for the hard mutation confirmation modal.
+#[derive(Clone, Debug)]
+pub struct MutationConfirmHardRequest {
+    /// Short description of the operation shown in the body.
+    pub summary: String,
+    /// The exact table name the user must type to enable the confirm button (E-3).
+    pub type_to_confirm: String,
+    /// SQL preview text.
+    pub sql_preview: String,
+    /// Optional pre-fetched sample rows.
+    pub sample_rows: Option<Vec<Vec<String>>>,
+    /// Column headers for the sample-rows table.
+    pub sample_columns: Vec<String>,
+    /// When `true`, the per-execution opt-in checkbox is shown (E-2/E-4).
+    pub require_opt_in: bool,
+}
+
+/// Hard mutation confirmation modal (E-2, E-3, E-4, E-6).
+///
+/// Danger variant with a 2 px red top-border accent. The confirm button is
+/// disabled until:
+/// - The user types the table name exactly (TypeToConfirm gate, E-3).
+/// - The opt-in checkbox is checked, if `require_opt_in` is set (E-4).
+///
+/// The opt-in checkbox is always unchecked on every open (E-4).
+pub struct ModalMutationConfirmHard {
+    request: Option<MutationConfirmHardRequest>,
+    visible: bool,
+    confirm_input: Entity<InputState>,
+    type_matches: bool,
+    opt_in_checked: bool,
+    focus: ModalFocus,
+    _subscription: Option<Subscription>,
+}
+
+impl ModalMutationConfirmHard {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let confirm_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(datatab_i18n::t!(
+                "modals.mutation_confirm.type_to_confirm_placeholder"
+            ))
+        });
+        Self {
+            request: None,
+            visible: false,
+            confirm_input,
+            type_matches: false,
+            opt_in_checked: false,
+            focus: ModalFocus::new(cx),
+            _subscription: None,
+        }
+    }
+
+    pub fn is_visible(&self) -> bool {
+        self.visible
+    }
+
+    pub fn open(
+        &mut self,
+        request: MutationConfirmHardRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Reset state on every open (E-4).
+        self.confirm_input.update(cx, |input, cx| {
+            input.set_value(String::new(), window, cx);
+        });
+        self.type_matches = false;
+        self.opt_in_checked = false;
+
+        let expected = request.type_to_confirm.clone();
+        let input = self.confirm_input.clone();
+
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            move |this, input_state, event: &InputEvent, _, cx| {
+                if !matches!(event, InputEvent::Change) {
+                    return;
+                }
+                let typed = input_state.read(cx).value().to_string();
+                let matches = typed == expected;
+                if this.type_matches != matches {
+                    this.type_matches = matches;
+                    cx.notify();
+                }
+            },
+        );
+
+        self.request = Some(request);
+        self.visible = true;
+        self._subscription = Some(subscription);
+
+        let input_focus = self.confirm_input.read(cx).focus_handle(cx);
+        self.focus.focus(Some(&input_focus), window, cx);
+
+        cx.notify();
+    }
+
+    pub fn close(&mut self, cx: &mut Context<Self>) {
+        self.visible = false;
+        self.request = None;
+        self.type_matches = false;
+        self.opt_in_checked = false;
+        self._subscription = None;
+        self.focus.restore(cx);
+        cx.notify();
+    }
+
+    /// Run the mutation, as the Confirm button does. Does nothing until the
+    /// typed name matches and, when required, the opt-in box is checked.
+    pub fn confirm(&mut self, cx: &mut Context<Self>) {
+        if !self.confirm_enabled() {
+            return;
+        }
+
+        cx.emit(MutationConfirmOutcome::Confirmed);
+        self.close(cx);
+    }
+
+    /// Dismiss the modal without running the mutation.
+    pub fn cancel(&mut self, cx: &mut Context<Self>) {
+        cx.emit(MutationConfirmOutcome::Cancelled);
+        self.close(cx);
+    }
+
+    fn confirm_enabled(&self) -> bool {
+        let require_opt_in = self
+            .request
+            .as_ref()
+            .map(|r| r.require_opt_in)
+            .unwrap_or(false);
+
+        self.type_matches && (!require_opt_in || self.opt_in_checked)
+    }
+}
+
+impl EventEmitter<MutationConfirmOutcome> for ModalMutationConfirmHard {}
+
+impl Render for ModalMutationConfirmHard {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if !self.visible {
+            return div().into_any_element();
+        }
+
+        let Some(ref request) = self.request else {
+            return div().into_any_element();
+        };
+
+        let theme = cx.theme();
+        let summary = request.summary.clone();
+        let sql = request.sql_preview.trim().to_string();
+        let sample_rows = request.sample_rows.clone();
+        let sample_columns = request.sample_columns.clone();
+        let require_opt_in = request.require_opt_in;
+        let confirm_enabled = self.confirm_enabled();
+        let opt_in_checked = self.opt_in_checked;
+
+        let _ = window;
+
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .gap(ModalMetrics::BODY_GAP)
+            .child(modal_lead(summary, cx))
+            .child(modal_code(sql, cx));
+
+        // Sample rows preview
+        match sample_rows {
+            Some(rows) if !rows.is_empty() => {
+                let mut table = div().flex().flex_col().gap(Spacing::XS);
+
+                let mut header_row = div().flex().flex_row().gap(Spacing::SM);
+                for col in &sample_columns {
+                    header_row = header_row.child(
+                        div()
+                            .flex_1()
+                            .text_size(FontSizes::XS)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(col.clone())),
+                    );
+                }
+                table = table.child(header_row);
+
+                for row_vals in rows.iter().take(5) {
+                    let mut data_row = div().flex().flex_row().gap(Spacing::SM);
+                    for val in row_vals {
+                        data_row = data_row.child(
+                            div()
+                                .flex_1()
+                                .text_size(FontSizes::XS)
+                                .font_family(crate::fonts::editor_family(cx))
+                                .text_color(theme.foreground)
+                                .child(SharedString::from(val.clone())),
+                        );
+                    }
+                    table = table.child(data_row);
+                }
+
+                body = body.child(
+                    surface(SurfaceRole::Raised, cx)
+                        .w_full()
+                        .p(Spacing::SM)
+                        .child(table),
+                );
+            }
+            Some(_) | None => {
+                body = body.child(
+                    div()
+                        .text_size(FontSizes::XS)
+                        .text_color(theme.muted_foreground)
+                        .child(datatab_i18n::t!(
+                            "modals.mutation_confirm.sample_unavailable"
+                        )),
+                );
+            }
+        }
+
+        // TypeToConfirm input
+        body = body.child(modal_field(
+            datatab_i18n::t!("modals.mutation_confirm.type_to_confirm_label"),
+            div()
+                .font_family(crate::fonts::editor_family(cx))
+                .child(crate::controls::Input::new(&self.confirm_input).w_full()),
+            cx,
+        ));
+
+        // Per-execution opt-in checkbox (E-2/E-4)
+        if require_opt_in {
+            body = body.child(
+                Checkbox::new("mutation-hard-opt-in")
+                    .checked(opt_in_checked)
+                    .label(datatab_i18n::t!("modals.mutation_confirm.opt_in_label"))
+                    .on_click(cx.listener(|this, checked, _window, cx| {
+                        this.opt_in_checked = *checked;
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let footer = div()
+            .flex()
+            .items_center()
+            .gap(ModalMetrics::FOOTER_GAP)
+            .child(
+                Button::new(
+                    "mutation-hard-cancel",
+                    datatab_i18n::t!("modals.mutation_confirm.cancel"),
+                )
+                .variant(ButtonVariant::Secondary)
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.cancel(cx);
+                })),
+            )
+            .child(
+                Button::new(
+                    "mutation-hard-confirm",
+                    datatab_i18n::t!("modals.mutation_confirm.confirm"),
+                )
+                .variant(ButtonVariant::Danger)
+                .icon(AppIcon::Play)
+                .disabled(!confirm_enabled)
+                .on_click(cx.listener(|this, _event, _window, cx| {
+                    this.confirm(cx);
+                })),
+            );
+
+        Modal::new(datatab_i18n::t!("modals.mutation_confirm.title"))
+            .body(body)
+            .footer(footer)
+            .icon(AppIcon::TriangleAlert)
+            .variant(ModalVariant::Danger)
+            .width(HARD_CONFIRM_WIDTH)
+            .focus_handle(self.focus.handle())
+            .on_close({
+                let entity = cx.entity().downgrade();
+                move |_, cx| {
+                    entity.update(cx, |this, cx| this.cancel(cx)).log_err();
+                }
+            })
+            .on_confirm({
+                let entity = cx.entity().downgrade();
+                move |_, cx| {
+                    entity.update(cx, |this, cx| this.confirm(cx)).log_err();
+                }
+            })
+            .confirm_enabled(confirm_enabled)
+            .into_any_element()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — catalog key resolution
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn mutation_confirm_keys_resolve() {
+        let keys = [
+            "modals.mutation_confirm.title",
+            "modals.mutation_confirm.sample_unavailable",
+            "modals.mutation_confirm.type_to_confirm_label",
+            "modals.mutation_confirm.type_to_confirm_placeholder",
+            "modals.mutation_confirm.opt_in_label",
+            "modals.mutation_confirm.cancel",
+            "modals.mutation_confirm.confirm",
+        ];
+
+        for key in keys {
+            let en = datatab_i18n::t!(key, locale = "en");
+            assert!(
+                !en.is_empty() && !en.starts_with("en."),
+                "en missing for {key}, got {en:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mutation_confirm_confirm_reads_confirm() {
+        let en = datatab_i18n::t!("modals.mutation_confirm.confirm", locale = "en");
+        assert_eq!(en, "Confirm");
+    }
+}

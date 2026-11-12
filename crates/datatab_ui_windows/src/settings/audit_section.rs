@@ -1,0 +1,1089 @@
+use super::SettingsSection;
+use super::SettingsSectionId;
+use super::section_trait::SectionFocusEvent;
+use crate::labels::audit_save_failed_copy;
+use crate::settings::layout;
+use crate::tokens::{FormMetrics, SettingsMetrics};
+use datatab_app::keymap::Modifiers;
+use datatab_components::controls::{
+    Checkbox, Dropdown, DropdownItem, DropdownSelectionChanged, Input, InputEvent, InputState,
+};
+use datatab_components::icons::AppIcon;
+use datatab_components::primitives::{Status, StatusIndicator};
+use datatab_core::observability::EventSeverity;
+use datatab_storage::repositories::audit_settings::AuditSettingsDto;
+use datatab_ui_base::AppStateEntity;
+use datatab_ui_base::keymap::key_chord_from_gpui;
+use datatab_ui_base::toast::{Toast, copy_action, now_hms};
+use gpui::prelude::*;
+use gpui::*;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum AuditFormRow {
+    EnableAudit,
+    RetentionDays,
+    CaptureUserActions,
+    CaptureSystemEvents,
+    CaptureQueryText,
+    CaptureHookOutputMetadata,
+    RedactSensitiveValues,
+    MaxDetailBytes,
+    PurgeOnStartup,
+    BackgroundPurgeInterval,
+    LogCaptureMinLevel,
+    SaveButton,
+}
+
+/// Effective state of the audit service as shown in the Settings status row.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AuditStatus {
+    Enabled,
+    /// The audit database could not be opened at startup, so the service is
+    /// off regardless of the persisted setting until DataTab restarts.
+    Degraded,
+    Disabled,
+}
+
+impl AuditStatus {
+    fn resolve(is_degraded: bool, enabled_setting: bool) -> Self {
+        if is_degraded {
+            AuditStatus::Degraded
+        } else if enabled_setting {
+            AuditStatus::Enabled
+        } else {
+            AuditStatus::Disabled
+        }
+    }
+
+    fn status(self) -> Status {
+        match self {
+            AuditStatus::Enabled => Status::Connected,
+            AuditStatus::Degraded => Status::Warning,
+            AuditStatus::Disabled => Status::Idle,
+        }
+    }
+
+    fn label_key(self) -> &'static str {
+        match self {
+            AuditStatus::Enabled => "settings.audit.status.enabled",
+            AuditStatus::Degraded => "settings.audit.status.degraded",
+            AuditStatus::Disabled => "settings.audit.status.disabled",
+        }
+    }
+}
+
+fn audit_form_rows() -> Vec<AuditFormRow> {
+    vec![
+        AuditFormRow::EnableAudit,
+        AuditFormRow::RetentionDays,
+        AuditFormRow::CaptureUserActions,
+        AuditFormRow::CaptureSystemEvents,
+        AuditFormRow::CaptureQueryText,
+        AuditFormRow::CaptureHookOutputMetadata,
+        AuditFormRow::RedactSensitiveValues,
+        AuditFormRow::MaxDetailBytes,
+        AuditFormRow::PurgeOnStartup,
+        AuditFormRow::BackgroundPurgeInterval,
+        AuditFormRow::LogCaptureMinLevel,
+        AuditFormRow::SaveButton,
+    ]
+}
+
+#[allow(dead_code)]
+pub(super) struct AuditSection {
+    pub(super) app_state: Entity<AppStateEntity>,
+    pub(super) settings: AuditSettingsDto,
+    pub(super) original_settings: AuditSettingsDto,
+    pub(super) audit_form_cursor: usize,
+    pub(super) audit_editing_field: bool,
+    pub(super) input_retention_days: Entity<InputState>,
+    pub(super) input_max_detail_bytes: Entity<InputState>,
+    pub(super) input_background_purge_interval: Entity<InputState>,
+    pub(super) dropdown_log_level: Entity<Dropdown>,
+    pub(super) content_focused: bool,
+    pub(super) switching_input: bool,
+    pub(super) event_count: Option<u64>,
+    pub(super) pending_save_result: Option<Result<(), String>>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl EventEmitter<SectionFocusEvent> for AuditSection {}
+
+impl AuditSection {
+    pub(super) fn new(
+        app_state: Entity<AppStateEntity>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let settings = Self::load_settings(app_state.clone(), cx);
+        let original_settings = settings.clone();
+
+        let retention_days = settings.retention_days.to_string();
+        let max_detail_bytes = settings.max_detail_bytes.to_string();
+        let background_purge_interval = settings.background_purge_interval_minutes.to_string();
+
+        let input_retention_days = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("30")
+                .default_value(retention_days.clone())
+        });
+        let input_max_detail_bytes = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("65536")
+                .default_value(max_detail_bytes.clone())
+        });
+        let input_background_purge_interval = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("360")
+                .default_value(background_purge_interval.clone())
+        });
+
+        let log_level_index = Self::log_level_index(&settings.log_capture_min_level);
+        let dropdown_log_level = cx.new(move |_cx| {
+            Dropdown::new("audit-log-capture-level")
+                .placeholder(datatab_i18n::t!("settings.audit.placeholder_level"))
+                .items(Self::log_level_items())
+                .selected_index(Some(log_level_index))
+        });
+
+        let subscription = cx.subscribe(
+            &app_state,
+            |this, _, _: &datatab_ui_base::AppStateChanged, cx| {
+                this.content_focused = false;
+                this.audit_editing_field = false;
+                cx.notify();
+            },
+        );
+
+        let blur_retention =
+            cx.subscribe(&input_retention_days, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Blur) {
+                    if this.switching_input {
+                        this.switching_input = false;
+                        return;
+                    }
+                    cx.emit(SectionFocusEvent::RequestFocusReturn);
+                }
+            });
+
+        let blur_max_detail = cx.subscribe(
+            &input_max_detail_bytes,
+            |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Blur) {
+                    if this.switching_input {
+                        this.switching_input = false;
+                        return;
+                    }
+                    cx.emit(SectionFocusEvent::RequestFocusReturn);
+                }
+            },
+        );
+
+        let blur_purge_interval = cx.subscribe(
+            &input_background_purge_interval,
+            |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Blur) {
+                    if this.switching_input {
+                        this.switching_input = false;
+                        return;
+                    }
+                    cx.emit(SectionFocusEvent::RequestFocusReturn);
+                }
+            },
+        );
+
+        let log_level_subscription = cx.subscribe(
+            &dropdown_log_level,
+            |this, _, event: &DropdownSelectionChanged, cx| {
+                this.settings.log_capture_min_level =
+                    Self::log_level_for_index(event.index).to_owned();
+                cx.notify();
+            },
+        );
+
+        Self {
+            app_state,
+            settings,
+            original_settings,
+            audit_form_cursor: 0,
+            audit_editing_field: false,
+            input_retention_days,
+            input_max_detail_bytes,
+            input_background_purge_interval,
+            dropdown_log_level,
+            content_focused: false,
+            switching_input: false,
+            event_count: None,
+            pending_save_result: None,
+            _subscriptions: vec![
+                subscription,
+                blur_retention,
+                blur_max_detail,
+                blur_purge_interval,
+                log_level_subscription,
+            ],
+        }
+    }
+
+    fn load_settings(
+        app_state: Entity<AppStateEntity>,
+        cx: &mut Context<Self>,
+    ) -> AuditSettingsDto {
+        let runtime = app_state.read(cx).storage_runtime();
+        let repo = runtime.audit_settings();
+        repo.get().ok().flatten().unwrap_or_default()
+    }
+
+    fn audit_current_row(&self) -> Option<AuditFormRow> {
+        audit_form_rows().get(self.audit_form_cursor).copied()
+    }
+
+    pub(super) fn audit_move_down(&mut self) {
+        let count = audit_form_rows().len();
+        if self.audit_form_cursor + 1 < count {
+            self.audit_form_cursor += 1;
+        }
+    }
+
+    pub(super) fn audit_move_up(&mut self) {
+        if self.audit_form_cursor > 0 {
+            self.audit_form_cursor -= 1;
+        }
+    }
+
+    fn audit_move_first(&mut self) {
+        self.audit_form_cursor = 0;
+    }
+
+    fn audit_move_last(&mut self) {
+        self.audit_form_cursor = audit_form_rows().len().saturating_sub(1);
+    }
+
+    pub(super) fn audit_activate_current_field(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.audit_current_row() {
+            Some(AuditFormRow::EnableAudit) => {
+                self.settings.enabled = !self.settings.enabled;
+                cx.notify();
+            }
+            Some(AuditFormRow::RetentionDays) => {
+                self.audit_focus_current_input(window, cx);
+            }
+            // capture_user_actions, capture_system_events, capture_hook_output_metadata
+            // are stored but NOT yet wired to AuditService runtime behavior.
+            // They are marked as non-interactive in render_audit_section.
+            Some(AuditFormRow::CaptureUserActions)
+            | Some(AuditFormRow::CaptureSystemEvents)
+            | Some(AuditFormRow::CaptureHookOutputMetadata) => {}
+            Some(AuditFormRow::CaptureQueryText) => {
+                self.settings.capture_query_text = !self.settings.capture_query_text;
+                cx.notify();
+            }
+            Some(AuditFormRow::RedactSensitiveValues) => {
+                self.settings.redact_sensitive_values = !self.settings.redact_sensitive_values;
+                cx.notify();
+            }
+            Some(AuditFormRow::MaxDetailBytes) => {
+                self.audit_focus_current_input(window, cx);
+            }
+            Some(AuditFormRow::PurgeOnStartup) => {
+                self.settings.purge_on_startup = !self.settings.purge_on_startup;
+                cx.notify();
+            }
+            // background_purge_interval_minutes controls the periodic purge timer
+            // in Workspace. The input is kept active so users can set it, but
+            // the timer itself is controlled by Workspace's purge scheduling.
+            Some(AuditFormRow::BackgroundPurgeInterval) => {
+                self.audit_focus_current_input(window, cx);
+            }
+            Some(AuditFormRow::LogCaptureMinLevel) => {
+                // Dropdown is self-contained; keyboard activation is a no-op here.
+            }
+            Some(AuditFormRow::SaveButton) => {
+                self.save_audit_settings(window, cx);
+            }
+            None => {}
+        }
+    }
+
+    fn audit_focus_current_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.audit_editing_field = true;
+
+        match self.audit_current_row() {
+            Some(AuditFormRow::RetentionDays) => {
+                self.input_retention_days
+                    .update(cx, |state, cx| state.focus(window, cx));
+            }
+            Some(AuditFormRow::MaxDetailBytes) => {
+                self.input_max_detail_bytes
+                    .update(cx, |state, cx| state.focus(window, cx));
+            }
+            Some(AuditFormRow::BackgroundPurgeInterval) => {
+                self.input_background_purge_interval
+                    .update(cx, |state, cx| state.focus(window, cx));
+            }
+            _ => {
+                self.audit_editing_field = false;
+            }
+        }
+    }
+
+    pub(super) fn has_unsaved_audit_changes(&self, _cx: &App) -> bool {
+        self.settings.enabled != self.original_settings.enabled
+            || self.settings.retention_days != self.original_settings.retention_days
+            || self.settings.capture_user_actions != self.original_settings.capture_user_actions
+            || self.settings.capture_system_events != self.original_settings.capture_system_events
+            || self.settings.capture_query_text != self.original_settings.capture_query_text
+            || self.settings.capture_hook_output_metadata
+                != self.original_settings.capture_hook_output_metadata
+            || self.settings.redact_sensitive_values
+                != self.original_settings.redact_sensitive_values
+            || self.settings.max_detail_bytes != self.original_settings.max_detail_bytes
+            || self.settings.purge_on_startup != self.original_settings.purge_on_startup
+            || self.settings.background_purge_interval_minutes
+                != self.original_settings.background_purge_interval_minutes
+            || self.settings.log_capture_min_level != self.original_settings.log_capture_min_level
+    }
+
+    pub(super) fn save_audit_settings(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let retention_str = self
+            .input_retention_days
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let retention_days = match retention_str.parse::<u32>() {
+            Ok(value) if value >= 1 => value,
+            _ => {
+                let msg = datatab_i18n::t!("settings.audit.error.retention_days_invalid");
+                Toast::error(msg.clone())
+                    .meta_right(now_hms())
+                    .action(copy_action(msg))
+                    .push(cx);
+                return;
+            }
+        };
+
+        let max_detail_str = self
+            .input_max_detail_bytes
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let max_detail_bytes = match max_detail_str.parse::<usize>() {
+            Ok(value) if value >= 1024 => value,
+            _ => {
+                let msg = datatab_i18n::t!("settings.audit.error.max_detail_bytes_invalid");
+                Toast::error(msg.clone())
+                    .meta_right(now_hms())
+                    .action(copy_action(msg))
+                    .push(cx);
+                return;
+            }
+        };
+
+        let purge_interval_str = self
+            .input_background_purge_interval
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let purge_interval = match purge_interval_str.parse::<u32>() {
+            Ok(value) => value,
+            _ => {
+                let msg = datatab_i18n::t!("settings.audit.error.purge_interval_invalid");
+                Toast::error(msg.clone())
+                    .meta_right(now_hms())
+                    .action(copy_action(msg))
+                    .push(cx);
+                return;
+            }
+        };
+
+        self.settings.retention_days = retention_days;
+        self.settings.max_detail_bytes = max_detail_bytes;
+        self.settings.background_purge_interval_minutes = purge_interval;
+
+        let app_state = self.app_state.read(cx);
+        let runtime = app_state.storage_runtime();
+        let repo = runtime.audit_settings();
+
+        // Check degraded state BEFORE writing. If the audit service is in degraded state
+        // (real DB could not be opened), do not allow enabling it. This avoids the
+        // write-then-correct pattern that could leave bad persisted state on crash.
+        if app_state.is_audit_degraded() && self.settings.enabled {
+            Toast::error(datatab_i18n::t!("settings.audit.error.cannot_enable"))
+                .meta_right(now_hms())
+                .body(datatab_i18n::t!("settings.audit.error.cannot_enable_body"))
+                .action(copy_action(datatab_i18n::t!(
+                    "settings.audit.error.cannot_enable_copy"
+                )))
+                .push(cx);
+            // Revert to disabled in-memory only; do NOT write — user must uncheck
+            // the enabled checkbox and save again to persist a disabled state.
+            self.settings.enabled = false;
+            return;
+        }
+
+        if let Err(e) = repo.upsert(&self.settings) {
+            let body = e.to_string();
+            Toast::error(datatab_i18n::t!("settings.audit.error.save_failed"))
+                .meta_right(now_hms())
+                .body(body.clone())
+                .action(copy_action(audit_save_failed_copy(&body)))
+                .push(cx);
+            return;
+        }
+
+        let audit_service = app_state.audit_service();
+        audit_service.set_enabled(self.settings.enabled);
+        audit_service.set_redact_sensitive(self.settings.redact_sensitive_values);
+        audit_service.set_capture_query_text(self.settings.capture_query_text);
+        audit_service.set_max_detail_bytes(self.settings.max_detail_bytes);
+
+        if let Some(level) = EventSeverity::from_str_repr(&self.settings.log_capture_min_level)
+            && let Err(e) = audit_service.set_log_capture_min_level(level)
+        {
+            log::warn!("Failed to apply log capture min level: {e}");
+        }
+
+        self.original_settings = self.settings.clone();
+
+        Toast::success(datatab_i18n::t!("settings.audit.toast.saved"))
+            .meta_right(now_hms())
+            .push(cx);
+    }
+}
+
+impl SettingsSection for AuditSection {
+    fn section_id(&self) -> SettingsSectionId {
+        SettingsSectionId::Audit
+    }
+
+    fn focus_in(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.content_focused = true;
+        cx.notify();
+    }
+
+    fn focus_out(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.content_focused = false;
+        self.audit_editing_field = false;
+        cx.notify();
+    }
+
+    fn is_dirty(&self, cx: &App) -> bool {
+        self.has_unsaved_audit_changes(cx)
+    }
+
+    fn render_footer_actions(
+        &self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        Some(self.render_audit_footer_actions(cx))
+    }
+
+    fn save_from_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_audit_settings(window, cx);
+    }
+
+    fn handle_key_event(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let chord = key_chord_from_gpui(&event.keystroke);
+
+        if self.audit_editing_field {
+            match (chord.key.as_str(), chord.modifiers) {
+                ("escape", modifiers) if modifiers == Modifiers::none() => {
+                    self.audit_editing_field = false;
+                    cx.emit(SectionFocusEvent::RequestFocusReturn);
+                    cx.notify();
+                }
+                ("enter", modifiers) if modifiers == Modifiers::none() => {
+                    self.audit_editing_field = false;
+                    self.audit_move_down();
+                    cx.notify();
+                }
+                ("tab", modifiers) if modifiers == Modifiers::none() => {
+                    self.audit_editing_field = false;
+                    self.audit_move_down();
+                    self.audit_focus_current_input(window, cx);
+                    cx.notify();
+                }
+                ("tab", modifiers) if modifiers == Modifiers::shift() => {
+                    self.audit_editing_field = false;
+                    self.audit_move_up();
+                    self.audit_focus_current_input(window, cx);
+                    cx.notify();
+                }
+                _ => {}
+            }
+
+            return;
+        }
+
+        match (chord.key.as_str(), chord.modifiers) {
+            ("j", modifiers) | ("down", modifiers) if modifiers == Modifiers::none() => {
+                self.audit_move_down();
+                cx.notify();
+            }
+            ("k", modifiers) | ("up", modifiers) if modifiers == Modifiers::none() => {
+                self.audit_move_up();
+                cx.notify();
+            }
+            ("l", modifiers) | ("right", modifiers) | ("enter", modifiers)
+                if modifiers == Modifiers::none() =>
+            {
+                self.audit_activate_current_field(window, cx);
+            }
+            ("tab", modifiers) if modifiers == Modifiers::none() => {
+                self.audit_move_down();
+                cx.notify();
+            }
+            ("tab", modifiers) if modifiers == Modifiers::shift() => {
+                self.audit_move_up();
+                cx.notify();
+            }
+            ("g", modifiers) if modifiers == Modifiers::none() => {
+                self.audit_move_first();
+                cx.notify();
+            }
+            ("G", modifiers) if modifiers == Modifiers::none() => {
+                self.audit_move_last();
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Render for AuditSection {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_audit_section(cx)
+    }
+}
+
+impl AuditSection {
+    pub(super) fn render_audit_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_focused = self.content_focused;
+        let cursor = self.audit_form_cursor;
+        let rows = audit_form_rows();
+
+        let is_at =
+            |row: AuditFormRow| -> bool { is_focused && rows.get(cursor).copied() == Some(row) };
+
+        let group = |title: String, icon: AppIcon, cx: &App| {
+            datatab_components::composites::section_header(title, Some(icon.into()), cx)
+        };
+
+        layout::single_form_section_shell(
+            datatab_components::composites::page_header(
+                datatab_i18n::t!("settings.audit.section_title"),
+                datatab_i18n::t!("settings.audit.section_description"),
+                cx,
+            ),
+            div()
+                .flex()
+                .flex_col()
+                .child(group(
+                    datatab_i18n::t!("settings.audit.group.status"),
+                    AppIcon::Info,
+                    cx,
+                ))
+                .child(self.render_audit_status_indicator(cx))
+                .child(group(
+                    datatab_i18n::t!("settings.audit.group.enable_disable"),
+                    AppIcon::Power,
+                    cx,
+                ))
+                .child(self.render_audit_checkbox(
+                    "audit-enabled",
+                    datatab_i18n::t!("settings.audit.field.enable_global"),
+                    self.settings.enabled,
+                    is_at(AuditFormRow::EnableAudit),
+                    AuditFormRow::EnableAudit,
+                    |this, value| this.settings.enabled = value,
+                    cx,
+                ))
+                .child(group(
+                    datatab_i18n::t!("settings.audit.group.capture_settings"),
+                    AppIcon::FingerprintPattern,
+                    cx,
+                ))
+                .child(self.render_audit_unsupported_checkbox(
+                    "capture-user-actions",
+                    datatab_i18n::t!("settings.audit.field.capture_user_actions"),
+                    self.settings.capture_user_actions,
+                    is_at(AuditFormRow::CaptureUserActions),
+                    cx,
+                ))
+                .child(self.render_audit_unsupported_checkbox(
+                    "capture-system-events",
+                    datatab_i18n::t!("settings.audit.field.capture_system_events"),
+                    self.settings.capture_system_events,
+                    is_at(AuditFormRow::CaptureSystemEvents),
+                    cx,
+                ))
+                .child(self.render_audit_checkbox(
+                    "capture-query-text",
+                    datatab_i18n::t!("settings.audit.field.capture_full_query_text"),
+                    self.settings.capture_query_text,
+                    is_at(AuditFormRow::CaptureQueryText),
+                    AuditFormRow::CaptureQueryText,
+                    |this, value| this.settings.capture_query_text = value,
+                    cx,
+                ))
+                .child(self.render_audit_unsupported_checkbox(
+                    "capture-hook-output",
+                    datatab_i18n::t!("settings.audit.field.capture_hook_output"),
+                    self.settings.capture_hook_output_metadata,
+                    is_at(AuditFormRow::CaptureHookOutputMetadata),
+                    cx,
+                ))
+                .child(group(
+                    datatab_i18n::t!("settings.audit.group.privacy"),
+                    AppIcon::EyeOff,
+                    cx,
+                ))
+                .child(self.render_audit_checkbox(
+                    "redact-sensitive",
+                    datatab_i18n::t!("settings.audit.field.redact_sensitive"),
+                    self.settings.redact_sensitive_values,
+                    is_at(AuditFormRow::RedactSensitiveValues),
+                    AuditFormRow::RedactSensitiveValues,
+                    |this, value| this.settings.redact_sensitive_values = value,
+                    cx,
+                ))
+                .child(group(
+                    datatab_i18n::t!("settings.audit.group.retention"),
+                    AppIcon::History,
+                    cx,
+                ))
+                .child(self.render_audit_input_field(
+                    &datatab_i18n::t!("settings.audit.field.retention_days"),
+                    &self.input_retention_days,
+                    is_at(AuditFormRow::RetentionDays),
+                    AuditFormRow::RetentionDays,
+                    cx,
+                ))
+                .child(self.render_audit_input_field(
+                    &datatab_i18n::t!("settings.audit.field.max_detail_bytes"),
+                    &self.input_max_detail_bytes,
+                    is_at(AuditFormRow::MaxDetailBytes),
+                    AuditFormRow::MaxDetailBytes,
+                    cx,
+                ))
+                .child(group(
+                    datatab_i18n::t!("settings.audit.group.purge"),
+                    AppIcon::Delete,
+                    cx,
+                ))
+                .child(self.render_audit_checkbox(
+                    "purge-on-startup",
+                    datatab_i18n::t!("settings.audit.field.purge_on_startup"),
+                    self.settings.purge_on_startup,
+                    is_at(AuditFormRow::PurgeOnStartup),
+                    AuditFormRow::PurgeOnStartup,
+                    |this, value| this.settings.purge_on_startup = value,
+                    cx,
+                ))
+                .child(self.render_audit_input_field(
+                    &datatab_i18n::t!("settings.audit.field.purge_interval_minutes"),
+                    &self.input_background_purge_interval,
+                    is_at(AuditFormRow::BackgroundPurgeInterval),
+                    AuditFormRow::BackgroundPurgeInterval,
+                    cx,
+                ))
+                .child(group(
+                    datatab_i18n::t!("settings.audit.group.log_capture"),
+                    AppIcon::ScrollText,
+                    cx,
+                ))
+                .child(self.render_audit_dropdown(
+                    &datatab_i18n::t!("settings.audit.field.min_log_level"),
+                    &self.dropdown_log_level,
+                    is_at(AuditFormRow::LogCaptureMinLevel),
+                    AuditFormRow::LogCaptureMinLevel,
+                    cx,
+                )),
+        )
+    }
+
+    fn render_audit_footer_actions(&self, cx: &mut Context<Self>) -> AnyElement {
+        let is_save_focused = self.content_focused
+            && audit_form_rows().get(self.audit_form_cursor).copied()
+                == Some(AuditFormRow::SaveButton);
+
+        datatab_components::controls::Button::new(
+            "save-audit",
+            datatab_i18n::t!("settings.audit.action.save"),
+        )
+        .primary()
+        .icon(AppIcon::Save)
+        .when_some(
+            crate::settings::save_shortcut(),
+            datatab_components::controls::Button::kbd,
+        )
+        .focused(is_save_focused)
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.select_audit_row(AuditFormRow::SaveButton);
+            this.save_audit_settings(window, cx);
+        }))
+        .into_any_element()
+    }
+
+    /// Moves the keyboard cursor to `row` and gives the page focus.
+    fn select_audit_row(&mut self, row: AuditFormRow) {
+        self.content_focused = true;
+
+        if let Some(position) = audit_form_rows()
+            .iter()
+            .position(|candidate| *candidate == row)
+        {
+            self.audit_form_cursor = position;
+        }
+    }
+
+    fn log_level_items() -> Vec<DropdownItem> {
+        vec![
+            DropdownItem::new(datatab_i18n::t!("settings.audit.log_level.trace")),
+            DropdownItem::new(datatab_i18n::t!("settings.audit.log_level.debug")),
+            DropdownItem::new(datatab_i18n::t!("settings.audit.log_level.info")),
+            DropdownItem::new(datatab_i18n::t!("settings.audit.log_level.warn")),
+            DropdownItem::new(datatab_i18n::t!("settings.audit.log_level.error")),
+        ]
+    }
+
+    fn log_level_index(level: &str) -> usize {
+        match level {
+            "trace" => 0,
+            "debug" => 1,
+            "info" => 2,
+            "warn" => 3,
+            "error" | "fatal" => 4,
+            _ => 2,
+        }
+    }
+
+    fn log_level_for_index(index: usize) -> &'static str {
+        match index {
+            0 => "trace",
+            1 => "debug",
+            2 => "info",
+            3 => "warn",
+            4 => "error",
+            _ => "info",
+        }
+    }
+
+    fn render_audit_dropdown(
+        &self,
+        label: &str,
+        dropdown: &Entity<Dropdown>,
+        is_focused: bool,
+        row: AuditFormRow,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        layout::form_row(
+            label.to_string(),
+            layout::cursor_ring(
+                is_focused,
+                div()
+                    .w(SettingsMetrics::SELECT_WIDTH)
+                    .child(dropdown.clone()),
+                cx,
+            )
+            .w(SettingsMetrics::SELECT_WIDTH)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.select_audit_row(row);
+                    cx.notify();
+                }),
+            ),
+            None,
+        )
+    }
+
+    fn render_audit_status_indicator(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let status = AuditStatus::resolve(
+            self.app_state.read(cx).is_audit_degraded(),
+            self.settings.enabled,
+        );
+
+        div()
+            .id("settings-audit-status")
+            .flex()
+            .items_center()
+            .py(FormMetrics::ROW_PADDING_Y)
+            .text_size(datatab_components::tokens::FontSizes::BASE)
+            .child(
+                StatusIndicator::new(status.status()).label(datatab_i18n::t!(status.label_key())),
+            )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_audit_checkbox(
+        &self,
+        id: &'static str,
+        label: impl Into<SharedString>,
+        checked: bool,
+        is_focused: bool,
+        row: AuditFormRow,
+        setter: fn(&mut Self, bool),
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        layout::check_row(
+            layout::cursor_ring(
+                is_focused,
+                Checkbox::new(id)
+                    .checked(checked)
+                    .label(label)
+                    .on_click(cx.listener(move |this, value: &bool, _, cx| {
+                        this.select_audit_row(row);
+                        setter(this, *value);
+                        cx.notify();
+                    })),
+                cx,
+            ),
+            None,
+        )
+    }
+
+    fn render_audit_input_field(
+        &self,
+        label: &str,
+        input: &Entity<InputState>,
+        is_focused: bool,
+        row: AuditFormRow,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        layout::form_row(
+            label.to_string(),
+            layout::field_frame(
+                is_focused && !self.audit_editing_field,
+                Some(SettingsMetrics::NUMBER_FIELD_WIDTH),
+                true,
+                Input::new(input).aria_label(label.to_string()),
+                cx,
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    this.switching_input = true;
+                    this.select_audit_row(row);
+                    this.audit_focus_current_input(window, cx);
+                    cx.notify();
+                }),
+            ),
+            None,
+        )
+    }
+
+    /// A capture option that exists in the settings model but is not wired
+    /// to any event source yet: shown checked or not, never toggleable, with
+    /// the "not wired" note as its description.
+    fn render_audit_unsupported_checkbox(
+        &self,
+        id: &'static str,
+        label: impl Into<SharedString>,
+        checked: bool,
+        is_focused: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        layout::check_row(
+            layout::cursor_ring(
+                is_focused,
+                Checkbox::new(id)
+                    .checked(checked)
+                    .disabled(true)
+                    .label(label),
+                cx,
+            )
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.content_focused = true;
+                    cx.notify();
+                }),
+            ),
+            Some(datatab_i18n::t!("settings.audit.field.not_wired").into()),
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AuditFormRow, AuditStatus, audit_form_rows};
+    use datatab_components::primitives::Status;
+
+    #[test]
+    fn audit_form_rows_excludes_status_indicator_row() {
+        let rows = audit_form_rows();
+
+        assert_eq!(rows.len(), 12);
+    }
+
+    #[test]
+    fn audit_form_rows_starts_with_enable_audit() {
+        let rows = audit_form_rows();
+
+        assert_eq!(rows.first().copied(), Some(AuditFormRow::EnableAudit));
+    }
+
+    const AUDIT_SECTION_KEYS: &[&str] = &[
+        "settings.audit.placeholder_level",
+        "settings.audit.section_title",
+        "settings.audit.section_description",
+        "settings.audit.group.status",
+        "settings.audit.group.enable_disable",
+        "settings.audit.group.capture_settings",
+        "settings.audit.group.privacy",
+        "settings.audit.group.retention",
+        "settings.audit.group.purge",
+        "settings.audit.group.log_capture",
+        "settings.audit.field.enable_global",
+        "settings.audit.field.capture_user_actions",
+        "settings.audit.field.capture_system_events",
+        "settings.audit.field.capture_full_query_text",
+        "settings.audit.field.capture_hook_output",
+        "settings.audit.field.redact_sensitive",
+        "settings.audit.field.retention_days",
+        "settings.audit.field.max_detail_bytes",
+        "settings.audit.field.purge_on_startup",
+        "settings.audit.field.purge_interval_minutes",
+        "settings.audit.field.min_log_level",
+        "settings.audit.field.not_wired",
+        "settings.audit.log_level.trace",
+        "settings.audit.log_level.debug",
+        "settings.audit.log_level.info",
+        "settings.audit.log_level.warn",
+        "settings.audit.log_level.error",
+        "settings.audit.action.save",
+        "settings.audit.status.degraded",
+        "settings.audit.status.enabled",
+        "settings.audit.status.disabled",
+        "settings.audit.error.retention_days_invalid",
+        "settings.audit.error.max_detail_bytes_invalid",
+        "settings.audit.error.purge_interval_invalid",
+        "settings.audit.error.cannot_enable",
+        "settings.audit.error.cannot_enable_body",
+        "settings.audit.error.cannot_enable_copy",
+        "settings.audit.error.save_failed",
+        "settings.audit.error.save_failed_copy",
+        "settings.audit.toast.saved",
+    ];
+
+    #[test]
+    fn audit_settings_keys_resolve() {
+        for key in AUDIT_SECTION_KEYS {
+            let value = datatab_i18n::t!(key, locale = "en");
+
+            assert!(!value.is_empty(), "key {key} resolved empty");
+            assert_ne!(value, *key, "key {key} did not resolve");
+            assert_ne!(
+                value,
+                format!("en.{key}"),
+                "key {key} fell back to the raw en-qualified form"
+            );
+        }
+    }
+
+    #[test]
+    fn audit_section_title_english_text() {
+        let english = datatab_i18n::t!("settings.audit.section_title", locale = "en");
+
+        assert_eq!(english, "Audit");
+    }
+
+    #[test]
+    fn audit_status_labels_english_text() {
+        let degraded_en = datatab_i18n::t!("settings.audit.status.degraded", locale = "en");
+        let enabled_en = datatab_i18n::t!("settings.audit.status.enabled", locale = "en");
+        let disabled_en = datatab_i18n::t!("settings.audit.status.disabled", locale = "en");
+
+        assert_eq!(
+            degraded_en,
+            "Audit is paused because its database could not be opened. Restart DataTab."
+        );
+        assert_eq!(enabled_en, "Audit is enabled");
+        assert_eq!(disabled_en, "Audit is disabled");
+    }
+
+    const ALL_AUDIT_STATUSES: [AuditStatus; 3] = [
+        AuditStatus::Enabled,
+        AuditStatus::Degraded,
+        AuditStatus::Disabled,
+    ];
+
+    #[test]
+    fn audit_status_maps_each_variant_to_its_own_dot_token() {
+        for status in ALL_AUDIT_STATUSES {
+            let expected = match status {
+                AuditStatus::Enabled => Status::Connected,
+                AuditStatus::Degraded => Status::Warning,
+                AuditStatus::Disabled => Status::Idle,
+            };
+
+            assert_eq!(status.status(), expected, "status {status:?}");
+        }
+
+        assert_ne!(
+            AuditStatus::Degraded.status(),
+            AuditStatus::Enabled.status()
+        );
+    }
+
+    #[test]
+    fn audit_status_maps_each_variant_to_its_own_label() {
+        for status in ALL_AUDIT_STATUSES {
+            let expected = match status {
+                AuditStatus::Enabled => "settings.audit.status.enabled",
+                AuditStatus::Degraded => "settings.audit.status.degraded",
+                AuditStatus::Disabled => "settings.audit.status.disabled",
+            };
+
+            assert_eq!(status.label_key(), expected, "status {status:?}");
+        }
+    }
+
+    #[test]
+    fn audit_status_degraded_wins_over_the_persisted_setting() {
+        assert_eq!(AuditStatus::resolve(true, true), AuditStatus::Degraded);
+        assert_eq!(AuditStatus::resolve(true, false), AuditStatus::Degraded);
+        assert_eq!(AuditStatus::resolve(false, true), AuditStatus::Enabled);
+        assert_eq!(AuditStatus::resolve(false, false), AuditStatus::Disabled);
+    }
+
+    #[test]
+    fn audit_degraded_label_tells_the_user_to_restart() {
+        let label = datatab_i18n::t!("settings.audit.status.degraded", locale = "en");
+
+        assert!(
+            label.contains("DataTab"),
+            "degraded label does not name DataTab: {label}"
+        );
+    }
+
+    #[test]
+    fn audit_cannot_enable_copy_contains_prefix_once() {
+        let prefix = datatab_i18n::t!("settings.audit.error.cannot_enable", locale = "en");
+        let copy = datatab_i18n::t!("settings.audit.error.cannot_enable_copy", locale = "en");
+
+        assert!(
+            copy.starts_with(prefix.as_str()),
+            "copy text does not start with the prefix: {copy}"
+        );
+        assert_eq!(
+            copy.matches(prefix.as_str()).count(),
+            1,
+            "copy text repeats the prefix: {copy}"
+        );
+    }
+}

@@ -1,0 +1,826 @@
+//! `PaneHandle` — type-erased shell for open documents.
+//!
+//! Each open document is wrapped in a `PaneHandle` whose fields are closures
+//! that capture the typed `Entity<T>`. Callers interact through these forwarding
+//! methods and never observe the concrete document type.
+//!
+//! `PaneHandle` is NOT `Clone`. Callers that previously cloned `DocumentHandle`
+//! should access documents through `TabManager::with_pane(id, |p| ...)` instead.
+
+#![allow(clippy::type_complexity)]
+
+use super::dedup::DocumentKey;
+use super::handle::DocumentEvent;
+use super::types::{DocumentId, DocumentKind, DocumentMetaSnapshot};
+use datatab_app::keymap::{Command, ContextId};
+use datatab_components::modals::CloseAction;
+use datatab_core::RefreshPolicy;
+use gpui::{AnyElement, App, Subscription, Window};
+
+/// Type-erased callback for document events, used by the `subscribe` closure.
+pub type BoxedDocEventCallback = Box<dyn Fn(&DocumentEvent, &mut App) + 'static>;
+
+/// What closing a document means, decided by the document's own close policy.
+///
+/// A pane exposes a policy through [`PaneHandle::resolve_close`]; panes without
+/// one leave the workspace on its existing behaviour, including the
+/// unsaved-changes dialog for a document that reports dirty state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseDisposition {
+    /// Nothing is pending: the workspace may remove the tab now.
+    CloseNow,
+    /// The document queued its pending edits to persist and will report
+    /// `DocumentEvent::RequestClose` once they land; the tab stays open until
+    /// then.
+    Deferred,
+    /// The pending edits could not be persisted; the tab stays open. The failure
+    /// has already been reported to the user.
+    ///
+    /// Also the fail-closed answer for a document that has nowhere to persist:
+    /// an untitled code buffer stores nothing on close, so a caller that reaches
+    /// its close policy keeps the tab open rather than forcing a save or
+    /// dropping the edits. The unsaved-changes confirmation is what normally
+    /// resolves that case.
+    KeepOpen,
+}
+
+/// What quitting the application means for a document's pending edits,
+/// decided by the document before the quit starts.
+///
+/// A pane reports it through [`PaneHandle::quit_disposition`]; panes that do
+/// not report one count as [`QuitDisposition::Clean`], which keeps the quit
+/// behaviour every other document had.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QuitDisposition {
+    /// Nothing is pending: quitting loses nothing.
+    Clean,
+    /// The shutdown flush saves the pending edits without asking.
+    SavedOnQuit,
+    /// The pending edits cannot be saved safely while quitting, so the user
+    /// decides whether to save or drop them before the quit starts.
+    NeedsDecision,
+}
+
+/// An empty script tab whose backing file may be deleted as the tab closes.
+///
+/// Reports what the document knows without reading anything: the file it owns and
+/// the bytes it last loaded or wrote there. Whether the file still holds those
+/// bytes is not answered here — that check reads the file, so the caller runs it
+/// off the UI thread together with the removal it authorizes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmptyScriptCleanup {
+    /// The backing file the close may delete.
+    pub path: std::path::PathBuf,
+    /// The bytes the document last loaded or wrote at `path`.
+    pub expected_bytes: String,
+}
+
+/// A single document-contributed status-bar segment.
+///
+/// Modeled directly on `datatab_components::result_panel::ToolbarSegment` —
+/// documents contribute chrome (here, status-bar text) without the host
+/// (`StatusBar`) branching on document type. `StatusBar` renders every
+/// segment returned by the active tab's `PaneHandle::status_segments()`
+/// generically, separated by dividers.
+#[derive(Clone, Debug)]
+pub struct StatusSegment {
+    pub text: gpui::SharedString,
+    pub tooltip: Option<gpui::SharedString>,
+}
+
+/// A panel a document hands to the workspace instead of drawing it inside its
+/// own island: a settings rail, a preview, the query history.
+///
+/// The workspace draws each one as a full-height island of `width` beside the
+/// document island, in the order the document returns them. `content` is
+/// built by the document, so its listeners still act on the document.
+pub struct DocumentSidePanel {
+    /// Stable per document; keys the island's element id.
+    pub id: gpui::SharedString,
+    pub width: gpui::Pixels,
+    pub content: AnyElement,
+}
+
+/// What running a [`PaneAction`] does.
+#[derive(Clone)]
+pub enum PaneActionRun {
+    /// Runs the command through the workspace, exactly as its key binding
+    /// does.
+    Command(Command),
+    /// Runs a document callback, for an action no command covers.
+    Callback(std::rc::Rc<dyn Fn(&mut Window, &mut App)>),
+}
+
+/// One entry of a pane's actions menu: a toolbar button or another control
+/// the pane otherwise offers only to the pointer.
+///
+/// The workspace lists a pane's entries in the menu `OpenPaneActions` opens
+/// (`m` in the pane's chrome) and runs the chosen one, so every document gets
+/// the menu by filling [`PaneHandle::pane_actions`], without the workspace
+/// knowing the document type.
+#[derive(Clone)]
+pub struct PaneAction {
+    /// Stable within the pane; keys the menu row's element id.
+    pub id: gpui::SharedString,
+    pub label: gpui::SharedString,
+    pub icon: Option<datatab_components::icons::AppIcon>,
+    /// The keys that run the same action directly, shown beside the label.
+    pub shortcut: Option<gpui::SharedString>,
+    /// A disabled entry is listed but cannot be chosen, like a disabled
+    /// toolbar button.
+    pub enabled: bool,
+    pub run: PaneActionRun,
+}
+
+impl PaneAction {
+    /// An entry that runs `command`. Its shortcut is the keys the effective
+    /// keymap gives the command in `context`, so a rebinding shows here too.
+    pub fn command(
+        id: impl Into<gpui::SharedString>,
+        label: impl Into<gpui::SharedString>,
+        command: Command,
+        context: ContextId,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            icon: None,
+            shortcut: datatab_ui_base::keymap::shortcut_label(context, command),
+            enabled: true,
+            run: PaneActionRun::Command(command),
+        }
+    }
+
+    /// An entry that runs `callback`, for an action without a command.
+    pub fn callback(
+        id: impl Into<gpui::SharedString>,
+        label: impl Into<gpui::SharedString>,
+        callback: impl Fn(&mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            label: label.into(),
+            icon: None,
+            shortcut: None,
+            enabled: true,
+            run: PaneActionRun::Callback(std::rc::Rc::new(callback)),
+        }
+    }
+
+    pub fn icon(mut self, icon: datatab_components::icons::AppIcon) -> Self {
+        self.icon = Some(icon);
+        self
+    }
+
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+}
+
+/// Callback a document supplies when it asks for an object editor tab, invoked
+/// with the object's key after every successful save.
+pub type ObjectSavedCallback = std::rc::Rc<dyn Fn(&str, &mut App)>;
+
+/// A request to open one object-store text object in its own editor tab.
+///
+/// Raised by a document that browses an object store and drained generically
+/// by the workspace, the same way `take_pending_open_bucket` is. The callback
+/// keeps the requesting document in sync without the workspace (or this shell)
+/// knowing which concrete document type asked.
+#[derive(Clone)]
+pub struct ObjectEditorRequest {
+    pub bucket: String,
+    pub key: String,
+    /// Invoked with the key after a successful save, so the requesting
+    /// document can refresh its own view of that object.
+    pub on_saved: ObjectSavedCallback,
+}
+
+/// A snapshot of a code document's session state, used to reconstruct tabs
+/// on next launch and to write the session manifest.
+///
+/// Fields carry all data that `write_session_manifest` previously read directly
+/// from `DocumentHandle::Code { entity, .. }`. The `kind` field maps to the
+/// `tab_kind` column in `WorkspaceTab` (values: `"FileBacked"`, `"Scratch"`).
+#[derive(Clone)]
+pub struct CodeSessionTabSnapshot {
+    /// `"FileBacked"` or `"Scratch"` — maps to `WorkspaceTab::tab_kind`.
+    pub kind: &'static str,
+    pub id: super::types::DocumentId,
+    pub title: String,
+    pub language: datatab_core::QueryLanguage,
+    pub exec_ctx: datatab_core::ExecutionContext,
+    pub file_path: Option<std::path::PathBuf>,
+    pub scratch_path: Option<std::path::PathBuf>,
+    pub shadow_path: Option<std::path::PathBuf>,
+}
+
+/// Type-erased shell for an open document.
+///
+/// All 22 operations from the `DocumentHandle` interface are exposed here
+/// without leaking the concrete entity type. Each field is a heap-allocated
+/// closure capturing the typed `Entity<T>`.
+///
+/// GPUI constraint: closures capture `Entity<T>` (which is `Clone + 'static`).
+/// `Window` and `App` are always passed as per-call parameters and never captured.
+pub struct PaneHandle {
+    /// Document ID — cheap, sync, no `cx` required.
+    id: DocumentId,
+
+    /// Document kind — cheap, sync, no `cx` required.
+    kind: DocumentKind,
+
+    // --- Rendering and behaviour (per-call Window + App) ---
+    render: Box<dyn Fn(&mut Window, &mut App) -> AnyElement>,
+    focus: Box<dyn Fn(&mut Window, &mut App)>,
+    dispatch_command: Box<dyn Fn(Command, &mut Window, &mut App) -> bool>,
+
+    // --- Pure reads (shared &App) ---
+    meta_snapshot: Box<dyn Fn(&App) -> DocumentMetaSnapshot>,
+    tab_title: Box<dyn Fn(&App) -> String>,
+    can_close: Box<dyn Fn(&App) -> bool>,
+    connection_id: Box<dyn Fn(&App) -> Option<uuid::Uuid>>,
+    active_context: Box<dyn Fn(&App) -> ContextId>,
+    change_summary: Box<dyn Fn(&App) -> Option<String>>,
+    refresh_policy: Box<dyn Fn(&App) -> RefreshPolicy>,
+
+    // --- Side-effect reads (shared &App) ---
+    flush_auto_save: Box<dyn Fn(&App)>,
+
+    /// Flushes this document's pending edits for a graceful shutdown without
+    /// closing its tab, and reports whether a physical write is still queued or
+    /// running. `None` for documents with no persistence path.
+    pub flush_for_shutdown: Option<Box<dyn Fn(&mut App) -> bool>>,
+
+    /// Commits input the document still holds in an open editor, such as a
+    /// value typed into a grid cell before Enter, so the pending changes that
+    /// a close or a shutdown reads include it.
+    ///
+    /// Returns `false` when some input could not be committed, and a close must
+    /// then keep the document open. `None` for documents that hold no such
+    /// input.
+    pub commit_pending_input: Option<Box<dyn Fn(&mut App) -> bool>>,
+
+    // --- Mutations (&mut App) ---
+    set_active_tab: Box<dyn Fn(bool, &mut App)>,
+    set_refresh_policy: Box<dyn Fn(RefreshPolicy, &mut App)>,
+
+    // --- Dedup (&App, since all current is_* only call entity.read(cx)) ---
+    matches_dedup_key: Box<dyn Fn(&DocumentKey, &App) -> bool>,
+
+    // --- Subscription ---
+    subscribe: Box<dyn Fn(&mut App, BoxedDocEventCallback) -> Subscription>,
+
+    // --- Optional document-specific helpers ---
+    // Populated only when the pane supports the operation; `None` means
+    // the call site should skip or no-op.
+    /// Sets the category filter on audit-style documents.
+    pub set_category_filter: Option<Box<dyn Fn(Option<String>, &mut App)>>,
+
+    /// Sets (or clears) the correlation-id filter on audit-style documents.
+    ///
+    /// `Some(id_string)` applies the filter; `None` clears it.
+    /// `None` on the outer `Option` means the document does not support this operation.
+    pub set_correlation_filter: Option<Box<dyn Fn(Option<String>, &mut App)>>,
+
+    /// Returns true when this pane matches a given event-stream target.
+    pub matches_event_stream:
+        Option<Box<dyn Fn(uuid::Uuid, &datatab_core::EventStreamTarget, &App) -> bool>>,
+
+    /// Reports the cleanup an emptying close leaves behind, without touching the
+    /// disk.
+    ///
+    /// `Some(cleanup)` when this document's backing file may be deleted on close:
+    /// the buffer is empty and `cleanup.expected_bytes` are the bytes the document
+    /// last loaded or wrote there. A file changed outside datatab, a baseline
+    /// recorded for another path, and a missing baseline all report `None`, so the
+    /// file is kept (used by the empty-script cleanup in `actions/documents.rs`).
+    ///
+    /// The report is a candidate, not a verdict: the caller re-reads the file and
+    /// compares it against `expected_bytes` before removing anything, and does both
+    /// away from the UI thread — this used to read the whole file here, inside an
+    /// `&App`, which blocked the close gesture for as long as the disk took.
+    pub empty_script_cleanup: Option<Box<dyn Fn(&App) -> Option<EmptyScriptCleanup>>>,
+
+    /// Returns a session snapshot for code documents (used by session manifest).
+    pub session_tab_snapshot: Option<Box<dyn Fn(&App) -> Option<CodeSessionTabSnapshot>>>,
+
+    /// Tells the document that the workspace inspector was dismissed by the
+    /// user (× button or ESC). Documents that own inspector state clear it
+    /// here so the rail stays closed on subsequent tab activations.
+    pub mark_inspector_closed: Option<Box<dyn Fn(&mut App)>>,
+
+    /// Row-inspector tracking is transferred between table tabs so an open
+    /// inspector follows the active grid instead of showing stale content.
+    pub row_inspector_is_tracking: Option<Box<dyn Fn(&App) -> bool>>,
+    pub set_row_inspector_tracking: Option<Box<dyn Fn(bool, &mut App)>>,
+
+    /// The value panel is transferred the same way, so switching tables keeps
+    /// it open and re-points it at the new grid's cell.
+    pub value_panel_is_open: Option<Box<dyn Fn(&App) -> bool>>,
+    pub set_value_panel_open: Option<Box<dyn Fn(bool, &mut App)>>,
+
+    /// Returns the document's contributed status-bar segments (e.g. engine +
+    /// region, bucket path, key count, last-operation timing). `None` means
+    /// the document does not contribute any — `StatusBar` renders nothing
+    /// extra for it, unchanged from today's behavior.
+    pub status_segments: Option<Box<dyn Fn(&App) -> Vec<StatusSegment>>>,
+
+    /// Returns key=value entries the workspace adds to its root key context
+    /// while this document owns the keyboard (`vim_mode=normal`,
+    /// `language=sql`), so keymap predicates can name them.
+    pub key_context_entries:
+        Option<Box<dyn Fn(&App) -> Vec<(gpui::SharedString, gpui::SharedString)>>>,
+
+    /// Returns the text of the tab's hover tooltip (a script's file path).
+    /// `None`, or a closure returning `None`, shows no tooltip.
+    pub tab_tooltip: Option<Box<dyn Fn(&App) -> Option<gpui::SharedString>>>,
+
+    /// Drains a browse-this-bucket intent raised by row activation (Enter),
+    /// same `pending_*` + `take()` convention as the other optional helpers.
+    /// Only `BucketsTableDocument` populates this — the workspace polls the
+    /// active tab for it each render pass and opens `ObjectBrowserDocument`
+    /// on `Some`. `None` on the outer `Option` means the document never
+    /// raises this intent.
+    pub take_pending_open_bucket: Option<Box<dyn Fn(&mut App) -> Option<String>>>,
+
+    /// Drains an open-this-object-in-an-editor-tab intent, same convention as
+    /// `take_pending_open_bucket`. Only object-browsing documents populate it.
+    pub take_pending_open_object_editor:
+        Option<Box<dyn Fn(&mut App) -> Option<ObjectEditorRequest>>>,
+
+    /// Opens `path` of a hierarchical secret store in its existing tab, so a
+    /// path activated in the sidebar navigates the store's one tab. Only
+    /// `SecretStoreDocument` populates it.
+    pub navigate_secret_path: Option<Box<dyn Fn(Option<String>, &mut App)>>,
+
+    /// Returns the side panels the document currently shows, drawn by the
+    /// workspace as islands beside the document island. `None` for documents
+    /// that never show one.
+    pub side_panels: Option<Box<dyn Fn(&mut Window, &mut App) -> Vec<DocumentSidePanel>>>,
+
+    /// Returns the actions the document offers in its pane-actions menu right
+    /// now (see [`PaneAction`]). `None` for documents that offer none; the
+    /// workspace then opens no menu.
+    pub pane_actions: Option<Box<dyn Fn(&App) -> Vec<PaneAction>>>,
+
+    /// Runs document-owned asynchronous teardown before the pane is removed.
+    pub on_close: Option<Box<dyn Fn(&mut App)>>,
+
+    /// Saves the document as part of an interrupted close and asks the
+    /// workspace to close its tab once the write actually lands. `None` means
+    /// the document has no save path, so its tab keeps the pending changes.
+    pub save_for_close: Option<Box<dyn Fn(&mut Window, &mut App) -> bool>>,
+
+    /// Applies the document's pending edits as part of an interrupted close and
+    /// asks the workspace to close its tab once they actually land. `None` for
+    /// every document whose pending edits are not a database write.
+    pub apply_for_close: Option<Box<dyn Fn(&mut Window, &mut App) -> bool>>,
+
+    /// Decides what closing this document means, before its tab is removed.
+    ///
+    /// `None` means the document has no close policy of its own: the workspace
+    /// falls back to its existing behaviour. Set only by documents that persist
+    /// their pending edits as part of closing (code documents).
+    pub resolve_close: Option<Box<dyn Fn(&mut Window, &mut App) -> CloseDisposition>>,
+
+    /// Reports whether the document's close policy applies in its current
+    /// state.
+    ///
+    /// A document can have a close policy that does not apply in its current
+    /// state: a code document persists itself only when it has a file to
+    /// persist to, so an untitled buffer reports `false` here and keeps the
+    /// unsaved-changes dialog. `None` means the document has no close policy,
+    /// so its policy never applies; the workspace consults this through
+    /// [`PaneHandle::has_close_policy`] rather than reading the field directly.
+    pub decides_own_close: Option<Box<dyn Fn(&App) -> bool>>,
+
+    /// Reports what quitting means for the document's pending edits (see
+    /// [`QuitDisposition`]). `None` for documents that do not take part in
+    /// the quit check.
+    pub quit_disposition: Option<Box<dyn Fn(&App) -> QuitDisposition>>,
+
+    /// Saves the document for a quit the user confirmed, without closing its
+    /// tab, and reports the outcome through `DocumentEvent::SaveFinished`.
+    /// Returns whether a save started. `None` for documents without one.
+    pub save_for_quit: Option<Box<dyn Fn(&mut Window, &mut App) -> bool>>,
+
+    /// Drops the document's pending edits for a quit the user confirmed
+    /// without saving them, so the shutdown flush does not write them.
+    pub discard_for_quit: Option<Box<dyn Fn(&mut App)>>,
+
+    /// Positions a table document on one record from outside the document:
+    /// replaces its filter with an equality on `column = value` and reloads
+    /// (foreign-key navigation). `None` for documents that are not
+    /// table-backed.
+    pub apply_table_filter: Option<Box<dyn Fn(&str, &datatab_core::Value, &mut Window, &mut App)>>,
+
+    /// Reports whether an applied query-builder spec owns the document's
+    /// query composition, so the equality [`PaneHandle::apply_table_filter`]
+    /// writes would be ignored. `None` for documents that are not
+    /// table-backed.
+    pub has_applied_builder_query: Option<Box<dyn Fn(&App) -> bool>>,
+}
+
+impl PaneHandle {
+    /// Constructs a `PaneHandle` for documents that have no optional helpers.
+    ///
+    /// Called by per-document `into_pane` constructors for simple documents
+    /// (Chart, KeyValue) that do not need `set_category_filter`,
+    /// `matches_event_stream`, `empty_script_cleanup`, or `session_tab_snapshot`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_chart(
+        id: DocumentId,
+        kind: DocumentKind,
+        render: Box<dyn Fn(&mut Window, &mut App) -> AnyElement>,
+        focus: Box<dyn Fn(&mut Window, &mut App)>,
+        dispatch_command: Box<dyn Fn(Command, &mut Window, &mut App) -> bool>,
+        meta_snapshot: Box<dyn Fn(&App) -> DocumentMetaSnapshot>,
+        tab_title: Box<dyn Fn(&App) -> String>,
+        can_close: Box<dyn Fn(&App) -> bool>,
+        connection_id: Box<dyn Fn(&App) -> Option<uuid::Uuid>>,
+        active_context: Box<dyn Fn(&App) -> ContextId>,
+        change_summary: Box<dyn Fn(&App) -> Option<String>>,
+        refresh_policy: Box<dyn Fn(&App) -> RefreshPolicy>,
+        flush_auto_save: Box<dyn Fn(&App)>,
+        set_active_tab: Box<dyn Fn(bool, &mut App)>,
+        set_refresh_policy: Box<dyn Fn(RefreshPolicy, &mut App)>,
+        matches_dedup_key: Box<dyn Fn(&DocumentKey, &App) -> bool>,
+        subscribe: Box<dyn Fn(&mut App, BoxedDocEventCallback) -> Subscription>,
+    ) -> Self {
+        Self {
+            id,
+            kind,
+            render,
+            focus,
+            dispatch_command,
+            meta_snapshot,
+            tab_title,
+            can_close,
+            connection_id,
+            active_context,
+            change_summary,
+            refresh_policy,
+            flush_auto_save,
+            flush_for_shutdown: None,
+            commit_pending_input: None,
+            set_active_tab,
+            set_refresh_policy,
+            matches_dedup_key,
+            subscribe,
+            set_category_filter: None,
+            set_correlation_filter: None,
+            matches_event_stream: None,
+            empty_script_cleanup: None,
+            session_tab_snapshot: None,
+            mark_inspector_closed: None,
+            row_inspector_is_tracking: None,
+            set_row_inspector_tracking: None,
+            value_panel_is_open: None,
+            set_value_panel_open: None,
+            status_segments: None,
+            key_context_entries: None,
+            tab_tooltip: None,
+            take_pending_open_bucket: None,
+            take_pending_open_object_editor: None,
+            navigate_secret_path: None,
+            side_panels: None,
+            pane_actions: None,
+            on_close: None,
+            save_for_close: None,
+            apply_for_close: None,
+            resolve_close: None,
+            decides_own_close: None,
+            quit_disposition: None,
+            save_for_quit: None,
+            discard_for_quit: None,
+            apply_table_filter: None,
+            has_applied_builder_query: None,
+        }
+    }
+
+    /// Document ID — does not require `cx`.
+    pub fn id(&self) -> DocumentId {
+        self.id
+    }
+
+    /// Document kind — does not require `cx`.
+    pub fn kind(&self) -> DocumentKind {
+        self.kind
+    }
+
+    /// Renders the document into a GPUI element.
+    pub fn render(&self, window: &mut Window, cx: &mut App) -> AnyElement {
+        (self.render)(window, cx)
+    }
+
+    /// Transfers focus to the document's primary focus handle.
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        (self.focus)(window, cx)
+    }
+
+    /// Dispatches a keymap command to the document.
+    ///
+    /// Returns `true` if the command was handled.
+    pub fn dispatch_command(&self, cmd: Command, window: &mut Window, cx: &mut App) -> bool {
+        (self.dispatch_command)(cmd, window, cx)
+    }
+
+    /// Returns a cheap metadata snapshot for the tab bar.
+    pub fn meta_snapshot(&self, cx: &App) -> DocumentMetaSnapshot {
+        (self.meta_snapshot)(cx)
+    }
+
+    /// Returns the display title for the tab bar.
+    pub fn tab_title(&self, cx: &App) -> String {
+        (self.tab_title)(cx)
+    }
+
+    /// Returns `true` when the document can be closed without data loss.
+    pub fn can_close(&self, cx: &App) -> bool {
+        (self.can_close)(cx)
+    }
+
+    /// Returns the connection (profile) ID, if any.
+    pub fn connection_id(&self, cx: &App) -> Option<uuid::Uuid> {
+        (self.connection_id)(cx)
+    }
+
+    /// Returns the active keyboard context for this document.
+    pub fn active_context(&self, cx: &App) -> ContextId {
+        (self.active_context)(cx)
+    }
+
+    /// Returns a short description of pending changes for the dirty-dot tooltip.
+    pub fn change_summary(&self, cx: &App) -> Option<String> {
+        (self.change_summary)(cx)
+    }
+
+    /// Returns the current refresh policy.
+    pub fn refresh_policy(&self, cx: &App) -> RefreshPolicy {
+        (self.refresh_policy)(cx)
+    }
+
+    /// Flushes any pending auto-save for file-backed documents.
+    pub fn flush_auto_save(&self, cx: &App) {
+        (self.flush_auto_save)(cx)
+    }
+
+    /// Flushes this document's pending edits for a graceful shutdown.
+    ///
+    /// Returns `true` while a physical write is still queued or running so a
+    /// shutdown loop can poll. Never closes the tab and never reports through
+    /// the save/close flow. A pane with no persistence path returns `false`.
+    pub fn flush_for_shutdown(&self, cx: &mut App) -> bool {
+        self.flush_for_shutdown
+            .as_ref()
+            .map(|flush| flush(cx))
+            .unwrap_or(false)
+    }
+
+    /// Commits input the document still holds in an open editor.
+    ///
+    /// Called before a close decides whether to ask about pending changes, and
+    /// before a shutdown flush. Returns `false` when some input could not be
+    /// committed, so a close must keep the document open. A pane that holds no
+    /// such input returns `true` and changes nothing.
+    pub fn commit_pending_input(&self, cx: &mut App) -> bool {
+        self.commit_pending_input
+            .as_ref()
+            .is_none_or(|commit| commit(cx))
+    }
+
+    /// Notifies the document that it became (or stopped being) the active tab.
+    pub fn set_active_tab(&self, active: bool, cx: &mut App) {
+        (self.set_active_tab)(active, cx)
+    }
+
+    /// Updates the refresh policy on this document.
+    pub fn set_refresh_policy(&self, policy: RefreshPolicy, cx: &mut App) {
+        (self.set_refresh_policy)(policy, cx)
+    }
+
+    /// Returns `true` when this pane's identity matches `key`.
+    ///
+    /// Used by `TabManager::find_by_key` for deduplication.
+    pub fn matches_dedup_key(&self, key: &DocumentKey, cx: &App) -> bool {
+        (self.matches_dedup_key)(key, cx)
+    }
+
+    /// Subscribes to document events.
+    ///
+    /// The returned `Subscription` must be stored; dropping it cancels delivery.
+    pub fn subscribe<F>(&self, cx: &mut App, callback: F) -> Subscription
+    where
+        F: Fn(&DocumentEvent, &mut App) + 'static,
+    {
+        (self.subscribe)(cx, Box::new(callback))
+    }
+
+    /// Invokes the optional close hook before tab removal.
+    pub fn on_close(&self, cx: &mut App) {
+        if let Some(close) = self.on_close.as_ref() {
+            close(cx);
+        }
+    }
+
+    /// Starts a save for an interrupted close.
+    ///
+    /// Returns `false` when the document has no save path: the workspace must
+    /// then leave the tab open with its changes.
+    pub fn save_for_close(&self, window: &mut Window, cx: &mut App) -> bool {
+        if let Some(save) = self.save_for_close.as_ref() {
+            save(window, cx)
+        } else {
+            false
+        }
+    }
+
+    /// Starts applying this document's pending edits for an interrupted close.
+    ///
+    /// Returns `false` when the document has no apply path: the workspace must
+    /// then leave the tab open with its changes.
+    pub fn apply_for_close(&self, window: &mut Window, cx: &mut App) -> bool {
+        if let Some(apply) = self.apply_for_close.as_ref() {
+            apply(window, cx)
+        } else {
+            false
+        }
+    }
+
+    /// What this document's pending edits are brought to when a close keeps them.
+    ///
+    /// Derived from which close action the pane provides rather than stored, so
+    /// the word the dialog shows cannot disagree with the work the action does.
+    pub fn close_action(&self) -> CloseAction {
+        if self.apply_for_close.is_some() {
+            CloseAction::Apply
+        } else {
+            CloseAction::Save
+        }
+    }
+
+    /// Returns `true` when this document currently decides its own close
+    /// policy.
+    ///
+    /// A document can have a close policy that does not apply in its current
+    /// state: a code document persists itself only when it has a file to
+    /// persist to, so an untitled buffer reports `false` and keeps the
+    /// unsaved-changes dialog. The workspace consults this before deferring to
+    /// [`PaneHandle::resolve_close`]; a document whose policy does not apply is
+    /// never closed over its pending edits without an explicit user decision.
+    pub fn has_close_policy(&self, cx: &App) -> bool {
+        self.resolve_close.is_some()
+            && self
+                .decides_own_close
+                .as_ref()
+                .is_none_or(|decides| decides(cx))
+    }
+
+    /// Asks the document what closing means now.
+    ///
+    /// A pane with no close policy reports [`CloseDisposition::CloseNow`], so
+    /// callers keep today's behaviour for every other document type.
+    pub fn resolve_close(&self, window: &mut Window, cx: &mut App) -> CloseDisposition {
+        match self.resolve_close.as_ref() {
+            Some(resolve) => resolve(window, cx),
+            None => CloseDisposition::CloseNow,
+        }
+    }
+
+    /// What quitting means for the document's pending edits. A pane that
+    /// does not take part in the quit check reports
+    /// [`QuitDisposition::Clean`].
+    pub fn quit_disposition(&self, cx: &App) -> QuitDisposition {
+        self.quit_disposition
+            .as_ref()
+            .map_or(QuitDisposition::Clean, |disposition| disposition(cx))
+    }
+
+    /// Starts the save of a quit the user confirmed. Returns `false` when the
+    /// document has no such save, or could not start one.
+    pub fn save_for_quit(&self, window: &mut Window, cx: &mut App) -> bool {
+        self.save_for_quit
+            .as_ref()
+            .is_some_and(|save| save(window, cx))
+    }
+
+    /// Drops the pending edits for a quit the user confirmed without saving.
+    pub fn discard_for_quit(&self, cx: &mut App) {
+        if let Some(discard) = self.discard_for_quit.as_ref() {
+            discard(cx);
+        }
+    }
+
+    /// Positions the document's table on one record: replaces its filter with
+    /// an equality on `column = value` and reloads. A pane that does not
+    /// support it does nothing.
+    pub fn apply_table_filter(
+        &self,
+        column: &str,
+        value: &datatab_core::Value,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(apply) = self.apply_table_filter.as_ref() {
+            apply(column, value, window, cx);
+        }
+    }
+
+    /// Whether an applied builder query owns the document's refresh, so the
+    /// equality `apply_table_filter` writes would be ignored. A pane without
+    /// the helper never reports one.
+    pub fn has_applied_builder_query(&self, cx: &App) -> bool {
+        self.has_applied_builder_query
+            .as_ref()
+            .is_some_and(|has| has(cx))
+    }
+
+    /// Returns the document's contributed status-bar segments.
+    ///
+    /// Returns an empty `Vec` for every document that does not populate
+    /// `status_segments` — the default, unchanged behavior for existing
+    /// documents.
+    pub fn status_segments(&self, cx: &App) -> Vec<StatusSegment> {
+        self.status_segments
+            .as_ref()
+            .map(|f| f(cx))
+            .unwrap_or_default()
+    }
+
+    /// Key context entries the document contributes while it owns the
+    /// keyboard; empty for documents that contribute none.
+    pub fn key_context_entries(&self, cx: &App) -> Vec<(gpui::SharedString, gpui::SharedString)> {
+        self.key_context_entries
+            .as_ref()
+            .map(|entries| entries(cx))
+            .unwrap_or_default()
+    }
+
+    /// The side panels the document shows right now; empty for documents
+    /// that never show one.
+    pub fn side_panels(&self, window: &mut Window, cx: &mut App) -> Vec<DocumentSidePanel> {
+        self.side_panels
+            .as_ref()
+            .map(|panels| panels(window, cx))
+            .unwrap_or_default()
+    }
+
+    /// The entries of the document's pane-actions menu right now; empty for
+    /// documents that offer none.
+    pub fn pane_actions(&self, cx: &App) -> Vec<PaneAction> {
+        self.pane_actions
+            .as_ref()
+            .map(|actions| actions(cx))
+            .unwrap_or_default()
+    }
+
+    /// The tab's hover tooltip, if the document provides one.
+    pub fn tab_tooltip(&self, cx: &App) -> Option<gpui::SharedString> {
+        self.tab_tooltip.as_ref().and_then(|f| f(cx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Structural compile-time test: `PaneHandle` and `CodeSessionTabSnapshot`
+    /// exist and the public type alias `BoxedDocEventCallback` is accessible.
+    ///
+    /// This test cannot construct a `PaneHandle` (all fields are private closures
+    /// with no public constructor yet — constructors come in Arc 1). Instead it
+    /// verifies that the associated types and the `CodeSessionTabSnapshot` struct
+    /// compile without issue.
+    #[test]
+    fn code_session_tab_snapshot_constructs_and_clones() {
+        use datatab_core::{ExecutionContext, QueryLanguage};
+
+        let snap = CodeSessionTabSnapshot {
+            kind: "Scratch",
+            id: super::super::types::DocumentId::new(),
+            title: "Query 1".to_string(),
+            language: QueryLanguage::Sql,
+            exec_ctx: ExecutionContext::default(),
+            file_path: None,
+            scratch_path: Some(std::path::PathBuf::from("/tmp/scratch.sql")),
+            shadow_path: None,
+        };
+
+        let cloned = snap.clone();
+        assert_eq!(cloned.kind, "Scratch");
+        assert!(cloned.file_path.is_none());
+        assert!(cloned.scratch_path.is_some());
+    }
+
+    /// Verify that `BoxedDocEventCallback` is a valid type alias by constructing
+    /// a value that satisfies it. This is a compile-time shape test.
+    #[test]
+    fn boxed_doc_event_callback_type_alias_is_valid() {
+        // The closure type must match `Box<dyn Fn(&DocumentEvent, &mut App) + 'static>`.
+        // We just verify that the alias exists and a correctly-shaped closure
+        // compiles into it — we do not actually call it.
+        let _cb: BoxedDocEventCallback = Box::new(|_event: &DocumentEvent, _cx: &mut App| {});
+    }
+}

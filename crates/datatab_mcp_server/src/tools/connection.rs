@@ -1,0 +1,298 @@
+use rmcp::{
+    ErrorData, handler::server::wrapper::Parameters, model::CallToolResult, schemars::JsonSchema,
+    tool, tool_router,
+};
+use serde::Deserialize;
+
+use crate::{
+    helper::{IntoErrorData, to_json_content},
+    server::DataTabServer,
+    state::ServerState,
+};
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ConnectParams {
+    #[schemars(description = "Connection ID from DataTab configuration")]
+    pub connection_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct DisconnectParams {
+    #[schemars(description = "Connection ID to disconnect")]
+    pub connection_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct GetConnectionInfoParams {
+    #[schemars(description = "Connection ID to get info for")]
+    pub connection_id: String,
+}
+
+#[tool_router(router = connection_router, vis = "pub")]
+impl DataTabServer {
+    #[tool(description = "List all available database connections configured in DataTab")]
+    async fn list_connections(&self) -> Result<CallToolResult, ErrorData> {
+        use datatab_policy::ExecutionClassification;
+
+        let state = self.governance.state.clone();
+        self.governance
+            .authorize_and_execute(
+                "list_connections",
+                None,
+                ExecutionClassification::Metadata,
+                move || async move {
+                    let pm = state.profile_manager.read().await;
+                    let runtime = state.runtime.read().await;
+                    let client_id = &state.client_id;
+
+                    // Only show connections where this client has an assignment
+                    let connections: Vec<serde_json::Value> = pm
+                        .profiles
+                        .iter()
+                        .filter(|profile| {
+                            // Check if profile has MCP enabled
+                            let mcp_enabled = profile
+                                .mcp_governance
+                                .as_ref()
+                                .map(|g| g.enabled)
+                                .unwrap_or(state.mcp_enabled_by_default);
+
+                            if !mcp_enabled {
+                                return false;
+                            }
+
+                            // Check if client has an assignment for this connection
+                            runtime
+                                .policy_assignments_for_engine()
+                                .iter()
+                                .any(|assignment| {
+                                    assignment.actor_id == *client_id
+                                        && assignment.scope.connection_id == profile.id.to_string()
+                                })
+                        })
+                        .map(|profile| {
+                            serde_json::json!({
+                                "id": profile.id.to_string(),
+                                "name": profile.name,
+                                "driver_id": profile.driver_id(),
+                                "kind": format!("{:?}", profile.kind()),
+                            })
+                        })
+                        .collect();
+
+                    let json_output = serde_json::json!({ "connections": connections });
+                    Ok(CallToolResult::success(vec![to_json_content(
+                        &json_output,
+                    )?]))
+                },
+            )
+            .await
+    }
+
+    #[tool(
+        description = "Connect to a database using a configured connection. The response reports `current_database` and the `databases` available on the server when the driver has databases; pass the `database` parameter of other tools to target a different one."
+    )]
+    async fn connect(
+        &self,
+        Parameters(params): Parameters<ConnectParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        use datatab_policy::ExecutionClassification;
+
+        let state = self.state.clone();
+        let connection_id = params.connection_id.clone();
+
+        self.governance
+            .authorize_and_execute(
+                "connect",
+                Some(&params.connection_id),
+                ExecutionClassification::Metadata,
+                move || async move {
+                    let response = Self::connect_impl(state, &connection_id)
+                        .await
+                        .map_err(|e| e.into_error_data())?;
+
+                    Ok(CallToolResult::success(vec![to_json_content(&response)?]))
+                },
+            )
+            .await
+    }
+
+    pub(crate) async fn connect_impl(
+        state: ServerState,
+        connection_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        let connection = Self::connect_cached(state.clone(), connection_id).await?;
+
+        let context = Self::database_context(&state, connection_id, connection).await;
+
+        let mut response = serde_json::json!({
+            "success": true,
+            "message": format!("Connected to {}", connection_id)
+        });
+
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "response is an object literal from serde_json::json!; indexing a Value \
+                object with a str key cannot panic (missing keys yield Null)"
+        )]
+        if let Some(current_database) = context.current_database {
+            response["current_database"] = serde_json::Value::String(current_database);
+        }
+
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "response is an object literal from serde_json::json!; indexing a Value \
+                object with a str key cannot panic (missing keys yield Null)"
+        )]
+        if !context.databases.is_empty() {
+            response["databases"] = serde_json::json!(context.databases);
+        }
+
+        Ok(response)
+    }
+
+    #[tool(description = "Disconnect from a database connection")]
+    async fn disconnect(
+        &self,
+        Parameters(params): Parameters<DisconnectParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        use datatab_policy::ExecutionClassification;
+
+        let state = self.state.clone();
+        let connection_id = params.connection_id.clone();
+
+        self.governance
+            .authorize_and_execute(
+                "disconnect",
+                Some(&params.connection_id),
+                ExecutionClassification::Metadata,
+                move || async move {
+                    Self::disconnect_impl(state, &connection_id)
+                        .await
+                        .map_err(|error| ErrorData::internal_error(error, None))?;
+
+                    Ok(CallToolResult::success(vec![to_json_content(
+                        &serde_json::json!({
+                            "success": true,
+                            "message": format!("Disconnected from {}", connection_id)
+                        }),
+                    )?]))
+                },
+            )
+            .await
+    }
+
+    #[tool(
+        description = "Get information about a database connection (version, server info, status)"
+    )]
+    async fn get_connection_info(
+        &self,
+        Parameters(params): Parameters<GetConnectionInfoParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        use datatab_core::QueryRequest;
+        use datatab_policy::ExecutionClassification;
+
+        let state = self.state.clone();
+        let connection_id = params.connection_id.clone();
+
+        self.governance
+            .authorize_and_execute(
+                "get_connection_info",
+                Some(&params.connection_id),
+                ExecutionClassification::Metadata,
+                move || async move {
+                    let conn = Self::get_or_connect(state.clone(), &connection_id)
+                        .await
+                        .map_err(|e| e.into_error_data())?;
+
+                    let driver_type = format!("{:?}", conn.kind());
+                    let category = conn.metadata().category;
+                    let current_database =
+                        Self::execute_connection_blocking(conn.clone(), move |connection| {
+                            Ok(connection.active_database())
+                        })
+                        .await
+                        .map_err(|e| e.into_error_data())?;
+                    let conn_for_blocking = conn.clone();
+
+                    let blocking_result: Result<Option<String>, tokio::task::JoinError> =
+                        tokio::task::spawn_blocking(move || {
+                            // A driver without a version query reports
+                            // not-supported instead of panicking: skip the
+                            // probe and leave the version out of the
+                            // response rather than failing the call.
+                            let Ok(version_query) = conn_for_blocking.version_query() else {
+                                return None;
+                            };
+
+                            // `confirmed_ceiling` mirrors the classification
+                            // this call site was already authorised at
+                            // (`Metadata`, above) — never a value the MCP
+                            // client supplied. See
+                            // `QueryRequest::confirmed_ceiling`'s invariant.
+                            let result = conn_for_blocking.execute(&QueryRequest {
+                                sql: version_query.to_string(),
+                                params: Vec::new(),
+                                limit: Some(1),
+                                offset: None,
+                                statement_timeout: None,
+                                database: None,
+                                execution_context: None,
+                                confirmed_ceiling: Some(ExecutionClassification::Metadata),
+                                read_only: datatab_core::ReadOnlyEnforcement::None,
+                            });
+
+                            result.ok().and_then(|r| {
+                                #[expect(
+                                    clippy::indexing_slicing,
+                                    reason = "the condition guards rows with !is_empty() and \
+                                        rows[0] with !is_empty(), so both row[0] accesses are \
+                                        within bounds"
+                                )]
+                                if !r.rows.is_empty() && !r.rows[0].is_empty() {
+                                    Some(format!("{:?}", r.rows[0][0]))
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .await;
+
+                    let version_info = blocking_result
+                        .map_err(|e| format!("Blocking task failed: {}", e))
+                        .ok()
+                        .flatten();
+
+                    let mut info = serde_json::json!({
+                        "connection_id": connection_id,
+                        "driver_type": driver_type,
+                        "category": format!("{:?}", category),
+                        "status": "connected",
+                    });
+
+                    #[expect(
+                        clippy::indexing_slicing,
+                        reason = "info is an object literal from serde_json::json!; indexing \
+                            a Value object with a str key cannot panic (missing keys yield \
+                            Null)"
+                    )]
+                    if let Some(version) = version_info {
+                        info["version"] = serde_json::Value::String(version);
+                    }
+
+                    #[expect(
+                        clippy::indexing_slicing,
+                        reason = "info is an object literal from serde_json::json!; indexing \
+                            a Value object with a str key cannot panic (missing keys yield \
+                            Null)"
+                    )]
+                    if let Some(db) = current_database {
+                        info["current_database"] = serde_json::Value::String(db);
+                    }
+
+                    Ok(CallToolResult::success(vec![to_json_content(&info)?]))
+                },
+            )
+            .await
+    }
+}

@@ -1,0 +1,1357 @@
+use super::*;
+use datatab_components::composites::{EmptyState, SplitButton, result_tab, result_tab_bar};
+use datatab_components::controls::Checkbox;
+use datatab_components::controls::{Button, ButtonVariant};
+use datatab_components::fonts;
+use datatab_components::helpers::text_color_for_active;
+use datatab_components::modals::modal::{Modal, ModalVariant};
+use datatab_components::modals::{modal_code, modal_lead};
+use datatab_components::primitives::{
+    Badge, BadgeTone, BannerBlock, BannerVariant, Icon, Kbd, Text,
+};
+use datatab_components::tokens::{
+    ChamferCut, ChromeColors, EditorMetrics, Fields, ModalMetrics, TableViewMetrics, ui,
+};
+use datatab_components::typography::AppFonts;
+use datatab_components::vim::VimBinding;
+use datatab_ui_base::keymap::{CODE_EDITOR_KEY_CONTEXT, RunCommand};
+use datatab_ui_base::toast::{Toast, copy_action, now_hms};
+use gpui::KeyContext;
+use gpui_component::scroll::ScrollableElement;
+
+impl CodeDocument {
+    /// The toolbar as pane actions (see [`crate::pane::PaneAction`]): the
+    /// same buttons, under the same conditions, so the whole toolbar is
+    /// reachable from the pane-actions menu. `entity` is this document, for
+    /// the entries that call back into it.
+    pub(crate) fn pane_actions(&self, entity: &Entity<Self>) -> Vec<crate::pane::PaneAction> {
+        use crate::pane::PaneAction;
+
+        if self.read_only {
+            return Vec::new();
+        }
+
+        let is_executing = self.state == DocumentState::Executing;
+        let is_db_language = self.supports_connection_context();
+        let context = ContextId::Editor;
+        let mut actions = Vec::new();
+
+        if is_executing {
+            actions.push(
+                PaneAction::command(
+                    "run",
+                    datatab_i18n::t!("document.code.toolbar.cancel"),
+                    Command::CancelQuery,
+                    context,
+                )
+                .icon(AppIcon::X),
+            );
+        } else {
+            actions.push(
+                PaneAction::command(
+                    "run",
+                    datatab_i18n::t!("document.code.toolbar.run"),
+                    Command::RunQuery,
+                    context,
+                )
+                .icon(AppIcon::Play)
+                .enabled(!self.drift.preflight_running),
+            );
+        }
+
+        if is_db_language && !is_executing {
+            actions.push(
+                PaneAction::command(
+                    "run-in-new-tab",
+                    datatab_i18n::t!("document.code.toolbar.run_in_new_tab"),
+                    Command::RunQueryInNewTab,
+                    context,
+                )
+                .icon(AppIcon::SquarePlay),
+            );
+        }
+
+        actions.push(
+            PaneAction::command(
+                "save",
+                datatab_i18n::t!("document.code.toolbar.save"),
+                Command::SaveQuery,
+                context,
+            )
+            .icon(AppIcon::Save),
+        );
+
+        actions.push(
+            PaneAction::callback(
+                "format",
+                datatab_i18n::t!("document.code.toolbar.formatter_unavailable"),
+                |_window, _cx| {},
+            )
+            .icon(AppIcon::Zap)
+            .enabled(false),
+        );
+
+        actions.push(
+            PaneAction::command(
+                "history",
+                datatab_i18n::t!("document.code.toolbar.query_history"),
+                Command::ToggleHistoryDropdown,
+                context,
+            )
+            .icon(AppIcon::History),
+        );
+
+        if is_db_language {
+            let document = entity.clone();
+            actions.push(
+                PaneAction::callback(
+                    "explain",
+                    datatab_i18n::t!("document.code.toolbar.explain_query"),
+                    move |window, cx| {
+                        document.update(cx, |document, cx| document.run_explain(window, cx));
+                    },
+                )
+                .icon(AppIcon::Info),
+            );
+        }
+
+        let document = entity.clone();
+        actions.push(
+            PaneAction::callback(
+                "chart",
+                datatab_i18n::t!("document.code.toolbar.open_in_chart"),
+                move |_window, cx| {
+                    document.update(cx, |document, cx| document.emit_chart_this_query(cx));
+                },
+            )
+            .icon(AppIcon::ChartColumnBig),
+        );
+
+        actions.extend(self.results_pane_actions());
+
+        actions
+    }
+
+    /// The results header as pane actions, while there are results to show:
+    /// Refresh and the auto-refresh interval, the result tabs (switch, close)
+    /// and the maximize and hide buttons.
+    fn results_pane_actions(&self) -> Vec<crate::pane::PaneAction> {
+        use crate::pane::PaneAction;
+
+        let mut actions = Vec::new();
+        let tab_count = self.result_tabs.result_tabs.len();
+
+        // The interval dropdown lives in the results header, so it can only
+        // take focus while the header is drawn.
+        if self.shows_results_header() && self.supports_connection_context() {
+            let refresh_command = if self.runner.is_primary_active() {
+                Command::CancelQuery
+            } else {
+                Command::RunQuery
+            };
+
+            actions.push(
+                PaneAction::command(
+                    "refresh",
+                    datatab_i18n::t!("document.code.toolbar.refresh"),
+                    refresh_command,
+                    ContextId::Editor,
+                )
+                .icon(AppIcon::RefreshCcw),
+            );
+
+            let dropdown = self.refresh.refresh_dropdown.clone();
+            actions.push(
+                PaneAction::callback(
+                    "auto-refresh",
+                    datatab_i18n::t!("document.code.toolbar.auto_refresh_interval"),
+                    move |window, cx| {
+                        dropdown.update(cx, |dropdown, cx| dropdown.focus_and_open(window, cx));
+                    },
+                )
+                .icon(AppIcon::Clock),
+            );
+        }
+
+        if tab_count > 0 {
+            actions.push(
+                PaneAction::command(
+                    "next-result-tab",
+                    datatab_i18n::t!("document.code.toolbar.next_result_tab"),
+                    Command::NextResultTab,
+                    ContextId::Results,
+                )
+                .icon(AppIcon::ChevronRight)
+                .enabled(tab_count > 1),
+            );
+            actions.push(
+                PaneAction::command(
+                    "previous-result-tab",
+                    datatab_i18n::t!("document.code.toolbar.previous_result_tab"),
+                    Command::PrevResultTab,
+                    ContextId::Results,
+                )
+                .icon(AppIcon::ChevronLeft)
+                .enabled(tab_count > 1),
+            );
+            actions.push(
+                PaneAction::command(
+                    "close-result-tab",
+                    datatab_i18n::t!("document.code.toolbar.close_result_tab"),
+                    Command::CloseResultTab,
+                    ContextId::Results,
+                )
+                .icon(AppIcon::CircleX),
+            );
+        }
+
+        if tab_count == 0 && self.execution.live_output.is_none() {
+            return actions;
+        }
+
+        let (maximize_label, maximize_icon) = if self.results_maximized {
+            (
+                datatab_i18n::t!("document.code.toolbar.restore_results"),
+                AppIcon::Minimize2,
+            )
+        } else {
+            (
+                datatab_i18n::t!("document.code.toolbar.maximize_results"),
+                AppIcon::Maximize2,
+            )
+        };
+        actions.push(
+            PaneAction::command(
+                "maximize-results",
+                maximize_label,
+                Command::ToggleResults,
+                ContextId::Editor,
+            )
+            .icon(maximize_icon),
+        );
+
+        let hidden = self.layout == SqlQueryLayout::EditorOnly;
+        let (hide_id, hide_label, hide_icon) = if hidden {
+            (
+                "show-results",
+                datatab_i18n::t!("document.code.toolbar.show_results"),
+                self.results_position.show_icon(),
+            )
+        } else {
+            (
+                "hide-results",
+                datatab_i18n::t!("document.code.toolbar.hide_results"),
+                self.results_position.hide_icon(),
+            )
+        };
+        actions.push(
+            PaneAction::command(
+                hide_id,
+                hide_label,
+                Command::ToggleEditor,
+                ContextId::Editor,
+            )
+            .icon(hide_icon),
+        );
+
+        let (position_label, position_icon) = self.results_position.toggle_label_and_icon();
+        actions.push(
+            PaneAction::command(
+                "results-position",
+                position_label,
+                Command::ToggleResultsPosition,
+                ContextId::Editor,
+            )
+            .icon(position_icon),
+        );
+
+        actions
+    }
+
+    /// The editor action strip (IslEditor): a column of icon buttons on the
+    /// editor's left edge, with Run first and set apart by a short line. The
+    /// buttons keep the ids the toolbar row had. A read-only document has no
+    /// strip.
+    fn render_action_strip(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.read_only {
+            return None;
+        }
+
+        let theme = cx.theme().clone();
+        let is_executing = self.state == DocumentState::Executing;
+        let is_preflight = self.drift.preflight_running;
+        let is_db_language = self.supports_connection_context();
+        let history_open = self.history.history_panel.read(cx).is_visible();
+
+        let (run_icon, run_label, run_enabled) = if is_executing {
+            (
+                AppIcon::X,
+                datatab_i18n::t!("document.code.toolbar.cancel"),
+                true,
+            )
+        } else if is_preflight {
+            (
+                AppIcon::Loader,
+                datatab_i18n::t!("document.code.toolbar.checking"),
+                false,
+            )
+        } else {
+            (
+                AppIcon::Play,
+                datatab_i18n::t!("document.code.toolbar.run"),
+                true,
+            )
+        };
+
+        // Keep this shortcut in sync with the RunQuery binding (Cmd+Enter on
+        // macOS, Ctrl+Enter elsewhere) registered in `keymap::defaults`.
+        #[cfg(target_os = "macos")]
+        let run_shortcut = "Cmd \u{21B5}";
+        #[cfg(not(target_os = "macos"))]
+        let run_shortcut = "Ctrl \u{21B5}";
+
+        let run_tooltip: SharedString = if is_executing || is_preflight {
+            run_label.clone().into()
+        } else {
+            format!("{run_label} ({run_shortcut})").into()
+        };
+
+        let strip = div()
+            .id("editor-action-strip")
+            .debug_selector(|| "editor-action-strip".to_string())
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .items_center()
+            .w(EditorMetrics::ACTION_STRIP_WIDTH)
+            .h_full()
+            // The editor pane can be dragged shorter than the strip.
+            .overflow_y_scroll()
+            .pt(EditorMetrics::ACTION_STRIP_PADDING_TOP)
+            .gap(EditorMetrics::ACTION_STRIP_GAP)
+            .border_r_1()
+            .border_color(theme.border)
+            .child(
+                Button::new("run-query-btn", run_label)
+                    .icon(run_icon)
+                    .icon_only()
+                    .inline()
+                    .tooltip(run_tooltip)
+                    .variant(if is_executing {
+                        ButtonVariant::Danger
+                    } else {
+                        ButtonVariant::Primary
+                    })
+                    .disabled(!run_enabled)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        if this.state == DocumentState::Executing {
+                            this.cancel_query(cx);
+                        } else {
+                            this.run_query(window, cx);
+                        }
+                    })),
+            )
+            .child(
+                div()
+                    .w(EditorMetrics::ACTION_STRIP_SEPARATOR_WIDTH)
+                    .h(px(1.0))
+                    .my(EditorMetrics::ACTION_STRIP_SEPARATOR_MARGIN_Y)
+                    .bg(theme.border),
+            )
+            .when(is_db_language && !is_executing, |el| {
+                el.child(
+                    Button::new(
+                        "run-in-new-tab-btn",
+                        datatab_i18n::t!("document.code.toolbar.run_in_new_tab"),
+                    )
+                    .icon(AppIcon::SquarePlay)
+                    .icon_only()
+                    .inline()
+                    .ghost()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.run_query_in_new_tab(window, cx);
+                    })),
+                )
+            })
+            .child(
+                Button::new(
+                    "toolbar-save-btn",
+                    datatab_i18n::t!("document.code.toolbar.save"),
+                )
+                .icon(AppIcon::Save)
+                .icon_only()
+                .inline()
+                .ghost()
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if this.is_file_backed() {
+                        this.save_file(window, cx);
+                    } else {
+                        this.save_file_as(window, cx);
+                    }
+                })),
+            )
+            .child(
+                Button::new(
+                    "toolbar-format-btn",
+                    datatab_i18n::t!("document.code.toolbar.formatter_unavailable"),
+                )
+                .icon(AppIcon::Zap)
+                .icon_only()
+                .inline()
+                .ghost()
+                .disabled(true),
+            )
+            .child(
+                Button::new(
+                    "toolbar-history-btn",
+                    datatab_i18n::t!("document.code.toolbar.query_history"),
+                )
+                .icon(AppIcon::History)
+                .icon_only()
+                .inline()
+                .ghost()
+                .selected(history_open)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    let is_open = this.history.history_panel.read(cx).is_visible();
+                    if is_open {
+                        this.history
+                            .history_panel
+                            .update(cx, |panel, cx| panel.close(cx));
+                    } else {
+                        this.history
+                            .history_panel
+                            .update(cx, |panel, cx| panel.open(window, cx));
+                    }
+                })),
+            )
+            .when(is_db_language, |el| {
+                el.child(
+                    Button::new(
+                        "toolbar-explain-btn",
+                        datatab_i18n::t!("document.code.toolbar.explain_query"),
+                    )
+                    .icon(AppIcon::Info)
+                    .icon_only()
+                    .inline()
+                    .ghost()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.run_explain(window, cx);
+                    })),
+                )
+            })
+            .child(
+                Button::new(
+                    "toolbar-chart-btn",
+                    datatab_i18n::t!("document.code.toolbar.open_in_chart"),
+                )
+                .icon(AppIcon::ChartColumnBig)
+                .icon_only()
+                .inline()
+                .ghost()
+                .on_click(cx.listener(|this, _, _window, cx| {
+                    this.emit_chart_this_query(cx);
+                })),
+            );
+
+        Some(strip.into_any_element())
+    }
+
+    /// The Refresh split button at the end of the results header: run the
+    /// query again (cancel while it runs) and pick an auto-refresh interval.
+    fn render_results_refresh(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let is_executing = self.state == DocumentState::Executing;
+        let auto_refresh_enabled = self.refresh.refresh_policy.is_auto();
+
+        let refresh_label = if auto_refresh_enabled {
+            crate::labels::refresh_policy_label(self.refresh.refresh_policy)
+        } else {
+            datatab_i18n::t!("document.code.toolbar.refresh")
+        };
+        let refresh_icon = if is_executing {
+            AppIcon::Loader
+        } else if auto_refresh_enabled {
+            AppIcon::Clock
+        } else {
+            AppIcon::RefreshCcw
+        };
+        let refresh_menu_focused = self.refresh.refresh_dropdown.read(cx).is_focused(window);
+
+        SplitButton::new(
+            "sql-refresh-split",
+            Button::new("sql-refresh-action", refresh_label)
+                .icon(refresh_icon)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if this.runner.is_primary_active() {
+                        this.cancel_query(cx);
+                    } else {
+                        this.run_query(window, cx);
+                    }
+                })),
+            self.refresh.refresh_dropdown.clone(),
+        )
+        .menu_focused(refresh_menu_focused)
+        .into_any_element()
+    }
+
+    fn render_editor(&self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let bg = cx.theme().background;
+
+        // Focus inside the editor shows through its caret; the pane draws no
+        // ring of its own.
+        let mut key_context = KeyContext::default();
+        key_context.add(CODE_EDITOR_KEY_CONTEXT);
+        if let Some(identifier) = self.vim.leader_key_context(cx) {
+            key_context.add(identifier);
+        }
+        for (key, value) in self.key_context_entries(cx) {
+            key_context.set(key, value);
+        }
+
+        let editor = div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .min_h_0()
+            .bg(bg)
+            .key_context(key_context)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.enter_editor_mode(cx);
+                    this.editor
+                        .input_state
+                        .update(cx, |state, cx| state.focus(window, cx));
+                    cx.emit(DocumentEvent::RequestFocus);
+                }),
+            );
+
+        let input = self.vim.input_id();
+
+        VimBinding::wire(editor, input, cx)
+            // A keymap binding runs before the key listeners Vim installs. Vim
+            // takes its own keys ahead of a default binding, as it did when the
+            // workspace resolved keys after them; a binding the user made wins
+            // over Vim. Any other command drops a half-typed count or operator,
+            // and Cancel keeps the editor focused, as the Escape key listener
+            // does when no binding takes the key.
+            .capture_action(cx.listener(move |this, action: &RunCommand, window, cx| {
+                if let Some(command) = Command::from_action_id(&action.command)
+                    && this.handle_editor_overlay_pane_move(command, window, cx)
+                {
+                    cx.stop_propagation();
+                    return;
+                }
+
+                if VimBinding::route_binding(this, input, action.from_user_binding, window, cx) {
+                    cx.stop_propagation();
+                    return;
+                }
+
+                if Command::from_action_id(&action.command) == Some(Command::Cancel) {
+                    this.schedule_editor_refocus(window, cx);
+                }
+            }))
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if event.keystroke.key != "escape"
+                    || event.keystroke.modifiers.alt
+                    || event.keystroke.modifiers.control
+                    || event.keystroke.modifiers.shift
+                    || event.keystroke.modifiers.platform
+                    || event.keystroke.modifiers.function
+                {
+                    return;
+                }
+                this.schedule_editor_refocus(window, cx);
+            }))
+            .child(
+                div().flex_1().min_h_0().overflow_hidden().child(
+                    self.vim
+                        .editor(self.read_only)
+                        .appearance(false)
+                        .font_family(fonts::editor_family(cx))
+                        .text_size(fonts::editor_font_size(cx))
+                        .line_height(fonts::editor_line_height(cx))
+                        .w_full()
+                        .h_full(),
+                ),
+            )
+            .children(self.vim.render_indicator(cx))
+    }
+
+    /// Whether the results draw their header (result tabs, Refresh, maximize
+    /// and hide): there are result tabs and no script output replaces them.
+    fn has_results_header(&self) -> bool {
+        let has_error = self
+            .execution
+            .active_execution_index
+            .and_then(|index| self.execution.execution_history.get(index))
+            .is_some_and(|record| record.error.is_some());
+        let has_live_output = self.execution.live_output.is_some() && !has_error;
+
+        !has_live_output && !self.result_tabs.result_tabs.is_empty()
+    }
+
+    /// Whether the results header is on screen: it exists and the results
+    /// are not hidden.
+    fn shows_results_header(&self) -> bool {
+        self.has_results_header() && self.layout != SqlQueryLayout::EditorOnly
+    }
+
+    fn render_results(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let bg = cx.theme().background;
+        let is_executing = self.state == DocumentState::Executing;
+
+        let error = self
+            .execution
+            .active_execution_index
+            .and_then(|i| self.execution.execution_history.get(i))
+            .and_then(|r| r.error.clone());
+
+        let has_error = error.is_some();
+        let has_live_output = self.execution.live_output.is_some() && !has_error;
+        let active_panel = self.active_result_panel();
+        let has_panel = active_panel.is_some();
+        let has_tabs = self.has_results_header();
+
+        // The results show focus through their own grid cursor and tabs.
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .min_h_0()
+            .bg(bg)
+            .when(has_tabs, |el| {
+                el.child(self.render_results_header(window, cx))
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .when_some(error, |el, err| el.child(self.render_error_state(&err, cx)))
+                    .when(has_live_output, |el| el.child(self.render_live_output(cx)))
+                    .when(!has_live_output, |el| {
+                        el.when_some(active_panel, |el, panel| el.child(panel))
+                    })
+                    .when(
+                        !has_live_output && !has_panel && !has_error && is_executing,
+                        |el| el.child(self.render_loading_results(cx)),
+                    )
+                    .when(
+                        !has_live_output && !has_panel && !has_error && !is_executing,
+                        |el| el.child(self.render_empty_results(cx)),
+                    ),
+            )
+    }
+
+    fn render_live_output(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        #[expect(
+            clippy::expect_used,
+            reason = "the render path guards this call with has_live_output, computed as live_output.is_some(), in the same render pass"
+        )]
+        let live_output = self
+            .execution
+            .live_output
+            .as_ref()
+            .expect("live output state should exist when rendering");
+
+        let status = if self.state == DocumentState::Executing {
+            datatab_i18n::t!("document.code.output.running")
+        } else if live_output.is_finished() {
+            datatab_i18n::t!("document.code.output.stopped")
+        } else {
+            datatab_i18n::t!("document.code.output.output")
+        };
+
+        let text = SharedString::from(live_output.render_text());
+        let line_count_label = crate::labels::live_output_lines_label(live_output.line_count());
+
+        div()
+            .id("script-live-output")
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme.background)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px(Spacing::MD)
+                    .py(Spacing::SM)
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(Text::body(status))
+                    .child(Text::caption(line_count_label))
+                    .when(live_output.has_stderr(), |el| {
+                        el.child(Badge::new("stderr", BadgeTone::Warning))
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_y_scrollbar()
+                    .p(Spacing::MD)
+                    .child(div().whitespace_nowrap().child(Text::code(text))),
+            )
+            .when(live_output.is_truncated(), |el| {
+                el.child(div().px(Spacing::MD).pb(Spacing::SM).child(Text::caption(
+                    crate::labels::live_output_truncated_label(LiveOutputState::MAX_LINES),
+                )))
+            })
+    }
+
+    /// Result tabs strip (IslEditor): one tab per result with its row count
+    /// and a close button, then Refresh and the maximize and hide controls.
+    fn render_results_header(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_index = self.result_tabs.active_result_index;
+        let muted = cx.theme().muted_foreground;
+        let refresh = (!self.read_only && self.supports_connection_context())
+            .then(|| self.render_results_refresh(window, cx));
+
+        let tabs: Vec<AnyElement> = self
+            .result_tabs
+            .result_tabs
+            .iter()
+            .enumerate()
+            .map(|(i, tab)| {
+                let is_active = active_index == Some(i);
+                let tab_id = tab.id;
+                let row_count = tab.grid.read(cx).result().row_count();
+
+                result_tab(
+                    ElementId::Name(format!("result-tab-{}", tab.id).into()),
+                    tab.title.clone(),
+                    Some(crate::labels::row_count_label(row_count).into()),
+                    is_active,
+                    cx,
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.activate_result_tab(i, cx);
+                }))
+                .child(
+                    div()
+                        .id(ElementId::Name(
+                            format!("close-result-tab-{}", tab.id).into(),
+                        ))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_result_tab(tab_id, cx);
+                        }))
+                        .child(
+                            Icon::new(AppIcon::CircleX)
+                                .size(Fields::CHEVRON)
+                                .color(muted),
+                        ),
+                )
+                .into_any_element()
+            })
+            .collect();
+
+        result_tab_bar(cx)
+            .id("results-header")
+            .child(
+                div()
+                    .flex()
+                    .items_end()
+                    .h_full()
+                    .overflow_x_hidden()
+                    .flex_1()
+                    .children(tabs),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(Spacing::SM)
+                    .h_full()
+                    .children(refresh)
+                    .child(self.render_results_controls(cx)),
+            )
+    }
+
+    fn render_results_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let is_maximized = self.results_maximized;
+        let (_, position_icon) = self.results_position.toggle_label_and_icon();
+
+        div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .id("toggle-results-position")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size_6()
+                    .rounded(Radii::SM)
+                    .cursor_pointer()
+                    .hover(|d| d.bg(theme.secondary))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_results_position(cx);
+                    }))
+                    .child(Icon::new(position_icon).size(ui(14.0)).muted()),
+            )
+            .child(
+                div()
+                    .id("toggle-maximize-results")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size_6()
+                    .rounded(Radii::SM)
+                    .cursor_pointer()
+                    .hover(|d| d.bg(theme.secondary))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.toggle_maximize_results(cx);
+                    }))
+                    .child(
+                        Icon::new(if is_maximized {
+                            AppIcon::Minimize2
+                        } else {
+                            AppIcon::Maximize2
+                        })
+                        .size(ui(14.0))
+                        .muted(),
+                    ),
+            )
+            .child(
+                div()
+                    .id("hide-results-panel")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size_6()
+                    .rounded(Radii::SM)
+                    .cursor_pointer()
+                    .hover(|d| d.bg(theme.secondary))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.hide_results(cx);
+                    }))
+                    .child(
+                        Icon::new(self.results_position.hide_icon())
+                            .size(ui(14.0))
+                            .muted(),
+                    ),
+            )
+    }
+
+    fn render_collapsed_results_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let tab_count = self.result_tabs.result_tabs.len();
+
+        div()
+            .id("collapsed-results-bar")
+            .flex()
+            .items_center()
+            .h(Heights::TAB)
+            .px(Spacing::SM)
+            .border_t_1()
+            .border_color(theme.border)
+            .bg(theme.tab_bar)
+            .child(div().flex().items_center().gap_1().child(Text::caption(
+                crate::labels::result_tab_count_label(tab_count),
+            )))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("expand-results-panel")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .size_6()
+                    .rounded(Radii::SM)
+                    .cursor_pointer()
+                    .hover(|d| d.bg(theme.secondary))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.layout = SqlQueryLayout::Split;
+                        cx.notify();
+                    }))
+                    .child(
+                        Icon::new(self.results_position.show_icon())
+                            .size(ui(14.0))
+                            .muted(),
+                    ),
+            )
+    }
+
+    fn render_loading_results(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        let icon = Icon::new(AppIcon::Loader).size(ui(12.0));
+        div().p(Spacing::MD).size_full().child(
+            BannerBlock::new(
+                BannerVariant::Info,
+                datatab_i18n::t!("document.code.result.loading.title"),
+            )
+            .with_icon(icon)
+            .with_body(datatab_i18n::t!("document.code.result.loading.body")),
+        )
+    }
+
+    fn render_error_state(&self, error: &str, _cx: &mut Context<Self>) -> impl IntoElement {
+        let icon = Icon::new(AppIcon::CircleX).size(Heights::ICON_SM);
+        div().p(Spacing::MD).size_full().overflow_y_hidden().child(
+            BannerBlock::new(
+                BannerVariant::Danger,
+                datatab_i18n::t!("document.code.result.error.title"),
+            )
+            .with_icon(icon)
+            .with_pre(error.to_string()),
+        )
+    }
+
+    fn render_empty_results(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        EmptyState::new(
+            AppIcon::Table,
+            datatab_i18n::t!("document.code.result.empty"),
+        )
+    }
+
+    /// Placeholder shown for a routine document when no connection is active for
+    /// its profile.  The definition will be fetched automatically on connect.
+    fn render_awaiting_connection(&self, _cx: &mut Context<Self>) -> impl IntoElement {
+        EmptyState::new(
+            AppIcon::Plug,
+            datatab_i18n::t!("document.code.result.awaiting_connection"),
+        )
+    }
+
+    fn render_script_confirm_modal(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // Capture entity clones for each callback before building the footer.
+        let entity_cancel = cx.entity().clone();
+        let entity_run = cx.entity().clone();
+        let entity_close = cx.entity().clone();
+        let entity_confirm = cx.entity().clone();
+        let entity_statement = cx.entity().clone();
+
+        let pending = self.pending.script_confirm.as_ref();
+        let statement_count = pending.map(|p| p.statement_count).unwrap_or(0);
+        let cursor_statement = pending.and_then(|p| p.cursor_statement.as_ref());
+
+        let offers_script = cursor_statement.is_none_or(|statement| statement.offers_script);
+
+        let (title, message) = match cursor_statement {
+            Some(statement) if statement.offers_script => (
+                datatab_i18n::t!("document.code.script_confirm.transaction.title"),
+                datatab_i18n::t!(
+                    "document.code.script_confirm.transaction.message",
+                    line = statement.line,
+                    statement = statement.text,
+                    count = statement_count
+                ),
+            ),
+            Some(statement) => (
+                datatab_i18n::t!("document.code.script_confirm.transaction.title"),
+                datatab_i18n::t!(
+                    "document.code.script_confirm.transaction.message_statement_only",
+                    line = statement.line,
+                    statement = statement.text
+                ),
+            ),
+            None => (
+                datatab_i18n::t!("document.code.script_confirm.title"),
+                crate::labels::script_confirm_message_label(statement_count),
+            ),
+        };
+
+        let body = Text::caption(message).into_any_element();
+
+        let footer = div()
+            .flex()
+            .gap(Spacing::SM)
+            .child(
+                Button::new(
+                    "script-confirm-cancel-btn",
+                    datatab_i18n::t!("document.code.script_confirm.cancel"),
+                )
+                .on_click(move |_, window, cx| {
+                    entity_cancel.update(cx, |doc, cx| {
+                        doc.cancel_script_query(window, cx);
+                    });
+                }),
+            )
+            .when(cursor_statement.is_some(), |footer| {
+                footer.child(
+                    Button::new(
+                        "script-confirm-statement-btn",
+                        datatab_i18n::t!("document.code.script_confirm.run_statement"),
+                    )
+                    .when(!offers_script, |button| button.primary())
+                    .on_click(move |_, window, cx| {
+                        entity_statement.update(cx, |doc, cx| {
+                            doc.confirm_cursor_statement(window, cx);
+                        });
+                    }),
+                )
+            })
+            .when(offers_script, |footer| {
+                footer.child(
+                    Button::new(
+                        "script-confirm-run-btn",
+                        datatab_i18n::t!("document.code.script_confirm.run"),
+                    )
+                    .primary()
+                    .on_click(move |_, window, cx| {
+                        entity_run.update(cx, |doc, cx| {
+                            doc.confirm_script_query(window, cx);
+                        });
+                    }),
+                )
+            })
+            .into_any_element();
+
+        Modal::new(title)
+            .body(body)
+            .footer(footer)
+            .icon(AppIcon::Play)
+            .width(px(460.0))
+            .focus_handle(self.script_confirm_focus.handle())
+            .on_close(move |window, cx| {
+                entity_close.update(cx, |doc, cx| {
+                    doc.cancel_script_query(window, cx);
+                });
+            })
+            .on_confirm(move |window, cx| {
+                entity_confirm.update(cx, |doc, cx| {
+                    doc.confirm_script_query(window, cx);
+                });
+            })
+    }
+
+    fn render_dangerous_query_modal(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity_run = cx.entity().clone();
+        let entity_cancel = cx.entity().clone();
+        let entity_toggle = cx.entity().clone();
+        let entity_close = cx.entity().clone();
+        let entity_confirm = cx.entity().clone();
+
+        let pending = self.pending.dangerous_query.as_ref();
+        let suppress = pending.is_some_and(|pending| pending.suppress);
+        let query = pending.map(|pending| pending.query.clone());
+
+        let (title, message) = pending
+            .map(|p| {
+                (
+                    crate::labels::dangerous_query_title(p.kind),
+                    crate::labels::dangerous_query_body(p.kind),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    datatab_i18n::t!("document.code.dangerous_query.fallback.title"),
+                    datatab_i18n::t!("document.code.dangerous_query.fallback.body"),
+                )
+            });
+
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap(ModalMetrics::BODY_GAP)
+            .child(modal_lead(message, cx))
+            .when_some(query, |body, query| {
+                body.child(modal_code(query.trim().to_string(), cx))
+            })
+            .child(
+                Checkbox::new("dangerous-dont-ask-again")
+                    .checked(suppress)
+                    .label(datatab_i18n::t!(
+                        "document.code.dangerous_query.dont_ask_again"
+                    ))
+                    .on_click(move |checked: &bool, _, cx| {
+                        let checked = *checked;
+                        entity_toggle.update(cx, |doc, cx| {
+                            if let Some(pending) = doc.pending.dangerous_query.as_mut() {
+                                pending.suppress = checked;
+                                cx.notify();
+                            }
+                        });
+                    }),
+            );
+
+        let cancel_btn = Button::new(
+            "dangerous-cancel-btn",
+            datatab_i18n::t!("document.code.dangerous_query.cancel"),
+        )
+        .when_some(
+            datatab_ui_base::keymap::shortcut_label(ContextId::ConfirmModal, Command::Cancel),
+            Button::kbd,
+        )
+        .on_click(move |_, window, cx| {
+            entity_cancel.update(cx, |doc, cx| {
+                doc.cancel_dangerous_query(window, cx);
+            });
+        });
+
+        let run_anyway_btn = Button::new(
+            "dangerous-confirm-btn",
+            datatab_i18n::t!("document.code.dangerous_query.run_anyway"),
+        )
+        .danger()
+        .icon(AppIcon::Play)
+        .when_some(
+            datatab_ui_base::keymap::shortcut_label(ContextId::ConfirmModal, Command::Execute),
+            Button::kbd,
+        )
+        .on_click(move |_, window, cx| {
+            entity_run.update(cx, |doc, cx| {
+                doc.confirm_dangerous_query(suppress, window, cx);
+            });
+        });
+
+        let footer = div()
+            .flex()
+            .items_center()
+            .gap(ModalMetrics::FOOTER_GAP)
+            .child(cancel_btn)
+            .child(run_anyway_btn)
+            .into_any_element();
+
+        Modal::new(title)
+            .body(body)
+            .footer(footer)
+            .icon(AppIcon::TriangleAlert)
+            .width(ModalMetrics::WIDTH)
+            .variant(ModalVariant::Danger)
+            .focus_handle(self.dangerous_query_focus.handle())
+            .on_close(move |window, cx| {
+                entity_close.update(cx, |doc, cx| {
+                    doc.cancel_dangerous_query(window, cx);
+                });
+            })
+            .on_confirm(move |window, cx| {
+                entity_confirm.update(cx, |doc, cx| {
+                    doc.confirm_dangerous_query(suppress, window, cx);
+                });
+            })
+    }
+}
+
+impl Render for CodeDocument {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_statement_gutter_style(cx);
+
+        self.process_pending_result(window, cx);
+
+        self.process_pending_set_query(window, cx);
+
+        self.process_pending_auto_refresh(window, cx);
+
+        self.process_pending_load_all_rows(window, cx);
+
+        if std::mem::take(&mut self.pending.history_focus_restore) {
+            self.focus(window, cx);
+        }
+
+        self.process_pending_drift_continue(window, cx);
+
+        if let Some((start_value, end_value)) = self.pending.source_input_values.take() {
+            // Each `set_value` emits an `InputEvent::Change`; mark both as
+            // seed-originated so the subscription handler skips them.
+            self.source.source_seed_suppress = self.source.source_seed_suppress.saturating_add(2);
+
+            self.source
+                .source_start_input
+                .update(cx, |state, cx| state.set_value(&start_value, window, cx));
+            self.source
+                .source_end_input
+                .update(cx, |state, cx| state.set_value(&end_value, window, cx));
+        }
+
+        // Lazily create the source-context time-range panel the first time a
+        // connection with labelled start/end inputs is active.  Panel creation
+        // requires a Window reference (for DatePickerState), so it is deferred
+        // here from sync_source_controls which runs in a subscription context.
+        if self.source.source_time_range_panel.is_none() && self.should_show_source_controls(cx) {
+            let spec = self.current_source_context_spec(cx);
+            if spec.is_some_and(|s| !s.start_label.is_empty() && !s.end_label.is_empty()) {
+                let panel = cx.new(|cx| {
+                    // Index 3 = Last24Hours (24h is the sensible default for time-series sources).
+                    TimeRangePanel::new(
+                        TimeRangePanel::preset_label(TimeRange::Last24Hours),
+                        Some(3),
+                        window,
+                        cx,
+                    )
+                });
+                let sub = cx.subscribe(&panel, |this, _panel, event: &TimeRangeChanged, cx| {
+                    this.on_source_time_range_panel_changed(event.start_ms, event.end_ms, cx);
+                });
+                self.source.source_time_range_panel = Some(panel.clone());
+                self.source._source_time_range_sub = Some(sub);
+
+                // Wire the panel into the active result grid so the chart
+                // toolbar's RANGE chips can drive it.
+                if let Some(grid) = self
+                    .result_tabs
+                    .active_result_index
+                    .and_then(|i| self.result_tabs.result_tabs.get(i))
+                    .map(|t| t.grid.clone())
+                {
+                    grid.update(cx, |g, cx| {
+                        g.set_chart_time_range_panel(Some(panel.clone()), cx);
+                    });
+                }
+
+                // Seed the initial window for the default preset only when no
+                // user-selected window already exists. On panel *recreation*
+                // (e.g. after a transient teardown / connection reload) the
+                // existing exec_ctx.source carries the user's current selection
+                // and must not be overwritten by Last-24h.
+                if self.source.exec_ctx.source.is_none() {
+                    panel.update(cx, |panel, cx| panel.emit_initial(cx));
+                }
+            }
+        }
+
+        if std::mem::take(&mut self.pending.chart_reexecute)
+            && !self.result_tabs.result_tabs.is_empty()
+        {
+            self.run_query(window, cx);
+        }
+
+        if let Some(error) = self.pending.error.take() {
+            let toast_msg = error.to_string();
+            Toast::error(toast_msg.clone())
+                .meta_right(now_hms())
+                .action(copy_action(toast_msg))
+                .push(cx);
+        }
+
+        // Apply a pending routine definition fetched from a background task.
+        // `set_content` requires a `Window` reference, so it is deferred here.
+        if let Some(body) = self.pending.routine_definition.take() {
+            self.set_content(&body, window, cx);
+        }
+
+        let context_bar = self.render_context_bar(cx).into_any_element();
+        let production_banner = self.render_production_banner(cx);
+
+        let editor_view = if self.routine_definition_pending {
+            self.render_awaiting_connection(cx).into_any_element()
+        } else {
+            div()
+                .size_full()
+                .flex()
+                .min_h_0()
+                .children(self.render_action_strip(cx))
+                .child(
+                    div()
+                        .debug_selector(|| "code-editor-area".to_string())
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .child(self.render_editor(window, cx)),
+                )
+                .into_any_element()
+        };
+        let results_view = self.render_results(window, cx).into_any_element();
+
+        let bg = cx.theme().background;
+        let has_collapsed_results =
+            self.layout == SqlQueryLayout::EditorOnly && !self.result_tabs.result_tabs.is_empty();
+        let drift_modal_visible = self.drift.schema_drift_modal.read(cx).is_visible();
+
+        div()
+            .id(ElementId::Name(format!("sql-doc-{}", self.id.0).into()))
+            .size_full()
+            .flex()
+            .flex_col()
+            .min_h_0()
+            .bg(bg)
+            .track_focus(&self.focus_handle)
+            .child(context_bar)
+            .when_some(production_banner, |el, banner| el.child(banner))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(match self.layout {
+                        SqlQueryLayout::Split
+                            if self.results_position == ResultsPosition::Right =>
+                        {
+                            h_resizable(SharedString::from(format!(
+                                "sql-split-right-{}",
+                                self.id.0
+                            )))
+                            .child(
+                                resizable_panel()
+                                    .size(px(200.0))
+                                    .size_range(px(200.0)..px(10_000.0))
+                                    .child(editor_view),
+                            )
+                            .child(
+                                resizable_panel()
+                                    .size(px(200.0))
+                                    .size_range(px(200.0)..px(10_000.0))
+                                    .child(results_view),
+                            )
+                            .into_any_element()
+                        }
+
+                        SqlQueryLayout::Split => {
+                            v_resizable(SharedString::from(format!("sql-split-{}", self.id.0)))
+                                .child(
+                                    resizable_panel()
+                                        .size(px(200.0))
+                                        .size_range(px(100.0)..px(1000.0))
+                                        .child(editor_view),
+                                )
+                                .child(
+                                    resizable_panel()
+                                        .size(px(200.0))
+                                        .size_range(EditorMetrics::RESULTS_MIN_HEIGHT..px(1000.0))
+                                        .child(results_view),
+                                )
+                                .into_any_element()
+                        }
+
+                        SqlQueryLayout::EditorOnly => editor_view,
+
+                        SqlQueryLayout::ResultsOnly => results_view,
+                    }),
+            )
+            .when(has_collapsed_results, |el| {
+                el.child(self.render_collapsed_results_bar(cx))
+            })
+            .when(self.pending.dangerous_query.is_some(), |el| {
+                el.child(self.render_dangerous_query_modal(cx))
+            })
+            .when(self.pending.script_confirm.is_some(), |el| {
+                el.child(self.render_script_confirm_modal(cx))
+            })
+            .when(drift_modal_visible, |el| {
+                el.child(self.drift.schema_drift_modal.clone())
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The editor and results panes draw no focus ring around themselves:
+    /// focus inside a document shows through its own caret, grid cursor and
+    /// controls.
+    #[test]
+    fn code_panes_draw_no_ring_around_the_document() {
+        let source = include_str!("render.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("render.rs has production code before its tests");
+
+        for pane in ["fn render_editor(", "fn render_results("] {
+            let start = production.find(pane).expect("pane renderer");
+            let body = &production[start..start + 600];
+
+            assert!(
+                !body.contains("focus_ring("),
+                "{pane} wraps itself in a focus ring"
+            );
+        }
+    }
+}

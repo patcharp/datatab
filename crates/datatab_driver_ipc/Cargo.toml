@@ -1,0 +1,33 @@
+[package]
+name = "datatab_driver_ipc"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[dependencies]
+datatab_core = { path = "../datatab_core" }
+datatab_ipc = { path = "../datatab_ipc" }
+interprocess.workspace = true
+serde_json = { workspace = true }
+uuid = { workspace = true }
+log = "0.4"
+thiserror = "2.0"
+
+[dev-dependencies]
+datatab_test_support.workspace = true
+
+[lib]
+name = "datatab_driver_ipc"
+path = "src/lib.rs"
+
+[package.metadata.cargo-machete]
+# uuid::Uuid is used directly in src/transport.rs (line 15: `use uuid::Uuid`);
+# machete misses it because the import comes from the workspace re-export path.
+ignored = ["uuid"]
+
+[lints]
+workspace = true

@@ -1,0 +1,46 @@
+# DynamoDB
+
+AWS managed NoSQL key-value and document database.
+
+## At a glance
+
+- **Category** — Document
+- **Query language** — DynamoDB expressions
+- **URI scheme** — `dynamodb`
+
+AWS DynamoDB driver for DataTab, built on the [`aws-sdk-dynamodb`](https://crates.io/crates/aws-sdk-dynamodb) SDK.
+
+## Features
+
+- Managed NoSQL driver classified as `DatabaseCategory::Document` with a `QueryLanguage::Custom("DynamoDB")` command envelope; the editor uses a DynamoDB-specific syntax, not SQL.
+- AWS connection configuration via region, named profile, and optional endpoint override (for DynamoDB Local or VPC endpoints). `deployment_class` is `CloudManaged`.
+- Table discovery with `ListTables` and `DescribeTable`, mapping partition key (PK), sort key (SK), and Global/Local Secondary Index (GSI/LSI) key metadata into DataTab schema abstractions.
+- Native command envelope execution for `scan`, `query`, `put`, `update`, and `delete`. The query generator emits scan-shaped preview envelopes and notes that execution may optimize to `Query` when the filter matches the table key schema. An envelope's own limit still applies.
+- `execute` enforces `QueryRequest::limit` (`REQUEST_ROW_LIMIT`), so editor queries carry the editor row limit.
+- Read options for index targeting, consistent-read control, and a filter-translation fallback policy (server-side filter vs. client-side fallback; client filtering is rejected when the fallback policy is set to reject).
+- WHERE operators in semantic filters: `Eq`, `Ne`, `Gt`, `Gte`, `Lt`, `Lte`, `In`, `NotIn`, and logical `And`/`Or` (see Limitations for `Not`).
+- Mutations: insert (`put`), update, and delete (`INSERT`/`UPDATE`/`DELETE`). Batch writes support up to 25 items (`max_insert_values: 25`, `supports_batch: true`) with bounded retry for unprocessed batch-write items.
+- Single-item upsert support via a conditional update with a put fallback; the key map is resolved from either the filter or the update payload (partition key required, sort key required when the table defines one).
+- Many-item update path (`update` with `many=true`) using a shared update expression.
+- Nested documents and arrays mapped into the document-tree view (`NESTED_DOCUMENTS`, `ARRAYS`).
+- DDL: drop table (`supports_drop_table: true`).
+- Pagination via page tokens (`PaginationStyle::PageToken`).
+- Client identity: every request carries `datatab-<version>` as the AWS SDK app name, visible in CloudTrail's `userAgent` field.
+
+## Limitations
+
+- The `profile` field (AWS named profile) is an `AuthProfileRef` form field. The generic portability seam (`DbDriver::export_field_hint`) maps all `AuthProfileRef` fields to `RequiredOnImport`, so the field value is omitted from any exported bundle and recipients must supply or create a matching auth profile at import time. No driver-specific override is required.
+- Explicit statement timeouts are rejected before execution, including zero-duration timeouts. Query cancellation is not supported; the driver returns `NotSupported` for cancel requests.
+- The request row limit is not sent as DynamoDB `Limit`, which counts evaluated items. PartiQL `SELECT` and Scan/Query envelopes cut the returned items locally and mark the result truncated only when the limit dropped items; a truncated result carries no pagination token. Writes accept and ignore the limit.
+- PartiQL `SELECT` reads a full first page (up to 1 MB) before cutting it, so a limited query costs as much read capacity as an unlimited one. PartiQL returns only the first page and exposes a next-page token without an inbound token on `QueryRequest`.
+- Row limits bound returned rows, not bytes or DynamoDB server work.
+- The command envelope API does not expose PartiQL or DynamoDB transaction operations; transactions are disabled (`supports_transactions: false`).
+- Single-item upsert is supported (`supports_upsert: true`); `update` with `many=true` and `upsert=true` together is rejected (`update_many_with_upsert`).
+- Bulk update and bulk delete are not supported (`supports_bulk_update: false`, `supports_bulk_delete: false`), and `RETURNING` is not supported.
+- Semantic filters do not support `NOT` expressions or operators outside the supported set; unsupported operators return `NotSupported`.
+- No SSL form (TLS is handled by the AWS SDK transport), no schemas, and no DDL beyond drop-table (no create/alter table, no index creation).
+- Aggregate requests are not supported by the semantic planner.
+- Collection browsing in the core request layer remains offset-based, while the underlying API is page-token based.
+- No write-privilege probe: `Connection::probe_write_privilege` intentionally stays at the trait default (`WritePrivilege::Unknown`), since a reliable check would need `iam:SimulatePrincipalPolicy`, a permission the connecting role typically lacks.
+- No instance metrics or instance inspector (`INSTANCE_METRICS`/`INSTANCE_INSPECTOR` are not declared): DynamoDB's server-side metrics already live in CloudWatch, so a per-driver `InstanceCatalog` would duplicate that surface rather than add one.
+- No visual document query builder (`DocumentFeatures::VISUAL_BUILDER` is not declared): the Builder button in the collection header shows disabled for DynamoDB tables.

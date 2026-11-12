@@ -1,0 +1,28 @@
+[package]
+name = "datatab_transfer"
+version.workspace = true
+publish = false
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+datatab_core = { path = "../datatab_core" }
+datatab_export.workspace = true
+thiserror = "2"
+serde.workspace = true
+serde_json.workspace = true
+csv.workspace = true
+
+[dev-dependencies]
+datatab_test_support.workspace = true
+datatab_driver_postgres.workspace = true

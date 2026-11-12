@@ -1,0 +1,89 @@
+use gpui::prelude::*;
+use gpui::{App, Hsla, SharedString, Window, div};
+
+use crate::primitives::Text;
+
+/// Stateless field label with an optional required marker.
+#[derive(IntoElement)]
+pub struct Label {
+    text: SharedString,
+    required: bool,
+    color_override: Option<Hsla>,
+}
+
+impl Label {
+    pub fn new(text: impl Into<SharedString>) -> Self {
+        Self {
+            text: text.into(),
+            required: false,
+            color_override: None,
+        }
+    }
+
+    /// Show a red asterisk after the label text.
+    pub fn required(mut self, required: bool) -> Self {
+        self.required = required;
+        self
+    }
+
+    /// Override the label color (replaces the shared field-label default).
+    pub fn text_color(mut self, color: impl Into<Hsla>) -> Self {
+        self.color_override = Some(color.into());
+        self
+    }
+
+    /// Override the label color (replaces the shared field-label default).
+    pub fn color(self, color: impl Into<Hsla>) -> Self {
+        self.text_color(color)
+    }
+
+    fn build_text(text: SharedString, color_override: Option<Hsla>) -> Text {
+        match color_override {
+            Some(color) => Text::body(text).text_color(color),
+            None => Text::body(text).muted_foreground(),
+        }
+    }
+
+    #[cfg(test)]
+    fn text(&self) -> Text {
+        Self::build_text(self.text.clone(), self.color_override)
+    }
+}
+
+impl RenderOnce for Label {
+    fn render(self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+        let label = Self::build_text(self.text, self.color_override);
+
+        // A text flex item's automatic minimum width is its unwrapped width, so
+        // without `min_w_0` a label longer than its column overflows it instead
+        // of wrapping.
+        let mut el = div()
+            .flex()
+            .items_center()
+            .gap(gpui::px(2.0))
+            .child(div().min_w_0().child(label));
+
+        if self.required {
+            el = el.child(Text::body("*").danger());
+        }
+
+        el
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Label;
+    use crate::primitives::TextVariant;
+
+    #[test]
+    fn label_defaults_to_muted_field_label_typography() {
+        let label = Label::new("Host").text();
+
+        let inspection = label.inspect();
+
+        assert_eq!(inspection.variant, TextVariant::Body);
+        assert!(inspection.uses_muted_foreground_override);
+        assert!(!inspection.uses_role_default_color);
+    }
+}

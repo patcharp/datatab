@@ -1,0 +1,4079 @@
+pub mod inspector;
+pub mod pane;
+mod routing;
+
+use gpui::prelude::*;
+use gpui::*;
+use gpui_component::ActiveTheme;
+use gpui_component::scroll::{Scrollable, ScrollableElement};
+
+use datatab_core::observability::actions as audit_actions;
+use datatab_core::observability::{
+    AuditAction, EventCategory, EventOrigin, EventOutcome, EventRecord, EventSeverity,
+};
+use datatab_core::{
+    CancelToken, CollectionPresentation, ColumnInfo, Connection, DbError, DbSchemaInfo,
+    DriverCapabilities, DriverMetadata, ForeignKeyInfo, IndexData, IndexInfo, SchemaColumnInfo,
+    SchemaForeignKeyInfo, SchemaIndexInfo, TableInfo, TaskKind, TaskTarget,
+};
+use datatab_schema_viz::{
+    graph::SchemaGraph,
+    layout::{
+        LayoutFormat, LayoutResult, NODE_BODY_TOP_PX, NODE_HEADER_PX, NODE_INDEX_HEADER_PX,
+        NODE_INDEX_ROW_PX, NODE_ROW_PX, NodeLayout,
+    },
+};
+use petgraph::graph::NodeIndex;
+use std::collections::{HashMap, HashSet, hash_map::Entry};
+use std::sync::Arc;
+use uuid::Uuid;
+
+use crate::handle::DocumentEvent;
+use crate::types::{DocumentId, DocumentState};
+use datatab_app::keymap::{Command, ContextId};
+use datatab_components::composites::{MenuItem, menu_frame, menu_row};
+use datatab_components::controls::Button;
+use datatab_components::icons::AppIcon;
+use datatab_components::primitives::{Chamfer, ChamferRing, Icon, Spinner};
+use datatab_components::tokens::{
+    ChamferCut, ChromeColors, DocumentMetrics, Fields, FontSizes, SchemaMetrics, Spacing,
+    SyntaxColors,
+};
+use datatab_components::typography::AppFonts;
+use datatab_ui_base::AppStateEntity;
+use datatab_ui_base::keymap::{RunCommand, effective_keymap, run_command};
+use datatab_ui_base::toast::{PendingToast, flush_pending_toast};
+
+/// Spacing of the diagram's dot grid, in graph coordinates. Node drags and
+/// keyboard nudges land on this lattice, so tables line up instead of drifting.
+const GRID_LATTICE: f32 = 24.0;
+
+/// Minimum width of the toolbar menus.
+const SCHEMA_MENU_WIDTH: Pixels = px(160.0);
+
+/// Independent on/off toggles drawn as a segmented track (the Types and
+/// Indexes switches of P1Schema): every active item shows the raised thumb.
+///
+/// Each item is a switch named by its own label and carrying its on/off state,
+/// so assistive technology and UI automation can tell the two apart and read
+/// whether the diagram is showing that group.
+fn toggle_group<const N: usize>(
+    items: [(&'static str, String, bool); N],
+    on_toggle: impl Fn(&SharedString, &mut Window, &mut App) + 'static,
+    theme: &gpui_component::Theme,
+) -> impl IntoElement {
+    let on_toggle = std::rc::Rc::new(on_toggle);
+
+    let segments = items.into_iter().map(|(id, label, active)| {
+        let on_toggle = on_toggle.clone();
+        let id = SharedString::from(id);
+        let clicked = id.clone();
+        let accessible_label = SharedString::from(label.clone());
+
+        let thumb = if active {
+            Chamfer::new(ChamferCut::KEYCAP).fill(theme.secondary)
+        } else {
+            Chamfer::new(ChamferCut::KEYCAP)
+                .fill_hover(theme.accent)
+                .interactive(SharedString::from(format!("{id}-thumb")))
+        };
+
+        div()
+            .id(id)
+            .role(Role::Switch)
+            .aria_label(accessible_label)
+            .aria_toggled(if active {
+                Toggled::True
+            } else {
+                Toggled::False
+            })
+            .relative()
+            .flex()
+            .items_center()
+            .h(SEGMENT_HEIGHT)
+            .px(Fields::SEGMENT_PADDING_X)
+            .cursor_pointer()
+            .text_color(if active {
+                ChromeColors::strong(theme)
+            } else {
+                theme.muted_foreground
+            })
+            .child(thumb)
+            .child(label)
+            .on_click(move |_, window, cx| {
+                on_toggle(&clicked, window, cx);
+            })
+    });
+
+    div()
+        .relative()
+        .flex()
+        .flex_none()
+        .items_center()
+        .p(Fields::SEGMENT_TRACK_PADDING)
+        .text_size(FontSizes::XS)
+        .child(
+            Chamfer::new(ChamferCut::CONTROL)
+                .fill(theme.background)
+                .border(theme.border),
+        )
+        .children(segments)
+}
+
+/// Height of a toggle segment (the 24 px segments of P1Schema).
+const SEGMENT_HEIGHT: Rems = SchemaMetrics::TOGGLE_HEIGHT;
+
+/// Longest type name shown in a column row before it is cut short.
+///
+/// The row reserves a fixed slot for it, and the types that overflow it are the
+/// loud ones — `timestamp with time zone`, `character varying(255)` — whose first
+/// characters already identify them.
+const TYPE_NAME_CHARS: usize = 8;
+
+/// Shortens a column type to fit its row slot, keeping the tail visible.
+fn truncate_type_name(type_name: &str) -> String {
+    if type_name.chars().count() <= TYPE_NAME_CHARS {
+        return type_name.to_owned();
+    }
+    let head: String = type_name.chars().take(TYPE_NAME_CHARS - 1).collect();
+    format!("{head}…")
+}
+
+/// Rounds a graph-space coordinate onto the diagram lattice.
+fn snap_to_lattice(value: f32) -> f32 {
+    (value / GRID_LATTICE).round() * GRID_LATTICE
+}
+
+/// Direction for spatial selection navigation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// Actions for the schema viz context menu.
+#[derive(Debug, Clone)]
+enum SchemaVizMenuAction {
+    Separator,
+    ZoomIn,
+    ZoomOut,
+    ResetView,
+    FitToView,
+    LayoutSubmenu,
+    Arrange,
+    CopyAsSubmenu,
+    /// Carries whether the Types toggle is on, for its check mark.
+    ShowTypes(bool),
+    /// Carries whether the Indexes toggle is on, for its check mark.
+    ShowIndexes(bool),
+    FocusOnTable,
+    InspectTable,
+    // Submenu actions
+    LayoutLeftRight,
+    LayoutSnowflake,
+    LayoutCompact,
+    CopyAsDbml,
+    CopyAsSql,
+}
+
+/// The toolbar's Types and Indexes toggles, as the context menu shows them.
+#[derive(Debug, Clone, Copy)]
+struct ViewToggles {
+    show_types: bool,
+    show_indexes: bool,
+}
+
+/// Context menu state following the app's standard pattern (see sidebar::ContextMenuState).
+struct SchemaVizContextMenuState {
+    selected_index: usize,
+    actions: Vec<SchemaVizMenuAction>,
+    parent_stack: Vec<(Vec<SchemaVizMenuAction>, usize)>,
+    position: Point<Pixels>,
+}
+
+impl SchemaVizMenuAction {
+    /// Converts this action to a MenuItem for rendering.
+    fn to_menu_item(&self) -> datatab_components::composites::MenuItem {
+        use datatab_components::composites::MenuItem;
+
+        match self {
+            SchemaVizMenuAction::Separator => MenuItem::separator(),
+            SchemaVizMenuAction::ZoomIn => {
+                MenuItem::new(datatab_i18n::t!("document.schema_viz.menu.zoom_in"))
+                    .icon(AppIcon::ZoomIn)
+            }
+            SchemaVizMenuAction::ZoomOut => {
+                MenuItem::new(datatab_i18n::t!("document.schema_viz.menu.zoom_out"))
+                    .icon(AppIcon::ZoomOut)
+            }
+            SchemaVizMenuAction::ResetView => {
+                MenuItem::new(datatab_i18n::t!("document.schema_viz.menu.reset_view"))
+                    .icon(AppIcon::RefreshCcw)
+            }
+            SchemaVizMenuAction::FitToView => {
+                MenuItem::new(datatab_i18n::t!("document.schema_viz.menu.fit"))
+                    .icon(AppIcon::Maximize2)
+            }
+            SchemaVizMenuAction::LayoutSubmenu => {
+                MenuItem::new(datatab_i18n::t!("document.schema_viz.menu.layout"))
+                    .icon(AppIcon::Layers)
+                    .submenu()
+            }
+            SchemaVizMenuAction::Arrange => {
+                MenuItem::new(datatab_i18n::t!("document.schema_viz.menu.arrange"))
+                    .icon(AppIcon::Grid3x3)
+            }
+            SchemaVizMenuAction::ShowTypes(on) => {
+                let item = MenuItem::new(datatab_i18n::t!("document.schema_viz.menu.show_types"));
+                if *on { item.icon(AppIcon::Check) } else { item }
+            }
+            SchemaVizMenuAction::ShowIndexes(on) => {
+                let item = MenuItem::new(datatab_i18n::t!("document.schema_viz.menu.show_indexes"));
+                if *on { item.icon(AppIcon::Check) } else { item }
+            }
+            SchemaVizMenuAction::CopyAsSubmenu => {
+                MenuItem::new(datatab_i18n::t!("document.schema_viz.menu.copy_as"))
+                    .icon(AppIcon::Database)
+                    .submenu()
+            }
+            SchemaVizMenuAction::FocusOnTable => {
+                MenuItem::new(datatab_i18n::t!("document.schema_viz.menu.focus_table"))
+                    .icon(AppIcon::Maximize2)
+            }
+            SchemaVizMenuAction::InspectTable => {
+                MenuItem::new(datatab_i18n::t!("document.schema_viz.menu.inspect_schema"))
+                    .icon(AppIcon::Table)
+            }
+            SchemaVizMenuAction::LayoutLeftRight => {
+                MenuItem::new(SchemaVizDocument::layout_label(LayoutFormat::LeftRight))
+                    .icon(AppIcon::ArrowLeftRight)
+            }
+            SchemaVizMenuAction::LayoutSnowflake => {
+                MenuItem::new(SchemaVizDocument::layout_label(LayoutFormat::Snowflake))
+                    .icon(AppIcon::Snowflake)
+            }
+            SchemaVizMenuAction::LayoutCompact => {
+                MenuItem::new(SchemaVizDocument::layout_label(LayoutFormat::Compact))
+                    .icon(AppIcon::Grid3x3)
+            }
+            SchemaVizMenuAction::CopyAsDbml => {
+                MenuItem::new(datatab_i18n::t!("document.schema_viz.menu.copy_as_dbml"))
+                    .icon(AppIcon::Copy)
+            }
+            SchemaVizMenuAction::CopyAsSql => {
+                MenuItem::new(datatab_i18n::t!("document.schema_viz.menu.copy_as_sql"))
+                    .icon(AppIcon::Code)
+            }
+        }
+    }
+
+    /// Builds the MenuItem list from an action list (1:1 mapping).
+    fn to_menu_items(actions: &[Self]) -> Vec<datatab_components::composites::MenuItem> {
+        actions.iter().map(|a| a.to_menu_item()).collect()
+    }
+}
+
+impl SchemaVizContextMenuState {
+    fn new(position: Point<Pixels>, has_selected_node: bool, toggles: ViewToggles) -> Self {
+        let actions = Self::build_main_actions(has_selected_node, toggles);
+        Self {
+            selected_index: 0,
+            actions,
+            parent_stack: Vec::new(),
+            position,
+        }
+    }
+
+    /// The camera and layout actions, the Types and Indexes toggles of the
+    /// toolbar, then the selected table's actions.
+    fn build_main_actions(
+        has_selected_node: bool,
+        toggles: ViewToggles,
+    ) -> Vec<SchemaVizMenuAction> {
+        let mut actions = vec![
+            SchemaVizMenuAction::ZoomIn,
+            SchemaVizMenuAction::ZoomOut,
+            SchemaVizMenuAction::ResetView,
+            SchemaVizMenuAction::FitToView,
+            SchemaVizMenuAction::Separator,
+            SchemaVizMenuAction::LayoutSubmenu,
+            SchemaVizMenuAction::Arrange,
+            SchemaVizMenuAction::CopyAsSubmenu,
+            SchemaVizMenuAction::Separator,
+            SchemaVizMenuAction::ShowTypes(toggles.show_types),
+            SchemaVizMenuAction::ShowIndexes(toggles.show_indexes),
+        ];
+
+        if has_selected_node {
+            actions.push(SchemaVizMenuAction::Separator);
+            actions.push(SchemaVizMenuAction::InspectTable);
+            actions.push(SchemaVizMenuAction::FocusOnTable);
+        }
+
+        actions
+    }
+
+    fn build_layout_actions() -> Vec<SchemaVizMenuAction> {
+        vec![
+            SchemaVizMenuAction::LayoutLeftRight,
+            SchemaVizMenuAction::LayoutSnowflake,
+            SchemaVizMenuAction::LayoutCompact,
+        ]
+    }
+
+    fn build_copy_as_actions() -> Vec<SchemaVizMenuAction> {
+        vec![
+            SchemaVizMenuAction::CopyAsDbml,
+            SchemaVizMenuAction::CopyAsSql,
+        ]
+    }
+
+    /// Returns rendered menu items for the current level.
+    fn menu_items(&self) -> Vec<datatab_components::composites::MenuItem> {
+        SchemaVizMenuAction::to_menu_items(&self.actions)
+    }
+
+    /// Returns rendered menu items for the parent level (if in submenu).
+    fn parent_menu_items(&self) -> Option<Vec<datatab_components::composites::MenuItem>> {
+        self.parent_stack
+            .last()
+            .map(|(actions, _)| SchemaVizMenuAction::to_menu_items(actions))
+    }
+
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "selected_index is assigned only values in 0..count below (decrement or count - 1) and count > 0 after the early return"
+    )]
+    fn navigate_up(&mut self) -> bool {
+        let count = self.actions.len();
+        if count == 0 {
+            return false;
+        }
+        for _ in 0..count {
+            if self.selected_index > 0 {
+                self.selected_index -= 1;
+            } else {
+                self.selected_index = count - 1;
+            }
+            if !matches!(
+                self.actions[self.selected_index],
+                SchemaVizMenuAction::Separator
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "selected_index is assigned only values in 0..count below (increment or 0) and count > 0 after the early return"
+    )]
+    fn navigate_down(&mut self) -> bool {
+        let count = self.actions.len();
+        if count == 0 {
+            return false;
+        }
+        for _ in 0..count {
+            if self.selected_index < count - 1 {
+                self.selected_index += 1;
+            } else {
+                self.selected_index = 0;
+            }
+            if !matches!(
+                self.actions[self.selected_index],
+                SchemaVizMenuAction::Separator
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn go_into_submenu(&mut self) -> bool {
+        let action = match self.actions.get(self.selected_index) {
+            Some(a) => a.clone(),
+            None => return false,
+        };
+
+        let sub_actions = match action {
+            SchemaVizMenuAction::LayoutSubmenu => Self::build_layout_actions(),
+            SchemaVizMenuAction::CopyAsSubmenu => Self::build_copy_as_actions(),
+            _ => return false,
+        };
+
+        let current_actions = std::mem::take(&mut self.actions);
+        let current_index = self.selected_index;
+
+        self.parent_stack.push((current_actions, current_index));
+        self.actions = sub_actions;
+        self.selected_index = 0;
+        true
+    }
+
+    fn go_back(&mut self) -> bool {
+        if let Some((parent_actions, parent_index)) = self.parent_stack.pop() {
+            self.actions = parent_actions;
+            self.selected_index = parent_index;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+// Node layout constants are imported from datatab_schema_viz::layout so that
+// render_node, render_edges_overlay, and the layout engine always agree on anchor
+// positions without duplicating magic numbers.
+
+/// Display mode for the schema diagram.
+#[derive(Clone)]
+pub enum SchemaVizMode {
+    /// Focused view: one table + immediate FK neighbors.
+    Focused {
+        table: String,
+        schema: Option<String>,
+    },
+    /// Global view: all tables in the schema (Phase 2, not yet implemented).
+    Global,
+}
+
+/// Loading status for the schema diagram.
+#[derive(Clone, PartialEq)]
+pub enum LoadStatus {
+    Loading,
+    Ready,
+    Error(String),
+    NotSupported,
+}
+
+pub struct SchemaVizDocument {
+    id: DocumentId,
+    pub profile_id: Uuid,
+    pub database: Option<String>,
+    pub mode: SchemaVizMode,
+    pub tables: Vec<TableInfo>,
+    pub graph: Option<SchemaGraph>,
+    pub layout: Option<LayoutResult>,
+    pub load_status: LoadStatus,
+    pub scroll_offset: Point<Pixels>,
+    pub zoom: f32,
+    pub focus_handle: FocusHandle,
+    _subscriptions: Vec<Subscription>,
+    // Dependencies
+    app_state: Entity<AppStateEntity>,
+    // Pan state
+    is_panning: bool,
+    pan_start: Point<Pixels>,
+    pan_offset: Point<Pixels>,
+    // Node interaction
+    selected_node: Option<petgraph::graph::NodeIndex>,
+    /// Fit the diagram into the viewport once it has been measured: set when
+    /// a schema loads without a focal table and when the layout changes.
+    pending_fit: bool,
+    // Drag state for node repositioning
+    dragging_node: Option<petgraph::graph::NodeIndex>,
+    drag_offset: Point<Pixels>,
+    node_position_overrides: std::collections::HashMap<petgraph::graph::NodeIndex, Point<f32>>,
+    // Layout
+    pub layout_format: LayoutFormat,
+    pub show_types: bool,
+    pub show_indexes: bool,
+    pub table_cap_warning: bool,
+    // Cancellation
+    cancel_token: Option<Arc<CancelToken>>,
+    /// Frame of the loading spinner, advanced by a timer while the schema loads.
+    loading_frame: usize,
+    // Pending toast notification (set from sync context, flushed in render)
+    pending_toast: Option<PendingToast>,
+    // Toolbar dropdowns
+    layout_menu_open: bool,
+    export_menu_open: bool,
+    // Context menu (using app's standard component pattern)
+    context_menu: Option<SchemaVizContextMenuState>,
+    // When true, focus_handle.focus(window, cx) is called at the start of the next render
+    pending_focus_restore: bool,
+    // Last mouse position for keyboard-opened menus (window-absolute)
+    last_mouse_position: Point<Pixels>,
+    // Absolute position of the document panel's top-left corner in window
+    // coordinates. Updated each frame via a canvas element. Used to convert
+    // event.position (window-absolute) to panel-local coordinates for context
+    // menu placement. Same pattern as DataGridPanel and AuditDocument.
+    panel_origin: Point<Pixels>,
+    // Absolute bounds of the graph viewport in window coordinates. Mouse and
+    // scroll event positions are window-absolute, while pan/zoom math is
+    // viewport-local.
+    viewport_origin: Point<Pixels>,
+    viewport_size: Size<Pixels>,
+    // Schema inspector content reused across opens.
+    schema_inspector_content: Option<Entity<inspector::SchemaInspector>>,
+    // Title of the schema inspector this tab has mounted in the workspace
+    // rail. `None` once the user dismisses the rail, so activation does not
+    // bring back a rail they closed.
+    schema_inspector_title: Option<SharedString>,
+    _schema_inspector_subscription: Option<Subscription>,
+}
+
+/// Largest zoom the Fit button picks, so a small diagram is not blown up.
+const FIT_MAX_ZOOM: f32 = 1.5;
+
+/// Largest zoom the fit on open picks: a diagram that already fits opens at
+/// its natural size.
+const OPEN_FIT_MAX_ZOOM: f32 = 1.0;
+
+/// Screen margin kept around a fitted diagram, on every side.
+const FIT_MARGIN: f32 = 48.0;
+
+/// Zoom and pan that fit the graph-space box `(min_x, min_y, max_x, max_y)`
+/// inside `viewport` with [`FIT_MARGIN`] on every side, anchored at the
+/// top-left margin, at no more than `max_zoom`. `None` for an empty box or an
+/// unmeasured viewport.
+fn fit_diagram(
+    (min_x, min_y, max_x, max_y): (f32, f32, f32, f32),
+    viewport: Size<Pixels>,
+    max_zoom: f32,
+) -> Option<(f32, Point<Pixels>)> {
+    if min_x > max_x || min_y > max_y {
+        return None;
+    }
+
+    let viewport_width: f32 = viewport.width.into();
+    let viewport_height: f32 = viewport.height.into();
+    if viewport_width <= 0.0 || viewport_height <= 0.0 {
+        return None;
+    }
+
+    let content_width = (max_x - min_x).max(1.0);
+    let content_height = (max_y - min_y).max(1.0);
+    let available_width = (viewport_width - 2.0 * FIT_MARGIN).max(1.0);
+    let available_height = (viewport_height - 2.0 * FIT_MARGIN).max(1.0);
+
+    let zoom = (available_width / content_width)
+        .min(available_height / content_height)
+        .clamp(0.25, max_zoom.max(0.25));
+
+    let pan = Point::new(px(FIT_MARGIN - min_x * zoom), px(FIT_MARGIN - min_y * zoom));
+
+    Some((zoom, pan))
+}
+
+fn pixel_aligned_diagram_pan(
+    pan_offset: Point<Pixels>,
+    viewport_origin: Point<Pixels>,
+    zoom: f32,
+    scale_factor: f32,
+) -> Point<Pixels> {
+    if !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return pan_offset;
+    }
+
+    let pivot_translation = viewport_origin * (1.0 - zoom);
+    let matrix_translation = pan_offset + pivot_translation;
+    Point::new(
+        px((f32::from(matrix_translation.x) * scale_factor).round() / scale_factor)
+            - pivot_translation.x,
+        px((f32::from(matrix_translation.y) * scale_factor).round() / scale_factor)
+            - pivot_translation.y,
+    )
+}
+
+impl SchemaVizDocument {
+    /// Returns the table name if in focused mode.
+    pub fn table_name(&self) -> Option<&str> {
+        match &self.mode {
+            SchemaVizMode::Focused { table, .. } => Some(table.as_str()),
+            SchemaVizMode::Global => None,
+        }
+    }
+
+    /// Tab title: the focal table in focused mode, otherwise the database.
+    pub(crate) fn title(&self) -> String {
+        Self::tab_title(self.table_name(), self.database.as_deref())
+    }
+
+    /// "shop · schema": the focal table, else the database, then "schema".
+    pub(crate) fn tab_title(table: Option<&str>, database: Option<&str>) -> String {
+        let name = match table.or(database) {
+            Some(name) => name.to_string(),
+            None => datatab_i18n::t!("document.schema_viz.view.title_default_database"),
+        };
+
+        datatab_i18n::t!("document.schema_viz.view.title", name = name)
+    }
+
+    /// The database a diagram is opened for. An empty name means the same as
+    /// none, so the document normalizes it once: the connection it resolves,
+    /// the task target and the metadata calls the loader makes must agree on
+    /// which database this diagram belongs to.
+    fn normalized_database(database: Option<String>) -> Option<String> {
+        database.filter(|database| !database.is_empty())
+    }
+
+    /// Creates a new SchemaVizDocument and starts async loading.
+    /// NOTE: This must be called from within a `cx.new(|cx| ...)` closure
+    /// where `cx` is `Context<Self>`. The caller is responsible for wrapping
+    /// this with `cx.new(|cx| SchemaVizDocument::new(..., cx))`.
+    pub fn new(
+        profile_id: Uuid,
+        database: Option<String>,
+        mode: SchemaVizMode,
+        app_state: Entity<AppStateEntity>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let focus_handle = cx.focus_handle();
+        let id = DocumentId::new();
+        let database = Self::normalized_database(database);
+
+        // Get the correct per-database connection using TaskTarget.
+        // This is critical for ConnectionPerDatabase drivers (e.g., PostgreSQL) where
+        // multiple databases exist on the same host and the primary connection may be
+        // on a different database than the one the user selected.
+        let task_target = TaskTarget {
+            profile_id,
+            database: database.clone(),
+        };
+        let connection = app_state
+            .read(cx)
+            .facade
+            .connections
+            .connection_for_task_target(&task_target);
+
+        let mut doc = Self {
+            id,
+            profile_id,
+            database: database.clone(),
+            mode: mode.clone(),
+            tables: Vec::new(),
+            graph: None,
+            layout: None,
+            load_status: LoadStatus::Loading,
+            scroll_offset: Point::default(),
+            zoom: 1.0,
+            focus_handle,
+            _subscriptions: Vec::new(),
+            app_state: app_state.clone(),
+            is_panning: false,
+            pan_start: Point::default(),
+            pan_offset: Point::default(),
+            selected_node: None,
+            pending_fit: false,
+            dragging_node: None,
+            drag_offset: Point::default(),
+            node_position_overrides: std::collections::HashMap::new(),
+            layout_format: LayoutFormat::LeftRight,
+            show_types: true,
+            show_indexes: false,
+            table_cap_warning: false,
+            cancel_token: None,
+            loading_frame: 0,
+            pending_toast: None,
+            layout_menu_open: false,
+            export_menu_open: false,
+            context_menu: None,
+            pending_focus_restore: false,
+            last_mouse_position: Point::default(),
+            panel_origin: Point::default(),
+            viewport_origin: Point::default(),
+            viewport_size: Size::default(),
+            schema_inspector_content: None,
+            schema_inspector_title: None,
+            _schema_inspector_subscription: None,
+        };
+
+        // Spawn async loading task with the correct per-database connection
+        doc.spawn_loading(profile_id, database, mode, connection, cx);
+
+        doc
+    }
+
+    /// Cancels any in-progress schema loading.
+    pub fn cancel_loading(&mut self, cx: &App) {
+        if let Some(ref cancel_token) = self.cancel_token {
+            cancel_token.cancel();
+        }
+
+        let mode_str = match &self.mode {
+            SchemaVizMode::Focused { .. } => "focused",
+            SchemaVizMode::Global => "global",
+        };
+        let tables_loaded = self.tables.len();
+        // Estimate total tables based on current state
+        let tables_total = if self.load_status == LoadStatus::Ready {
+            tables_loaded
+        } else {
+            0
+        };
+
+        let details = serde_json::json!({
+            "mode": mode_str,
+            "database": self.database,
+            "tables_loaded": tables_loaded,
+            "tables_total": tables_total,
+        });
+        self.emit_audit_event(
+            EventSeverity::Warn,
+            EventOutcome::Cancelled,
+            audit_actions::SCHEMA_VIZ_CANCEL,
+            "Schema diagram loading cancelled",
+            details,
+            cx,
+        );
+    }
+
+    /// Emits an audit event for schema visualization operations.
+    fn emit_audit_event(
+        &self,
+        severity: EventSeverity,
+        outcome: EventOutcome,
+        action: AuditAction,
+        summary: &str,
+        details: serde_json::Value,
+        cx: &App,
+    ) {
+        let now_ms = datatab_core::chrono::Utc::now().timestamp_millis();
+        let object_id = self
+            .database
+            .as_ref()
+            .map(|d| format!("{}/{}", self.profile_id, d))
+            .unwrap_or_else(|| self.profile_id.to_string());
+
+        let event = EventRecord::new(now_ms, severity, EventCategory::Config, outcome)
+            .with_summary(summary)
+            .with_typed_action(action)
+            .with_origin(EventOrigin::local())
+            .with_actor_id("local")
+            .with_connection_context(
+                self.profile_id.to_string(),
+                self.database.as_deref().unwrap_or(""),
+                "",
+            )
+            .with_object_ref("schema_diagram", object_id);
+
+        let event = event.with_details_json(details.to_string());
+
+        if let Err(e) = self.app_state.read(cx).audit_service().record(event) {
+            log::error!("CRITICAL: schema_viz audit event failed to record: {}", e);
+        }
+    }
+
+    /// Spawns the background loading task for schema data.
+    fn spawn_loading(
+        &mut self,
+        profile_id: Uuid,
+        database: Option<String>,
+        mode: SchemaVizMode,
+        connection: Option<Arc<dyn Connection>>,
+        cx: &mut Context<Self>,
+    ) {
+        // Register the task with the TasksPanel before spawning
+        let (task_id, cancel_token) = {
+            let database_label = database
+                .clone()
+                .unwrap_or_else(|| datatab_i18n::t!("document.schema_viz.task.global_scope"));
+            let description =
+                datatab_i18n::t!("document.schema_viz.task.load", database = database_label);
+            let target = TaskTarget {
+                profile_id,
+                database: database.clone(),
+            };
+            self.app_state.update(cx, |state, _cx| {
+                state.start_task_for_target(TaskKind::LoadSchema, description, Some(target))
+            })
+        };
+
+        // Store cancel token so it can be triggered from cancel_loading()
+        let cancel_token = Arc::new(cancel_token);
+        self.cancel_token = Some(cancel_token.clone());
+
+        let task = cx.background_executor().spawn(async move {
+            match connection {
+                Some(connection) => {
+                    Self::load_focused_schema_blocking(database, mode, &connection, cancel_token)
+                }
+                None => Err(datatab_i18n::t!(
+                    "document.schema_viz.error.connection_unavailable"
+                )),
+            }
+        });
+
+        // Advance the loading spinner while the load runs. The future upgrades the
+        // document weakly on every tick, so a load that outlives its tab neither
+        // holds the document alive nor keeps ticking.
+        cx.spawn(async move |entity, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(Spinner::INTERVAL_MS))
+                    .await;
+
+                let still_loading = entity
+                    .update(cx, |doc, cx| {
+                        if !matches!(doc.load_status, LoadStatus::Loading) {
+                            return false;
+                        }
+                        doc.loading_frame = doc.loading_frame.wrapping_add(1);
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+
+                if !still_loading {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        // The load runs on a background task and can outlive its tab, or its
+        // window. The future only ever upgrades a weak handle, after the await:
+        // holding a strong one across it would keep the document — and the app
+        // state — alive until the load finishes.
+        let app_state = self.app_state.downgrade();
+        cx.spawn(async move |entity, cx| {
+            let load_result = task.await;
+
+            // Determine if cancelled by checking if error message is "Cancelled"
+            let is_cancelled = load_result
+                .as_ref()
+                .err()
+                .map(|e| e == "Cancelled")
+                .unwrap_or(false);
+
+            cx.update(|cx| {
+                let (Some(entity), Some(app_state)) = (entity.upgrade(), app_state.upgrade())
+                else {
+                    // The tab or the app state went away while the schema was
+                    // loading: nothing is left to update.
+                    log::debug!("Schema diagram load finished after its document was released");
+                    return;
+                };
+
+                entity.update(cx, |doc, cx| {
+                    match load_result {
+                        Ok(result) => {
+                            let LoadedSchemaData {
+                                tables,
+                                graph,
+                                layout,
+                                capped,
+                                tables_loaded,
+                                bulk,
+                            } = result;
+                            let (focal_table, focal_schema) = match &doc.mode {
+                                SchemaVizMode::Focused { table, schema } => {
+                                    (table.clone(), schema.clone())
+                                }
+                                SchemaVizMode::Global => ("".to_string(), None),
+                            };
+                            let mode_str = match &doc.mode {
+                                SchemaVizMode::Focused { .. } => "focused",
+                                SchemaVizMode::Global => "global",
+                            };
+                            let table_count = tables.len();
+                            let edge_count = graph.edge_count();
+                            let layout_format = format!("{:?}", doc.layout_format);
+
+                            let details = serde_json::json!({
+                                "mode": mode_str,
+                                "table": focal_table,
+                                "schema": focal_schema,
+                                "database": doc.database,
+                                "table_count": table_count,
+                                "edge_count": edge_count,
+                                "layout_format": layout_format,
+                                "tables_loaded": tables_loaded,
+                            });
+                            doc.emit_audit_event(
+                                EventSeverity::Info,
+                                EventOutcome::Success,
+                                audit_actions::SCHEMA_VIZ_OPEN,
+                                "Opened schema diagram",
+                                details,
+                                cx,
+                            );
+
+                            // Seed the connection manager's per-schema caches
+                            // with the unfiltered bulk result, so the sidebar's
+                            // Indexes and Foreign Keys folders are warm and a
+                            // later consumer does not refetch. A failed bulk
+                            // seam arrives as `None` and leaves its cache key
+                            // empty rather than caching a stand-in.
+                            app_state.update(cx, |state, cx| {
+                                for FetchedSchemaBulk {
+                                    database,
+                                    schema,
+                                    columns,
+                                    indexes,
+                                    foreign_keys,
+                                } in bulk
+                                {
+                                    if let Some(columns) = columns {
+                                        state.set_schema_columns(
+                                            doc.profile_id,
+                                            database.clone(),
+                                            schema.clone(),
+                                            columns,
+                                        );
+                                    }
+                                    if let Some(indexes) = indexes {
+                                        state.set_schema_indexes(
+                                            doc.profile_id,
+                                            database.clone(),
+                                            schema.clone(),
+                                            indexes,
+                                        );
+                                    }
+                                    if let Some(foreign_keys) = foreign_keys {
+                                        state.set_schema_foreign_keys(
+                                            doc.profile_id,
+                                            database,
+                                            schema,
+                                            foreign_keys,
+                                        );
+                                    }
+                                }
+
+                                state.complete_task(task_id);
+                                cx.emit(datatab_ui_base::AppStateChanged);
+                            });
+
+                            let viewport_width = 800.0;
+                            let viewport_height = 600.0;
+                            let initial_pan = if let Some(focal_node) =
+                                graph.nodes().find(|(_, n)| {
+                                    n.id.name == focal_table
+                                        && n.id.schema.as_ref() == focal_schema.as_ref()
+                                }) {
+                                if let Some(focal_layout) = layout.nodes.get(&focal_node.0) {
+                                    let focal_center_x = focal_layout.x + focal_layout.width / 2.0;
+                                    let focal_center_y = focal_layout.y + focal_layout.height / 2.0;
+                                    let viewport_center_x = viewport_width / 2.0;
+                                    let viewport_center_y = viewport_height / 2.0;
+                                    Some(Point::new(
+                                        px(viewport_center_x - focal_center_x * doc.zoom),
+                                        px(viewport_center_y - focal_center_y * doc.zoom),
+                                    ))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            };
+                            doc.tables = tables;
+                            doc.graph = Some(graph);
+                            doc.layout = Some(layout);
+                            doc.load_status = LoadStatus::Ready;
+                            doc.table_cap_warning = capped;
+                            match initial_pan {
+                                Some(pan) => doc.pan_offset = pan,
+                                None => doc.pending_fit = true,
+                            }
+                        }
+                        Err(msg) => {
+                            let mode_str = match &doc.mode {
+                                SchemaVizMode::Focused { .. } => "focused",
+                                SchemaVizMode::Global => "global",
+                            };
+
+                            // Emit cancel or error audit event
+                            if is_cancelled {
+                                let details = serde_json::json!({
+                                    "mode": mode_str,
+                                    "database": doc.database,
+                                    "reason": "cancelled",
+                                });
+                                doc.emit_audit_event(
+                                    EventSeverity::Warn,
+                                    EventOutcome::Failure,
+                                    audit_actions::SCHEMA_VIZ_CANCEL,
+                                    "Schema diagram loading cancelled",
+                                    details,
+                                    cx,
+                                );
+
+                                // Cancel the task in the TasksPanel
+                                app_state.update(cx, |state, cx| {
+                                    state.cancel_task(task_id);
+                                    cx.emit(datatab_ui_base::AppStateChanged);
+                                });
+                            } else {
+                                let details = serde_json::json!({
+                                    "mode": mode_str,
+                                    "error": msg,
+                                    "database": doc.database,
+                                });
+                                doc.emit_audit_event(
+                                    EventSeverity::Error,
+                                    EventOutcome::Failure,
+                                    audit_actions::SCHEMA_VIZ_ERROR,
+                                    "Schema diagram load error",
+                                    details,
+                                    cx,
+                                );
+
+                                // Fail the task in the TasksPanel
+                                app_state.update(cx, |state, cx| {
+                                    state.fail_task(task_id, msg.clone());
+                                    cx.emit(datatab_ui_base::AppStateChanged);
+                                });
+                            }
+                            doc.load_status = LoadStatus::Error(msg);
+                        }
+                    }
+                    cx.notify();
+                })
+            });
+        })
+        .detach();
+    }
+
+    /// Fabricates a `TableInfo` for one relation from that relation's
+    /// schema-scoped bulk data. Pure, so tests can drive it directly.
+    ///
+    /// Returns `None` when the relation is absent from the column map so the
+    /// caller can fall back to `table_details` for that relation alone. The
+    /// column and index maps are keyed per schema and are never merged across
+    /// schemas: `SchemaColumnInfo` carries no schema field, so a same-named
+    /// table in two schemas must not cross-contaminate.
+    fn fabricated_table_from_bulk(
+        name: &str,
+        schema: Option<&str>,
+        columns: &HashMap<String, Vec<ColumnInfo>>,
+        indexes: &HashMap<String, Vec<IndexInfo>>,
+        foreign_keys: &[SchemaForeignKeyInfo],
+    ) -> Option<TableInfo> {
+        let table_columns = columns.get(name)?;
+        let table_indexes = indexes.get(name).cloned().unwrap_or_default();
+        let foreign_keys = foreign_keys
+            .iter()
+            .filter(|fk| fk.table_name == name)
+            .map(|fk| ForeignKeyInfo {
+                name: fk.name.clone(),
+                columns: fk.columns.clone(),
+                referenced_table: fk.referenced_table.clone(),
+                referenced_schema: fk.referenced_schema.clone(),
+                referenced_columns: fk.referenced_columns.clone(),
+                on_delete: fk.on_delete.clone(),
+                on_update: fk.on_update.clone(),
+            })
+            .collect();
+
+        Some(TableInfo {
+            name: name.to_owned(),
+            schema: schema.map(str::to_owned),
+            columns: Some(table_columns.clone()),
+            indexes: Some(IndexData::Relational(table_indexes)),
+            foreign_keys: Some(foreign_keys),
+            constraints: None,
+            sample_fields: None,
+            presentation: CollectionPresentation::DataGrid,
+            child_items: None,
+            storage_hints: None,
+            pseudo_columns: Box::default(),
+        })
+    }
+
+    /// Bulk metadata for one schema, from one attempt per method. When
+    /// `schema_columns` is not supported the whole schema keeps the per-table
+    /// path (`columns_ok: false`); index and foreign-key failures only log and
+    /// degrade to empty, they never fail the load.
+    fn bulk_metadata(
+        source: &dyn MetadataSource,
+        database: &str,
+        schema: Option<&str>,
+        foreign_keys_when_unsupported: bool,
+    ) -> SchemaBulk {
+        let (columns, columns_ok, fetched_columns) = match source.schema_columns(database, schema) {
+            Ok(rows) => {
+                let mut map: HashMap<String, Vec<ColumnInfo>> = HashMap::new();
+                for row in &rows {
+                    map.entry(row.table_name.clone())
+                        .or_default()
+                        .push(row.column.clone());
+                }
+                (map, true, Some(rows))
+            }
+            Err(error) => {
+                log::debug!(
+                    "Bulk column load not supported for schema {:?}: {}",
+                    schema,
+                    error
+                );
+                (HashMap::new(), false, None)
+            }
+        };
+
+        let (indexes, fetched_indexes) = if columns_ok {
+            match source.schema_indexes(database, schema) {
+                Ok(rows) => {
+                    let mut map: HashMap<String, Vec<IndexInfo>> = HashMap::new();
+                    for row in &rows {
+                        map.entry(row.table_name.clone())
+                            .or_default()
+                            .push(IndexInfo {
+                                name: row.name.clone(),
+                                columns: row.columns.clone(),
+                                is_unique: row.is_unique,
+                                is_primary: row.is_primary,
+                            });
+                    }
+                    (map, Some(rows))
+                }
+                Err(error) => {
+                    log::warn!("Failed to list indexes for schema {:?}: {}", schema, error);
+                    (HashMap::new(), None)
+                }
+            }
+        } else {
+            (HashMap::new(), None)
+        };
+
+        let (foreign_keys, fetched_foreign_keys) = if columns_ok || foreign_keys_when_unsupported {
+            match source.schema_foreign_keys(database, schema) {
+                Ok(foreign_keys) => (foreign_keys.clone(), Some(foreign_keys)),
+                Err(error) => {
+                    log::warn!(
+                        "Failed to list foreign keys for schema {:?}: {}",
+                        schema,
+                        error
+                    );
+                    (Vec::new(), None)
+                }
+            }
+        } else {
+            (Vec::new(), None)
+        };
+
+        SchemaBulk {
+            columns,
+            indexes,
+            foreign_keys,
+            columns_ok,
+            fetched_columns,
+            fetched_indexes,
+            fetched_foreign_keys,
+        }
+    }
+
+    /// Loads one relation, preferring the bulk data of its schema and falling
+    /// back to `table_details` for the relation alone. The schema's bulk
+    /// attempt happens here if it has not run yet — once per distinct schema.
+    fn load_relation(
+        source: &dyn MetadataSource,
+        database: &str,
+        schema: Option<&str>,
+        name: &str,
+        bulk: &mut HashMap<Option<String>, SchemaBulk>,
+        cancel_token: &CancelToken,
+    ) -> LoadedRelation {
+        let schema_bulk = match bulk.entry(schema.map(str::to_owned)) {
+            Entry::Vacant(slot) => {
+                slot.insert(Self::bulk_metadata(source, database, schema, false))
+            }
+            Entry::Occupied(slot) => slot.into_mut(),
+        };
+
+        if schema_bulk.columns_ok
+            && let Some(assembled) = Self::fabricated_table_from_bulk(
+                name,
+                schema,
+                &schema_bulk.columns,
+                &schema_bulk.indexes,
+                &schema_bulk.foreign_keys,
+            )
+        {
+            return LoadedRelation::Loaded(assembled);
+        }
+
+        if cancel_token.is_cancelled() {
+            return LoadedRelation::Cancelled;
+        }
+
+        match source.table_details(database, schema, name) {
+            Ok(details) => LoadedRelation::Loaded(details),
+            Err(error) => LoadedRelation::Failed(error),
+        }
+    }
+
+    /// Loads schema data (blocking, runs on background executor).
+    /// The connection must be the correct per-database connection (obtained via
+    /// `connection_for_task_target` in `SchemaVizDocument::new`), not the primary connection.
+    ///
+    /// The `cancel_token` is checked at key points to allow cancellation.
+    /// Returns the diagram data plus, in `LoadedSchemaData::bulk`, every
+    /// schema's unfiltered bulk result so the caller can seed the connection
+    /// manager's per-schema caches.
+    #[allow(clippy::collapsible_if)]
+    fn load_focused_schema_blocking(
+        database: Option<String>,
+        mode: SchemaVizMode,
+        source: &dyn MetadataSource,
+        cancel_token: Arc<CancelToken>,
+    ) -> Result<LoadedSchemaData, String> {
+        // A driver with no database dimension, such as a single-file database,
+        // names its sidebar nodes with the schema alone, so the diagram is
+        // opened without a database. Its schema stands in for the database
+        // name, which is how the sidebar's other consumers of those ids
+        // resolve it (`database.as_deref().unwrap_or(schema)` when a table is
+        // dropped). An empty name names nothing either, so the load only fails
+        // when neither input carries one.
+        let db_name = database
+            .filter(|database| !database.is_empty())
+            .or_else(|| match &mode {
+                SchemaVizMode::Focused { schema, .. } => {
+                    schema.clone().filter(|schema| !schema.is_empty())
+                }
+                SchemaVizMode::Global => None,
+            })
+            .ok_or_else(|| datatab_i18n::t!("document.schema_viz.error.no_database"))?;
+
+        match mode {
+            SchemaVizMode::Focused { table, schema } => {
+                let metadata = source.metadata();
+                if !metadata
+                    .capabilities
+                    .contains(datatab_core::DriverCapabilities::FOREIGN_KEYS)
+                {
+                    return Err(datatab_i18n::t!(
+                        "document.schema_viz.error.foreign_keys_unsupported"
+                    ));
+                }
+
+                if cancel_token.is_cancelled() {
+                    return Err("Cancelled".into());
+                }
+
+                // Bulk metadata is attempted once per distinct schema and the
+                // bulk-vs-per-table decision is made once per schema. The
+                // focal schema is attempted first, so discovering outbound
+                // references never triggers a second call for it.
+                let mut bulk: HashMap<Option<String>, SchemaBulk> = HashMap::new();
+                bulk.insert(
+                    schema.clone(),
+                    Self::bulk_metadata(source, &db_name, schema.as_deref(), true),
+                );
+
+                let focal_table = match Self::load_relation(
+                    source,
+                    &db_name,
+                    schema.as_deref(),
+                    &table,
+                    &mut bulk,
+                    &cancel_token,
+                ) {
+                    LoadedRelation::Loaded(details) => details,
+                    LoadedRelation::Failed(e) => {
+                        return Err(datatab_i18n::t!(
+                            "document.schema_viz.error.fetch_table_details_failed",
+                            error = e
+                        ));
+                    }
+                    LoadedRelation::Cancelled => return Err("Cancelled".into()),
+                };
+
+                if cancel_token.is_cancelled() {
+                    return Err("Cancelled".into());
+                }
+
+                let mut all_table_names: HashSet<(Option<String>, String)> = HashSet::new();
+                all_table_names.insert((schema.clone(), table.clone()));
+
+                if let Some(ref fks) = focal_table.foreign_keys {
+                    for fk in fks {
+                        all_table_names
+                            .insert((fk.referenced_schema.clone(), fk.referenced_table.clone()));
+                    }
+                }
+
+                // The focal table's own foreign keys only name the tables it
+                // references. Tables that reference *it* declare that in their own
+                // DDL, so ask the driver for every foreign key in the schema and
+                // keep the ones pointing here. A driver without the batch query
+                // returns an empty list, and the scan over the loaded tables below
+                // still finds whatever it can see.
+                // The focal schema's foreign keys arrived with the bulk
+                // attempt above (also on the fallback path — `bulk_metadata`
+                // fetches them when asked); failures already degraded to an
+                // empty list with a warning.
+                let focal_foreign_keys = bulk
+                    .get(&schema)
+                    .map(|schema_bulk| schema_bulk.foreign_keys.clone())
+                    .unwrap_or_default();
+                for name in
+                    Self::inbound_neighbor_names(&focal_foreign_keys, &table, schema.as_deref())
+                {
+                    all_table_names.insert((schema.clone(), name));
+                }
+
+                let mut all_tables = Vec::with_capacity(all_table_names.len());
+                all_tables.push(focal_table.clone());
+                let mut tables_loaded = 1; // focal table already loaded
+
+                for (tbl_schema, tbl_name) in &all_table_names {
+                    if tbl_name == &table && tbl_schema.as_deref() == schema.as_deref() {
+                        continue;
+                    }
+
+                    if cancel_token.is_cancelled() {
+                        return Err("Cancelled".into());
+                    }
+
+                    match Self::load_relation(
+                        source,
+                        &db_name,
+                        tbl_schema.as_deref(),
+                        tbl_name,
+                        &mut bulk,
+                        &cancel_token,
+                    ) {
+                        LoadedRelation::Loaded(details) => {
+                            tables_loaded += 1;
+                            all_tables.push(details);
+                        }
+                        LoadedRelation::Failed(e) => {
+                            log::warn!(
+                                "Failed to fetch details for table {}.{:?}: {}",
+                                tbl_schema.as_deref().unwrap_or("<default>"),
+                                tbl_name,
+                                e
+                            );
+                        }
+                        LoadedRelation::Cancelled => return Err("Cancelled".into()),
+                    }
+                }
+
+                let inbound_neighbors =
+                    Self::find_inbound_references(&all_tables, schema.as_deref(), &table);
+
+                for (s, n) in inbound_neighbors {
+                    all_table_names.insert((Some(s), n));
+                }
+
+                for (tbl_schema, tbl_name) in &all_table_names {
+                    if !all_tables.iter().any(|t| {
+                        t.name == *tbl_name && t.schema.as_deref() == tbl_schema.as_deref()
+                    }) {
+                        if cancel_token.is_cancelled() {
+                            return Err("Cancelled".into());
+                        }
+
+                        match Self::load_relation(
+                            source,
+                            &db_name,
+                            tbl_schema.as_deref(),
+                            tbl_name,
+                            &mut bulk,
+                            &cancel_token,
+                        ) {
+                            LoadedRelation::Loaded(details) => {
+                                tables_loaded += 1;
+                                all_tables.push(details);
+                            }
+                            LoadedRelation::Failed(_) => {}
+                            LoadedRelation::Cancelled => return Err("Cancelled".into()),
+                        }
+                    }
+                }
+
+                let graph = SchemaGraph::build(&all_tables);
+                let focused_graph = graph.neighborhood(&table, schema.as_deref(), 1);
+                let layout = datatab_schema_viz::layout::compute_layout(
+                    &focused_graph,
+                    LayoutFormat::LeftRight,
+                    Some((table.as_str(), schema.as_deref())),
+                    true,
+                    false,
+                );
+
+                Ok(LoadedSchemaData {
+                    tables: all_tables,
+                    graph: focused_graph,
+                    layout,
+                    capped: false,
+                    tables_loaded,
+                    bulk: bulk
+                        .into_iter()
+                        .map(|(schema, schema_bulk)| {
+                            schema_bulk.cache_seed(&db_name, schema.as_deref())
+                        })
+                        .collect(),
+                })
+            }
+            SchemaVizMode::Global => {
+                let metadata = source.metadata();
+                if !metadata
+                    .capabilities
+                    .contains(datatab_core::DriverCapabilities::FOREIGN_KEYS)
+                {
+                    return Err(datatab_i18n::t!(
+                        "document.schema_viz.error.foreign_keys_unsupported"
+                    ));
+                }
+
+                // Load ALL tables in the database
+                let schema_info = source.schema_for_database(&db_name).map_err(|e| {
+                    datatab_i18n::t!("document.schema_viz.error.list_tables_failed", error = e)
+                })?;
+
+                if cancel_token.is_cancelled() {
+                    return Err("Cancelled".into());
+                }
+
+                const TABLE_CAP: usize = 100;
+                let capped = schema_info.tables.len() > TABLE_CAP;
+                let tables_to_load: Vec<_> =
+                    schema_info.tables.into_iter().take(TABLE_CAP).collect();
+
+                let mut all_table_details = Vec::with_capacity(tables_to_load.len());
+                let mut tables_loaded = 0;
+
+                let mut bulk: HashMap<Option<String>, SchemaBulk> = HashMap::new();
+
+                for tbl in &tables_to_load {
+                    if cancel_token.is_cancelled() {
+                        return Err("Cancelled".into());
+                    }
+
+                    // One bulk attempt per distinct schema, on the first
+                    // relation seen from it; the fallback decision is made
+                    // once per schema.
+                    match Self::load_relation(
+                        source,
+                        &db_name,
+                        tbl.schema.as_deref(),
+                        &tbl.name,
+                        &mut bulk,
+                        &cancel_token,
+                    ) {
+                        LoadedRelation::Loaded(details) => {
+                            tables_loaded += 1;
+                            all_table_details.push(details);
+                        }
+                        LoadedRelation::Failed(e) => {
+                            log::warn!("Failed to fetch details for {}: {}", tbl.name, e)
+                        }
+                        LoadedRelation::Cancelled => return Err("Cancelled".into()),
+                    }
+                }
+
+                let graph = SchemaGraph::build(&all_table_details);
+                let layout = Self::initial_global_layout(&graph);
+
+                Ok(LoadedSchemaData {
+                    tables: all_table_details,
+                    graph,
+                    layout,
+                    capped,
+                    tables_loaded,
+                    bulk: bulk
+                        .into_iter()
+                        .map(|(schema, schema_bulk)| {
+                            schema_bulk.cache_seed(&db_name, schema.as_deref())
+                        })
+                        .collect(),
+                })
+            }
+        }
+    }
+
+    fn initial_global_layout(graph: &SchemaGraph) -> LayoutResult {
+        datatab_schema_viz::layout::compute_layout(
+            graph,
+            LayoutFormat::LeftRight,
+            None,
+            true,
+            false,
+        )
+    }
+
+    /// Finds tables that reference the focal table via FK.
+    /// Uses the already-fetched tables (which have FK data populated via table_details).
+    fn find_inbound_references(
+        tables: &[TableInfo],
+        focal_schema: Option<&str>,
+        focal_table: &str,
+    ) -> Vec<(String, String)> {
+        let mut neighbors = Vec::new();
+
+        for tbl in tables {
+            let Some(ref fks) = tbl.foreign_keys else {
+                continue;
+            };
+            for fk in fks {
+                if fk.referenced_table == focal_table
+                    && fk.referenced_schema.as_deref() == focal_schema
+                {
+                    neighbors.push((
+                        tbl.schema.clone().unwrap_or_else(|| "main".to_string()),
+                        tbl.name.clone(),
+                    ));
+                }
+            }
+        }
+
+        neighbors
+    }
+
+    /// Names of the tables that declare a foreign key pointing at `focal_table`.
+    ///
+    /// `schema_foreign_keys` is scoped to one schema and reports the keys that
+    /// schema's tables declare, so the declaring table lives in that same schema.
+    fn inbound_neighbor_names(
+        schema_foreign_keys: &[datatab_core::SchemaForeignKeyInfo],
+        focal_table: &str,
+        focal_schema: Option<&str>,
+    ) -> Vec<String> {
+        let mut names: Vec<String> = schema_foreign_keys
+            .iter()
+            .filter(|fk| {
+                fk.table_name != focal_table
+                    && fk.referenced_table == focal_table
+                    && Self::same_namespace(fk.referenced_schema.as_deref(), focal_schema)
+            })
+            .map(|fk| fk.table_name.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// Whether a foreign key's referenced schema and the focal node's schema mean
+    /// the same namespace. A driver that reports no referenced schema and a node
+    /// the sidebar opened without one are the same place, not different ones.
+    fn same_namespace(referenced: Option<&str>, focal: Option<&str>) -> bool {
+        match (referenced, focal) {
+            (Some(referenced), Some(focal)) => referenced == focal,
+            _ => true,
+        }
+    }
+
+    pub fn id(&self) -> DocumentId {
+        self.id
+    }
+
+    pub fn state(&self) -> DocumentState {
+        match &self.load_status {
+            LoadStatus::Loading => DocumentState::Loading,
+            LoadStatus::Ready => DocumentState::Clean,
+            LoadStatus::Error(_) => DocumentState::Error,
+            LoadStatus::NotSupported => DocumentState::Error,
+        }
+    }
+
+    pub fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_handle.focus(window, cx);
+    }
+
+    /// Fit the whole diagram into the viewport: pick the zoom that makes every
+    /// node visible with a margin around it, never above `max_zoom`.
+    fn fit_to_view(&mut self, max_zoom: f32) {
+        let (Some(graph), Some(layout)) = (&self.graph, &self.layout) else {
+            return;
+        };
+
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        for (idx, _) in graph.nodes() {
+            let Some(node_layout) = layout.nodes.get(&idx) else {
+                continue;
+            };
+            let (x, y) = self
+                .node_position_overrides
+                .get(&idx)
+                .map_or((node_layout.x, node_layout.y), |pos| (pos.x, pos.y));
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x + node_layout.width);
+            max_y = max_y.max(y + node_layout.height);
+        }
+
+        let Some((zoom, pan)) =
+            fit_diagram((min_x, min_y, max_x, max_y), self.viewport_size, max_zoom)
+        else {
+            return;
+        };
+
+        self.zoom = zoom;
+        self.pan_offset = pan;
+    }
+
+    /// Runs the fit a load or layout change asked for, once the viewport has
+    /// a size and the layout exists. Until then the request stays pending.
+    fn apply_pending_fit(&mut self, cx: &mut Context<Self>) {
+        if !self.pending_fit || self.layout.is_none() {
+            return;
+        }
+
+        let measured = self.viewport_size.width > px(0.0) && self.viewport_size.height > px(0.0);
+        if !measured {
+            return;
+        }
+
+        self.pending_fit = false;
+        self.fit_to_view(OPEN_FIT_MAX_ZOOM);
+        cx.notify();
+    }
+
+    /// The zoom readout's click: 100% zoom and the camera back at the origin.
+    fn reset_view(&mut self) {
+        self.zoom = 1.0;
+        self.pan_offset = Point::default();
+    }
+
+    /// The Arrange button: drops the tables moved by hand and lays them out
+    /// again.
+    fn arrange(&mut self) {
+        self.node_position_overrides.clear();
+        self.recompute_layout();
+    }
+
+    fn recompute_layout(&mut self) {
+        let Some(ref graph) = self.graph else {
+            return;
+        };
+
+        let focal = match &self.mode {
+            SchemaVizMode::Focused { table, schema } => Some((table.as_str(), schema.as_deref())),
+            SchemaVizMode::Global => {
+                if self.layout_format == LayoutFormat::Snowflake {
+                    graph
+                        .most_connected_node()
+                        .map(|(_, node)| (node.id.name.as_str(), node.id.schema.as_deref()))
+                } else {
+                    None
+                }
+            }
+        };
+
+        self.layout = Some(datatab_schema_viz::layout::compute_layout(
+            graph,
+            self.layout_format,
+            focal,
+            self.show_types,
+            self.show_indexes,
+        ));
+    }
+
+    /// Updates the `show_types` toggle, recomputes layout, and notifies.
+    pub fn set_show_types(&mut self, value: bool, cx: &mut Context<Self>) {
+        self.show_types = value;
+        self.recompute_layout();
+        cx.notify();
+    }
+
+    /// Updates the `show_indexes` toggle, recomputes layout, and notifies.
+    pub fn set_show_indexes(&mut self, value: bool, cx: &mut Context<Self>) {
+        self.show_indexes = value;
+        self.recompute_layout();
+        cx.notify();
+    }
+
+    pub fn set_layout_format(&mut self, format: LayoutFormat, cx: &mut Context<Self>) {
+        let old_format = self.layout_format;
+        self.layout_format = format;
+        if let Some(ref graph) = self.graph {
+            let focal = match &self.mode {
+                SchemaVizMode::Focused { table, schema } => {
+                    Some((table.as_str(), schema.as_deref()))
+                }
+                SchemaVizMode::Global => {
+                    if format == LayoutFormat::Snowflake {
+                        // Auto-select the most-connected table as focal in global mode
+                        graph
+                            .most_connected_node()
+                            .map(|(_, node)| (node.id.name.as_str(), node.id.schema.as_deref()))
+                    } else {
+                        None
+                    }
+                }
+            };
+            self.layout = Some(datatab_schema_viz::layout::compute_layout(
+                graph,
+                format,
+                focal,
+                self.show_types,
+                self.show_indexes,
+            ));
+            self.zoom = 1.0;
+            self.pan_offset = Point::default();
+            self.node_position_overrides.clear();
+            self.pending_fit = true;
+        }
+        cx.notify();
+
+        // Emit audit event after recomputation
+        let mode_str = match &self.mode {
+            SchemaVizMode::Focused { table, .. } => {
+                let details = serde_json::json!({
+                    "old_format": format!("{:?}", old_format),
+                    "new_format": format!("{:?}", format),
+                    "mode": "focused",
+                    "table": table,
+                });
+                self.emit_audit_event(
+                    EventSeverity::Info,
+                    EventOutcome::Success,
+                    audit_actions::SCHEMA_VIZ_LAYOUT_CHANGE,
+                    "Changed schema diagram layout",
+                    details,
+                    cx,
+                );
+                return;
+            }
+            SchemaVizMode::Global => "global",
+        };
+        let details = serde_json::json!({
+            "old_format": format!("{:?}", old_format),
+            "new_format": format!("{:?}", format),
+            "mode": mode_str,
+        });
+        self.emit_audit_event(
+            EventSeverity::Info,
+            EventOutcome::Success,
+            audit_actions::SCHEMA_VIZ_LAYOUT_CHANGE,
+            "Changed schema diagram layout",
+            details,
+            cx,
+        );
+    }
+
+    /// Returns nodes sorted spatially: y first (top-to-bottom), then x (left-to-right).
+    fn spatial_sorted_nodes(&self) -> Vec<NodeIndex> {
+        let layout = match &self.layout {
+            Some(l) => l,
+            None => return Vec::new(),
+        };
+
+        let mut nodes: Vec<_> = layout.nodes.keys().copied().collect();
+
+        nodes.sort_by(|&a, &b| {
+            let pos_a = layout.nodes.get(&a);
+            let pos_b = layout.nodes.get(&b);
+            match (pos_a, pos_b) {
+                (Some(node_a), Some(node_b)) => {
+                    let y_cmp = node_a
+                        .y
+                        .partial_cmp(&node_b.y)
+                        .unwrap_or(std::cmp::Ordering::Equal);
+                    if y_cmp != std::cmp::Ordering::Equal {
+                        y_cmp
+                    } else {
+                        node_a
+                            .x
+                            .partial_cmp(&node_b.x)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    }
+                }
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => std::cmp::Ordering::Equal,
+            }
+        });
+
+        nodes
+    }
+
+    /// Finds the next node in the given direction from the currently selected node.
+    #[expect(
+        clippy::unwrap_used,
+        reason = "candidate ids pass a layout.nodes.get(...) probe earlier in the same function"
+    )]
+    fn find_next_node(&self, direction: Direction) -> Option<NodeIndex> {
+        let current = self.selected_node?;
+        let sorted = self.spatial_sorted_nodes();
+        let _current_idx = sorted.iter().position(|&idx| idx == current)?;
+
+        let layout = self.layout.as_ref()?;
+        let current_pos = layout.nodes.get(&current)?;
+
+        let threshold = 20.0_f32;
+
+        match direction {
+            Direction::Left => {
+                // Find nodes with x < current.x, pick the one with highest x
+                let candidates: Vec<_> = sorted
+                    .iter()
+                    .filter(|&&idx| {
+                        idx != current
+                            && layout
+                                .nodes
+                                .get(&idx)
+                                .map(|n| n.x < current_pos.x - threshold)
+                                .unwrap_or(false)
+                    })
+                    .collect();
+
+                candidates
+                    .into_iter()
+                    .max_by(|a, b| {
+                        let pos_a = layout.nodes.get(a).unwrap();
+                        let pos_b = layout.nodes.get(b).unwrap();
+                        pos_a
+                            .x
+                            .partial_cmp(&pos_b.x)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .copied()
+                    .or_else(|| {
+                        // Wrap: return rightmost node
+                        sorted.last().copied()
+                    })
+            }
+            Direction::Right => {
+                // Find nodes with x > current.x, pick the one with lowest x
+                let candidates: Vec<_> = sorted
+                    .iter()
+                    .filter(|&&idx| {
+                        idx != current
+                            && layout
+                                .nodes
+                                .get(&idx)
+                                .map(|n| n.x > current_pos.x + threshold)
+                                .unwrap_or(false)
+                    })
+                    .collect();
+
+                candidates
+                    .into_iter()
+                    .min_by(|a, b| {
+                        let pos_a = layout.nodes.get(a).unwrap();
+                        let pos_b = layout.nodes.get(b).unwrap();
+                        pos_a
+                            .x
+                            .partial_cmp(&pos_b.x)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .copied()
+                    .or_else(|| {
+                        // Wrap: return leftmost node
+                        sorted.first().copied()
+                    })
+            }
+            Direction::Up => {
+                // Find nodes with y < current.y, pick the one with highest y
+                let candidates: Vec<_> = sorted
+                    .iter()
+                    .filter(|&&idx| {
+                        idx != current
+                            && layout
+                                .nodes
+                                .get(&idx)
+                                .map(|n| n.y < current_pos.y - threshold)
+                                .unwrap_or(false)
+                    })
+                    .collect();
+
+                candidates
+                    .into_iter()
+                    .max_by(|a, b| {
+                        let pos_a = layout.nodes.get(a).unwrap();
+                        let pos_b = layout.nodes.get(b).unwrap();
+                        pos_a
+                            .y
+                            .partial_cmp(&pos_b.y)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .copied()
+                    .or_else(|| {
+                        // Wrap: return bottommost node
+                        sorted.last().copied()
+                    })
+            }
+            Direction::Down => {
+                // Find nodes with y > current.y, pick the one with lowest y
+                let candidates: Vec<_> = sorted
+                    .iter()
+                    .filter(|&&idx| {
+                        idx != current
+                            && layout
+                                .nodes
+                                .get(&idx)
+                                .map(|n| n.y > current_pos.y + threshold)
+                                .unwrap_or(false)
+                    })
+                    .collect();
+
+                candidates
+                    .into_iter()
+                    .min_by(|a, b| {
+                        let pos_a = layout.nodes.get(a).unwrap();
+                        let pos_b = layout.nodes.get(b).unwrap();
+                        pos_a
+                            .y
+                            .partial_cmp(&pos_b.y)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .copied()
+                    .or_else(|| {
+                        // Wrap: return topmost node
+                        sorted.first().copied()
+                    })
+            }
+        }
+    }
+
+    /// Centers the camera on the given node index, focusing on the table header.
+    fn center_on_node(&mut self, node_idx: NodeIndex) {
+        let layout = match &self.layout {
+            Some(l) => l,
+            None => return,
+        };
+
+        let node_layout = match layout.nodes.get(&node_idx) {
+            Some(n) => n,
+            None => return,
+        };
+
+        let viewport_width = if self.viewport_size.width > px(0.0) {
+            self.viewport_size.width.into()
+        } else {
+            800.0
+        };
+        let viewport_height = if self.viewport_size.height > px(0.0) {
+            self.viewport_size.height.into()
+        } else {
+            600.0
+        };
+
+        // Center horizontally on the node center
+        let node_center_x = node_layout.x + node_layout.width / 2.0;
+        let viewport_center_x = viewport_width / 2.0;
+
+        // Center vertically on the table HEADER (top of the node), not the center
+        // NODE_HEADER_PX is the height of the header
+        let header_y = node_layout.y + NODE_HEADER_PX / 2.0;
+        let viewport_center_y = viewport_height / 2.0;
+
+        self.pan_offset = Point::new(
+            px(viewport_center_x - node_center_x * self.zoom),
+            px(viewport_center_y - header_y * self.zoom),
+        );
+    }
+
+    fn viewport_local_position(&self, window_position: Point<Pixels>) -> Point<Pixels> {
+        Point::new(
+            window_position.x - self.viewport_origin.x,
+            window_position.y - self.viewport_origin.y,
+        )
+    }
+
+    fn diagram_pan(&self, window: &Window) -> Point<Pixels> {
+        pixel_aligned_diagram_pan(
+            self.pan_offset,
+            self.viewport_origin,
+            self.zoom,
+            window.scale_factor(),
+        )
+    }
+
+    /// Export the current schema graph as DBML to clipboard.
+    pub fn export_dbml(&mut self, cx: &mut Context<Self>) {
+        let graph = match &self.graph {
+            Some(g) => g,
+            None => return,
+        };
+
+        let scope = datatab_schema_viz::DbmlScope::Subgraph;
+        let dbml_result = datatab_schema_viz::to_dbml(graph, scope);
+
+        match dbml_result {
+            Ok(dbml_text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(dbml_text));
+
+                self.pending_toast = Some(PendingToast {
+                    message: datatab_i18n::t!("document.schema_viz.toast.dbml_copied"),
+                    is_error: false,
+                });
+
+                // Emit audit event
+                let details = serde_json::json!({
+                    "scope": "Subgraph",
+                    "table_count": graph.node_count(),
+                    "edge_count": graph.edge_count(),
+                });
+                self.emit_audit_event(
+                    EventSeverity::Info,
+                    EventOutcome::Success,
+                    audit_actions::SCHEMA_VIZ_EXPORT_DBML,
+                    "Exported schema to DBML",
+                    details,
+                    cx,
+                );
+            }
+            Err(e) => {
+                log::error!("DBML export failed: {}", e);
+
+                self.pending_toast = Some(PendingToast {
+                    message: datatab_i18n::t!("document.schema_viz.toast.dbml_failed", error = e),
+                    is_error: true,
+                });
+
+                // Emit error audit event
+                let details = serde_json::json!({
+                    "error": e,
+                });
+                self.emit_audit_event(
+                    EventSeverity::Error,
+                    EventOutcome::Failure,
+                    audit_actions::SCHEMA_VIZ_EXPORT_DBML,
+                    "DBML export failed",
+                    details,
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// Copy the current schema graph as SQL DDL to clipboard.
+    pub fn copy_as_sql(&mut self, cx: &mut Context<Self>) {
+        let graph = match &self.graph {
+            Some(g) => g,
+            None => return,
+        };
+
+        let scope = datatab_schema_viz::SqlScope::Subgraph;
+        let sql_result = datatab_schema_viz::to_sql(graph, scope);
+
+        match sql_result {
+            Ok(sql_text) => {
+                cx.write_to_clipboard(ClipboardItem::new_string(sql_text.clone()));
+
+                self.pending_toast = Some(PendingToast {
+                    message: datatab_i18n::t!("document.schema_viz.toast.sql_copied"),
+                    is_error: false,
+                });
+
+                let details = serde_json::json!({
+                    "scope": "Subgraph",
+                    "table_count": graph.node_count(),
+                    "edge_count": graph.edge_count(),
+                    "sql_length": sql_text.len(),
+                });
+                self.emit_audit_event(
+                    EventSeverity::Info,
+                    EventOutcome::Success,
+                    audit_actions::SCHEMA_VIZ_EXPORT_SQL,
+                    "Exported schema as SQL",
+                    details,
+                    cx,
+                );
+            }
+            Err(e) => {
+                log::error!("SQL export failed: {}", e);
+
+                self.pending_toast = Some(PendingToast {
+                    message: datatab_i18n::t!("document.schema_viz.toast.sql_failed", error = e),
+                    is_error: true,
+                });
+
+                let details = serde_json::json!({ "error": e });
+                self.emit_audit_event(
+                    EventSeverity::Error,
+                    EventOutcome::Failure,
+                    audit_actions::SCHEMA_VIZ_EXPORT_SQL,
+                    "SQL export failed",
+                    details,
+                    cx,
+                );
+            }
+        }
+    }
+
+    pub fn active_context(&self) -> ContextId {
+        if self.context_menu.is_some() {
+            ContextId::ContextMenu
+        } else {
+            ContextId::SchemaViz
+        }
+    }
+
+    // ── Rendering helpers ──────────────────────────────────────────────────────
+
+    fn render_loading(&self, cx: &mut Context<Self>) -> Div {
+        let theme = cx.theme();
+        let card_bg = theme.secondary;
+        let border = theme.border;
+
+        // A diagram skeleton instead of a spinner floating in a void: an empty
+        // schema panel is large, and six placeholder cards read as "tables are
+        // coming" while the metadata load runs.
+        let placeholder = |rows: usize| {
+            div()
+                .w(px(200.0))
+                .rounded_md()
+                .border_1()
+                .border_color(border.opacity(0.45))
+                .bg(card_bg.opacity(0.35))
+                .p(Spacing::SM)
+                .flex()
+                .flex_col()
+                .gap(Spacing::XXS)
+                .child(
+                    div()
+                        .h(px(10.0))
+                        .w(px(110.0))
+                        .rounded_sm()
+                        .bg(border.opacity(0.55)),
+                )
+                .children((0..rows).map(|_| {
+                    div()
+                        .h(Spacing::SM)
+                        .w_full()
+                        .rounded_sm()
+                        .bg(border.opacity(0.25))
+                }))
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .gap(Spacing::XL)
+            .bg(theme.background)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(Spacing::XS)
+                    .child(Spinner::new(self.loading_frame))
+                    .child(
+                        div()
+                            .text_size(FontSizes::SM)
+                            .text_color(theme.muted_foreground)
+                            .child(datatab_i18n::t!("document.schema_viz.status.loading")),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(Spacing::XL)
+                    .opacity(0.75)
+                    .child(
+                        div()
+                            .flex()
+                            .gap(Spacing::XL)
+                            .child(placeholder(4))
+                            .child(placeholder(6))
+                            .child(placeholder(3)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(Spacing::XL)
+                            .child(placeholder(5))
+                            .child(placeholder(3))
+                            .child(placeholder(6)),
+                    ),
+            )
+    }
+
+    fn render_error(&self, msg: &str) -> Div {
+        div()
+            .flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .child(div().text_color(gpui::red()).child(datatab_i18n::t!(
+                "document.shared.error_prefix",
+                message = msg
+            )))
+    }
+
+    fn render_not_supported(&self) -> Div {
+        div()
+            .flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .child(datatab_i18n::t!("document.schema_viz.status.unsupported"))
+    }
+
+    pub(crate) fn layout_label(format: LayoutFormat) -> String {
+        match format {
+            LayoutFormat::LeftRight => datatab_i18n::t!("document.schema_viz.layout.left_right"),
+            LayoutFormat::Snowflake => datatab_i18n::t!("document.schema_viz.layout.snowflake"),
+            LayoutFormat::Compact => datatab_i18n::t!("document.schema_viz.layout.compact"),
+        }
+    }
+
+    fn render_layout_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let items = [
+            LayoutFormat::LeftRight,
+            LayoutFormat::Snowflake,
+            LayoutFormat::Compact,
+        ]
+        .into_iter()
+        .map(|format| {
+            let mut item = MenuItem::new(Self::layout_label(format));
+            if self.layout_format == format {
+                item = item.icon(AppIcon::Check);
+            }
+
+            menu_row(
+                SharedString::from(format!("schema-layout-{format:?}")),
+                &item,
+                self.layout_format == format,
+                cx,
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.set_layout_format(format, cx);
+                this.layout_menu_open = false;
+                cx.notify();
+            }))
+            .into_any_element()
+        })
+        .collect::<Vec<_>>();
+
+        self.build_dropdown_menu(items, cx)
+    }
+
+    fn render_export_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let items = vec![
+            menu_row(
+                "schema-export-dbml",
+                &MenuItem::new(datatab_i18n::t!("document.schema_viz.menu.copy_as_dbml"))
+                    .icon(AppIcon::Copy),
+                false,
+                cx,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.export_dbml(cx);
+                this.export_menu_open = false;
+                cx.notify();
+            }))
+            .into_any_element(),
+            menu_row(
+                "schema-export-sql",
+                &MenuItem::new(datatab_i18n::t!("document.schema_viz.menu.copy_as_sql"))
+                    .icon(AppIcon::Copy),
+                false,
+                cx,
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.copy_as_sql(cx);
+                this.export_menu_open = false;
+                cx.notify();
+            }))
+            .into_any_element(),
+        ];
+
+        self.build_dropdown_menu(items, cx)
+    }
+
+    fn build_dropdown_menu(
+        &self,
+        items: Vec<AnyElement>,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        deferred(
+            menu_frame(cx)
+                .absolute()
+                .top_full()
+                .mt(Spacing::XS)
+                .left_0()
+                .min_w(SCHEMA_MENU_WIDTH)
+                .occlude()
+                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                    this.layout_menu_open = false;
+                    this.export_menu_open = false;
+                    cx.notify();
+                }))
+                .children(items),
+        )
+        .with_priority(2)
+    }
+
+    /// Opens the context menu at the given position.
+    fn open_context_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        self.context_menu = Some(SchemaVizContextMenuState::new(
+            position,
+            self.selected_node.is_some(),
+            ViewToggles {
+                show_types: self.show_types,
+                show_indexes: self.show_indexes,
+            },
+        ));
+        cx.notify();
+    }
+
+    /// Closes the context menu and schedules focus restoration for the next render.
+    fn close_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu.take().is_some() {
+            self.pending_focus_restore = true;
+            cx.notify();
+        }
+    }
+
+    /// Dispatches a keymap command, from the diagram's own key handler or
+    /// from the workspace. Returns true if the command was handled.
+    pub fn dispatch_command(
+        &mut self,
+        cmd: Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.context_menu.is_some()
+            && matches!(
+                cmd,
+                Command::MenuUp | Command::MenuDown | Command::MenuSelect | Command::MenuBack
+            )
+        {
+            self.dispatch_menu_command(cmd, cx);
+            return true;
+        }
+
+        match cmd {
+            Command::Cancel => {
+                if self.context_menu.is_some() {
+                    self.close_context_menu(cx);
+                    self.focus_handle.focus(window, cx);
+                    return true;
+                }
+                if self.selected_node.is_some() {
+                    self.selected_node = None;
+                    cx.notify();
+                    return true;
+                }
+                false
+            }
+            Command::OpenContextMenu => {
+                let menu_pos = if self.last_mouse_position != Point::default() {
+                    self.last_mouse_position
+                } else {
+                    Point::new(px(400.0), px(300.0))
+                };
+                self.open_context_menu(menu_pos, cx);
+                true
+            }
+            Command::ZoomIn => {
+                self.zoom = (self.zoom * 1.25).min(4.0);
+                cx.notify();
+                true
+            }
+            Command::ZoomOut => {
+                self.zoom = (self.zoom / 1.25).max(0.25);
+                cx.notify();
+                true
+            }
+            Command::LayoutLeftRight => {
+                self.set_layout_format(LayoutFormat::LeftRight, cx);
+                true
+            }
+            Command::LayoutSnowflake => {
+                self.set_layout_format(LayoutFormat::Snowflake, cx);
+                true
+            }
+            Command::LayoutCompact => {
+                self.set_layout_format(LayoutFormat::Compact, cx);
+                true
+            }
+            Command::PanLeft => {
+                self.pan_by(50.0, 0.0, cx);
+                true
+            }
+            Command::PanRight => {
+                self.pan_by(-50.0, 0.0, cx);
+                true
+            }
+            Command::PanUp => {
+                self.pan_by(0.0, 50.0, cx);
+                true
+            }
+            Command::PanDown => {
+                self.pan_by(0.0, -50.0, cx);
+                true
+            }
+            Command::SelectTableLeft => {
+                self.select_table_towards(Direction::Left, cx);
+                true
+            }
+            Command::SelectTableRight => {
+                self.select_table_towards(Direction::Right, cx);
+                true
+            }
+            Command::SelectTableUp => {
+                self.select_table_towards(Direction::Up, cx);
+                true
+            }
+            Command::SelectTableDown => {
+                self.select_table_towards(Direction::Down, cx);
+                true
+            }
+            Command::MoveTableLeft => {
+                self.move_selected_table(-20.0, 0.0, cx);
+                true
+            }
+            Command::MoveTableRight => {
+                self.move_selected_table(20.0, 0.0, cx);
+                true
+            }
+            Command::MoveTableUp => {
+                self.move_selected_table(0.0, -20.0, cx);
+                true
+            }
+            Command::MoveTableDown => {
+                self.move_selected_table(0.0, 20.0, cx);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Navigates the open context menu: up/down move the highlight, select
+    /// enters a submenu or runs the highlighted action, and back leaves a
+    /// submenu or closes the menu.
+    fn dispatch_menu_command(&mut self, cmd: Command, cx: &mut Context<Self>) {
+        match cmd {
+            Command::MenuUp => {
+                if let Some(menu) = self.context_menu.as_mut() {
+                    menu.navigate_up();
+                }
+                cx.notify();
+            }
+            Command::MenuDown => {
+                if let Some(menu) = self.context_menu.as_mut() {
+                    menu.navigate_down();
+                }
+                cx.notify();
+            }
+            Command::MenuSelect => {
+                let action = self
+                    .context_menu
+                    .as_ref()
+                    .and_then(|m| m.actions.get(m.selected_index).cloned());
+                match action {
+                    Some(SchemaVizMenuAction::LayoutSubmenu)
+                    | Some(SchemaVizMenuAction::CopyAsSubmenu) => {
+                        if let Some(menu) = self.context_menu.as_mut() {
+                            menu.go_into_submenu();
+                        }
+                        cx.notify();
+                    }
+                    _ => {
+                        let selected_index = self
+                            .context_menu
+                            .as_ref()
+                            .map(|m| m.selected_index)
+                            .unwrap_or(0);
+                        self.context_menu_execute_at(selected_index, cx);
+                    }
+                }
+            }
+            Command::MenuBack => {
+                let went_back = self
+                    .context_menu
+                    .as_mut()
+                    .is_some_and(|menu| menu.go_back());
+                if went_back {
+                    cx.notify();
+                } else {
+                    self.close_context_menu(cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Moves the camera by the given screen-space offset.
+    fn pan_by(&mut self, dx: f32, dy: f32, cx: &mut Context<Self>) {
+        let pan_x: f32 = self.pan_offset.x.into();
+        let pan_y: f32 = self.pan_offset.y.into();
+        self.pan_offset = Point::new(px(pan_x + dx), px(pan_y + dy));
+        cx.notify();
+    }
+
+    /// Selects the nearest table in `direction` and centers on it.
+    ///
+    /// With nothing selected yet, it starts from the spatial edge the
+    /// direction points away from: the first table for Right and Down, the
+    /// last for Left and Up.
+    fn select_table_towards(&mut self, direction: Direction, cx: &mut Context<Self>) {
+        if let Some(next) = self.find_next_node(direction) {
+            self.selected_node = Some(next);
+            self.center_on_node(next);
+            self.follow_selection_in_inspector(next, cx);
+            cx.notify();
+            return;
+        }
+
+        if self.selected_node.is_some() {
+            return;
+        }
+
+        let sorted = self.spatial_sorted_nodes();
+        let start = match direction {
+            Direction::Right | Direction::Down => sorted.first().copied(),
+            Direction::Left | Direction::Up => sorted.last().copied(),
+        };
+
+        if let Some(node) = start {
+            self.selected_node = Some(node);
+            self.center_on_node(node);
+            self.follow_selection_in_inspector(node, cx);
+            cx.notify();
+        }
+    }
+
+    /// Moves an open schema inspector to the newly selected table, so the
+    /// details panel follows keyboard selection. A closed rail stays closed.
+    fn follow_selection_in_inspector(
+        &mut self,
+        node_idx: petgraph::graph::NodeIndex,
+        cx: &mut Context<Self>,
+    ) {
+        if self.schema_inspector_title.is_some() {
+            self.open_schema_inspector(node_idx, cx);
+        }
+    }
+
+    /// Nudges the selected table by the given graph-space offset, snapping
+    /// the result onto the diagram lattice.
+    fn move_selected_table(&mut self, dx: f32, dy: f32, cx: &mut Context<Self>) {
+        let Some(selected) = self.selected_node else {
+            return;
+        };
+
+        let current_pos = self
+            .node_position_overrides
+            .get(&selected)
+            .copied()
+            .or_else(|| {
+                self.layout
+                    .as_ref()
+                    .and_then(|l| l.nodes.get(&selected))
+                    .map(|n| Point::new(n.x, n.y))
+            })
+            .unwrap_or(Point::new(0.0, 0.0));
+
+        self.node_position_overrides.insert(
+            selected,
+            Point::new(
+                snap_to_lattice(current_pos.x + dx),
+                snap_to_lattice(current_pos.y + dy),
+            ),
+        );
+        cx.notify();
+    }
+
+    /// Executes the action at the given index in the current context menu.
+    /// Builds (or reuses) a `SchemaInspector` for the given table node and
+    /// emits a `DocumentEvent::OpenInspector` so the workspace mounts it in
+    /// the right-side rail.
+    fn open_schema_inspector(
+        &mut self,
+        node_idx: petgraph::graph::NodeIndex,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(graph) = self.graph.as_ref() else {
+            return;
+        };
+        let Some(snapshot) = inspector::snapshot_for_node(graph, node_idx) else {
+            return;
+        };
+
+        let title = snapshot.qualified_name();
+
+        let content = match self.schema_inspector_content.clone() {
+            Some(existing) => {
+                existing.update(cx, |c, cx| c.open(snapshot, cx));
+                existing
+            }
+            None => {
+                let new_content = cx.new(|cx| inspector::SchemaInspector::new(snapshot, cx));
+                self._schema_inspector_subscription = Some(cx.subscribe(
+                    &new_content,
+                    |this, _, event: &inspector::SchemaInspectorEvent, cx| match event {
+                        inspector::SchemaInspectorEvent::Close => {
+                            this.mark_inspector_closed();
+                            cx.emit(DocumentEvent::CloseInspector);
+                        }
+                    },
+                ));
+                self.schema_inspector_content = Some(new_content.clone());
+                new_content
+            }
+        };
+
+        let title = SharedString::from(title);
+        self.schema_inspector_title = Some(title.clone());
+
+        cx.emit(DocumentEvent::OpenInspector {
+            title,
+            content: content.into(),
+            content_has_header: true,
+        });
+    }
+
+    /// Re-mounts this tab's schema inspector when the tab becomes active, so
+    /// the shared rail shows it again after the user returns. Nothing is sent
+    /// when the tab has no inspector open: the workspace already hid the rail.
+    pub fn set_active_tab(&mut self, active: bool, cx: &mut Context<Self>) {
+        if !active {
+            return;
+        }
+
+        let (Some(title), Some(content)) = (
+            self.schema_inspector_title.clone(),
+            self.schema_inspector_content.clone(),
+        ) else {
+            return;
+        };
+
+        cx.emit(DocumentEvent::OpenInspector {
+            title,
+            content: content.into(),
+            content_has_header: true,
+        });
+    }
+
+    /// Forgets the mounted schema inspector after the user dismissed the
+    /// workspace rail, so the next activation leaves the rail closed.
+    pub fn mark_inspector_closed(&mut self) {
+        self.schema_inspector_title = None;
+    }
+
+    fn context_menu_execute_at(&mut self, index: usize, cx: &mut Context<Self>) {
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "index >= menu.actions.len() returns early, so both menu.actions[index] accesses are in bounds"
+        )]
+        let action = match self.context_menu.as_mut() {
+            Some(menu) => {
+                if index >= menu.actions.len() {
+                    return;
+                }
+                // Skip separators
+                if matches!(menu.actions[index], SchemaVizMenuAction::Separator) {
+                    return;
+                }
+                menu.selected_index = index;
+                menu.actions[index].clone()
+            }
+            None => return,
+        };
+
+        match action {
+            SchemaVizMenuAction::LayoutSubmenu | SchemaVizMenuAction::CopyAsSubmenu => {
+                if let Some(menu) = self.context_menu.as_mut() {
+                    menu.go_into_submenu();
+                }
+                cx.notify();
+            }
+            SchemaVizMenuAction::ZoomIn => {
+                self.zoom = (self.zoom * 1.25).min(4.0);
+                self.context_menu = None;
+                cx.notify();
+            }
+            SchemaVizMenuAction::ZoomOut => {
+                self.zoom = (self.zoom / 1.25).max(0.25);
+                self.context_menu = None;
+                cx.notify();
+            }
+            SchemaVizMenuAction::ResetView => {
+                self.reset_view();
+                self.context_menu = None;
+                cx.notify();
+            }
+            SchemaVizMenuAction::FitToView => {
+                self.fit_to_view(FIT_MAX_ZOOM);
+                self.context_menu = None;
+                cx.notify();
+            }
+            SchemaVizMenuAction::Arrange => {
+                self.arrange();
+                self.context_menu = None;
+                cx.notify();
+            }
+            SchemaVizMenuAction::ShowTypes(on) => {
+                self.context_menu = None;
+                self.set_show_types(!on, cx);
+            }
+            SchemaVizMenuAction::ShowIndexes(on) => {
+                self.context_menu = None;
+                self.set_show_indexes(!on, cx);
+            }
+            SchemaVizMenuAction::FocusOnTable => {
+                self.context_menu = None;
+                cx.notify();
+            }
+            SchemaVizMenuAction::InspectTable => {
+                if let Some(node_idx) = self.selected_node {
+                    self.open_schema_inspector(node_idx, cx);
+                }
+                self.context_menu = None;
+                cx.notify();
+            }
+            SchemaVizMenuAction::LayoutLeftRight => {
+                self.set_layout_format(LayoutFormat::LeftRight, cx);
+                self.context_menu = None;
+                cx.notify();
+            }
+            SchemaVizMenuAction::LayoutSnowflake => {
+                self.set_layout_format(LayoutFormat::Snowflake, cx);
+                self.context_menu = None;
+                cx.notify();
+            }
+            SchemaVizMenuAction::LayoutCompact => {
+                self.set_layout_format(LayoutFormat::Compact, cx);
+                self.context_menu = None;
+                cx.notify();
+            }
+            SchemaVizMenuAction::CopyAsDbml => {
+                self.export_dbml(cx);
+                self.context_menu = None;
+                cx.notify();
+            }
+            SchemaVizMenuAction::CopyAsSql => {
+                self.copy_as_sql(cx);
+                self.context_menu = None;
+                cx.notify();
+            }
+            SchemaVizMenuAction::Separator => {}
+        }
+    }
+
+    /// Renders the context menu using the app's standard context_menu component.
+    fn render_context_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        use datatab_components::composites as ctx;
+
+        let menu = self.context_menu.as_ref()?;
+        let entity = cx.entity().clone();
+
+        let menu_x = menu.position.x;
+        let menu_y = menu.position.y;
+        let selected = menu.selected_index;
+
+        let in_submenu = !menu.parent_stack.is_empty();
+
+        // Layout constants (must match the sidebar pattern)
+        let menu_container_padding = Spacing::XS;
+        let menu_item_height = px(28.0);
+        let menu_width = px(160.0);
+        let menu_gap = Spacing::XS;
+
+        let submenu_y_offset = if let Some((_, parent_selected)) = menu.parent_stack.last() {
+            menu_container_padding + (menu_item_height * (*parent_selected as f32))
+        } else {
+            px(0.0)
+        };
+
+        // Build menu items from actions (same pattern as sidebar's to_menu_items)
+        let items = menu.menu_items();
+
+        let dismiss_entity = entity.clone();
+        let overlay = ctx::render_menu_overlay("schema-viz-menu-overlay", move |_, cx| {
+            dismiss_entity.update(cx, |this, cx| this.close_context_menu(cx));
+        });
+
+        let parent_menu = menu.parent_menu_items().map(|parent_items| {
+            let parent_selected = menu.parent_stack.last().map(|(_, idx)| *idx).unwrap_or(0);
+            let parent_click = entity.clone();
+            let parent_hover = entity.clone();
+            div()
+                .absolute()
+                .top(menu_y)
+                .left(menu_x)
+                .child(ctx::render_menu_items(
+                    "schema-viz-parent-menu",
+                    &parent_items,
+                    Some(parent_selected),
+                    move |idx, cx| {
+                        parent_click.update(cx, |this, cx| {
+                            if let Some(menu) = this.context_menu.as_mut() {
+                                menu.go_back();
+                            }
+                            this.context_menu_execute_at(idx, cx);
+                        });
+                    },
+                    move |idx, cx| {
+                        parent_hover.update(cx, |this, cx| {
+                            if let Some(menu) = this.context_menu.as_mut() {
+                                menu.selected_index = idx;
+                                cx.notify();
+                            }
+                        });
+                    },
+                    cx,
+                ))
+        });
+
+        let click_entity = entity.clone();
+        let hover_entity = entity.clone();
+
+        let current_menu = div()
+            .absolute()
+            .top(menu_y + submenu_y_offset)
+            .left(if in_submenu {
+                menu_x + menu_width + menu_gap
+            } else {
+                menu_x
+            })
+            .child(ctx::render_menu_items(
+                "schema-viz-menu",
+                &items,
+                Some(selected),
+                move |idx, cx| {
+                    click_entity.update(cx, |this, cx| this.context_menu_execute_at(idx, cx));
+                },
+                move |idx, cx| {
+                    hover_entity.update(cx, |this, cx| {
+                        if let Some(menu) = this.context_menu.as_mut() {
+                            menu.selected_index = idx;
+                            cx.notify();
+                        }
+                    });
+                },
+                cx,
+            ));
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .child(overlay)
+                .when_some(parent_menu, |d, m| d.child(m))
+                .child(current_menu),
+        )
+    }
+
+    fn render_diagram(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let zoom = self.zoom;
+        let pan = self.diagram_pan(window);
+
+        let theme = cx.theme().clone();
+        let background = theme.background;
+        let border = theme.border;
+        let muted_foreground = theme.muted_foreground;
+
+        let diagram_transform = ElementTransform::default()
+            .translate(pan)
+            .scale(size(zoom, zoom));
+
+        let diagram_canvas = match &self.layout {
+            Some(layout) => {
+                // T20: dot-grid background rendered via a single canvas element.
+                // Each dot is a 1.5px square painted at 24px lattice intersections.
+                let dot_color = border;
+                let dot_lattice = GRID_LATTICE;
+                let dot_extent = 3000.0_f32;
+                let dot_size = SchemaMetrics::DOT;
+                let dot_grid = canvas(
+                    |_bounds, _, _cx| {},
+                    move |bounds, _, window, _cx| {
+                        let ox: f32 = bounds.origin.x.into();
+                        let oy: f32 = bounds.origin.y.into();
+                        let cols = (dot_extent / dot_lattice) as usize + 1;
+                        let rows = (dot_extent / dot_lattice) as usize + 1;
+                        for col in 0..cols {
+                            for row in 0..rows {
+                                let cx_f = col as f32 * dot_lattice + ox;
+                                let cy_f = row as f32 * dot_lattice + oy;
+                                let dot_bounds = gpui::Bounds::centered_at(
+                                    gpui::Point::new(px(cx_f), px(cy_f)),
+                                    gpui::Size {
+                                        width: dot_size,
+                                        height: dot_size,
+                                    },
+                                );
+                                window.paint_quad(gpui::fill(dot_bounds, dot_color));
+                            }
+                        }
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .w(px(dot_extent))
+                .h(px(dot_extent));
+
+                let mut canvas_children: Vec<AnyElement> = Vec::new();
+
+                canvas_children.push(dot_grid.into_any_element());
+
+                for seg in self.render_edges_overlay(layout, &theme) {
+                    canvas_children.push(seg.into_any_element());
+                }
+                for node_div in self.render_nodes(layout, &theme, cx) {
+                    canvas_children.push(node_div.into_any_element());
+                }
+
+                div()
+                    .relative()
+                    .size_full()
+                    .bg(background)
+                    .transform(diagram_transform)
+                    .children(canvas_children)
+            }
+            None => div()
+                .size_full()
+                .bg(background)
+                .child(self.render_error(&datatab_i18n::t!("document.schema_viz.error.no_layout"))),
+        };
+
+        // Toolbar (P1Schema): zoom out, the zoom readout (click resets the
+        // view), zoom in, Fit, Arrange, the layout select, Export, then the
+        // table and relation counter and the Types / Indexes toggles.
+        let n_tables = self.layout.as_ref().map(|l| l.nodes.len()).unwrap_or(0);
+        let n_relations = self.layout.as_ref().map(|l| l.edges.len()).unwrap_or(0);
+        let counter_label = datatab_i18n::t!(
+            "document.schema_viz.toolbar.counter",
+            tables = n_tables,
+            relations = n_relations
+        );
+
+        let layout_select = {
+            let mut shape = Chamfer::new(ChamferCut::CONTROL)
+                .fill(theme.secondary)
+                .fill_hover(theme.secondary_hover)
+                .border(border)
+                .interactive("schema-layout-select-shape");
+
+            if self.layout_menu_open {
+                shape = shape.ring(ChamferRing::outline(ChromeColors::tint(&theme)));
+            }
+
+            div()
+                .relative()
+                .flex_shrink_0()
+                .child(
+                    div()
+                        .id("schema-layout-select")
+                        .relative()
+                        .flex()
+                        .items_center()
+                        .gap(Fields::GAP)
+                        .w(SchemaMetrics::LAYOUT_WIDTH)
+                        .h(Fields::HEIGHT)
+                        .px(Fields::PADDING_X)
+                        .cursor_pointer()
+                        .text_size(Fields::TEXT)
+                        .text_color(ChromeColors::strong(&theme))
+                        .child(shape)
+                        .child(
+                            Icon::new(AppIcon::ArrowLeftRight)
+                                .size(Fields::LEADING_ICON)
+                                .color(muted_foreground),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .truncate()
+                                .child(Self::layout_label(self.layout_format)),
+                        )
+                        .child(
+                            Icon::new(AppIcon::ChevronDown)
+                                .size(Fields::CHEVRON)
+                                .color(muted_foreground),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.layout_menu_open = !this.layout_menu_open;
+                            this.export_menu_open = false;
+                            cx.notify();
+                        })),
+                )
+                .when(self.layout_menu_open, |d| {
+                    d.child(self.render_layout_menu(cx))
+                })
+        };
+
+        let export_control = div()
+            .relative()
+            .flex_shrink_0()
+            .child(
+                Button::new(
+                    "schema-export",
+                    datatab_i18n::t!("document.schema_viz.toolbar.export"),
+                )
+                .icon(AppIcon::FileDown)
+                .trailing_icon(AppIcon::ChevronDown)
+                .selected(self.export_menu_open)
+                .tab_stop(false)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.export_menu_open = !this.export_menu_open;
+                    this.layout_menu_open = false;
+                    cx.notify();
+                })),
+            )
+            .when(self.export_menu_open, |d| {
+                d.child(self.render_export_menu(cx))
+            });
+
+        let show_types = self.show_types;
+        let show_indexes = self.show_indexes;
+        let toggles = toggle_group(
+            [
+                (
+                    "schema-viz-show-types",
+                    datatab_i18n::t!("document.schema_viz.toolbar.types"),
+                    show_types,
+                ),
+                (
+                    "schema-viz-show-indexes",
+                    datatab_i18n::t!("document.schema_viz.toolbar.indexes"),
+                    show_indexes,
+                ),
+            ],
+            cx.listener(|this, id: &SharedString, _, cx| {
+                if id.as_ref() == "schema-viz-show-types" {
+                    let next = !this.show_types;
+                    this.set_show_types(next, cx);
+                } else {
+                    let next = !this.show_indexes;
+                    this.set_show_indexes(next, cx);
+                }
+            }),
+            &theme,
+        );
+
+        let zoom_controls = div()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(DocumentMetrics::GAP)
+            .w_full()
+            .h(SchemaMetrics::TOOLBAR_HEIGHT)
+            .px(DocumentMetrics::PADDING_X)
+            .border_b_1()
+            .border_color(border)
+            .child(
+                Button::new(
+                    "schema-zoom-out",
+                    datatab_i18n::t!("document.schema_viz.toolbar.zoom_out"),
+                )
+                .icon(AppIcon::ZoomOut)
+                .icon_only()
+                .disabled(self.zoom <= 0.25)
+                .tab_stop(false)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.zoom = (this.zoom / 1.25).max(0.25);
+                    cx.notify();
+                })),
+            )
+            .child(
+                div()
+                    .id("schema-zoom-reset")
+                    .w(SchemaMetrics::ZOOM_WIDTH)
+                    .flex()
+                    .justify_center()
+                    .cursor_pointer()
+                    .font_family(datatab_components::fonts::editor_family(cx))
+                    .text_size(SchemaMetrics::ZOOM_FONT)
+                    .text_color(theme.foreground)
+                    .tooltip(|window, cx| {
+                        gpui_component::tooltip::Tooltip::new(datatab_i18n::t!(
+                            "document.schema_viz.toolbar.reset"
+                        ))
+                        .build(window, cx)
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.reset_view();
+                        cx.notify();
+                    }))
+                    .child(format!("{:.0}%", zoom * 100.0)),
+            )
+            .child(
+                Button::new(
+                    "schema-zoom-in",
+                    datatab_i18n::t!("document.schema_viz.toolbar.zoom_in"),
+                )
+                .icon(AppIcon::ZoomIn)
+                .icon_only()
+                .disabled(self.zoom >= 4.0)
+                .tab_stop(false)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.zoom = (this.zoom * 1.25).min(4.0);
+                    cx.notify();
+                })),
+            )
+            .child(
+                Button::new(
+                    "schema-fit",
+                    datatab_i18n::t!("document.schema_viz.toolbar.fit"),
+                )
+                .icon(AppIcon::Maximize2)
+                .tab_stop(false)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.fit_to_view(FIT_MAX_ZOOM);
+                    cx.notify();
+                })),
+            )
+            .child(
+                Button::new(
+                    "schema-arrange",
+                    datatab_i18n::t!("document.schema_viz.toolbar.arrange"),
+                )
+                .icon(AppIcon::Grid3x3)
+                .tab_stop(false)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.arrange();
+                    cx.notify();
+                })),
+            )
+            .child(layout_select)
+            .child(export_control)
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .text_size(SchemaMetrics::ZOOM_FONT)
+                    .text_color(muted_foreground)
+                    .child(counter_label),
+            )
+            .child(toggles);
+
+        // The viewport handles all pointer and scroll events.
+        // It is `relative()` so child `absolute()` elements are anchored to it.
+        // `overflow_hidden` clips elements outside the visible area.
+        let viewport = div()
+            .flex_1()
+            .relative()
+            .overflow_hidden()
+            .track_focus(&self.focus_handle)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, _, _cx| {
+                    if event.click_count == 1 && this.dragging_node.is_none() {
+                        this.is_panning = true;
+                        this.pan_start = event.position;
+                    }
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                // Track mouse position in panel-local coordinates for keyboard-opened menus
+                this.last_mouse_position = Point::new(
+                    event.position.x - this.panel_origin.x,
+                    event.position.y - this.panel_origin.y,
+                );
+
+                if let Some(node_idx) = this.dragging_node {
+                    let local_position = this.viewport_local_position(event.position);
+                    let screen_x: f32 = local_position.x.into();
+                    let screen_y: f32 = local_position.y.into();
+                    let off_x: f32 = this.drag_offset.x.into();
+                    let off_y: f32 = this.drag_offset.y.into();
+                    let pan = this.diagram_pan(window);
+                    let pan_x: f32 = pan.x.into();
+                    let pan_y: f32 = pan.y.into();
+                    let zoom = this.zoom;
+                    // graph_x = (screen_x - drag_offset_x - pan_x) / zoom
+                    let new_graph_x = (screen_x - off_x - pan_x) / zoom;
+                    let new_graph_y = (screen_y - off_y - pan_y) / zoom;
+                    this.node_position_overrides.insert(
+                        node_idx,
+                        Point::new(snap_to_lattice(new_graph_x), snap_to_lattice(new_graph_y)),
+                    );
+                    cx.notify();
+                    return;
+                }
+                if !this.is_panning {
+                    return;
+                }
+                let dx = event.position.x - this.pan_start.x;
+                let dy = event.position.y - this.pan_start.y;
+                if dx.abs() > px(0.5) || dy.abs() > px(0.5) {
+                    this.pan_offset = Point::new(this.pan_offset.x + dx, this.pan_offset.y + dy);
+                    this.pan_start = event.position;
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _cx| {
+                    this.is_panning = false;
+                    this.dragging_node = None;
+                }),
+            )
+            .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, window, cx| {
+                let mouse = this.viewport_local_position(event.position);
+                let old_zoom = this.zoom;
+                let delta = event.delta.pixel_delta(px(1.0)).y;
+                let factor = if delta > px(0.0) { 1.1_f32 } else { 0.9_f32 };
+                let new_zoom = (old_zoom * factor).clamp(0.25, 4.0);
+
+                if (new_zoom - old_zoom).abs() < 0.001 {
+                    return;
+                }
+
+                // Keep the point under the mouse fixed:
+                // graph_pt = (screen - pan) / old_zoom
+                // new_pan  = screen - graph_pt * new_zoom
+                let pan = this.diagram_pan(window);
+                let graph_x = (mouse.x - pan.x) / old_zoom;
+                let graph_y = (mouse.y - pan.y) / old_zoom;
+                let new_pan_x = mouse.x - graph_x * new_zoom;
+                let new_pan_y = mouse.y - graph_y * new_zoom;
+
+                this.pan_offset = Point::new(new_pan_x, new_pan_y);
+                this.zoom = new_zoom;
+                cx.notify();
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                    // Convert window-absolute position to panel-local
+                    let local = Point::new(
+                        event.position.x - this.panel_origin.x,
+                        event.position.y - this.panel_origin.y,
+                    );
+                    this.open_context_menu(local, cx);
+                }),
+            )
+            // The diagram's keys arrive as keymap commands in the SchemaViz and
+            // ContextMenu contexts (see `active_context`). A diagram command
+            // stays here even when it does nothing right now, so the
+            // workspace never takes focus away from the diagram; a command
+            // only the Global context binds (the palette, tab switching) goes
+            // on to the workspace.
+            .on_action(cx.listener(|this, action: &RunCommand, window, cx| {
+                let Some(command) = run_command(action) else {
+                    return;
+                };
+
+                if this.dispatch_command(command, window, cx) {
+                    return;
+                }
+
+                let keymap = effective_keymap();
+                let owned_here = [ContextId::SchemaViz, ContextId::ContextMenu]
+                    .into_iter()
+                    .filter_map(|context| keymap.layer(context))
+                    .any(|layer| layer.ordered_bindings().any(|(_, bound)| bound == command));
+
+                if !owned_here {
+                    cx.propagate();
+                }
+            }))
+            // Keys no binding takes stop here too, so nothing typed on the
+            // diagram reaches the workspace.
+            .on_key_down(cx.listener(|_this, _event: &KeyDownEvent, _window, cx| {
+                cx.stop_propagation();
+            }))
+            .child({
+                let entity_for_viewport = cx.entity().clone();
+                canvas(
+                    move |bounds: gpui::Bounds<Pixels>, _, cx| {
+                        entity_for_viewport.update(cx, |this, cx| {
+                            if this.viewport_origin != bounds.origin {
+                                this.viewport_origin = bounds.origin;
+                                cx.notify();
+                            }
+                            this.viewport_size = bounds.size;
+                            this.apply_pending_fit(cx);
+                        });
+                    },
+                    |_: gpui::Bounds<Pixels>, _, _, _| {},
+                )
+                .absolute()
+                .size_full()
+            })
+            .child(diagram_canvas);
+
+        let cap_warning = self.table_cap_warning.then(|| {
+            div()
+                .px(Spacing::MD)
+                .py(Spacing::XS)
+                .bg(ChromeColors::tint(&theme).opacity(0.08))
+                .border_b_1()
+                .border_color(theme.border)
+                .text_size(FontSizes::XS)
+                .text_color(theme.muted_foreground)
+                .child(datatab_i18n::t!("document.schema_viz.status.table_cap"))
+        });
+
+        // Clone entity before rendering to avoid borrow conflicts with canvas below.
+        let entity_for_origin = cx.entity().clone();
+
+        // Context menu overlay (rendered via app's standard component)
+        let context_menu = self.render_context_menu(cx);
+
+        // Track panel origin for context menu positioning (same pattern as
+        // DataGridPanel and AuditDocument). event.position from mouse events
+        // is window-absolute; the menu renders inside this div, so we need
+        // to subtract panel_origin to get local coordinates.
+        let origin_tracker = canvas(
+            move |bounds: gpui::Bounds<Pixels>, _, cx| {
+                entity_for_origin.update(cx, |this, _cx| {
+                    this.panel_origin = bounds.origin;
+                });
+            },
+            |_: gpui::Bounds<Pixels>, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
+
+        div()
+            .relative()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(background)
+            .child(origin_tracker)
+            .child(zoom_controls)
+            .children(cap_warning)
+            .child(viewport)
+            .when_some(context_menu, |d, menu| d.child(menu))
+    }
+
+    fn render_nodes(
+        &self,
+        layout: &LayoutResult,
+        theme: &gpui_component::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<Div> {
+        let Some(graph) = &self.graph else {
+            return Vec::new();
+        };
+
+        let dragging_node = self.dragging_node;
+
+        graph
+            .nodes()
+            .filter_map(|(idx, node)| {
+                let node_layout = layout.nodes.get(&idx)?;
+                Some(self.render_node(node, node_layout, idx, theme, dragging_node, cx))
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_node(
+        &self,
+        node: &datatab_schema_viz::graph::TableNode,
+        layout: &NodeLayout,
+        node_idx: petgraph::graph::NodeIndex,
+        theme: &gpui_component::theme::Theme,
+        dragging_node: Option<petgraph::graph::NodeIndex>,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let width = layout.width;
+
+        let position_override = self.node_position_overrides.get(&node_idx);
+        let (node_left, node_top) = if let Some(pos) = position_override {
+            (px(pos.x), px(pos.y))
+        } else {
+            (px(layout.x), px(layout.y))
+        };
+
+        let is_selected = self.selected_node.as_ref() == Some(&node_idx);
+
+        let tint = ChromeColors::tint(theme);
+        let strong = ChromeColors::strong(theme);
+        let muted_fg = theme.muted_foreground;
+
+        let is_dragging = dragging_node == Some(node_idx);
+        let cursor_style = if is_dragging {
+            CursorStyle::PointingHand
+        } else {
+            CursorStyle::Arrow
+        };
+
+        let node_idx_clone = node_idx;
+
+        let table_name = match &node.id.schema {
+            Some(s) => format!("{}.{}", s, node.id.name),
+            None => node.id.name.clone(),
+        };
+
+        // The header keeps a 1 px inset so its fill never covers the card's
+        // border, and cuts only its top-right corner to follow the card.
+        let header_fill = if is_selected {
+            tint.opacity(SchemaMetrics::SELECTED_HEADER_ALPHA)
+        } else {
+            theme.secondary
+        };
+
+        let node_header = div()
+            .relative()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(SchemaMetrics::HEADER_GAP)
+            .mt(px(1.0))
+            .mx(px(1.0))
+            .px(SchemaMetrics::CARD_PADDING_X)
+            .h(px(NODE_HEADER_PX - 1.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .child(Chamfer::new(ChamferCut::INPUT).fill(header_fill))
+            .child(
+                Icon::new(AppIcon::Table)
+                    .size(SchemaMetrics::HEADER_ICON)
+                    .color(tint),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .font_family(datatab_components::fonts::editor_family(cx))
+                    .text_size(SchemaMetrics::HEADER_FONT)
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(strong)
+                    .child(table_name),
+            );
+
+        let show_types = self.show_types;
+        let col_rows: Vec<_> = node
+            .columns
+            .iter()
+            .map(|col| {
+                let key_icon = if col.is_pk {
+                    Some((AppIcon::KeyRound, theme.warning))
+                } else if col.is_fk {
+                    Some((AppIcon::Link2, theme.info))
+                } else {
+                    None
+                };
+
+                div()
+                    .flex()
+                    .items_center()
+                    .h(px(NODE_ROW_PX))
+                    .gap(SchemaMetrics::ROW_GAP)
+                    .overflow_hidden()
+                    .font_family(datatab_components::fonts::editor_family(cx))
+                    .text_size(SchemaMetrics::ROW_FONT)
+                    .child(match key_icon {
+                        Some((icon, color)) => Icon::new(icon)
+                            .size(SchemaMetrics::ROW_ICON)
+                            .color(color)
+                            .into_any_element(),
+                        None => div()
+                            .flex_shrink_0()
+                            .w(SchemaMetrics::ROW_ICON)
+                            .into_any_element(),
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(strong)
+                            .child(col.name.clone()),
+                    )
+                    .when(show_types, |d| {
+                        d.child(
+                            div()
+                                .flex_shrink_0()
+                                .max_w(SchemaMetrics::TYPE_WIDTH)
+                                .truncate()
+                                .text_color(muted_fg)
+                                .child(truncate_type_name(&col.type_name)),
+                        )
+                    })
+            })
+            .collect();
+
+        // Indexes section (only when show_indexes is true and there are indexes)
+        let show_indexes = self.show_indexes;
+        let index_color = SyntaxColors::for_current(cx).number;
+        let indexes_section = if show_indexes && !node.indexes.is_empty() {
+            let index_rows: Vec<_> = node
+                .indexes
+                .iter()
+                .map(|idx| {
+                    let label = format!("{} ({})", idx.name, idx.columns.join(", "));
+
+                    div()
+                        .flex()
+                        .items_center()
+                        .h(px(NODE_INDEX_ROW_PX))
+                        .gap(SchemaMetrics::ROW_GAP)
+                        .overflow_hidden()
+                        .font_family(datatab_components::fonts::editor_family(cx))
+                        .text_size(SchemaMetrics::ROW_FONT)
+                        .text_color(muted_fg)
+                        .child(
+                            Icon::new(AppIcon::Hash)
+                                .size(SchemaMetrics::ROW_ICON)
+                                .color(index_color),
+                        )
+                        .child(div().flex_1().min_w_0().truncate().child(label))
+                        .when(idx.unique, |d| {
+                            d.child(
+                                Icon::new(AppIcon::KeyRound)
+                                    .size(SchemaMetrics::ROW_ICON)
+                                    .color(tint),
+                            )
+                        })
+                })
+                .collect::<Vec<_>>();
+
+            Some(
+                div()
+                    .flex()
+                    .flex_col()
+                    .px(SchemaMetrics::CARD_PADDING_X)
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(
+                        div()
+                            .h(px(NODE_INDEX_HEADER_PX))
+                            .flex()
+                            .items_center()
+                            .child(datatab_components::primitives::Text::label(
+                                datatab_i18n::t!("document.schema_viz.node.indexes"),
+                            )),
+                    )
+                    .children(index_rows),
+            )
+        } else {
+            None
+        };
+
+        // A selected table shows selection the way the board draws it: its
+        // header takes the tinted fill and its edge the tint, with no focus
+        // ring, which stays reserved for keyboard focus.
+        let card_shape = Chamfer::new(ChamferCut::INPUT)
+            .fill(theme.popover)
+            .border(if is_selected { tint } else { theme.input });
+
+        div()
+            .absolute()
+            .left(node_left)
+            .top(node_top)
+            .w(px(width))
+            .when(is_selected, |card| card.shadow_lg())
+            .cursor(cursor_style)
+            .child(card_shape)
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                    if event.click_count >= 2 {
+                        this.selected_node = Some(node_idx_clone);
+                        this.open_schema_inspector(node_idx_clone, cx);
+                        return;
+                    }
+                    if event.click_count == 1 {
+                        this.selected_node = Some(node_idx_clone);
+                        this.open_schema_inspector(node_idx_clone, cx);
+                        this.dragging_node = Some(node_idx_clone);
+                        this.is_panning = false;
+                        let zoom = this.zoom;
+                        let node_x = this
+                            .node_position_overrides
+                            .get(&node_idx_clone)
+                            .map(|p| p.x)
+                            .or_else(|| {
+                                this.layout
+                                    .as_ref()
+                                    .and_then(|l| l.nodes.get(&node_idx_clone))
+                                    .map(|n| n.x)
+                            })
+                            .unwrap_or(0.0);
+                        let node_y = this
+                            .node_position_overrides
+                            .get(&node_idx_clone)
+                            .map(|p| p.y)
+                            .or_else(|| {
+                                this.layout
+                                    .as_ref()
+                                    .and_then(|l| l.nodes.get(&node_idx_clone))
+                                    .map(|n| n.y)
+                            })
+                            .unwrap_or(0.0);
+                        let pan = this.diagram_pan(window);
+                        let pan_x: f32 = pan.x.into();
+                        let pan_y: f32 = pan.y.into();
+                        let node_screen_x = px(node_x * zoom + pan_x);
+                        let node_screen_y = px(node_y * zoom + pan_y);
+                        let local_position = this.viewport_local_position(event.position);
+                        this.drag_offset = Point::new(
+                            local_position.x - node_screen_x,
+                            local_position.y - node_screen_y,
+                        );
+                        this.node_position_overrides
+                            .insert(node_idx_clone, Point::new(node_x, node_y));
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                    // Always retarget the selection to the node under the cursor
+                    // before opening the menu so the menu actions apply to the
+                    // table the user actually right-clicked on (not a stale
+                    // previously-selected table).
+                    this.selected_node = Some(node_idx_clone);
+                    let local = Point::new(
+                        event.position.x - this.panel_origin.x,
+                        event.position.y - this.panel_origin.y,
+                    );
+                    this.open_context_menu(local, cx);
+                    cx.stop_propagation();
+                }),
+            )
+            .flex()
+            .flex_col()
+            .child(node_header)
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .px(SchemaMetrics::CARD_PADDING_X)
+                    .pt(px(NODE_BODY_TOP_PX))
+                    .children(col_rows),
+            )
+            .when_some(indexes_section, |d, sec| d.child(sec))
+    }
+
+    /// Renders edges as cubic bezier curves on a canvas element.
+    ///
+    /// Column-level anchor Y positions are computed using the same formula as
+    /// `compute_node_height` so that edge endpoints always hit the correct row.
+    /// Edges that connect off-screen nodes are rendered dashed.
+    fn render_edges_overlay(
+        &self,
+        layout: &LayoutResult,
+        theme: &gpui_component::theme::Theme,
+    ) -> Vec<Div> {
+        let edge_color = ChromeColors::tint(theme);
+        let edge_color_dim = ChromeColors::tint(theme).opacity(0.5);
+        let edge_color_rest = theme.input;
+
+        let Some(graph) = &self.graph else {
+            return Vec::new();
+        };
+
+        // Collect all edge data before moving into the canvas closure.
+        struct EdgeData {
+            route: routing::OrthogonalRoute,
+
+            dashed: bool,
+            /// The edge touches the selected table, so it takes the tint.
+            highlighted: bool,
+        }
+
+        let mut edges: Vec<EdgeData> = Vec::new();
+        let row_center = NODE_ROW_PX / 2.0;
+        let mut lane_counts: HashMap<(NodeIndex, NodeIndex), usize> = HashMap::new();
+        for edge_idx in graph.edge_indices() {
+            if let Some(endpoints) = graph.edge_endpoints(edge_idx) {
+                *lane_counts.entry(endpoints).or_default() += 1;
+            }
+        }
+        let mut next_lane_rank: HashMap<(NodeIndex, NodeIndex), usize> = HashMap::new();
+
+        // Node rectangles in world space, built once: the router needs them for the
+        // edge's own ends and to keep its lanes clear of every other table.
+        let mut bounds_by_node: HashMap<NodeIndex, routing::NodeBounds> = HashMap::new();
+        for (idx, _) in graph.nodes() {
+            let Some(node_layout) = layout.nodes.get(&idx) else {
+                continue;
+            };
+            let (x, y) = self
+                .node_position_overrides
+                .get(&idx)
+                .map_or((node_layout.x, node_layout.y), |pos| (pos.x, pos.y));
+            bounds_by_node.insert(
+                idx,
+                routing::NodeBounds {
+                    x,
+                    y,
+                    width: node_layout.width,
+                    height: node_layout.height,
+                },
+            );
+        }
+        let obstacles: Vec<routing::NodeBounds> = bounds_by_node.values().copied().collect();
+
+        for edge_idx in graph.edge_indices() {
+            let (source, target) = match graph.edge_endpoints(edge_idx) {
+                Some(endpoints) => endpoints,
+                None => continue,
+            };
+            let endpoints = (source, target);
+            let lane_rank = *next_lane_rank.entry(endpoints).or_default();
+            *next_lane_rank.entry(endpoints).or_default() += 1;
+            let lane_count = lane_counts.get(&endpoints).copied().unwrap_or(1);
+            let edge_weight = match graph.edge_weight(edge_idx) {
+                Some(w) => w,
+                None => continue,
+            };
+            let from_node_weight = match graph.node_weight(source) {
+                Some(n) => n,
+                None => continue,
+            };
+            let to_node_weight = match graph.node_weight(target) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            let (Some(&source_bounds), Some(&target_bounds)) =
+                (bounds_by_node.get(&source), bounds_by_node.get(&target))
+            else {
+                continue;
+            };
+
+            let from_col_y = edge_weight
+                .from_columns
+                .first()
+                .and_then(|col_name| {
+                    from_node_weight
+                        .columns
+                        .iter()
+                        .position(|c| &c.name == col_name)
+                })
+                .map(|col_idx| {
+                    NODE_HEADER_PX + NODE_BODY_TOP_PX + col_idx as f32 * NODE_ROW_PX + row_center
+                })
+                .unwrap_or(NODE_HEADER_PX + NODE_BODY_TOP_PX);
+
+            let to_col_y = edge_weight
+                .to_columns
+                .first()
+                .and_then(|col_name| {
+                    to_node_weight
+                        .columns
+                        .iter()
+                        .position(|c| &c.name == col_name)
+                })
+                .map(|col_idx| {
+                    NODE_HEADER_PX + NODE_BODY_TOP_PX + col_idx as f32 * NODE_ROW_PX + row_center
+                })
+                .unwrap_or(NODE_HEADER_PX + NODE_BODY_TOP_PX);
+
+            // Anchor a few px outside the node so the curve and arrowhead never
+            // visually overlap the FK / PK badges inside the row.
+
+            let route = routing::route_foreign_key(
+                source_bounds,
+                target_bounds,
+                from_col_y,
+                to_col_y,
+                lane_rank,
+                lane_count,
+                &obstacles,
+            );
+
+            // All edges render solid; the off-screen dashed variant was dropped.
+            let highlighted = self
+                .selected_node
+                .is_some_and(|selected| selected == source || selected == target);
+
+            edges.push(EdgeData {
+                route,
+
+                dashed: false,
+                highlighted,
+            });
+        }
+
+        if edges.is_empty() {
+            return Vec::new();
+        }
+
+        // Paint all edges on a single canvas element covering the full canvas area.
+        // `paint_path` works in window-absolute coordinates, so every point must be
+        // offset by the canvas element's `bounds.origin`.
+        let canvas_el = canvas(
+            |_bounds, _, _cx| {},
+            move |bounds, _, window, _cx| {
+                use gpui::PathBuilder;
+
+                let ox: f32 = bounds.origin.x.into();
+                let oy: f32 = bounds.origin.y.into();
+
+                for e in &edges {
+                    let start = e.route.start();
+                    let end = e.route.end();
+                    let ox_start = start.x + ox;
+                    let oy_start = start.y + oy;
+                    let ox_end = end.x + ox;
+                    let oy_end = end.y + oy;
+                    let color = if e.dashed {
+                        edge_color_dim
+                    } else if e.highlighted {
+                        edge_color
+                    } else {
+                        edge_color_rest
+                    };
+
+                    let mut builder = PathBuilder::stroke(px(1.5));
+                    if e.dashed {
+                        // FK edge dash on/off lengths are diagram stroke geometry, not UI spacing.
+                        builder = builder.dash_array(&[px(6.0), px(4.0)]); // guardrail-allow: diagram stroke geometry
+                    }
+                    for (position, point) in e.route.points.iter().enumerate() {
+                        let target = gpui::point(px(point.x + ox), px(point.y + oy));
+                        if position == 0 {
+                            builder.move_to(target);
+                        } else {
+                            builder.line_to(target);
+                        }
+                    }
+                    if let Ok(path) = builder.build() {
+                        window.paint_path(path, color);
+                    }
+
+                    // Arrowhead: small filled triangle at the referenced end, along the
+                    // direction the last segment enters with.
+                    let (ux, uy) = e.route.end_direction();
+                    let arrow_len = 8.0_f32;
+                    let arrow_half_base = 3.0_f32;
+                    let tip = gpui::point(px(ox_end), px(oy_end));
+                    let base_center_x = ox_end - ux * arrow_len;
+                    let base_center_y = oy_end - uy * arrow_len;
+                    let left = gpui::point(
+                        px(base_center_x - uy * arrow_half_base),
+                        px(base_center_y + ux * arrow_half_base),
+                    );
+                    let right = gpui::point(
+                        px(base_center_x + uy * arrow_half_base),
+                        px(base_center_y - ux * arrow_half_base),
+                    );
+
+                    let mut arrow_builder = PathBuilder::fill();
+                    arrow_builder.move_to(tip);
+                    arrow_builder.line_to(left);
+                    arrow_builder.line_to(right);
+                    arrow_builder.close();
+
+                    if let Ok(arrow_path) = arrow_builder.build() {
+                        window.paint_path(arrow_path, color);
+                    }
+
+                    // Cardinality notation, as in an IDEF1X diagram: a crow's foot on the
+                    // table that declares the key (many) and a tick on the table it points
+                    // at (one), so the direction is readable without following the line.
+                    let (sx_dir, sy_dir) = e.route.start_direction();
+                    let (perp_x, perp_y) = (-sy_dir, sx_dir);
+                    let foot_len = 9.0_f32;
+                    let foot_spread = 4.5_f32;
+                    let base_x = ox_start + sx_dir * foot_len;
+                    let base_y = oy_start + sy_dir * foot_len;
+
+                    let mut foot_builder = PathBuilder::stroke(px(1.5));
+                    for offset in [-foot_spread, 0.0, foot_spread] {
+                        foot_builder.move_to(gpui::point(px(base_x), px(base_y)));
+                        foot_builder.line_to(gpui::point(
+                            px(ox_start + perp_x * offset),
+                            px(oy_start + perp_y * offset),
+                        ));
+                    }
+                    if let Ok(foot_path) = foot_builder.build() {
+                        window.paint_path(foot_path, color);
+                    }
+
+                    let tick_offset = 6.0_f32;
+                    let tick_half = 5.0_f32;
+                    let tick_x = ox_end - ux * tick_offset;
+                    let tick_y = oy_end - uy * tick_offset;
+                    let mut tick_builder = PathBuilder::stroke(px(1.5));
+                    tick_builder.move_to(gpui::point(
+                        px(tick_x + uy * tick_half),
+                        px(tick_y - ux * tick_half),
+                    ));
+                    tick_builder.line_to(gpui::point(
+                        px(tick_x - uy * tick_half),
+                        px(tick_y + ux * tick_half),
+                    ));
+                    if let Ok(tick_path) = tick_builder.build() {
+                        window.paint_path(tick_path, color);
+                    }
+                }
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .w(px(10000.0))
+        .h(px(10000.0));
+
+        vec![div().absolute().top_0().left_0().child(canvas_el)]
+    }
+}
+
+/// Tests for SchemaVizDocument logic (pure unit tests — no GPUI harness required).
+/// Bulk metadata fetched for one schema. `columns_ok` is false when the
+/// driver has no bulk column path and the schema keeps the per-table path.
+struct SchemaBulk {
+    columns: HashMap<String, Vec<ColumnInfo>>,
+    indexes: HashMap<String, Vec<IndexInfo>>,
+    foreign_keys: Vec<SchemaForeignKeyInfo>,
+    columns_ok: bool,
+    /// Exactly what each bulk seam returned, kept so the loader can hand the
+    /// unfiltered result back for cache seeding. `None` means the seam was
+    /// never called or it failed — the cache must never be seeded from a
+    /// degraded empty stand-in.
+    fetched_columns: Option<Vec<SchemaColumnInfo>>,
+    fetched_indexes: Option<Vec<SchemaIndexInfo>>,
+    fetched_foreign_keys: Option<Vec<SchemaForeignKeyInfo>>,
+}
+
+impl SchemaBulk {
+    /// The cache-seed view of this schema's bulk result: the rows exactly as
+    /// fetched, including every relation the diagram itself did not use.
+    fn cache_seed(&self, database: &str, schema: Option<&str>) -> FetchedSchemaBulk {
+        FetchedSchemaBulk {
+            database: database.to_string(),
+            schema: schema.map(str::to_string),
+            columns: self.fetched_columns.clone(),
+            indexes: self.fetched_indexes.clone(),
+            foreign_keys: self.fetched_foreign_keys.clone(),
+        }
+    }
+}
+
+/// One schema's unfiltered bulk metadata, handed back by the loader so the
+/// caller can seed the connection manager's per-schema caches. A populated
+/// schema key in those caches means "fully loaded", so these carry the whole
+/// per-schema result — including relations the diagram filtered out.
+struct FetchedSchemaBulk {
+    database: String,
+    schema: Option<String>,
+    columns: Option<Vec<SchemaColumnInfo>>,
+    indexes: Option<Vec<SchemaIndexInfo>>,
+    foreign_keys: Option<Vec<SchemaForeignKeyInfo>>,
+}
+
+/// What `load_focused_schema_blocking` produced for one diagram load.
+struct LoadedSchemaData {
+    tables: Vec<TableInfo>,
+    graph: SchemaGraph,
+    layout: LayoutResult,
+    capped: bool,
+    /// Relations assembled from either path — bulk or per-table
+    /// `table_details` (useful for audit events on cancel).
+    tables_loaded: usize,
+    /// One entry per distinct schema whose bulk data was fetched.
+    bulk: Vec<FetchedSchemaBulk>,
+}
+
+/// Outcome of loading one relation for the diagram.
+enum LoadedRelation {
+    Loaded(TableInfo),
+    Failed(DbError),
+    Cancelled,
+}
+
+/// Metadata seam for the schema-diagram loader so it can be unit-tested with
+/// a fake instead of a live connection. Every schema-scoped method carries
+/// the database name: `ConnectionPerDatabase` drivers and the MySQL and MSSQL
+/// `schema_for_database` implementations treat it as load-bearing.
+trait MetadataSource {
+    #[allow(clippy::result_large_err)]
+    fn metadata(&self) -> &DriverMetadata;
+
+    #[allow(clippy::result_large_err)]
+    fn table_details(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<TableInfo, DbError>;
+
+    #[allow(clippy::result_large_err)]
+    fn schema_columns(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+    ) -> Result<Vec<SchemaColumnInfo>, DbError>;
+
+    #[allow(clippy::result_large_err)]
+    fn schema_indexes(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+    ) -> Result<Vec<SchemaIndexInfo>, DbError>;
+
+    #[allow(clippy::result_large_err)]
+    fn schema_foreign_keys(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+    ) -> Result<Vec<SchemaForeignKeyInfo>, DbError>;
+
+    #[allow(clippy::result_large_err)]
+    fn schema_for_database(&self, database: &str) -> Result<DbSchemaInfo, DbError>;
+}
+
+#[allow(clippy::result_large_err)]
+impl MetadataSource for Arc<dyn Connection> {
+    fn metadata(&self) -> &DriverMetadata {
+        self.as_ref().metadata()
+    }
+
+    fn table_details(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<TableInfo, DbError> {
+        self.as_ref().table_details(database, schema, table)
+    }
+
+    fn schema_columns(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+    ) -> Result<Vec<SchemaColumnInfo>, DbError> {
+        self.as_ref().schema_columns(database, schema)
+    }
+
+    fn schema_indexes(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+    ) -> Result<Vec<SchemaIndexInfo>, DbError> {
+        self.as_ref().schema_indexes(database, schema)
+    }
+
+    fn schema_foreign_keys(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+    ) -> Result<Vec<SchemaForeignKeyInfo>, DbError> {
+        self.as_ref().schema_foreign_keys(database, schema)
+    }
+
+    fn schema_for_database(&self, database: &str) -> Result<DbSchemaInfo, DbError> {
+        self.as_ref().schema_for_database(database)
+    }
+}
+
+/// Kept in a separate file to avoid rustc stack overflow during compilation of
+/// this large module (see crates/datatab_ui/src/ui/document/schema_viz/tests.rs).
+#[cfg(test)]
+mod tests;
+
+#[cfg(test)]
+mod rail_tests;
+
+#[cfg(test)]
+mod keymap_tests;
+
+#[cfg(test)]
+mod accessibility_tests;
+
+impl EventEmitter<DocumentEvent> for SchemaVizDocument {}
+
+impl Render for SchemaVizDocument {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        flush_pending_toast(self.pending_toast.take(), window, cx);
+
+        // Restore focus after context menu closes (the overlay dismiss callback
+        // runs in App context without Window, so it sets pending_focus_restore
+        // and we restore focus here where Window is available).
+        if self.pending_focus_restore && self.context_menu.is_none() {
+            self.pending_focus_restore = false;
+            self.focus_handle.focus(window, cx);
+        }
+
+        match &self.load_status {
+            LoadStatus::Loading => self.render_loading(cx).into_any_element(),
+            LoadStatus::Error(msg) => self.render_error(msg).into_any_element(),
+            LoadStatus::NotSupported => self.render_not_supported().into_any_element(),
+            LoadStatus::Ready => self.render_diagram(window, cx).into_any_element(),
+        }
+    }
+}

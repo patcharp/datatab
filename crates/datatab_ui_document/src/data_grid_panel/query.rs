@@ -1,0 +1,1418 @@
+use super::filter_bar::{FilterMode, RelationalFilterState, classify_filter_input};
+use super::{DataGridPanel, DataSource, GridState, PendingToast, PendingTotalCount, TableReload};
+use crate::result_view::ResultViewMode;
+use datatab_components::components::data_table::SortState as TableSortState;
+use datatab_core::{
+    CollectionBrowseRequest, CollectionCountRequest, CollectionRef, EditableBinding, OrderByColumn,
+    Pagination, QueryResult, SelectQuery, SourceTable, TableBrowseRequest, TableCountRequest,
+    TableRef, TaskKind, TaskTarget, VisualQuerySpec,
+};
+use datatab_core::{
+    RelationalFilterError, RelationalResolveError, count_query_from_spec, parse_and_resolve,
+    project_aggregate_kinds,
+};
+use datatab_ui_base::toast::{Toast, copy_action, now_hms};
+use gpui::*;
+use log::info;
+use uuid::Uuid;
+
+impl DataGridPanel {
+    /// Whether the table holds edits, inserts or deletes that are not saved.
+    /// A reload replaces the rows those edits are keyed by, so it drops them.
+    pub(super) fn has_pending_edits(&self, cx: &App) -> bool {
+        self.grid_table
+            .table_state
+            .as_ref()
+            .is_some_and(|table_state| table_state.read(cx).has_pending_operations())
+    }
+
+    /// Whether unsaved edits sit on a result without a primary key: they are
+    /// addressed by row position only, so no reload can carry them over.
+    pub(super) fn pending_edits_lack_row_identity(&self, cx: &App) -> bool {
+        self.grid_table
+            .table_state
+            .as_ref()
+            .is_some_and(|table_state| {
+                let state = table_state.read(cx);
+                state.has_pending_operations() && state.pk_columns().is_empty()
+            })
+    }
+
+    /// Refuses a reload of the rows (refresh, filter, limit, page, sort,
+    /// query builder, chart re-run) while there are unsaved edits, telling the
+    /// user to save or revert them first. Returns `true` when the reload must
+    /// not run.
+    pub(super) fn reload_blocked_by_pending_edits(&self, cx: &mut Context<Self>) -> bool {
+        if !self.has_pending_edits(cx) {
+            return false;
+        }
+
+        Toast::warning(crate::labels::grid_reload_blocked_by_pending_edits())
+            .meta_right(now_hms())
+            .push(cx);
+        true
+    }
+
+    /// Refresh requested by the user (refresh key, toolbar button, command
+    /// palette). Unsaved edits are never dropped: the refresh is refused with
+    /// a warning instead.
+    pub fn request_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.reload_blocked_by_pending_edits(cx) {
+            return;
+        }
+
+        // Refresh keeps its place in the neighbor bar and reads the same
+        // neighbors again.
+        if self.rerun_nearest_neighbors(cx) {
+            return;
+        }
+
+        // Cached labels name the rows read before this refresh — a rename in
+        // another tab left them stale, and a cached miss would hide a row
+        // inserted since. Page turns and other internal reloads keep the
+        // cache: their rows name the same referenced rows.
+        self.fk_display.clear();
+        self.refresh(window, cx);
+    }
+
+    /// Reload after a landed mutation. The request issued here takes the
+    /// keep-edits intent with it, so its result carries the edits still staged
+    /// on other rows over to the reloaded rows by primary key.
+    pub(super) fn refresh_keeping_edits(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.grid_table.keep_edits_on_reload = true;
+        self.refresh(window, cx);
+
+        // A refresh that issued no request (a static result, a missing
+        // connection) leaves the intent unclaimed. It belongs to no result, so
+        // no later rebuild may pick it up.
+        self.grid_table.keep_edits_on_reload = false;
+    }
+
+    /// Replace the filter text and reload the rows under it (clear buttons,
+    /// context-menu filters). Guarded like [`Self::request_refresh`]: with
+    /// unsaved edits the filter is left untouched and the user is warned.
+    pub(super) fn replace_filter_and_reload(
+        &mut self,
+        filter: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.reload_blocked_by_pending_edits(cx) {
+            return;
+        }
+
+        self.filter_bar
+            .filter_input
+            .update(cx, |input, cx| input.set_value(filter, window, cx));
+        self.refresh(window, cx);
+    }
+
+    /// Positions the table on one record: replaces the filter with an
+    /// equality on `key_column = key_value`, rendered through the driver's
+    /// dialect, and reloads from the first page with the cursor dropped.
+    /// No-op on a source that is not a table or without a connected profile
+    /// for it — the navigation target is always a table.
+    pub(crate) fn focus_row_by_key(
+        &mut self,
+        key_column: &str,
+        key_value: &datatab_core::Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let profile_id = match &self.source {
+            DataSource::Table { profile_id, .. } => *profile_id,
+            _ => return,
+        };
+
+        let filter = {
+            let dialect = self
+                .app_state
+                .read(cx)
+                .connections()
+                .get(&profile_id)
+                .map(|connected| connected.connection.dialect());
+
+            let Some(dialect) = dialect else {
+                return;
+            };
+
+            format!(
+                "{} = {}",
+                dialect.quote_identifier(key_column),
+                dialect.value_to_literal(key_value)
+            )
+        };
+
+        // Guarded before any state changes, like the sort handlers: a
+        // blocked reload leaves the page and the cursor as they are.
+        if self.reload_blocked_by_pending_edits(cx) {
+            return;
+        }
+
+        // The equality must run from the first page (an offset held over
+        // from the previous view can answer with no rows), and the reload
+        // replaces the row set the cursor addresses — the same reset a page
+        // change marks before it queries.
+        if let DataSource::Table { pagination, .. } = &mut self.source {
+            *pagination = pagination.reset_offset();
+        }
+        self.grid_table.reload = TableReload::ResetRows;
+
+        self.replace_filter_and_reload(&filter, window, cx);
+    }
+
+    /// Refresh data from source.
+    ///
+    /// When a `visual_select` is present (i.e., the builder panel has produced
+    /// a structured SELECT), the parameterized query takes precedence over the
+    /// normal `TableBrowseRequest` path.
+    pub fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A search still running is dropped by this read; its bar must not
+        // come back while the table page loads.
+        self.nearest.running = None;
+
+        match &self.source {
+            DataSource::Table {
+                profile_id,
+                database,
+                table,
+                pagination,
+                order_by,
+                total_rows,
+            } => {
+                let profile_id = *profile_id;
+                let database = database.clone();
+                let table = table.clone();
+                let pagination = pagination.clone();
+                let order_by = order_by.clone();
+                let total_rows = *total_rows;
+
+                if let Some(select) = self.builder.visual_select.clone() {
+                    self.run_visual_query(profile_id, database.clone(), select, window, cx);
+
+                    if let Some(spec) = self.builder.builder_draft_spec.clone()
+                        && spec.is_grouped()
+                    {
+                        self.fetch_grouped_total_count(profile_id, database, spec, cx);
+                    }
+                } else {
+                    self.run_table_query(
+                        profile_id, database, table, pagination, order_by, total_rows, window, cx,
+                    );
+                }
+            }
+            DataSource::Collection {
+                profile_id,
+                collection,
+                pagination,
+                total_docs,
+            } => {
+                self.run_collection_query(
+                    *profile_id,
+                    collection.clone(),
+                    pagination.clone(),
+                    *total_docs,
+                    window,
+                    cx,
+                );
+            }
+            DataSource::QueryResult { .. } => {
+                // QueryResult is static, nothing to refresh
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn run_table_query(
+        &mut self,
+        profile_id: Uuid,
+        database: Option<String>,
+        table: TableRef,
+        pagination: Pagination,
+        order_by: Vec<OrderByColumn>,
+        total_rows: Option<u64>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let filter_value = self.filter_bar.filter_input.read(cx).value();
+        let filter = if filter_value.trim().is_empty() {
+            None
+        } else {
+            Some(filter_value.to_string())
+        };
+
+        let limit_value = self.filter_bar.limit_input.read(cx).value();
+        let limit_str = limit_value.trim();
+        let previous_limit = pagination.limit();
+        let pagination = match limit_str.parse::<u32>() {
+            Ok(0) => {
+                Toast::warning(datatab_i18n::t!(
+                    "document.data.grid.error.limit_must_be_positive"
+                ))
+                .meta_right(now_hms())
+                .push(cx);
+                pagination
+            }
+            Ok(limit) if limit != previous_limit => {
+                // A new page size makes every row index refer somewhere else.
+                self.grid_table.reload = TableReload::ResetRows;
+                pagination.with_limit(limit).reset_offset()
+            }
+            Ok(_) => pagination,
+            Err(_) if !limit_str.is_empty() => {
+                Toast::warning(datatab_i18n::t!("document.data.grid.error.invalid_limit"))
+                    .meta_right(now_hms())
+                    .push(cx);
+                pagination
+            }
+            Err(_) => pagination,
+        };
+
+        // Taken here so a request that never lands (cancelled or failed) does
+        // not leave the next reload with this one's intent.
+        let reload = std::mem::take(&mut self.grid_table.reload);
+
+        // --- Relational filter gate (FR-GATE-1 to FR-GATE-3) ---
+        //
+        // Only attempt FK resolution when: the input has an unquoted `.`,
+        // the driver is SQL, the source is a Table, and the FK cache is Ready
+        // with at least one FK. All other cases fall through to the raw path.
+        if let Some(filter_text) = &filter {
+            if classify_filter_input(filter_text) == FilterMode::Relational {
+                if self.try_relational_filter(
+                    profile_id,
+                    database.clone(),
+                    table.clone(),
+                    pagination.clone(),
+                    order_by.clone(),
+                    filter_text.clone(),
+                    _window,
+                    cx,
+                ) {
+                    // The visual query applies its result through the
+                    // pending-rebuild route, which reads this same field, so
+                    // the intent taken above is handed back instead of being
+                    // dropped on the way out.
+                    self.grid_table.reload = reload;
+                    return;
+                }
+            } else {
+                // FR-GATE-3: no unquoted dot → clear any stale relational state
+                if !matches!(
+                    self.builder.relational_filter_state,
+                    RelationalFilterState::Inactive
+                ) {
+                    self.builder.relational_filter_state = RelationalFilterState::Inactive;
+                    cx.notify();
+                }
+            }
+        } else {
+            if !matches!(
+                self.builder.relational_filter_state,
+                RelationalFilterState::Inactive
+            ) {
+                self.builder.relational_filter_state = RelationalFilterState::Inactive;
+                cx.notify();
+            }
+        }
+        // --- end relational filter gate ---
+
+        // Taken after the gate: a relational filter runs as a visual query,
+        // which takes the intent itself.
+        let keep_edits = std::mem::take(&mut self.grid_table.keep_edits_on_reload);
+
+        let mut request = TableBrowseRequest::new(table.clone())
+            .with_database(database.clone())
+            .with_pagination(pagination.clone())
+            .with_order_by(order_by.clone())
+            .with_columns(self.table_projection_columns());
+
+        if let Some(ref f) = filter {
+            request = request.with_filter(f.clone());
+        }
+
+        let conn = {
+            let state = self.app_state.read(cx);
+            let Some(connected) = state.connections().get(&profile_id) else {
+                let message = datatab_i18n::t!("document.data.grid.error.connection_not_found");
+                Toast::error(message.clone())
+                    .meta_right(now_hms())
+                    .action(copy_action(message))
+                    .push(cx);
+                return;
+            };
+
+            match connected.resolve_connection_for_execution(database.as_deref()) {
+                Ok(connection) => connection,
+                Err(datatab_core::ConnectionResolutionError::PendingDatabaseConnection {
+                    database,
+                }) => {
+                    let msg = format!(
+                        "No connection to database '{}'. Please expand it in the sidebar first.",
+                        database
+                    );
+                    Toast::error(msg.clone())
+                        .meta_right(now_hms())
+                        .action(copy_action(msg))
+                        .push(cx);
+                    return;
+                }
+            }
+        };
+
+        let active_database = {
+            let state = self.app_state.read(cx);
+            state
+                .connections()
+                .get(&profile_id)
+                .and_then(|c| c.active_database.clone())
+        };
+
+        let mut browse_request = request.clone();
+        if browse_request.table.schema.is_none()
+            && let Some(ref db) = active_database
+        {
+            browse_request.table.schema = Some(db.clone());
+        }
+
+        info!(
+            "Running table browse: {:?}",
+            browse_request.table.qualified_name()
+        );
+
+        let estimate_request = browse_request.clone();
+        let applied_request = browse_request.clone();
+
+        let task_target = TaskTarget {
+            profile_id,
+            database: database.clone(),
+        };
+
+        let select_list = if browse_request.columns.is_empty() {
+            "*".to_string()
+        } else {
+            browse_request.columns.join(", ")
+        };
+
+        let (task_id, cancel_token) = self.runner.start_primary_for_target(
+            TaskKind::Query,
+            format!("SELECT {select_list} FROM {}", table.qualified_name()),
+            Some(task_target),
+            cx,
+        );
+
+        self.refresh.state = GridState::Loading;
+        cx.notify();
+
+        let entity = cx.entity().clone();
+        let conn_for_cleanup = conn.clone();
+
+        let table_for_spawn = table.clone();
+        let pagination_for_spawn = pagination.clone();
+        let order_by_for_spawn = order_by.clone();
+
+        let task = cx
+            .background_executor()
+            .spawn(async move { conn.browse_table(&browse_request) });
+
+        cx.spawn(async move |_this, cx| {
+            let mut result = task.await;
+
+            if let Ok(query_result) = result.as_mut() {
+                crate::result_warnings::handoff_table_browse_result(query_result, |warning| {
+                    datatab_ui_base::user_error::report_error_async(warning, cx)
+                });
+            }
+
+            cx.update(|cx| {
+                if cancel_token.is_cancelled() {
+                    log::info!("Query was cancelled, discarding result");
+                    if let Err(e) = conn_for_cleanup.cleanup_after_cancel() {
+                        log::warn!("Cleanup after cancel failed: {}", e);
+                    }
+                    return;
+                }
+
+                match result {
+                    Ok(query_result) => {
+                        info!(
+                            "Query returned {} rows in {:?}",
+                            query_result.row_count(),
+                            query_result.execution_time
+                        );
+
+                        entity.update(cx, |panel, cx| {
+                            panel.runner.complete_primary(task_id, cx);
+                            panel.grid_table.reload = reload;
+                            panel.grid_table.keep_edits_on_reload = keep_edits;
+                            panel.last_replayable_read =
+                                Some(datatab_transfer::ReplayableRead::Table(applied_request));
+                            panel.apply_table_result(
+                                profile_id,
+                                table_for_spawn,
+                                pagination_for_spawn,
+                                order_by_for_spawn,
+                                total_rows,
+                                query_result,
+                                cx,
+                            );
+                            panel.estimate_table_read(estimate_request, cx);
+                        });
+                    }
+                    Err(e) => {
+                        log::error!("Query failed: {}", e);
+
+                        entity.update(cx, |panel, cx| {
+                            panel.runner.fail_primary(task_id, e.to_string(), cx);
+                            panel.pk_requery_pending = false;
+                            panel.refresh.state = GridState::Error;
+                            panel.pending.toast = Some(PendingToast {
+                                message: crate::labels::query_failed_error(&e.to_string()),
+                                is_error: true,
+                            });
+                            cx.notify();
+                        });
+                    }
+                }
+            });
+        })
+        .detach();
+
+        // Fetch total count if not known
+        if total_rows.is_none() {
+            self.fetch_total_count(profile_id, database, table, filter, cx);
+        }
+    }
+
+    /// Executes the parameterized SELECT produced by `QueryBuilderPanel`.
+    ///
+    /// Called by `refresh` when `visual_select` is set. The `SelectQuery` is
+    /// already fully formed (pagination baked in by the builder); we execute it
+    /// as a raw parameterized query and apply the result to the grid.
+    ///
+    /// On success, sets `current_visual_spec` from `builder_draft_spec` and
+    /// applies `project_aggregate_kinds` so aggregate result columns carry the
+    /// correct `ColumnKind` for the chart engine.
+    pub(super) fn run_visual_query(
+        &mut self,
+        profile_id: Uuid,
+        database: Option<String>,
+        select: SelectQuery,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Taken before anything can fail, so a request that never lands does
+        // not leave its intent for an unrelated rebuild.
+        let keep_edits = std::mem::take(&mut self.grid_table.keep_edits_on_reload);
+
+        let conn = {
+            let state = self.app_state.read(cx);
+            let Some(connected) = state.connections().get(&profile_id) else {
+                let message = datatab_i18n::t!("document.data.grid.error.connection_not_found");
+                Toast::error(message.clone())
+                    .meta_right(now_hms())
+                    .action(copy_action(message))
+                    .push(cx);
+                return;
+            };
+
+            match connected.resolve_connection_for_execution(database.as_deref()) {
+                Ok(connection) => connection,
+                Err(datatab_core::ConnectionResolutionError::PendingDatabaseConnection {
+                    database,
+                }) => {
+                    let msg = format!(
+                        "No connection to database '{}'. Please expand it in the sidebar first.",
+                        database
+                    );
+                    Toast::error(msg.clone())
+                        .meta_right(now_hms())
+                        .action(copy_action(msg))
+                        .push(cx);
+                    return;
+                }
+            }
+        };
+
+        let task_target = TaskTarget {
+            profile_id,
+            database: database.clone(),
+        };
+
+        let (task_id, cancel_token) = self.runner.start_primary_for_target(
+            TaskKind::Query,
+            select.sql.clone(),
+            Some(task_target),
+            cx,
+        );
+
+        self.refresh.state = GridState::Loading;
+        cx.notify();
+
+        let entity = cx.entity().clone();
+        let conn_for_cleanup = conn.clone();
+
+        let mut request = select.to_query_request(conn.dialect());
+        if let Some(ref db) = database {
+            request.database = Some(db.clone());
+        }
+
+        let committed_spec: Option<VisualQuerySpec> = self.builder.builder_draft_spec.clone();
+
+        let task = cx
+            .background_executor()
+            .spawn(async move { conn.execute(&request) });
+
+        cx.spawn(async move |_this, cx| {
+            let mut result = task.await;
+
+            if let Ok(query_result) = result.as_mut() {
+                crate::result_warnings::handoff_visual_query_result(query_result, |warning| {
+                    datatab_ui_base::user_error::report_error_async(warning, cx)
+                });
+            }
+
+            cx.update(|cx| {
+                if cancel_token.is_cancelled() {
+                    log::info!("Visual query was cancelled, discarding result");
+                    if let Err(e) = conn_for_cleanup.cleanup_after_cancel() {
+                        log::warn!("Cleanup after cancel failed: {}", e);
+                    }
+                    return;
+                }
+
+                match result {
+                    Ok(mut query_result) => {
+                        info!(
+                            "Visual query returned {} rows in {:?}",
+                            query_result.row_count(),
+                            query_result.execution_time
+                        );
+
+                        if let Some(ref spec) = committed_spec {
+                            project_aggregate_kinds(spec, &mut query_result.columns);
+                        }
+
+                        entity.update(cx, |panel, cx| {
+                            panel.runner.complete_primary(task_id, cx);
+                            panel.builder.current_visual_spec = committed_spec.clone();
+                            panel.last_replayable_read = committed_spec.clone().map(|spec| {
+                                datatab_transfer::ReplayableRead::VisualQuery {
+                                    spec,
+                                    database: database.clone(),
+                                }
+                            });
+                            panel.result = query_result;
+                            // Both orders describe the rows just replaced, not the
+                            // new ones; keeping them would leave the grid indexing
+                            // row positions that are gone.
+                            panel.grid_table.local_sort_state = None;
+                            panel.grid_table.original_row_order = None;
+                            panel.refresh.state = GridState::Ready;
+
+                            let binding = panel.compute_builder_binding(
+                                committed_spec.as_ref(),
+                                profile_id,
+                                database.as_deref(),
+                                cx,
+                            );
+                            panel.pk_columns = binding
+                                .as_ref()
+                                .map(|b| b.pk_columns.clone())
+                                .unwrap_or_default();
+                            panel.builder.builder_editable_binding = binding;
+                            panel.grid_table.keep_edits_on_reload = keep_edits;
+                            panel.pending.rebuild = true;
+
+                            cx.notify();
+                        });
+                    }
+                    Err(e) => {
+                        log::error!("Visual query failed: {}", e);
+
+                        entity.update(cx, |panel, cx| {
+                            panel.runner.fail_primary(task_id, e.to_string(), cx);
+                            panel.refresh.state = GridState::Error;
+                            panel.pending.toast = Some(PendingToast {
+                                message: crate::labels::query_failed_error(&e.to_string()),
+                                is_error: true,
+                            });
+                            cx.notify();
+                        });
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn run_collection_query(
+        &mut self,
+        profile_id: Uuid,
+        collection: CollectionRef,
+        pagination: Pagination,
+        total_docs: Option<u64>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let limit_value = self.filter_bar.limit_input.read(cx).value();
+        let limit_str = limit_value.trim();
+        let previous_limit = pagination.limit();
+        let pagination = match limit_str.parse::<u32>() {
+            Ok(0) => {
+                Toast::warning(datatab_i18n::t!(
+                    "document.data.grid.error.limit_must_be_positive"
+                ))
+                .meta_right(now_hms())
+                .push(cx);
+                pagination
+            }
+            Ok(limit) if limit != previous_limit => {
+                // A new page size makes every row index refer somewhere else.
+                self.grid_table.reload = TableReload::ResetRows;
+                pagination.with_limit(limit).reset_offset()
+            }
+            Ok(_) => pagination,
+            Err(_) if !limit_str.is_empty() => {
+                Toast::warning(datatab_i18n::t!("document.data.grid.error.invalid_limit"))
+                    .meta_right(now_hms())
+                    .push(cx);
+                pagination
+            }
+            Err(_) => pagination,
+        };
+
+        // Taken here so a request that never lands (cancelled or failed) does
+        // not leave the next reload with this one's intent.
+        let reload = std::mem::take(&mut self.grid_table.reload);
+        let keep_edits = std::mem::take(&mut self.grid_table.keep_edits_on_reload);
+
+        let conn = {
+            let state = self.app_state.read(cx);
+            match state.connections().get(&profile_id) {
+                Some(c) => Some(c.connection.clone()),
+                None => {
+                    let message = datatab_i18n::t!("document.data.grid.error.connection_not_found");
+                    Toast::error(message.clone())
+                        .meta_right(now_hms())
+                        .action(copy_action(message))
+                        .push(cx);
+                    return;
+                }
+            }
+        };
+
+        let Some(conn) = conn else {
+            let message = datatab_i18n::t!("document.data.grid.error.connection_not_available");
+            Toast::error(message.clone())
+                .meta_right(now_hms())
+                .action(copy_action(message))
+                .push(cx);
+            return;
+        };
+
+        let document_collection = self.is_document_collection(cx);
+        let (projection, sort) = if self.has_document_query_slots(cx) {
+            match self.document_query_options(cx) {
+                Ok(options) => options,
+                Err(()) => return,
+            }
+        } else {
+            (None, None)
+        };
+
+        let filter_value = self.filter_bar.filter_input.read(cx).value();
+        let filter_str = filter_value.trim();
+        let filter: Option<serde_json::Value> = if filter_str.is_empty() {
+            None
+        } else if document_collection {
+            match Self::parse_query_slot(filter_str, "filter", cx) {
+                Ok(filter) => filter,
+                Err(()) => return,
+            }
+        } else {
+            match serde_json::from_str(filter_str) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    let toast_body = e.to_string();
+                    let title = datatab_i18n::t!("document.data.grid.error.invalid_json_filter");
+                    Toast::error(title.clone())
+                        .meta_right(now_hms())
+                        .body(toast_body.clone())
+                        .action(copy_action(crate::labels::error_with_detail_clipboard(
+                            &title,
+                            &toast_body,
+                        )))
+                        .push(cx);
+                    return;
+                }
+            }
+        };
+
+        let filter_for_count = filter.clone();
+
+        // The page is counted from the builder's skip; only the request
+        // carries the absolute offset.
+        let skip = self.document_builder_skip(cx);
+        let request_pagination = Pagination::Offset {
+            limit: pagination.limit(),
+            offset: pagination.offset() + skip,
+        };
+        let mut browse_request =
+            CollectionBrowseRequest::new(collection.clone()).with_pagination(request_pagination);
+        if let Some(f) = filter {
+            browse_request = browse_request.with_filter(f);
+        }
+        if let Some(projection) = projection {
+            browse_request = browse_request.with_projection(projection);
+        }
+        if let Some(sort) = sort {
+            browse_request = browse_request.with_sort(sort);
+        }
+
+        info!(
+            "Running collection browse: {}.{}",
+            collection.database, collection.name
+        );
+
+        let task_target = TaskTarget {
+            profile_id,
+            database: Some(collection.database.clone()),
+        };
+
+        let browse_query = conn
+            .query_generator()
+            .and_then(|generator| generator.collection_browse_query(&browse_request));
+
+        self.filter_bar.browse_query_label = browse_query
+            .as_ref()
+            .map(|query| super::utils::single_line(&query.text));
+
+        let task_description = match &self.filter_bar.browse_query_label {
+            Some(label) => datatab_core::truncate_string_safe(label, 80),
+            None => format!("find {}.{}", collection.database, collection.name),
+        };
+
+        let (task_id, cancel_token) = self.runner.start_primary_for_target(
+            TaskKind::Query,
+            task_description,
+            Some(task_target),
+            cx,
+        );
+
+        if let Some(query) = &browse_query {
+            self.app_state.update(cx, |state, _cx| {
+                state.set_task_query_text(task_id, query.text.as_str());
+            });
+        }
+
+        self.refresh.state = GridState::Loading;
+        cx.notify();
+
+        let entity = cx.entity().clone();
+        let conn_for_cleanup = conn.clone();
+        let collection_for_spawn = collection.clone();
+        let applied_request = browse_request.clone();
+        let pagination_for_spawn = pagination.clone();
+
+        let task = cx
+            .background_executor()
+            .spawn(async move { conn.browse_collection(&browse_request) });
+
+        cx.spawn(async move |_this, cx| {
+            let mut result = task.await;
+
+            if let Ok(query_result) = result.as_mut() {
+                crate::result_warnings::handoff_collection_browse_result(query_result, |warning| {
+                    datatab_ui_base::user_error::report_error_async(warning, cx)
+                });
+            }
+
+            cx.update(|cx| {
+                if cancel_token.is_cancelled() {
+                    log::info!("Query was cancelled, discarding result");
+                    if let Err(e) = conn_for_cleanup.cleanup_after_cancel() {
+                        log::warn!("Cleanup after cancel failed: {}", e);
+                    }
+                    return;
+                }
+
+                match result {
+                    Ok(query_result) => {
+                        info!(
+                            "Collection query returned {} documents in {:?}",
+                            query_result.row_count(),
+                            query_result.execution_time
+                        );
+
+                        entity.update(cx, |panel, cx| {
+                            panel.runner.complete_primary(task_id, cx);
+                            panel.grid_table.reload = reload;
+                            panel.grid_table.keep_edits_on_reload = keep_edits;
+                            panel.collection.applied_skip = skip;
+                            panel.last_replayable_read =
+                                Some(datatab_transfer::ReplayableRead::Collection {
+                                    request: applied_request,
+                                    skip,
+                                });
+                            panel.apply_collection_result(
+                                profile_id,
+                                collection_for_spawn,
+                                pagination_for_spawn,
+                                total_docs,
+                                query_result,
+                                cx,
+                            );
+                        });
+                    }
+                    Err(e) => {
+                        log::error!("Collection query failed: {}", e);
+
+                        entity.update(cx, |panel, cx| {
+                            panel.runner.fail_primary(task_id, e.to_string(), cx);
+                            panel.refresh.state = GridState::Error;
+                            panel.pending.toast = Some(PendingToast {
+                                message: crate::labels::query_failed_error(&e.to_string()),
+                                is_error: true,
+                            });
+                            cx.notify();
+                        });
+                    }
+                }
+            });
+        })
+        .detach();
+
+        // A document collection counts once per filter (possibly estimated);
+        // paging keeps the count. Other collections count once.
+        if document_collection {
+            self.refresh_document_count(filter_for_count, cx);
+        } else if total_docs.is_none() {
+            self.fetch_collection_count(profile_id, collection, filter_for_count, cx);
+        }
+    }
+
+    pub(super) fn apply_collection_result(
+        &mut self,
+        profile_id: Uuid,
+        collection: CollectionRef,
+        pagination: Pagination,
+        total_docs: Option<u64>,
+        result: QueryResult,
+        cx: &mut Context<Self>,
+    ) {
+        // Preserve existing total_docs if not provided
+        let existing_total = match &self.source {
+            DataSource::Collection { total_docs, .. } => *total_docs,
+            _ => None,
+        };
+
+        self.source = DataSource::Collection {
+            profile_id,
+            collection,
+            pagination,
+            total_docs: total_docs.or(existing_total),
+        };
+
+        self.chrome.derived_json = None;
+        self.chrome.derived_text = None;
+        self.apply_chart_for_result(&result, cx);
+
+        if !self.apply_document_page(&result, cx) {
+            self.result = result;
+        }
+        self.grid_table.local_sort_state = None;
+        self.grid_table.original_row_order = None;
+        self.rebuild_table(None, cx);
+        self.refresh.state = GridState::Ready;
+        cx.notify();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn apply_table_result(
+        &mut self,
+        profile_id: Uuid,
+        table: TableRef,
+        pagination: Pagination,
+        order_by: Vec<OrderByColumn>,
+        total_rows: Option<u64>,
+        result: QueryResult,
+        cx: &mut Context<Self>,
+    ) {
+        self.pk_requery_pending = false;
+        self.nearest_neighbors = None;
+
+        // Determine sort state from order_by for visual indicator
+        let initial_sort = order_by.first().and_then(|col| {
+            let pos = result
+                .columns
+                .iter()
+                .position(|c| c.name == col.column.name);
+            pos.map(|column_ix| TableSortState::new(column_ix, col.direction))
+        });
+
+        // Preserve existing total_rows and database if not provided
+        let (existing_total, existing_database) = match &self.source {
+            DataSource::Table {
+                total_rows,
+                database,
+                ..
+            } => (*total_rows, database.clone()),
+            _ => (None, None),
+        };
+
+        self.source = DataSource::Table {
+            profile_id,
+            database: existing_database,
+            table,
+            pagination,
+            order_by,
+            total_rows: total_rows.or(existing_total),
+        };
+
+        // A table keeps the JSON view across pages and refreshes; the chart
+        // follows the same rules as a query result.
+        let keeps_json = self.chrome.result_view_mode == ResultViewMode::Json;
+        self.chrome.derived_json = None;
+        self.chrome.derived_text = None;
+        self.apply_chart_for_result(&result, cx);
+        if keeps_json {
+            self.chrome.result_view_mode = ResultViewMode::Json;
+        }
+
+        self.result = result;
+        self.grid_table.local_sort_state = None;
+        self.grid_table.original_row_order = None;
+        self.rebuild_table(initial_sort, cx);
+        // Read per page load: turning grid_fk_labels on and paginating
+        // resolves without recreating the panel.
+        if self.fk_labels_enabled(cx) {
+            self.ensure_fk_cache_loaded(cx);
+        }
+        self.resolve_fk_display_values(cx);
+        self.refresh.state = GridState::Ready;
+        cx.notify();
+    }
+
+    pub(super) fn fetch_total_count(
+        &mut self,
+        profile_id: Uuid,
+        database: Option<String>,
+        table: TableRef,
+        filter: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        let conn = {
+            let state = self.app_state.read(cx);
+            let Some(connected) = state.connections().get(&profile_id) else {
+                return;
+            };
+
+            match connected.resolve_connection_for_execution(database.as_deref()) {
+                Ok(connection) => connection,
+                Err(_) => return,
+            }
+        };
+
+        let mut count_request = TableCountRequest::new(table.clone()).with_database(database);
+        if let Some(f) = filter {
+            count_request = count_request.with_filter(f);
+        }
+
+        let entity = cx.entity().clone();
+        let qualified = table.qualified_name();
+
+        let task = cx
+            .background_executor()
+            .spawn(async move { conn.count_table(&count_request) });
+
+        cx.spawn(async move |_this, cx| {
+            let result = task.await;
+
+            cx.update(|cx| {
+                if let Ok(total) = result {
+                    entity.update(cx, |panel, cx| {
+                        panel.pending.total_count = Some(PendingTotalCount {
+                            source_qualified: qualified,
+                            total,
+                        });
+                        cx.notify();
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn apply_total_count(
+        &mut self,
+        source_qualified: String,
+        total: u64,
+        cx: &mut Context<Self>,
+    ) {
+        match &mut self.source {
+            DataSource::Table {
+                table, total_rows, ..
+            } if table.qualified_name() == source_qualified => {
+                *total_rows = Some(total);
+                cx.notify();
+            }
+            DataSource::Collection {
+                collection,
+                total_docs,
+                ..
+            } if collection.qualified_name() == source_qualified => {
+                *total_docs = Some(total);
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn fetch_collection_count(
+        &mut self,
+        profile_id: Uuid,
+        collection: CollectionRef,
+        filter: Option<serde_json::Value>,
+        cx: &mut Context<Self>,
+    ) {
+        let conn = {
+            let state = self.app_state.read(cx);
+            state
+                .connections()
+                .get(&profile_id)
+                .map(|c| c.connection.clone())
+        };
+
+        let Some(conn) = conn else {
+            return;
+        };
+
+        let mut count_request = CollectionCountRequest::new(collection.clone());
+        if let Some(f) = filter {
+            count_request = count_request.with_filter(f);
+        }
+
+        let entity = cx.entity().clone();
+        let qualified = collection.qualified_name();
+
+        let task = cx
+            .background_executor()
+            .spawn(async move { conn.count_collection(&count_request) });
+
+        cx.spawn(async move |_this, cx| {
+            let result = task.await;
+
+            cx.update(|cx| {
+                if let Ok(total) = result {
+                    entity.update(cx, |panel, cx| {
+                        panel.pending.total_count = Some(PendingTotalCount {
+                            source_qualified: qualified,
+                            total,
+                        });
+                        cx.notify();
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Attempt relational lowering for the given filter text.
+    ///
+    /// Returns `true` if lowering succeeded and query execution was dispatched;
+    /// returns `false` on any gate failure or parse error, signalling the caller
+    /// to fall through to the raw-filter path.
+    ///
+    /// Gate conditions (FR-GATE-1):
+    /// 1. `metadata.query_language == Sql`
+    /// 2. `data_source == Table`
+    /// 3. `fk_cache` is `Ready` with at least one FK
+    #[allow(clippy::too_many_arguments)]
+    fn try_relational_filter(
+        &mut self,
+        profile_id: Uuid,
+        database: Option<String>,
+        table: TableRef,
+        _pagination: Pagination,
+        _order_by: Vec<OrderByColumn>,
+        filter_text: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // Gate 1: SQL driver only (FR-GATE-5 — no driver-id branching)
+        let is_sql = self
+            .app_state
+            .read(cx)
+            .connections()
+            .get(&profile_id)
+            .map(|c| c.connection.metadata().query_language == datatab_core::QueryLanguage::Sql)
+            .unwrap_or(false);
+
+        if !is_sql {
+            return false;
+        }
+
+        // Gate 2: Table source (already guaranteed by run_table_query call path)
+        // Gate 3: FK cache ready with at least one FK
+        let fks = match &self.builder.fk_cache {
+            super::FkLoadState::Ready(fks) if !fks.is_empty() => fks.clone(),
+            super::FkLoadState::Loading => {
+                // FK fetch in flight — show Resolving state, fall through to raw
+                self.builder.relational_filter_state = RelationalFilterState::Resolving;
+                cx.notify();
+                return false;
+            }
+            _ => {
+                // Unavailable or empty — silently fall through (FR-ERR-6)
+                return false;
+            }
+        };
+
+        // Build source descriptor for the resolver
+        let source = SourceTable {
+            schema: table.schema.clone(),
+            table: table.name.clone(),
+            alias: table.name.clone(),
+        };
+
+        // Resolve using the driver's dialect for identifier case-folding
+        let resolve_result = {
+            let state = self.app_state.read(cx);
+            let Some(connected) = state.connections().get(&profile_id) else {
+                return false;
+            };
+            let dialect = connected.connection.dialect();
+            parse_and_resolve(&filter_text, source, &fks, dialect)
+        };
+
+        match resolve_result {
+            Ok(lowering) => {
+                let join_count = lowering.diagnostics.join_count;
+                let predicate_count = lowering.diagnostics.relational_predicate_count;
+
+                self.apply_builder_draft_spec(lowering.spec.clone(), cx);
+
+                self.builder.relational_filter_state = RelationalFilterState::Active {
+                    join_count,
+                    predicate_count,
+                };
+                cx.notify();
+
+                // Execute via the visual query path
+                let profile_id_for_run = profile_id;
+                let db_for_run = database.clone();
+                if let Some(select) = self.builder.visual_select.clone() {
+                    self.run_visual_query(
+                        profile_id_for_run,
+                        db_for_run.clone(),
+                        select.clone(),
+                        window,
+                        cx,
+                    );
+
+                    if let Some(spec) = &self.builder.builder_draft_spec {
+                        if spec.is_grouped() {
+                            self.fetch_grouped_total_count(profile_id, database, spec.clone(), cx);
+                        } else {
+                            self.fetch_relational_count(profile_id, database, spec.clone(), cx);
+                        }
+                    }
+                }
+
+                true
+            }
+
+            Err(RelationalFilterError::Parse(_)) => {
+                // FR-PARSE-7: parse errors silently fall back to raw filter
+                if !matches!(
+                    self.builder.relational_filter_state,
+                    RelationalFilterState::Inactive
+                ) {
+                    self.builder.relational_filter_state = RelationalFilterState::Inactive;
+                    cx.notify();
+                }
+                false
+            }
+
+            Err(RelationalFilterError::Resolve(boxed_err)) => {
+                // FR-ERR-1 / FR-ERR-2: resolve errors surface inline
+                let (message, partial_spec) = match *boxed_err {
+                    RelationalResolveError::Ambiguous {
+                        segment,
+                        from_table,
+                        partial_spec,
+                        ..
+                    } => (
+                        format!(
+                            "Ambiguous relation `{}` from `{}`. Multiple FKs match — open in builder to resolve.",
+                            segment, from_table
+                        ),
+                        partial_spec,
+                    ),
+                    RelationalResolveError::Unknown {
+                        segment,
+                        from_table,
+                        partial_spec,
+                        ..
+                    } => (
+                        format!(
+                            "Unknown relation `{}` from `{}`. Open in builder to select a join manually.",
+                            segment, from_table
+                        ),
+                        partial_spec,
+                    ),
+                };
+
+                self.builder.relational_filter_state = RelationalFilterState::Error {
+                    message,
+                    partial_spec: Box::new(partial_spec),
+                };
+                cx.notify();
+
+                // Do NOT execute a query for the error state — let the user act
+                false
+            }
+        }
+    }
+
+    /// Execute the grouped total-count subquery for a grouped visual query.
+    ///
+    /// When the visual spec is grouped, a plain `COUNT(*) FROM table` would
+    /// count source rows rather than the number of groups. This method wraps
+    /// the full grouped query (without LIMIT/OFFSET) in a
+    /// `SELECT COUNT(*) FROM (...) AS _datatab_count_subq` to get the correct
+    /// group count for the pagination footer.
+    pub(super) fn fetch_grouped_total_count(
+        &mut self,
+        profile_id: Uuid,
+        database: Option<String>,
+        spec: VisualQuerySpec,
+        cx: &mut Context<Self>,
+    ) {
+        let (conn, count_query) = {
+            let state = self.app_state.read(cx);
+            let Some(connected) = state.connections().get(&profile_id) else {
+                return;
+            };
+
+            let conn = match connected.resolve_connection_for_execution(database.as_deref()) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+
+            let dialect = connected.connection.dialect();
+            let count_query = match datatab_core::build_count_of_grouped_query(&spec, dialect) {
+                Ok(q) => q,
+                Err(e) => {
+                    log::warn!("Failed to build grouped count query: {}", e);
+                    return;
+                }
+            };
+
+            (conn, count_query)
+        };
+
+        let table_name = spec.source.table.clone();
+        let entity = cx.entity().clone();
+
+        let mut request = count_query.to_query_request(conn.dialect());
+        if let Some(ref db) = database {
+            request.database = Some(db.clone());
+        }
+
+        let task = cx
+            .background_executor()
+            .spawn(async move { conn.execute(&request) });
+
+        cx.spawn(async move |_this, cx| {
+            let result = task.await;
+
+            cx.update(|cx| {
+                if let Ok(query_result) = result
+                    && let Some(row) = query_result.rows.first()
+                    && let Some(first_value) = row.first()
+                {
+                    let count_opt: Option<u64> = match first_value {
+                        datatab_core::Value::Int(n) => Some(*n as u64),
+                        datatab_core::Value::Float(f) => Some(*f as u64),
+                        datatab_core::Value::Decimal(s) => s.parse::<u64>().ok(),
+                        datatab_core::Value::Text(s) => s.parse::<u64>().ok(),
+                        _ => None,
+                    };
+                    if let Some(total) = count_opt {
+                        entity.update(cx, |panel, cx| {
+                            panel.pending.total_count = Some(PendingTotalCount {
+                                source_qualified: table_name,
+                                total,
+                            });
+                            cx.notify();
+                        });
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Execute the count subquery for an active relational filter.
+    ///
+    /// Uses `SELECT COUNT(*) FROM (<inner SELECT>) AS datatab_count_subq` instead
+    /// of `TableCountRequest`, satisfying FR-COUNT-1 / FR-COUNT-2.
+    fn fetch_relational_count(
+        &mut self,
+        profile_id: Uuid,
+        database: Option<String>,
+        spec: datatab_core::VisualQuerySpec,
+        cx: &mut Context<Self>,
+    ) {
+        let (conn, count_query) = {
+            let state = self.app_state.read(cx);
+            let Some(connected) = state.connections().get(&profile_id) else {
+                return;
+            };
+
+            let conn = match connected.resolve_connection_for_execution(database.as_deref()) {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+
+            let dialect = connected.connection.dialect();
+            let count_query = count_query_from_spec(&spec, dialect);
+
+            (conn, count_query)
+        };
+
+        let table_name = spec.source.table.clone();
+        let entity = cx.entity().clone();
+
+        let mut request = count_query.to_query_request(conn.dialect());
+        if let Some(ref db) = database {
+            request.database = Some(db.clone());
+        }
+
+        let task = cx
+            .background_executor()
+            .spawn(async move { conn.execute(&request) });
+
+        cx.spawn(async move |_this, cx| {
+            let result = task.await;
+
+            cx.update(|cx| {
+                if let Ok(query_result) = result
+                    && let Some(row) = query_result.rows.first()
+                    && let Some(datatab_core::Value::Int(count)) = row.first()
+                {
+                    entity.update(cx, |panel, cx| {
+                        panel.pending.total_count = Some(PendingTotalCount {
+                            source_qualified: table_name,
+                            total: *count as u64,
+                        });
+                        cx.notify();
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+}

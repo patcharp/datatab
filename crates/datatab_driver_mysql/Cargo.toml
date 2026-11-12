@@ -1,0 +1,31 @@
+[package]
+name = "datatab_driver_mysql"
+version.workspace = true
+edition.workspace = true
+publish = false
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+chrono = { workspace = true }
+datatab_core.workspace = true
+datatab_ssh.workspace = true
+hex.workspace = true
+log.workspace = true
+mysql = { workspace = true, features = ["rustls-tls"] }
+rustls = { version = "0.23", default-features = false }
+serde_json = { workspace = true }
+urlencoding = "2"
+
+[dev-dependencies]
+datatab_test_support.workspace = true
+
+[lints]
+workspace = true

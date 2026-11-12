@@ -1,0 +1,567 @@
+mod pane;
+
+use super::console::{NativeConsole, NativeConsoleEvent, NativeConsoleTarget};
+use super::data_grid_panel::{DataGridEvent, DataGridPanel, DataSource};
+use super::handle::DocumentEvent;
+use super::types::{DataSourceKind, DocumentId, DocumentState};
+use datatab_app::keymap::{Command, ContextId};
+use datatab_components::result_panel::{ResultPanel, ResultPanelEvent};
+use datatab_core::{CollectionRef, ExecutionClassification, QueryResult, RefreshPolicy, TableRef};
+use datatab_ui_base::AppStateEntity;
+use gpui::*;
+use std::sync::Arc;
+use uuid::Uuid;
+
+/// Document for displaying data in a standalone tab.
+/// Used for both table browsing (click on sidebar) and promoted query results.
+pub struct DataDocument {
+    id: DocumentId,
+    title: String,
+    source_kind: DataSourceKind,
+    data_grid: Entity<DataGridPanel>,
+    /// Chrome host: owns the mode bar and delegates content rendering to
+    /// the inner `data_grid` entity via `ViewHandle`.
+    result_panel: Entity<ResultPanel>,
+    /// Native command console of a collection whose driver offers one.
+    console: Option<Entity<NativeConsole>>,
+    focus_handle: FocusHandle,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl DataDocument {
+    pub fn new_for_table(
+        profile_id: Uuid,
+        table: TableRef,
+        database: Option<String>,
+        app_state: Entity<AppStateEntity>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let title = table.qualified_name();
+        let schema = table.schema.clone();
+        let console_database = database.clone();
+        let data_grid = cx.new(|cx| {
+            DataGridPanel::new_for_table(profile_id, table, database, app_state.clone(), window, cx)
+        });
+
+        let mut document = Self::new_with_grid(title, DataSourceKind::Table, data_grid, window, cx);
+
+        let label = console_database
+            .clone()
+            .or(schema)
+            .or_else(|| {
+                app_state
+                    .read(cx)
+                    .connections()
+                    .get(&profile_id)
+                    .map(|connected| connected.profile.name.clone())
+            })
+            .unwrap_or_default();
+        document.attach_console(profile_id, console_database, label, app_state, window, cx);
+        document
+    }
+
+    pub fn new_for_collection(
+        profile_id: Uuid,
+        collection: CollectionRef,
+        app_state: Entity<AppStateEntity>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let title = collection.qualified_name();
+        let database = collection.database.clone();
+        let data_grid = cx.new(|cx| {
+            DataGridPanel::new_for_collection(profile_id, collection, app_state.clone(), window, cx)
+        });
+
+        let mut document =
+            Self::new_with_grid(title, DataSourceKind::Collection, data_grid, window, cx);
+        document.attach_console(
+            profile_id,
+            Some(database.clone()),
+            database,
+            app_state,
+            window,
+            cx,
+        );
+        document
+    }
+
+    /// Docks the native console under the table or collection when the
+    /// connection's driver advertises one. Commands run against `database`
+    /// (the connection's own when `None`); `label` names it in the header.
+    fn attach_console(
+        &mut self,
+        profile_id: Uuid,
+        database: Option<String>,
+        label: String,
+        app_state: Entity<AppStateEntity>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(profile) = app_state
+            .read(cx)
+            .connections()
+            .get(&profile_id)
+            .and_then(|connected| connected.connection.metadata().native_console())
+        else {
+            return;
+        };
+
+        let target = NativeConsoleTarget {
+            profile_id,
+            database,
+            label,
+        };
+
+        let console = cx.new(|cx| {
+            NativeConsole::new(target, profile, ContextId::Global, app_state, window, cx)
+        });
+
+        let subscription = cx.subscribe_in(&console, window, Self::on_console_event);
+        self._subscriptions.push(subscription);
+        self.console = Some(console);
+    }
+
+    fn on_console_event(
+        &mut self,
+        _console: &Entity<NativeConsole>,
+        event: &NativeConsoleEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            NativeConsoleEvent::InputFocused => cx.emit(DocumentEvent::RequestFocus),
+            // A write may have changed the documents on screen.
+            NativeConsoleEvent::Executed {
+                succeeded,
+                classification,
+            } => {
+                let read_only = matches!(
+                    classification,
+                    ExecutionClassification::Metadata | ExecutionClassification::Read
+                );
+
+                if *succeeded && !read_only {
+                    self.data_grid
+                        .update(cx, |grid, cx| grid.refresh(window, cx));
+                }
+            }
+        }
+    }
+
+    /// Shows or hides the console, handing focus back to the document when
+    /// it closes. Returns false when there is no console.
+    fn toggle_console(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(console) = self.console.clone() else {
+            return false;
+        };
+
+        let open = console.update(cx, |console, cx| console.toggle(window, cx));
+        if !open {
+            self.focus_handle.focus(window, cx);
+        }
+
+        cx.notify();
+        true
+    }
+
+    #[allow(dead_code)]
+    pub fn new_for_result(
+        result: Arc<QueryResult>,
+        query: String,
+        title: String,
+        app_state: Entity<AppStateEntity>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let data_grid =
+            cx.new(|cx| DataGridPanel::new_for_result(result, query, None, app_state, window, cx));
+
+        Self::new_with_grid(title, DataSourceKind::QueryResult, data_grid, window, cx)
+    }
+
+    /// A table document showing `result`, with rows identified by
+    /// `pk_columns`, that never queries a connection. For tests outside this
+    /// crate that need an editable grid.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn new_for_test_table(
+        result: QueryResult,
+        pk_columns: Vec<String>,
+        app_state: Entity<AppStateEntity>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let data_grid = cx
+            .new(|cx| DataGridPanel::new_for_test_table(result, pk_columns, app_state, window, cx));
+
+        Self::new_with_grid(
+            "public.orders".to_string(),
+            DataSourceKind::Table,
+            data_grid,
+            window,
+            cx,
+        )
+    }
+
+    /// Shared construction logic: builds a `ViewHandle` from the grid, wraps it
+    /// in `ResultPanel`, and wires subscriptions.
+    fn new_with_grid(
+        title: String,
+        source_kind: DataSourceKind,
+        data_grid: Entity<DataGridPanel>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // Build a ViewHandle from the DataGridPanel entity. The grid draws its
+        // own header, filter row and view switch for table and collection
+        // sources.
+        let view_handle = DataGridPanel::into_view_handle(data_grid.clone(), cx);
+
+        data_grid.update(cx, |grid, _| grid.set_side_panels_hosted(true));
+
+        let result_panel = cx.new(|cx| ResultPanel::new(view_handle, cx));
+
+        // Forward DataGridEvent to DocumentEvent and keep ResultPanel in sync
+        // for mode changes driven by the grid (e.g. auto chart selection).
+        let grid_sub = cx.subscribe(&data_grid, Self::on_grid_event);
+
+        // ResultPanel calls view.set_mode / view.set_refresh_policy directly
+        // via ViewHandle closures. We still subscribe to ResultPanelEvent for
+        // legacy compatibility (in case any other listener needs these events).
+        let panel_sub = cx.subscribe(&result_panel, {
+            move |_this: &mut DataDocument, _panel, _event: &ResultPanelEvent, _cx| {
+                // ViewHandle closures handle the actual mode/policy changes.
+                // No additional forwarding is required here.
+            }
+        });
+
+        Self {
+            id: DocumentId::new(),
+            title,
+            source_kind,
+            data_grid,
+            result_panel,
+            console: None,
+            focus_handle: cx.focus_handle(),
+            _subscriptions: vec![grid_sub, panel_sub],
+        }
+    }
+
+    /// Forwards `DataGridEvent` emissions to `DocumentEvent`.
+    ///
+    /// Mode sync is no longer needed here — the grid's `ViewHandle::available_modes`
+    /// and `ViewHandle::current_mode` closures are called by `ResultPanel` on every
+    /// render frame, so the chrome row always reflects the current state.
+    fn on_grid_event(
+        _this: &mut Self,
+        _grid: Entity<DataGridPanel>,
+        event: &DataGridEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            DataGridEvent::Focused => {
+                cx.emit(DocumentEvent::RequestFocus);
+            }
+            DataGridEvent::RequestSqlPreview {
+                context,
+                generation_type,
+            } => {
+                cx.emit(DocumentEvent::RequestSqlPreview {
+                    context: context.clone(),
+                    generation_type: *generation_type,
+                });
+            }
+            DataGridEvent::OpenInspector {
+                title,
+                content,
+                content_has_header,
+            } => {
+                cx.emit(DocumentEvent::OpenInspector {
+                    title: title.clone(),
+                    content: content.clone(),
+                    content_has_header: *content_has_header,
+                });
+            }
+            DataGridEvent::CloseInspector => {
+                cx.emit(DocumentEvent::CloseInspector);
+            }
+            DataGridEvent::ChartThisQuery {
+                query,
+                connection_id,
+            } => {
+                cx.emit(DocumentEvent::ChartThisQuery {
+                    query: query.clone(),
+                    connection_id: *connection_id,
+                });
+            }
+            DataGridEvent::RefreshPolicyReset(_policy) => {
+                // The refresh dropdown is owned by DataGridPanel itself and
+                // reset internally — no forwarding to ResultPanel needed.
+            }
+            DataGridEvent::OpenEditorWithContent { profile_id, sql } => {
+                cx.emit(DocumentEvent::OpenEditorWithContent {
+                    profile_id: *profile_id,
+                    sql: sql.clone(),
+                });
+            }
+            DataGridEvent::OpenReferencedRow { target } => {
+                cx.emit(DocumentEvent::OpenReferencedRow {
+                    target: target.clone(),
+                });
+            }
+            DataGridEvent::MutationFinished { landed } => {
+                cx.emit(DocumentEvent::MutationFinished { landed: *landed });
+            }
+            DataGridEvent::RequestClose => {
+                cx.emit(DocumentEvent::RequestClose);
+            }
+            _ => {}
+        }
+    }
+
+    // === Accessors ===
+
+    pub fn id(&self) -> DocumentId {
+        self.id
+    }
+
+    pub fn title(&self) -> String {
+        self.title.clone()
+    }
+
+    pub fn state(&self) -> DocumentState {
+        DocumentState::Clean
+    }
+
+    pub fn source_kind(&self) -> DataSourceKind {
+        self.source_kind
+    }
+
+    pub fn can_close(&self) -> bool {
+        true
+    }
+
+    /// Short summary of pending edits for the dirty-dot tooltip.
+    pub fn change_summary(&self, cx: &App) -> Option<String> {
+        self.data_grid.read(cx).change_summary(cx)
+    }
+
+    pub fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_handle.focus(window, cx);
+    }
+
+    pub fn connection_id(&self, cx: &App) -> Option<Uuid> {
+        match self.data_grid.read(cx).source() {
+            DataSource::Table { profile_id, .. } => Some(*profile_id),
+            DataSource::Collection { profile_id, .. } => Some(*profile_id),
+            DataSource::QueryResult { profile_id, .. } => *profile_id,
+        }
+    }
+
+    pub fn set_active_tab(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.data_grid
+            .update(cx, |grid, cx| grid.set_active_tab(active, cx));
+    }
+
+    /// Drop the cached row-inspector state in response to the user dismissing
+    /// the workspace inspector rail. Called from the `PaneHandle` closure
+    /// installed in `into_pane`.
+    pub fn mark_inspector_closed(&mut self, cx: &mut Context<Self>) {
+        self.data_grid
+            .update(cx, |grid, cx| grid.clear_inspector_state(cx));
+    }
+
+    pub fn row_inspector_is_tracking(&self, cx: &App) -> bool {
+        self.data_grid.read(cx).row_inspector_is_tracking()
+    }
+
+    pub fn value_panel_is_open(&self, cx: &App) -> bool {
+        self.data_grid.read(cx).value_panel_is_open()
+    }
+
+    pub fn set_value_panel_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        self.data_grid
+            .update(cx, |grid, cx| grid.set_value_panel_open(open, cx));
+    }
+
+    pub fn set_row_inspector_tracking(&mut self, tracking: bool, cx: &mut Context<Self>) {
+        self.data_grid
+            .update(cx, |grid, cx| grid.set_row_inspector_tracking(tracking, cx));
+    }
+
+    pub fn refresh_policy(&self, cx: &App) -> RefreshPolicy {
+        self.data_grid.read(cx).refresh_policy()
+    }
+
+    pub fn set_refresh_policy(&mut self, policy: RefreshPolicy, cx: &mut Context<Self>) {
+        self.data_grid
+            .update(cx, |grid, cx| grid.set_refresh_policy(policy, cx));
+    }
+
+    /// Returns the synthesized query text that produced the current result, if available.
+    pub fn synthesized_query(&self, cx: &App) -> Option<String> {
+        match self.data_grid.read(cx).source() {
+            DataSource::QueryResult { original_query, .. } => {
+                if original_query.is_empty() {
+                    None
+                } else {
+                    Some(original_query.clone())
+                }
+            }
+            DataSource::Table { .. } | DataSource::Collection { .. } => None,
+        }
+    }
+
+    /// Returns the table reference if this is a table document.
+    pub fn table_ref(&self, cx: &App) -> Option<TableRef> {
+        self.data_grid.read(cx).source().table_ref().cloned()
+    }
+
+    /// Returns the database name if this is a table document.
+    pub fn database(&self, cx: &App) -> Option<String> {
+        self.data_grid
+            .read(cx)
+            .source()
+            .database()
+            .map(|s| s.to_string())
+    }
+
+    pub fn collection_ref(&self, cx: &App) -> Option<CollectionRef> {
+        self.data_grid.read(cx).source().collection_ref().cloned()
+    }
+
+    /// The grid this document shows, for tests outside this crate that drive
+    /// a table tab's state directly (for example applying a builder spec).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn data_grid_for_tests(&self) -> &Entity<DataGridPanel> {
+        &self.data_grid
+    }
+
+    /// Returns the active context for keyboard handling.
+    pub fn active_context(&self, cx: &App) -> ContextId {
+        if self
+            .console
+            .as_ref()
+            .is_some_and(|console| console.read(cx).input_has_focus())
+        {
+            return ContextId::TextInput;
+        }
+
+        self.data_grid.read(cx).active_context(cx)
+    }
+
+    // === Command Dispatch ===
+
+    pub fn dispatch_command(
+        &mut self,
+        cmd: Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if cmd == Command::ToggleConsole {
+            return self.toggle_console(window, cx);
+        }
+
+        // A command waiting for confirmation answers Enter and Escape, as
+        // its Run anyway and Cancel buttons do. In the console's input, Enter
+        // already answers through the input itself.
+        if matches!(cmd, Command::Execute | Command::Cancel)
+            && let Some(console) = self.console.clone().filter(|console| {
+                let console = console.read(cx);
+                console.has_pending() && !(cmd == Command::Execute && console.input_has_focus())
+            })
+        {
+            console.update(cx, |console, cx| {
+                if cmd == Command::Execute {
+                    console.confirm_pending(cx);
+                } else {
+                    console.cancel_pending(cx);
+                }
+            });
+            return true;
+        }
+
+        self.data_grid
+            .update(cx, |grid, cx| grid.dispatch_command(cmd, window, cx))
+    }
+}
+
+impl EventEmitter<DocumentEvent> for DataDocument {}
+
+impl Render for DataDocument {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        // Render through the ResultPanel, which provides the chrome row
+        // (mode bar + filter bar segment + refresh dropdown) and hosts the
+        // DataGridPanel as its inner child view via ViewHandle.
+        let Some(console) = self.console.clone() else {
+            return div()
+                .size_full()
+                .track_focus(&self.focus_handle)
+                .child(self.result_panel.clone());
+        };
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .track_focus(&self.focus_handle)
+            .child(div().flex_1().min_h_0().child(self.result_panel.clone()))
+            .child(console)
+    }
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Compile-time structural assertion: `DataDocument` owns a `result_panel`
+    /// field of the correct type.
+    #[allow(dead_code)]
+    fn _assert_result_panel_field_type(doc: &DataDocument) -> &Entity<ResultPanel> {
+        &doc.result_panel
+    }
+}
+
+#[cfg(test)]
+mod console_tests {
+    use super::DataDocument;
+    use datatab_core::TableRef;
+    use gpui::AppContext as _;
+
+    /// A table document for a connection of `kind`, and whether it docked a
+    /// console.
+    fn table_has_console(cx: &mut gpui::TestAppContext, kind: datatab_core::DbKind) -> bool {
+        use crate::keyboard_test_support::{connected_app_state, init_keyboard_runtime};
+        use datatab_test_support::fake_driver::FakeDriver;
+
+        init_keyboard_runtime(cx);
+        let driver = FakeDriver::new(kind);
+        let (app_state, profile_id) = connected_app_state(cx, &driver, "shop");
+
+        let (document, window) = cx.add_window_view(move |window, cx| {
+            DataDocument::new_for_table(
+                profile_id,
+                TableRef::new("orders"),
+                None,
+                app_state,
+                window,
+                cx,
+            )
+        });
+
+        window.update(|_, cx| document.read(cx).console.is_some())
+    }
+
+    #[gpui::test]
+    fn sql_tables_dock_the_console_their_driver_offers(cx: &mut gpui::TestAppContext) {
+        assert!(table_has_console(cx, datatab_core::DbKind::Postgres));
+    }
+
+    #[gpui::test]
+    fn tables_without_a_console_render_as_before(cx: &mut gpui::TestAppContext) {
+        assert!(!table_has_console(cx, datatab_core::DbKind::SQLite));
+    }
+}

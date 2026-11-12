@@ -1,0 +1,29 @@
+[package]
+name = "datatab_ipc"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+description = "IPC protocol for DataTab single-instance"
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+postcard = { workspace = true }
+interprocess.workspace = true
+datatab_core.workspace = true
+datatab_storage.workspace = true
+uuid.workspace = true
+serde_json.workspace = true
+secrecy = "0.10"
+async-trait = { workspace = true }
+log.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+futures = "0.3"
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+
+[lints]
+workspace = true

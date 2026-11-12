@@ -1,0 +1,25 @@
+//! InfluxDB driver for DataTab.
+
+#![allow(clippy::result_large_err)]
+#![cfg_attr(
+    test,
+    allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+    )
+)]
+
+pub mod connection;
+pub mod driver;
+pub mod error_formatter;
+pub mod http;
+pub mod injection;
+pub mod instance_catalog;
+pub mod language_service;
+pub mod metadata;
+pub mod parser;
+pub mod query_generator;
+
+pub use driver::{INFLUXDB_FORM, INFLUXDB_METADATA, InfluxDriver};

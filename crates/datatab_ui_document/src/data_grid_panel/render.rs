@@ -1,0 +1,4249 @@
+use super::context_menu::ExportMenuEntry;
+use super::{
+    ChartRailTab, DataGridEvent, DataGridPanel, DataSource, EditState, GridFocusMode, GridState,
+    LimitedRowTotal, ToolbarFocus, documents,
+};
+use crate::data_grid_panel::filter_bar::{
+    filter_input_has_error, render_relational_chip, render_relational_error,
+    render_resolving_indicator,
+};
+use crate::data_view::DataViewMode;
+use crate::result_view::ResultViewMode;
+use datatab_components::chart::legend::legend_element;
+use datatab_components::chart::{
+    ChartDetection, ManualChartSelection, SeriesSpec, SeriesStats, count_columns_for_why,
+    format_resolution, format_span, format_x_value, format_y_value,
+};
+use datatab_components::chart::{SourceRowRef, point_inspector_element};
+use datatab_components::common::time_range::view::TimeRangePanel;
+use datatab_components::components::data_table::SortState as TableSortState;
+use datatab_components::components::filter_bar::FilterField;
+use datatab_components::composites::{
+    Breadcrumb, BreadcrumbSegment, MenuItem, SplitButton, menu_frame, menu_row, render_menu_header,
+    render_separator,
+};
+use datatab_components::controls::{Button, ButtonVariant, Checkbox, Dropdown, Input, InputState};
+use datatab_components::icons::AppIcon;
+use datatab_components::icons::DriverIconTone;
+use datatab_components::primitives::{
+    BannerBlock, BannerVariant, Icon, SegmentedControl, SegmentedItem, SurfaceRole, Text, surface,
+};
+use datatab_components::semantic::ChartColors;
+use datatab_components::tokens::{
+    ChromeColors, Fields, FontSizes, Heights, Radii, ResultMetrics, Spacing, TableViewMetrics, ui,
+};
+use datatab_components::typography::AppFonts;
+use datatab_core::{ColumnKind, Pagination, QueryResult, QueryResultShape, SortDirection, Value};
+use datatab_ui_base::toast::{Toast, copy_action, now_hms};
+use gpui::prelude::*;
+use gpui::*;
+use gpui_component::ActiveTheme;
+use gpui_component::input::EditorState;
+
+/// Snapshot of derived render state computed once per frame from `&self`.
+///
+/// All fields are cheap to clone (primitives, cloned handles). This struct
+/// keeps the `Render::render` entry point free of inline derivation logic.
+struct RenderState {
+    theme: gpui_component::theme::Theme,
+    row_count: usize,
+    exec_time: String,
+    show_data_toolbar: bool,
+    is_paginated: bool,
+    filter_keyword: String,
+    filter_input: Entity<EditorState>,
+    filter_has_value: bool,
+    limit_input: Entity<InputState>,
+    pagination_info: Option<Pagination>,
+    total_pages: Option<u64>,
+    can_prev: bool,
+    can_next: bool,
+    sort_info: Option<(String, SortDirection, bool)>,
+    show_toolbar_focus: bool,
+    toolbar_focus: ToolbarFocus,
+    focus_handle: FocusHandle,
+    has_data: bool,
+    is_loading: bool,
+    show_panel_controls: bool,
+    is_maximized: bool,
+    uses_result_view: bool,
+    content_mode: DataGridContentMode,
+    shows_content_controls: bool,
+    is_editable: bool,
+    dirty_count: usize,
+    can_undo: bool,
+    can_redo: bool,
+    show_grouped_warning: bool,
+    show_pk_warning: bool,
+    show_builder_readonly_hint: bool,
+    show_edit_toolbar: bool,
+    result_view_mode: ResultViewMode,
+    /// The source is a collection on a document connection.
+    document_collection: bool,
+    document_tab: documents::CollectionTab,
+}
+
+// Save-row shortcut hint: matches the SaveRow binding in the data-table
+// component (`secondary-enter` — Cmd+Enter on macOS, Ctrl+Enter elsewhere).
+#[cfg(target_os = "macos")]
+const SAVE_ROW_SHORTCUT_HINT: &str = "Cmd ↵";
+#[cfg(not(target_os = "macos"))]
+const SAVE_ROW_SHORTCUT_HINT: &str = "Ctrl ↵";
+
+/// Edit state shown in the header of an editable table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EditControls {
+    dirty_count: usize,
+    can_undo: bool,
+    can_redo: bool,
+    /// The rows are similar rows: every action is drawn disabled and the
+    /// status says why.
+    neighbors: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum DataGridContentMode {
+    EmptyFallback,
+    ResultView,
+    Document,
+    Table,
+}
+
+impl DataGridPanel {
+    /// What a query result without columns reports instead of an empty grid:
+    /// the statement ran, and how many rows it changed when the driver says.
+    pub(super) fn statement_outcome(&self) -> Option<String> {
+        if !self.is_statement_without_result_set() {
+            return None;
+        }
+
+        let executed = datatab_i18n::t!("document.data.grid.status.executed");
+        Some(match self.result.affected_rows {
+            Some(count) => format!("{executed} · {}", crate::labels::affected_rows_label(count)),
+            None => executed,
+        })
+    }
+
+    /// The footer's row figure: the rows a statement without columns
+    /// changed, otherwise the rows it returned.
+    pub(super) fn rows_footer(&self, row_count: usize) -> String {
+        if self.nearest_neighbors.is_some() {
+            let total = match &self.source {
+                DataSource::Table { total_rows, .. } => *total_rows,
+                _ => None,
+            };
+            return crate::labels::nearest_rows_label(row_count.saturating_sub(1), total);
+        }
+
+        match self.result.affected_rows {
+            Some(count) if self.is_statement_without_result_set() => {
+                crate::labels::affected_rows_label(count)
+            }
+            _ => self.row_count_footer(row_count),
+        }
+    }
+
+    /// The server notices the result carries, one line each, as
+    /// "WARNING: there is no transaction in progress".
+    pub(super) fn server_notice_lines(&self) -> Vec<String> {
+        self.result
+            .server_notices()
+            .into_iter()
+            .map(|notice| format!("{}: {}", notice.severity, notice.message))
+            .collect()
+    }
+
+    /// The notices drawn in the body, under the statement line. Every other
+    /// result carries them in the footer, so each notice shows once.
+    pub(super) fn body_notice_lines(&self) -> Vec<String> {
+        if self.is_statement_without_result_set() {
+            self.server_notice_lines()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// A query result that is a table without columns: a statement such as
+    /// `UPDATE` or `COMMIT` that returned no result set.
+    fn is_statement_without_result_set(&self) -> bool {
+        matches!(self.source, DataSource::QueryResult { .. })
+            && self.result.shape == datatab_core::QueryResultShape::Table
+            && self.result.columns.is_empty()
+    }
+
+    /// The footer's row count. A result the row limit cut short says it holds
+    /// only the first rows, and how many there are in all once counted.
+    fn row_count_footer(&self, row_count: usize) -> String {
+        if !self.result.rows_truncated() {
+            return crate::labels::row_count_label(row_count);
+        }
+
+        match self.limited_rows.total {
+            LimitedRowTotal::Known(total) => {
+                crate::labels::limited_row_count_of_total_label(row_count, total)
+            }
+            LimitedRowTotal::Unknown | LimitedRowTotal::Counting => {
+                crate::labels::limited_row_count_label(row_count)
+            }
+        }
+    }
+
+    pub(super) fn offers_count_rows(&self) -> bool {
+        self.result.rows_truncated()
+            && self.limited_rows.actions.count
+            && self.limited_rows.total == LimitedRowTotal::Unknown
+    }
+
+    pub(super) fn offers_load_all_rows(&self) -> bool {
+        self.result.rows_truncated() && self.limited_rows.actions.load_all
+    }
+
+    pub(super) fn request_count_rows(&mut self, cx: &mut Context<Self>) {
+        if self.offers_count_rows() {
+            self.limited_rows.total = LimitedRowTotal::Counting;
+            cx.emit(DataGridEvent::CountRowsRequested);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn request_load_all_rows(&mut self, cx: &mut Context<Self>) {
+        if self.offers_load_all_rows() {
+            cx.emit(DataGridEvent::LoadAllRowsRequested);
+        }
+    }
+}
+
+pub(super) fn content_mode_for_result(
+    uses_result_view: bool,
+    view_mode: DataViewMode,
+    has_columns: bool,
+    has_data: bool,
+) -> DataGridContentMode {
+    if uses_result_view {
+        DataGridContentMode::ResultView
+    } else if view_mode == DataViewMode::Document && has_data {
+        DataGridContentMode::Document
+    } else if view_mode != DataViewMode::Document && has_columns {
+        DataGridContentMode::Table
+    } else {
+        DataGridContentMode::EmptyFallback
+    }
+}
+
+impl Render for DataGridPanel {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.process_pending_actions(window, cx);
+        self.apply_pending_neighbor_controls(window, cx);
+        self.flush_aggregate_json(window, cx);
+        self.ensure_table_view_controls(window, cx);
+        let st = self.derive_render_state(cx);
+
+        // The Columns and Partitions views of a table replace the filter row,
+        // the grid and the status bar; the header with the tabs stays.
+        let table_side_view =
+            !st.document_collection && self.table_tab() != super::table_views::TableTab::Data;
+
+        // The Schema view of a collection shows only its sample toolbar and
+        // field table (IslDocSchema): no query bar and no documents footer.
+        // The Aggregate view brings its own editor, results and footer.
+        let schema_view =
+            st.document_collection && st.document_tab == documents::CollectionTab::Schema;
+        let aggregate_view =
+            st.document_collection && st.document_tab == documents::CollectionTab::Aggregate;
+
+        div()
+            .track_focus(&st.focus_handle)
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(self.panel_origin_canvas(cx))
+            .when(st.show_data_toolbar && st.document_collection, |d| {
+                let documents_tab = st.document_tab == documents::CollectionTab::Documents;
+
+                d.child(self.render_table_header(None, &st.theme, cx))
+                    .when(documents_tab, |d| {
+                        d.child(self.render_document_query_bar(cx))
+                            .child(self.render_document_view_row(cx))
+                    })
+            })
+            .when(
+                st.show_data_toolbar && !st.document_collection && table_side_view,
+                |d| d.child(self.render_table_header(None, &st.theme, cx)),
+            )
+            .when(
+                st.show_data_toolbar && !st.document_collection && !table_side_view,
+                |d| {
+                    let neighbors = self.nearest_neighbors.is_some();
+                    let edit_controls = st.show_edit_toolbar.then_some(EditControls {
+                        dirty_count: if neighbors { 0 } else { st.dirty_count },
+                        can_undo: st.can_undo && !neighbors,
+                        can_redo: st.can_redo && !neighbors,
+                        neighbors,
+                    });
+
+                    d.child(self.render_toolbar(
+                        &st.filter_keyword,
+                        &st.filter_input,
+                        st.filter_has_value,
+                        &st.limit_input,
+                        st.show_toolbar_focus,
+                        st.toolbar_focus,
+                        edit_controls,
+                        &st.theme,
+                        cx,
+                    ))
+                },
+            )
+            .when(
+                st.show_data_toolbar && self.shows_table_read_estimate(),
+                |d| d.children(self.render_table_read_estimate(cx)),
+            )
+            .when(!table_side_view, |d| {
+                d.child(self.render_warning_banners(&st))
+            })
+            .when(st.show_panel_controls && st.shows_content_controls, |d| {
+                d.child(self.render_panel_controls_header(&st, cx))
+            })
+            .child(if table_side_view {
+                self.render_table_view_body(cx)
+            } else {
+                self.render_content_body(&st, cx)
+            })
+            .when(!schema_view && !aggregate_view && !table_side_view, |d| {
+                d.child(self.render_status_bar(
+                    st.row_count,
+                    &st.exec_time,
+                    st.is_paginated,
+                    st.pagination_info,
+                    st.total_pages,
+                    st.can_prev,
+                    st.can_next,
+                    st.sort_info,
+                    st.has_data,
+                    st.uses_result_view,
+                    // A document collection counts its staged edits in the view row.
+                    if st.document_collection {
+                        0
+                    } else {
+                        st.dirty_count
+                    },
+                    st.is_editable,
+                    &st.theme,
+                    cx,
+                ))
+            })
+            .when_some(self.context_menu.as_ref(), |d, menu| {
+                d.child(self.render_context_menu(menu, st.is_editable, cx))
+            })
+            .when(self.chrome.export_menu_open, |d| {
+                d.child(self.render_export_backdrop(cx))
+            })
+            .when(self.pending_delete_confirm.is_some(), |d| {
+                d.child(self.render_delete_confirm_modal(&st.theme, cx))
+            })
+            .when(self.document_view.cell_editor.read(cx).is_visible(), |d| {
+                d.child(self.document_view.cell_editor.clone())
+            })
+            .when(
+                self.document_view
+                    .document_preview_modal
+                    .read(cx)
+                    .is_visible(),
+                |d| d.child(self.document_view.document_preview_modal.clone()),
+            )
+            .when(
+                self.mutation_confirm
+                    .mutation_confirm_light
+                    .read(cx)
+                    .is_visible(),
+                |d| d.child(self.mutation_confirm.mutation_confirm_light.clone()),
+            )
+            .when(
+                self.mutation_confirm
+                    .mutation_confirm_hard
+                    .read(cx)
+                    .is_visible(),
+                |d| d.child(self.mutation_confirm.mutation_confirm_hard.clone()),
+            )
+            .when_some(self.render_aggregate_confirm(cx), |d, modal| d.child(modal))
+    }
+}
+
+impl DataGridPanel {
+    /// Drains pending actions in the exact order the render entry expects; order
+    /// is load-bearing. Must stay on `DataGridPanel` because the drain calls
+    /// methods that require `&mut self` and GPUI's single-Context borrow model.
+    pub(super) fn process_pending_actions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(pending) = self.pending.total_count.take() {
+            self.apply_total_count(pending.source_qualified, pending.total, cx);
+        }
+
+        self.flush_json_reload(window, cx);
+
+        datatab_ui_base::toast::flush_pending_toast(self.pending.toast.take(), window, cx);
+
+        if let Some(requery) = self.pending.requery.take() {
+            self.run_table_query(
+                requery.profile_id,
+                requery.database,
+                requery.table,
+                requery.pagination,
+                requery.order_by,
+                requery.total_rows,
+                window,
+                cx,
+            );
+        }
+
+        if std::mem::take(&mut self.pending.rebuild) {
+            if std::mem::take(&mut self.pending.rebuild_keeps_edits) {
+                self.grid_table.keep_edits_on_reload = true;
+            }
+
+            let sort = self
+                .grid_table
+                .local_sort_state
+                .map(|s| TableSortState::new(s.column_ix, s.direction));
+            self.rebuild_table(sort, cx);
+        }
+
+        if std::mem::take(&mut self.pending.refresh) {
+            if std::mem::take(&mut self.pending.refresh_keeps_edits) {
+                self.refresh_keeping_edits(window, cx);
+            } else if !self.rerun_nearest_neighbors(cx) {
+                // An auto-refresh tick over similar rows reads them again;
+                // every other source reads its page.
+                self.refresh(window, cx);
+            }
+        }
+
+        if self.context_menu.is_none() {
+            self.pending.context_menu_focus = false;
+        } else if std::mem::take(&mut self.pending.context_menu_focus) {
+            self.focus.context_menu_focus.focus(window, cx);
+        }
+
+        if let Some(modal) = self.pending.modal_open.take() {
+            let column = self
+                .result
+                .columns
+                .get(modal.col)
+                .map(|column| (column.name.clone(), column.type_name.clone()));
+
+            self.document_view.cell_editor.update(cx, |editor, cx| {
+                editor.open(
+                    modal.row,
+                    modal.col,
+                    modal.value,
+                    modal.is_json,
+                    column,
+                    window,
+                    cx,
+                );
+            });
+        }
+
+        if let Some(target) = self.pending.value_panel.take() {
+            self.apply_pending_value_panel(target, window, cx);
+        }
+
+        if let Some(action) = self.pending.row_inspector_action.take() {
+            self.apply_row_inspector_action(action, window, cx);
+        }
+
+        if let Some(preview) = self.pending.document_preview.take() {
+            // A driver with field patches edits the document in document JSON,
+            // which keeps every type through the round trip.
+            let document_json = self
+                .document_preview_json(preview.doc_index, cx)
+                .unwrap_or(preview.document_json);
+
+            self.document_view
+                .document_preview_modal
+                .update(cx, |modal, cx| {
+                    modal.open(preview.doc_index, document_json, window, cx);
+                });
+        }
+
+        if let Some(pending_modal) = self.pending.mutation_modal.take() {
+            use crate::data_grid_panel::mutation_confirm::PendingMutationModal;
+            match pending_modal {
+                PendingMutationModal::Light(req) => {
+                    self.mutation_confirm
+                        .mutation_confirm_light
+                        .update(cx, |modal, cx| {
+                            modal.open(req, cx);
+                        });
+                }
+                PendingMutationModal::Hard(req) => {
+                    self.mutation_confirm
+                        .mutation_confirm_hard
+                        .update(cx, |modal, cx| {
+                            modal.open(req, window, cx);
+                        });
+                }
+            }
+        }
+    }
+
+    /// Derives the per-frame render state from `&self`. Pure read — no mutation.
+    fn derive_render_state(&self, cx: &mut Context<Self>) -> RenderState {
+        let theme = cx.theme().clone();
+
+        let row_count = self.result.row_count();
+        let exec_time = format!("{}ms", self.result.execution_time.as_millis());
+
+        let is_table_view = self.source.is_table();
+        let show_data_toolbar = matches!(
+            self.source,
+            DataSource::Table { .. } | DataSource::Collection { .. }
+        );
+        let is_paginated = self.source.is_paginated();
+        let (_, raw_filter_keyword) =
+            DataGridPanel::filter_labels_for_source(&self.source, &self.app_state, cx);
+        let filter_keyword = if self.filter_input_visible() {
+            raw_filter_keyword.to_string()
+        } else {
+            String::new()
+        };
+        let filter_input = self.filter_bar.filter_input.clone();
+        let filter_has_value = !self.filter_bar.filter_input.read(cx).value().is_empty();
+        let limit_input = self.filter_bar.limit_input.clone();
+
+        let pagination_info = self.source.pagination().cloned();
+        let total_pages = self.total_pages();
+        let can_prev = self.can_go_prev();
+        let can_next = self.can_go_next();
+        let sort_info = self.current_sort_info();
+
+        let focus_mode = self.focus.focus_mode;
+        let toolbar_focus = self.focus.toolbar_focus;
+        let edit_state = self.focus.edit_state;
+        let show_toolbar_focus =
+            focus_mode == GridFocusMode::Toolbar && edit_state == EditState::Navigating;
+        let focus_handle = self.focus_handle.clone();
+
+        let has_data = !self.result.rows.is_empty()
+            || self.result.text_body.is_some()
+            || self.result.raw_bytes.is_some();
+        let has_columns = !self.result.columns.is_empty();
+        let is_loading = self.refresh.state == GridState::Loading;
+        let view_mode = self.view_config.mode;
+
+        let show_panel_controls = self.chrome.show_panel_controls;
+        let is_maximized = self.chrome.is_maximized;
+        let uses_result_view = self.uses_result_view();
+        let content_mode =
+            content_mode_for_result(uses_result_view, view_mode, has_columns, has_data);
+        let shows_table_content = matches!(content_mode, DataGridContentMode::Table);
+        let shows_content_controls = has_data || shows_table_content;
+
+        let (is_editable, dirty_count, can_undo, can_redo) = self
+            .grid_table
+            .table_state
+            .as_ref()
+            .map(|ts| {
+                let state = ts.read(cx);
+                let buffer = state.edit_buffer();
+
+                let edit_count = buffer.dirty_row_count();
+                let insert_count = buffer.pending_insert_rows().len();
+                let delete_count = buffer.pending_delete_rows().len();
+                let total_count = edit_count + insert_count + delete_count;
+
+                (
+                    state.is_editable(),
+                    total_count,
+                    buffer.can_undo(),
+                    buffer.can_redo(),
+                )
+            })
+            .unwrap_or((false, 0, false, false));
+
+        let is_grouped_result = self.is_grouped_result();
+
+        let show_grouped_warning = is_table_view && shows_table_content && is_grouped_result;
+        let show_pk_warning = is_table_view
+            && shows_table_content
+            && !is_editable
+            && !is_grouped_result
+            && !self.primary_key_still_resolving()
+            && self.builder.current_visual_spec.is_none()
+            && self.nearest_neighbors.is_none();
+        let show_builder_readonly_hint = is_table_view
+            && shows_table_content
+            && !is_editable
+            && !is_grouped_result
+            && self.builder.current_visual_spec.is_some()
+            && self.builder.builder_editable_binding.is_none();
+        // Similar rows keep the edit controls drawn, disabled, so the header
+        // does not change shape when the search lands.
+        let show_edit_toolbar =
+            is_table_view && has_columns && (is_editable || self.nearest_neighbors.is_some());
+        let result_view_mode = self.chrome.result_view_mode;
+        let document_collection = self.collection.raw.is_some() || self.is_document_collection(cx);
+
+        RenderState {
+            theme,
+            row_count,
+            exec_time,
+            show_data_toolbar,
+            is_paginated,
+            filter_keyword,
+            filter_input,
+            filter_has_value,
+            limit_input,
+            pagination_info,
+            total_pages,
+            can_prev,
+            can_next,
+            sort_info,
+            show_toolbar_focus,
+            toolbar_focus,
+            focus_handle,
+            has_data,
+            is_loading,
+            show_panel_controls,
+            is_maximized,
+            uses_result_view,
+            content_mode,
+            shows_content_controls,
+            is_editable,
+            dirty_count,
+            can_undo,
+            can_redo,
+            show_grouped_warning,
+            show_pk_warning,
+            show_builder_readonly_hint,
+            show_edit_toolbar,
+            result_view_mode,
+            document_collection,
+            document_tab: self.collection.tab,
+        }
+    }
+
+    /// Invisible full-size canvas that tracks the panel's origin in window
+    /// coordinates, used for context menu positioning.
+    fn panel_origin_canvas(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let this_entity = cx.entity().clone();
+        canvas(
+            move |bounds, _, cx| {
+                this_entity.update(cx, |this, _cx| {
+                    this.panel_origin = bounds.origin;
+                    this.panel_size = bounds.size;
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full()
+    }
+
+    /// Renders the three informational banners (grouped-result, no-PK, builder
+    /// read-only). Each banner is conditionally included; the wrapper div is
+    /// always emitted so the call site never needs a conditional.
+    fn render_warning_banners(&self, st: &RenderState) -> impl IntoElement {
+        div()
+            .when(st.show_grouped_warning, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(Spacing::SM)
+                        .h(Heights::ROW_COMPACT)
+                        .px(Spacing::SM)
+                        .bg(st.theme.muted.opacity(0.15))
+                        .border_b_1()
+                        .border_color(st.theme.border)
+                        .child(
+                            Icon::new(AppIcon::TriangleAlert)
+                                .small()
+                                .color(st.theme.muted_foreground),
+                        )
+                        .child(
+                            Text::caption(datatab_i18n::t!(
+                                "document.data.grid.editing.aggregated"
+                            ))
+                            .color(st.theme.muted_foreground),
+                        ),
+                )
+            })
+            .when(st.show_pk_warning, |d| {
+                d.child(
+                    div()
+                        .debug_selector(|| "missing-primary-key-banner".to_string())
+                        .flex()
+                        .items_center()
+                        .gap(Spacing::SM)
+                        .h(Heights::ROW_COMPACT)
+                        .px(Spacing::SM)
+                        .bg(st.theme.warning.opacity(0.15))
+                        .border_b_1()
+                        .border_color(st.theme.warning.opacity(0.3))
+                        .child(Icon::new(AppIcon::TriangleAlert).small().warning())
+                        .child(
+                            Text::caption(datatab_i18n::t!(
+                                "document.data.grid.editing.no_primary_key"
+                            ))
+                            .warning(),
+                        ),
+                )
+            })
+            .when(st.show_builder_readonly_hint, |d| {
+                d.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(Spacing::SM)
+                        .h(Heights::ROW_COMPACT)
+                        .px(Spacing::SM)
+                        .bg(st.theme.muted.opacity(0.15))
+                        .border_b_1()
+                        .border_color(st.theme.border)
+                        .child(
+                            Icon::new(AppIcon::TriangleAlert)
+                                .small()
+                                .color(st.theme.muted_foreground),
+                        )
+                        .child(
+                            Text::caption(datatab_i18n::t!(
+                                "document.data.grid.editing.not_single_table"
+                            ))
+                            .color(st.theme.muted_foreground),
+                        ),
+                )
+            })
+    }
+
+    /// Renders the maximize/hide header bar shown when the panel is embedded
+    /// and content controls are visible.
+    fn render_panel_controls_header(
+        &self,
+        st: &RenderState,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .justify_end()
+            .h(Heights::ROW_COMPACT)
+            .px(Spacing::SM)
+            .border_b_1()
+            .border_color(st.theme.border)
+            .child(
+                div()
+                    .id("toggle-maximize")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(Heights::ICON_LG)
+                    .h(Heights::ICON_LG)
+                    .rounded(Radii::SM)
+                    .cursor_pointer()
+                    .hover(|d| d.bg(st.theme.secondary))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.request_toggle_maximize(cx);
+                    }))
+                    .child(
+                        Icon::new(if st.is_maximized {
+                            AppIcon::Minimize2
+                        } else {
+                            AppIcon::Maximize2
+                        })
+                        .small()
+                        .color(st.theme.muted_foreground),
+                    ),
+            )
+            .child(
+                div()
+                    .id("hide-panel")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .w(Heights::ICON_LG)
+                    .h(Heights::ICON_LG)
+                    .rounded(Radii::SM)
+                    .cursor_pointer()
+                    .hover(|d| d.bg(st.theme.secondary))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.request_hide(cx);
+                    }))
+                    .child(
+                        Icon::new(AppIcon::PanelBottomClose)
+                            .small()
+                            .color(st.theme.muted_foreground),
+                    ),
+            )
+    }
+
+    /// Renders the content area: empty fallback, result view, document view, or
+    /// the data table — selected by `st.content_mode`.
+    fn render_content_body(&mut self, st: &RenderState, cx: &mut Context<Self>) -> AnyElement {
+        let content_mode = st.content_mode;
+        let result_view_mode = st.result_view_mode;
+        let theme = st.theme.clone();
+        let is_loading = st.is_loading;
+
+        if st.document_collection {
+            let conflict = self.render_conflict_card(cx);
+
+            let body = if st.document_tab == documents::CollectionTab::Schema {
+                self.render_schema_view(cx).into_any_element()
+            } else if st.document_tab == documents::CollectionTab::Aggregate {
+                self.render_aggregate_view(cx)
+            } else if self.view_config.mode == DataViewMode::Json {
+                self.render_document_json_view(cx).into_any_element()
+            } else {
+                self.render_content_body_inner(
+                    content_mode,
+                    result_view_mode,
+                    &theme,
+                    is_loading,
+                    cx,
+                )
+                .into_any_element()
+            };
+
+            // The Aggregate view keeps its own focus (the pipeline editor and
+            // the result views), so a click there must not pull focus back to
+            // the documents grid.
+            let focuses_documents = st.document_tab != documents::CollectionTab::Aggregate;
+
+            return div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col()
+                .overflow_hidden()
+                .when(focuses_documents, |body| {
+                    body.on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            if this.focus.focus_mode != GridFocusMode::Table {
+                                this.focus_table(window, cx);
+                            }
+                        }),
+                    )
+                })
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .overflow_hidden()
+                        .child(body),
+                )
+                .when_some(conflict, |body, card| body.child(card))
+                .into_any_element();
+        }
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    if this.focus.focus_mode != GridFocusMode::Table {
+                        this.focus_table(window, cx);
+                    }
+                }),
+            )
+            .child(self.render_content_body_inner(
+                content_mode,
+                result_view_mode,
+                &theme,
+                is_loading,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    /// The content for `content_mode`: empty fallback, result view, document
+    /// tree or data table.
+    fn render_content_body_inner(
+        &mut self,
+        content_mode: DataGridContentMode,
+        result_view_mode: ResultViewMode,
+        theme: &gpui_component::theme::Theme,
+        is_loading: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = theme.clone();
+
+        let content = div().flex_1().min_h_0().overflow_hidden();
+
+        let content = content.when(
+            matches!(content_mode, DataGridContentMode::EmptyFallback),
+            |d| {
+                d.flex()
+                    .items_center()
+                    .justify_center()
+                    .child(if is_loading {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(Spacing::SM)
+                            .child(
+                                Icon::new(AppIcon::Loader)
+                                    .size(ui(12.0))
+                                    .color(theme.muted_foreground),
+                            )
+                            .child(Text::caption(datatab_i18n::t!(
+                                "document.data.grid.loading"
+                            )))
+                            .into_any_element()
+                    } else {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(Spacing::XS)
+                            .child(Text::caption(self.statement_outcome().unwrap_or_else(
+                                || datatab_i18n::t!("document.data.grid.empty"),
+                            )))
+                            .children(self.body_notice_lines().into_iter().map(|line| {
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(Spacing::XS)
+                                    .child(
+                                        Icon::new(AppIcon::TriangleAlert)
+                                            .size(ui(12.0))
+                                            .color(theme.warning),
+                                    )
+                                    .child(Text::caption(line))
+                            }))
+                            .into_any_element()
+                    })
+            },
+        );
+
+        let content = content.when(
+            matches!(content_mode, DataGridContentMode::ResultView),
+            |d| d.child(self.render_result_view(result_view_mode, &theme, cx)),
+        );
+
+        let content = content.when(matches!(content_mode, DataGridContentMode::Document), |d| {
+            d.child(self.render_document_view(&theme, cx))
+        });
+
+        content.when(matches!(content_mode, DataGridContentMode::Table), |d| {
+            d.when_some(self.grid_table.data_table.clone(), |d, data_table| {
+                d.child(data_table)
+            })
+        })
+    }
+}
+
+impl DataGridPanel {
+    /// Breadcrumb of a table or collection source (AppByzTable header): the
+    /// driver logo and connection name, the database and schema, then the
+    /// table itself with its column and row counts. `None` for query results.
+    pub(super) fn source_breadcrumb(&self, cx: &App) -> Option<Breadcrumb> {
+        let (profile_id, database, schema, name) = match &self.source {
+            DataSource::Table {
+                profile_id,
+                database,
+                table,
+                ..
+            } => (
+                *profile_id,
+                database.clone(),
+                table.schema.clone(),
+                table.name.clone(),
+            ),
+            DataSource::Collection {
+                profile_id,
+                collection,
+                ..
+            } => (
+                *profile_id,
+                Some(collection.database.clone()),
+                None,
+                collection.name.clone(),
+            ),
+            DataSource::QueryResult { .. } => return None,
+        };
+
+        let (_, source_label) = self.source_query_labels(cx);
+        let current_label = match &self.source {
+            DataSource::Collection { .. } if self.filter_bar.browse_query_label.is_some() => {
+                source_label
+            }
+            _ => name,
+        };
+
+        let state = self.app_state.read(cx);
+        let profile = state
+            .profiles()
+            .iter()
+            .find(|profile| profile.id == profile_id);
+
+        let mut segments = Vec::new();
+
+        if let Some(profile) = profile {
+            let mut segment = BreadcrumbSegment::new(profile.name.clone());
+
+            if let Some(driver) = state.drivers().get(&profile.driver_id()) {
+                let metadata = driver.metadata();
+                segment = segment.icon(
+                    AppIcon::for_driver(metadata.icon, metadata.category),
+                    Some(DriverIconTone::for_driver(metadata.icon, metadata.category).resolve(cx)),
+                );
+            }
+
+            segments.push(segment);
+        }
+
+        segments.extend(database.map(BreadcrumbSegment::new));
+        segments.extend(schema.map(BreadcrumbSegment::new));
+        if self.collection.raw.is_some() {
+            segments.push(BreadcrumbSegment::new(current_label).icon(AppIcon::Box, None));
+            let breadcrumb = Breadcrumb::new(segments);
+            return Some(match self.collection_meta_label() {
+                Some(meta) => breadcrumb.meta(meta),
+                None => breadcrumb,
+            });
+        }
+
+        segments.push(BreadcrumbSegment::new(current_label).icon(AppIcon::Table, None));
+
+        Some(Breadcrumb::new(segments).meta(self.source_breadcrumb_meta()))
+    }
+
+    /// The column and row counts beside a table's breadcrumb.
+    pub(super) fn source_breadcrumb_meta(&self) -> String {
+        // Similar rows count what is on screen: the neighbors, without the
+        // anchor row pinned above them.
+        if self.nearest_neighbors.is_some() {
+            let neighbors = self.result.rows.len().saturating_sub(1) as u64;
+            return crate::labels::breadcrumb_meta_label(
+                self.result.columns.len(),
+                Some(neighbors),
+            );
+        }
+
+        let total_rows = match &self.source {
+            DataSource::Table { total_rows, .. } => *total_rows,
+            DataSource::Collection { total_docs, .. } => *total_docs,
+            DataSource::QueryResult { .. } => None,
+        };
+
+        crate::labels::breadcrumb_meta_label(self.result.columns.len(), total_rows)
+    }
+}
+
+/// Width of the footer's export menu.
+const EXPORT_MENU_WIDTH: Pixels = px(220.0);
+
+/// Height of the chart above the grid in the Both view (P2Series). (330 px)
+const BOTH_CHART_HEIGHT: Pixels = px(330.0);
+
+/// Width of the chart stats rail. (320 px)
+const CHART_STATS_RAIL_WIDTH: Pixels = px(320.0);
+
+/// The Builder button beside the filter field (AppByzTable: secondary,
+/// icon and label).
+fn builder_button(
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    Button::new(
+        "open-builder-btn",
+        datatab_i18n::t!("document.data.grid.toolbar.builder"),
+    )
+    .icon(AppIcon::ListFilter)
+    .tab_stop(false)
+    .on_click(on_click)
+}
+
+/// Icon of the refresh action: a loader while a query runs, a clock while
+/// auto-refresh is on, a circling arrow otherwise.
+fn refresh_icon(is_running: bool, is_auto: bool) -> AppIcon {
+    if is_running {
+        AppIcon::Loader
+    } else if is_auto {
+        AppIcon::Clock
+    } else {
+        AppIcon::RefreshCcw
+    }
+}
+
+/// The table view's primary Refresh split: the main action refreshes (or
+/// cancels a running query) and the menu segment hosts the auto-refresh
+/// dropdown as a bare chevron.
+fn refresh_split(
+    label: String,
+    icon: AppIcon,
+    focused: bool,
+    refresh_dropdown: Entity<Dropdown>,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> SplitButton {
+    SplitButton::new(
+        "refresh-action-btn",
+        Button::new("refresh-action", label)
+            .primary()
+            .icon(icon)
+            .focused(focused)
+            .tab_stop(false)
+            .on_click(on_click),
+        refresh_dropdown,
+    )
+}
+
+impl DataGridPanel {
+    /// The table view's two top rows (AppByzTable): the header with the
+    /// source breadcrumb and, for an editable table, the edit status and the
+    /// undo, redo, save and revert actions; then the filter row with the
+    /// WHERE / LIMIT field, the Builder and the Refresh split.
+    #[allow(clippy::too_many_arguments)]
+    fn render_toolbar(
+        &self,
+        filter_keyword: &str,
+        filter_input: &Entity<EditorState>,
+        filter_has_value: bool,
+        limit_input: &Entity<InputState>,
+        show_toolbar_focus: bool,
+        toolbar_focus: ToolbarFocus,
+        edit_controls: Option<EditControls>,
+        theme: &gpui_component::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .flex_shrink_0()
+            .child(self.render_table_header(edit_controls, theme, cx))
+            .child(self.render_filter_row(
+                filter_keyword,
+                filter_input,
+                filter_has_value,
+                limit_input,
+                show_toolbar_focus,
+                toolbar_focus,
+                theme,
+                cx,
+            ))
+    }
+
+    /// Header row: breadcrumb and metadata chip on the left, the edit
+    /// controls of an editable table on the right.
+    fn render_table_header(
+        &self,
+        edit_controls: Option<EditControls>,
+        theme: &gpui_component::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(TableViewMetrics::HEADER_GAP)
+            .h(TableViewMetrics::HEADER_HEIGHT)
+            .px(TableViewMetrics::HEADER_PADDING_X)
+            .border_b_1()
+            .border_color(theme.border)
+            .when_some(self.source_breadcrumb(cx), |header, breadcrumb| {
+                header.child(div().min_w_0().overflow_hidden().child(breadcrumb))
+            })
+            .child(div().flex_1())
+            .when_some(edit_controls, |header, controls| {
+                header.child(self.render_edit_controls(controls, theme, cx))
+            })
+            .when(self.collection_tabs(cx).len() > 1, |header| {
+                header.child(self.render_collection_tabs(cx))
+            })
+            .when(self.table_tabs().len() > 1, |header| {
+                header.child(self.render_table_tabs(cx))
+            })
+            .when_some(self.render_document_builder_toggle(cx), |header, toggle| {
+                header.child(toggle)
+            })
+    }
+
+    /// Filter row: WHERE filter and LIMIT in one field (flex_1) | view toggle
+    /// | Builder | Refresh.
+    #[allow(clippy::too_many_arguments)]
+    fn render_filter_row(
+        &self,
+        filter_keyword: &str,
+        filter_input: &Entity<EditorState>,
+        filter_has_value: bool,
+        limit_input: &Entity<InputState>,
+        show_toolbar_focus: bool,
+        toolbar_focus: ToolbarFocus,
+        theme: &gpui_component::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let refresh_label = if self.refresh.refresh_policy.is_auto() {
+            crate::labels::refresh_policy_label(self.refresh.refresh_policy)
+        } else {
+            datatab_i18n::t!("document.data.grid.toolbar.refresh")
+        };
+
+        let toolbar_has_filter_error =
+            filter_input_has_error(&self.builder.relational_filter_state);
+        let filter_field_focused = self.focus.focus_mode == GridFocusMode::Toolbar
+            && self.focus.toolbar_focus == ToolbarFocus::Filter;
+        let limit_field_focused = self.focus.focus_mode == GridFocusMode::Toolbar
+            && self.focus.toolbar_focus == ToolbarFocus::Limit;
+        let toolbar_chip = render_relational_chip(
+            &self.builder.relational_filter_state,
+            cx,
+            Box::new(cx.listener(|this, _, window, cx| {
+                if let Some(spec) = this.builder.builder_draft_spec.clone()
+                    && !this.reload_blocked_by_pending_edits(cx)
+                {
+                    this.apply_builder_draft_spec(spec, cx);
+                }
+                this.open_query_builder(window, cx);
+            })),
+        );
+
+        let toolbar_resolving =
+            render_resolving_indicator(&self.builder.relational_filter_state, cx);
+
+        let toolbar_error = render_relational_error(
+            &self.builder.relational_filter_state,
+            cx,
+            Box::new(cx.listener(|this, _, window, cx| {
+                let partial_spec = if let super::filter_bar::RelationalFilterState::Error {
+                    partial_spec,
+                    ..
+                } = &this.builder.relational_filter_state
+                {
+                    Some(*partial_spec.clone())
+                } else {
+                    None
+                };
+                if let Some(spec) = partial_spec
+                    && !this.reload_blocked_by_pending_edits(cx)
+                {
+                    this.apply_builder_draft_spec(spec, cx);
+                }
+                this.open_query_builder(window, cx);
+            })),
+        );
+
+        let filter_editor = div()
+            .flex()
+            .items_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.focus.switching_input = true;
+                    this.focus.focus_mode = GridFocusMode::Toolbar;
+                    this.focus.toolbar_focus = ToolbarFocus::Filter;
+                    this.focus.edit_state = EditState::Editing;
+                    cx.notify();
+                }),
+            )
+            .child(
+                crate::completion_support::frameless_single_line_completion_editor(
+                    filter_input,
+                    cx,
+                )
+                .text_color(theme.accent_foreground)
+                .flex_1(),
+            );
+
+        let limit_value = div()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.focus.switching_input = true;
+                    this.focus.focus_mode = GridFocusMode::Toolbar;
+                    this.focus.toolbar_focus = ToolbarFocus::Limit;
+                    this.focus.edit_state = EditState::Editing;
+                    cx.notify();
+                }),
+            )
+            .child(Input::new(limit_input).small().appearance(false));
+
+        let has_filter = !filter_keyword.is_empty();
+
+        let field = FilterField::new("data-grid-filter-field")
+            .when(has_filter, |field| {
+                field.filter(filter_keyword.to_string(), filter_editor)
+            })
+            .when(filter_has_value && has_filter, |field| {
+                field.trailing(
+                    div()
+                        .id("clear-filter")
+                        .w(Heights::ICON_MD)
+                        .h(Heights::ICON_MD)
+                        .flex()
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .rounded(Radii::SM)
+                        .text_size(FontSizes::SM)
+                        .text_color(theme.muted_foreground)
+                        .cursor_pointer()
+                        .hover(|d| d.bg(theme.secondary).text_color(theme.foreground))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.replace_filter_and_reload("", window, cx);
+                        }))
+                        .child("\u{00d7}"),
+                )
+            })
+            .when_some(toolbar_chip, |field, chip| field.trailing(chip))
+            .when_some(toolbar_resolving, |field, indicator| {
+                field.trailing(indicator)
+            })
+            .limit("LIMIT", limit_value)
+            .filter_focused(filter_field_focused && has_filter)
+            .limit_focused(limit_field_focused)
+            .error(toolbar_has_filter_error);
+
+        // Similar rows put the neighbor bar in this row, at the same height,
+        // so the grid under it does not move; WHERE, LIMIT, the view toggle,
+        // the column picker and the builder do not apply to them.
+        let neighbor_search = self.neighbor_bar_search().cloned();
+        let filter_shown = neighbor_search.is_none();
+
+        div()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(TableViewMetrics::FILTER_ROW_GAP)
+            .h(TableViewMetrics::FILTER_ROW_HEIGHT)
+            .px(TableViewMetrics::FILTER_ROW_PADDING_X)
+            .border_b_1()
+            .border_color(theme.border)
+            .when(filter_shown, |row| {
+                row.debug_selector(|| "data-grid-filter-controls".to_string())
+            })
+            .when_some(neighbor_search, |row, search| {
+                row.debug_selector(|| "nearest-neighbors-bar".to_string())
+                    .child(self.render_neighbor_bar(&search, theme, cx))
+            })
+            .when(filter_shown, |row| {
+                row.child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .items_center()
+                        .gap(Spacing::XS)
+                        .when(self.builder_notice_visible(), |d| {
+                            d.child(self.render_builder_notice(theme, cx))
+                        })
+                        .child(field)
+                        .when_some(toolbar_error, |d, err| d.child(err)),
+                )
+            })
+            .when(filter_shown && self.can_toggle_view(cx), |d| {
+                let mode = self.view_config.mode;
+                let view_icon: AppIcon = match mode {
+                    DataViewMode::Table => AppIcon::Table,
+                    DataViewMode::Document | DataViewMode::Json => AppIcon::Braces,
+                };
+                let tooltip = match mode {
+                    DataViewMode::Table => {
+                        datatab_i18n::t!("document.data.grid.toolbar.switch_to_document")
+                    }
+                    DataViewMode::Document | DataViewMode::Json => {
+                        datatab_i18n::t!("document.data.grid.toolbar.switch_to_table")
+                    }
+                };
+
+                d.child(
+                    Button::new("view-toggle-btn", mode.label())
+                        .ghost()
+                        .icon(view_icon)
+                        .tooltip(tooltip)
+                        .tab_stop(false)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toggle_view_mode(cx);
+                        })),
+                )
+            })
+            .when(filter_shown && self.shows_table_column_picker(), |d| {
+                d.children(self.table_views.picker.clone())
+            })
+            .when(filter_shown && self.can_open_builder(cx), |d| {
+                d.child(builder_button(cx.listener(|this, _, window, cx| {
+                    this.open_query_builder(window, cx);
+                })))
+            })
+            .child(refresh_split(
+                refresh_label,
+                refresh_icon(
+                    self.runner.is_primary_active(),
+                    self.refresh.refresh_policy.is_auto(),
+                ),
+                show_toolbar_focus && toolbar_focus == ToolbarFocus::Refresh,
+                self.filter_bar.refresh_dropdown.clone(),
+                cx.listener(|this, _, window, cx| {
+                    if this.runner.is_primary_active() {
+                        this.runner.cancel_primary(cx);
+                        cx.notify();
+                    } else {
+                        this.request_refresh(window, cx);
+                        this.focus_table(window, cx);
+                    }
+                }),
+            ))
+    }
+
+    /// Stands in for the WHERE input while a closed builder's spec drives the
+    /// rows: says where the rows come from and offers to reopen the builder
+    /// or reset back to the plain table read.
+    fn render_builder_notice(
+        &self,
+        theme: &gpui_component::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id("builder-query-notice")
+            .debug_selector(|| "builder-query-notice".to_string())
+            .flex()
+            .flex_1()
+            .min_w(px(0.0))
+            .items_center()
+            .gap(Spacing::SM)
+            .child(
+                Icon::new(AppIcon::ListFilter)
+                    .size(Fields::FILTER_ICON)
+                    .color(theme.muted_foreground),
+            )
+            .child(
+                div().min_w(px(0.0)).truncate().child(
+                    Text::body_sm(datatab_i18n::t!("document.data.grid.filter.builder_notice"))
+                        .color(theme.muted_foreground),
+                ),
+            )
+            .child(
+                Button::new(
+                    "builder-notice-edit",
+                    datatab_i18n::t!("document.data.grid.filter.edit_in_builder"),
+                )
+                .ghost()
+                .inline()
+                .tab_stop(false)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_query_builder(window, cx);
+                })),
+            )
+            .child(
+                Button::new(
+                    "builder-notice-reset",
+                    datatab_i18n::t!("document.data.grid.filter.reset_builder"),
+                )
+                .ghost()
+                .inline()
+                .icon(AppIcon::RotateCcw)
+                .tab_stop(false)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.reset_builder_query(window, cx);
+                    cx.notify();
+                })),
+            )
+    }
+
+    /// Right side of the header of an editable table: the unsaved-changes
+    /// status, a divider, undo and redo, then Save (primary while there are
+    /// changes) and Revert.
+    fn render_edit_controls(
+        &self,
+        controls: EditControls,
+        theme: &gpui_component::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let has_changes = controls.dirty_count > 0;
+        let status_color = if has_changes {
+            theme.warning
+        } else {
+            theme.muted_foreground
+        };
+        let (status_icon, status_icon_color, status_label) = if controls.neighbors {
+            (
+                AppIcon::Lock,
+                theme.muted_foreground,
+                datatab_i18n::t!("document.data.grid.nearest.read_only"),
+            )
+        } else if has_changes {
+            (
+                AppIcon::CircleAlert,
+                theme.warning,
+                crate::labels::unsaved_changes_label(controls.dirty_count),
+            )
+        } else {
+            (
+                AppIcon::Check,
+                theme.success,
+                crate::labels::unsaved_changes_label(controls.dirty_count),
+            )
+        };
+
+        div()
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(TableViewMetrics::HEADER_GAP)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(TableViewMetrics::STATUS_GAP)
+                    .text_size(TableViewMetrics::STATUS_FONT)
+                    .text_color(status_color)
+                    .child(
+                        Icon::new(status_icon)
+                            .size(TableViewMetrics::STATUS_ICON)
+                            .color(status_icon_color),
+                    )
+                    .child(status_label),
+            )
+            .child(
+                div()
+                    .w(px(1.0))
+                    .h(TableViewMetrics::DIVIDER_HEIGHT)
+                    .mx(TableViewMetrics::HEADER_DIVIDER_MARGIN_X)
+                    .bg(theme.border),
+            )
+            .child(
+                Button::new(
+                    "undo-btn",
+                    datatab_i18n::t!("document.data.grid.edit_bar.undo"),
+                )
+                .icon(AppIcon::Undo)
+                .icon_only()
+                .disabled(!controls.can_undo)
+                .tab_stop(false)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.step_edit_history(true, window, cx);
+                })),
+            )
+            .child(
+                Button::new(
+                    "redo-btn",
+                    datatab_i18n::t!("document.data.grid.edit_bar.redo"),
+                )
+                .icon(AppIcon::Redo)
+                .icon_only()
+                .disabled(!controls.can_redo)
+                .tab_stop(false)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.step_edit_history(false, window, cx);
+                })),
+            )
+            .child(
+                Button::new(
+                    "save-btn",
+                    datatab_i18n::t!("document.data.grid.edit_bar.save"),
+                )
+                .variant(if has_changes {
+                    ButtonVariant::Primary
+                } else {
+                    ButtonVariant::Ghost
+                })
+                .icon(AppIcon::Save)
+                .kbd(SAVE_ROW_SHORTCUT_HINT)
+                .disabled(!has_changes)
+                .tab_stop(false)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if let Some(table_state) = &this.grid_table.table_state {
+                        table_state.update(cx, |state, cx| {
+                            state.request_save_all(cx);
+                        });
+                    }
+                    window.focus(&this.focus_handle, cx);
+                })),
+            )
+            .child(
+                Button::new(
+                    "revert-btn",
+                    datatab_i18n::t!("document.data.grid.edit_bar.revert"),
+                )
+                .ghost()
+                .icon(AppIcon::RotateCcw)
+                .disabled(!has_changes)
+                .tab_stop(false)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if let Some(table_state) = &this.grid_table.table_state {
+                        table_state.update(cx, |state, cx| {
+                            state.revert_all(cx);
+                        });
+                    }
+                    window.focus(&this.focus_handle, cx);
+                })),
+            )
+    }
+
+    /// Undo (`undo == true`) or redo one step of the staged edits, dropping
+    /// the selection when it now points past the last row, and hand focus
+    /// back to the grid.
+    fn step_edit_history(&mut self, undo: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(table_state) = &self.grid_table.table_state {
+            table_state.update(cx, |state, cx| {
+                if state.is_editing() {
+                    state.stop_editing(false, cx);
+                }
+
+                let changed = if undo {
+                    state.edit_buffer_mut().undo()
+                } else {
+                    state.edit_buffer_mut().redo()
+                };
+
+                if changed {
+                    let visual_count = state.edit_buffer().compute_visual_order().len();
+                    if let Some(active) = state.selection().active
+                        && active.row >= visual_count
+                    {
+                        state.clear_selection(cx);
+                    }
+                    cx.notify();
+                }
+            });
+        }
+
+        window.focus(&self.focus_handle, cx);
+    }
+
+    pub(super) fn render_document_view(
+        &self,
+        _theme: &gpui_component::theme::Theme,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        if let Some(tree) = &self.document_view.document_tree {
+            div()
+                .id("document-view-container")
+                .size_full()
+                .child(tree.clone())
+        } else {
+            let entity = _cx.entity();
+            let list_state = self
+                .document_view
+                .document_card_list
+                .clone()
+                .unwrap_or_else(|| {
+                    ListState::new(self.result.rows.len(), ListAlignment::Top, px(400.0))
+                });
+
+            let card_list = list(list_state, move |row_idx, _window, cx: &mut App| {
+                let theme = cx.theme().clone();
+                let this = entity.read(cx);
+                let Some(row) = this.result.rows.get(row_idx) else {
+                    return div().into_any_element();
+                };
+
+                // Variable-height cards: each gets bottom spacing instead of the
+                // container `gap`, which a virtualized list cannot apply.
+                div()
+                    .pb(Spacing::MD)
+                    .child(this.render_document_card(row_idx, row, &this.result.columns, &theme))
+                    .into_any_element()
+            })
+            .size_full();
+
+            div()
+                .id("document-view-container")
+                .size_full()
+                .p(Spacing::MD)
+                .child(card_list)
+        }
+    }
+
+    pub(super) fn render_document_card(
+        &self,
+        row_idx: usize,
+        row: &[Value],
+        columns: &[datatab_core::ColumnMeta],
+        theme: &gpui_component::theme::Theme,
+    ) -> impl IntoElement {
+        div()
+            .id(ElementId::Name(format!("doc-{}", row_idx).into()))
+            .flex()
+            .flex_col()
+            .w_full()
+            .p(Spacing::MD)
+            .rounded(Radii::MD)
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.secondary)
+            .gap(Spacing::XS)
+            .children(
+                columns
+                    .iter()
+                    .zip(row.iter())
+                    .filter(|(_, val)| !matches!(val, Value::Null))
+                    .map(|(col, val)| self.render_document_field(&col.name, val, theme, 0)),
+            )
+    }
+
+    pub(super) fn render_document_field(
+        &self,
+        name: &str,
+        value: &Value,
+        theme: &gpui_component::theme::Theme,
+        depth: usize,
+    ) -> impl IntoElement {
+        let indent = px(depth as f32 * 16.0);
+
+        div()
+            .flex()
+            .pl(indent)
+            .gap(Spacing::SM)
+            .child(Text::body_sm(format!("{}:", name)).muted_foreground())
+            .child(self.render_value(value, theme, depth))
+    }
+
+    pub(super) fn render_value(
+        &self,
+        value: &Value,
+        theme: &gpui_component::theme::Theme,
+        depth: usize,
+    ) -> impl IntoElement {
+        let text_color = match value {
+            Value::Null => theme.muted_foreground,
+            Value::Bool(_) => theme.chart_1,
+            Value::Int(_) | Value::Float(_) => theme.chart_2,
+            Value::Text(_) => theme.chart_3,
+            Value::ObjectId(_) => theme.chart_4,
+            _ => theme.foreground,
+        };
+
+        match value {
+            Value::Null => Text::caption("null").color(text_color).into_any_element(),
+
+            Value::Bool(b) => Text::caption(if *b { "true" } else { "false" })
+                .color(text_color)
+                .into_any_element(),
+
+            Value::Int(i) => Text::caption(i.to_string())
+                .color(text_color)
+                .into_any_element(),
+
+            Value::Float(f) => Text::caption(f.to_string())
+                .color(text_color)
+                .into_any_element(),
+
+            Value::Text(s) => {
+                let display: String = s.replace('\n', "\\n").replace('\r', "\\r");
+                Text::caption(format!("\"{}\"", display))
+                    .color(text_color)
+                    .into_any_element()
+            }
+
+            Value::ObjectId(oid) => Text::caption(format!("ObjectId(\"{}\")", oid))
+                .color(text_color)
+                .into_any_element(),
+
+            Value::DateTime(dt) => Text::caption(dt.to_rfc3339())
+                .color(text_color)
+                .into_any_element(),
+
+            Value::Array(arr) => {
+                if arr.is_empty() {
+                    Text::caption("[]").into_any_element()
+                } else if arr.len() <= 3 && depth < 2 {
+                    div()
+                        .flex()
+                        .gap(Spacing::XS)
+                        .child(Text::caption("["))
+                        .children(arr.iter().enumerate().map(|(i, v)| {
+                            div()
+                                .flex()
+                                .child(self.render_value(v, theme, depth + 1))
+                                .when(i < arr.len() - 1, |d| d.child(Text::caption(",")))
+                        }))
+                        .child(Text::caption("]"))
+                        .into_any_element()
+                } else {
+                    Text::caption(format!("[{} items]", arr.len())).into_any_element()
+                }
+            }
+
+            Value::Document(doc) => {
+                if doc.is_empty() {
+                    Text::caption("{}").into_any_element()
+                } else if depth < 2 {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .pl(Spacing::MD)
+                        .children(
+                            doc.iter()
+                                .map(|(k, v)| self.render_document_field(k, v, theme, depth + 1)),
+                        )
+                        .into_any_element()
+                } else {
+                    Text::caption(format!("{{{} fields}}", doc.len())).into_any_element()
+                }
+            }
+
+            _ => {
+                let display = format!("{:?}", value)
+                    .replace('\n', "\\n")
+                    .replace('\r', "\\r");
+                Text::body(display).into_any_element()
+            }
+        }
+    }
+
+    // -- Chart Toolbar --
+
+    /// Render the chart toolbar that sits between the result-tabs strip and the
+    /// canvas + rail row.
+    ///
+    /// Delegates the toolbar row to the shared `render_chart_toolbar` function
+    /// and assembles the AxisBar row below it. The AxisBar row is kept here and
+    /// is not part of the shared toolbar.
+    pub(super) fn render_chart_toolbar(
+        &mut self,
+        theme: &gpui_component::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        use crate::chart::toolbar::{
+            ChartToolbarContext, ChartToolbarHandlers, render_chart_toolbar,
+        };
+        use std::sync::Arc;
+
+        // The shell is required for chart mode; fall back gracefully if absent.
+        let Some(chart_shell) = self.chart.chart_shell.clone() else {
+            return div().into_any_element();
+        };
+
+        let resolved_window = self
+            .result
+            .resolved_window
+            .as_ref()
+            .map(|rw| (rw.start_ms, rw.end_ms));
+
+        // Capture clones for the handlers before borrowing self mutably.
+        let shell_for_stats = chart_shell.clone();
+        let shell_for_kind = chart_shell.clone();
+
+        let ctx = ChartToolbarContext {
+            theme,
+            chart_shell,
+            refresh_policy: self.refresh.refresh_policy,
+            refresh_dropdown: self.filter_bar.refresh_dropdown.clone(),
+            time_range_panel: self.chart.chart_source_time_range_panel.clone(),
+            row_count: self.result.row_count(),
+            resolved_window,
+            // Saving a chart stores its query; a table browse has none, so
+            // `open_collection_chart_save` does nothing for it.
+            source_supports_save: !matches!(self.source, DataSource::Table { .. }),
+            refresh_variant: ButtonVariant::Primary,
+            leading: None,
+            show_window: true,
+        };
+
+        let weak_panel_for_save = cx.weak_entity();
+        let weak_panel_for_refresh = cx.weak_entity();
+
+        let handlers = ChartToolbarHandlers {
+            on_refresh: Arc::new(move |_window, cx| {
+                if let Some(panel) = weak_panel_for_refresh.upgrade() {
+                    panel.update(cx, |this, cx| {
+                        if this.reload_blocked_by_pending_edits(cx) {
+                            return;
+                        }
+
+                        this.pending.refresh = true;
+                        cx.notify();
+                    });
+                }
+            }),
+            on_toggle_stats_rail: Arc::new(move |_window, cx| {
+                shell_for_stats.update(cx, |s, cx| {
+                    if s.chart_rail_open && s.chart_rail_tab == ChartRailTab::Stats {
+                        s.chart_rail_open = false;
+                    } else {
+                        s.chart_rail_open = true;
+                        s.chart_rail_tab = ChartRailTab::Stats;
+                    }
+                    cx.notify();
+                });
+            }),
+            on_save_chart: Arc::new(move |window, cx| {
+                if let Some(panel) = weak_panel_for_save.upgrade() {
+                    panel.update(cx, |this, cx| {
+                        this.open_collection_chart_save(window, cx);
+                    });
+                }
+            }),
+            on_select_chart_kind: Arc::new(move |kind, _window, cx| {
+                shell_for_kind.update(cx, |s, cx| s.set_chart_kind(kind, cx));
+            }),
+        };
+
+        let toolbar_row = render_chart_toolbar(ctx, handlers, cx);
+
+        // Custom date/time picker row — rendered between the chart toolbar and
+        // the AxisBar when the user has selected "Custom…" in the time-range
+        // preset dropdown. Allows adjusting the custom time window without
+        // leaving the CodeDocument's result chart view.
+        //
+        // The Apply button calls `panel.apply_custom_range`; the parent
+        // CodeDocument's `TimeRangeChanged` subscription handles re-execution.
+        let custom_picker_row: Option<AnyElement> = self
+            .chart
+            .chart_source_time_range_panel
+            .as_ref()
+            .and_then(|panel_entity| {
+                use datatab_components::common::time_range::state::TimeRange;
+                use datatab_components::controls::Button;
+
+                let panel = panel_entity.read(cx);
+                if panel.selected_time_range != Some(TimeRange::Custom) {
+                    return None;
+                }
+
+                let can_apply = panel.can_apply_custom_range(cx);
+                let picker_row = panel.render_custom_picker_row(px(320.0), cx);
+                let panel_clone = panel_entity.clone();
+
+                let row = div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .pt(Spacing::XS)
+                    .px(Spacing::SM)
+                    .py(Spacing::XS)
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .bg(theme.tab_bar)
+                    .child(picker_row)
+                    .child(
+                        Button::new(
+                            "data-grid-chart-time-range-apply",
+                            datatab_i18n::t!("document.data.chart_dock.toolbar.apply"),
+                        )
+                        .disabled(!can_apply)
+                        .on_click(move |_, _, cx| {
+                            panel_clone.update(cx, |p, cx| {
+                                // The returned bounds are intentionally discarded:
+                                // the parent CodeDocument's TimeRangeChanged
+                                // subscription drives re-execution.
+                                let _ = p.apply_custom_range(cx);
+                            });
+                        }),
+                    );
+
+                Some(row.into_any_element())
+            });
+
+        // AxisBar row: shown below the main toolbar when a chart view is live.
+        // Reads bindings and open-pill state from the shell.
+        let (bindings, open_pill, columns) = self
+            .chart
+            .chart_shell
+            .as_ref()
+            .map(|s| {
+                let shell = s.read(cx);
+                (
+                    shell.active_bindings(),
+                    shell.axis_open_pill,
+                    self.result.columns.clone(),
+                )
+            })
+            .unwrap_or_else(|| {
+                (
+                    datatab_components::chart::BindingSpec::default(),
+                    None,
+                    Vec::new(),
+                )
+            });
+
+        let shell_for_pill = self.chart.chart_shell.clone();
+        let shell_for_x = self.chart.chart_shell.clone();
+        let shell_for_y = self.chart.chart_shell.clone();
+        let shell_for_group = self.chart.chart_shell.clone();
+        let shell_for_agg = self.chart.chart_shell.clone();
+
+        let chart_colors = ChartColors::for_current(cx);
+
+        let picker_cursor = self
+            .chart
+            .chart_shell
+            .as_ref()
+            .and_then(|shell| shell.read(cx).axis_picker_cursor());
+
+        let axis_row = datatab_components::chart::axis_bar_element(
+            &bindings,
+            &columns,
+            open_pill,
+            picker_cursor,
+            &chart_colors,
+            move |pill, _window, cx| {
+                if let Some(shell) = &shell_for_pill {
+                    shell.update(cx, |s, cx| s.toggle_axis_pill(pill, cx));
+                }
+            },
+            move |col_idx, _window, cx| {
+                if let Some(shell) = &shell_for_x {
+                    shell.update(cx, |s, cx| {
+                        let mut b = s.active_bindings();
+                        b.x = col_idx;
+                        s.apply_bindings(b, cx);
+                    });
+                }
+            },
+            move |col_idx, checked, _window, cx| {
+                if let Some(shell) = &shell_for_y {
+                    shell.update(cx, |s, cx| s.toggle_y_column(col_idx, checked, cx));
+                }
+            },
+            move |group_col, _window, cx| {
+                if let Some(shell) = &shell_for_group {
+                    shell.update(cx, |s, cx| {
+                        let mut b = s.active_bindings();
+                        b.group_by = group_col;
+                        s.apply_bindings(b, cx);
+                    });
+                }
+            },
+            move |agg, _window, cx| {
+                if let Some(shell) = &shell_for_agg {
+                    shell.update(cx, |s, cx| {
+                        let mut b = s.active_bindings();
+                        b.aggregation = agg;
+                        s.apply_bindings(b, cx);
+                    });
+                }
+            },
+        );
+
+        div()
+            .flex()
+            .flex_col()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(toolbar_row)
+            .when_some(custom_picker_row, |el, row| el.child(row))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .h(Heights::ROW)
+                    .px(Spacing::SM)
+                    .bg(theme.tab_bar)
+                    .child(axis_row),
+            )
+            .into_any_element()
+    }
+
+    /// The chart view of a result: the chart toolbar and axis row, the
+    /// canvas with its legend and rail, the point inspector dock and the
+    /// save prompt. Shared by the Chart view and the chart half of Both.
+    fn render_chart_body(
+        &mut self,
+        theme: &gpui_component::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        // Build chart_view on first render before checking whether it exists.
+        self.ensure_chart_view(cx);
+
+        let (has_chart_view, rail_open, chart_view_entity, hovered_point) = self
+            .chart
+            .chart_shell
+            .as_ref()
+            .map_or((false, false, None, None), |s| {
+                let shell = s.read(cx);
+                let point = shell.hovered_data_point(cx);
+                (
+                    shell.chart_view().is_some(),
+                    shell.chart_rail_open,
+                    shell.chart_view().cloned(),
+                    point,
+                )
+            });
+
+        let hovered_source =
+            hovered_point.and_then(|point| self.chart_host_source_for_point(point, cx));
+
+        // The chart occupies 100% of the area regardless of whether the rail
+        // is open. The rail floats as an absolute-positioned overlay on the
+        // right edge so opening it does not resize the canvas.
+        let chart_area = if let Some(chart_entity) = chart_view_entity {
+            div().size_full().child(chart_entity).into_any_element()
+        } else {
+            div()
+                .size_full()
+                .child(self.render_chart_degraded(cx))
+                .into_any_element()
+        };
+
+        let chart_row = div()
+            .flex_grow(1.0)
+            .size_full()
+            .pt(Spacing::MD)
+            .pb(Spacing::SM)
+            .pl(Spacing::SM)
+            .pr(Spacing::MD)
+            .child(chart_area);
+
+        let body = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_grow(1.0)
+            .min_h_0()
+            .child(chart_row)
+            .when(has_chart_view, |d| {
+                d.child(self.render_chart_legend_row(theme, cx))
+            })
+            .when(rail_open && !self.side_panels_hosted, |d| {
+                d.child(self.render_chart_rail(theme, cx))
+            });
+
+        // PointInspector right dock — only visible when the host has a back-link
+        // to the source row (DataDocument with track_source_indices=true).
+        // CodeDocument-backed charts always get None here and the dock stays hidden.
+        let inspector_dock = hovered_source.map(|source| self.render_point_inspector(source, cx));
+
+        let chart_with_inspector = div()
+            .flex()
+            .flex_row()
+            .size_full()
+            .min_h_0()
+            .child(body)
+            .when_some(inspector_dock, |row, dock| row.child(dock));
+
+        // Name-prompt overlay for "Save chart" on Collection sources.
+        // Build the overlay outside of a closure to avoid borrow conflicts.
+        let save_overlay: Option<AnyElement> = if self.pending_collection_chart_save.is_some() {
+            Some(
+                self.render_collection_chart_save_overlay(theme, cx)
+                    .into_any_element(),
+            )
+        } else {
+            None
+        };
+
+        div()
+            .relative()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(self.render_chart_toolbar(theme, cx))
+            .child(chart_with_inspector)
+            .when_some(save_overlay, |el, overlay| el.child(overlay))
+    }
+
+    // -- Result View Renderers --
+
+    pub(super) fn render_result_view(
+        &mut self,
+        mode: ResultViewMode,
+        theme: &gpui_component::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let mut container = div().size_full();
+
+        match mode {
+            ResultViewMode::Table => {
+                container =
+                    container.when_some(self.grid_table.data_table.clone(), |d, dt| d.child(dt));
+            }
+            ResultViewMode::Chart => {
+                container = container.child(self.render_chart_body(theme, cx));
+            }
+            ResultViewMode::Both => {
+                let chart = self.render_chart_body(theme, cx);
+
+                container = container.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .size_full()
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .h(BOTH_CHART_HEIGHT)
+                                .border_b_1()
+                                .border_color(theme.border)
+                                .child(chart),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .overflow_hidden()
+                                .when_some(self.grid_table.data_table.clone(), |d, dt| d.child(dt)),
+                        ),
+                );
+            }
+            ResultViewMode::Text => {
+                let text = self.derived_text().to_string();
+                container = container.child(self.render_text_view(&text, theme));
+            }
+            ResultViewMode::Json => {
+                let json = self.derived_json().to_string();
+                container = container.child(self.render_json_view(&json, theme));
+            }
+            ResultViewMode::Raw => {
+                let bytes = self.result.raw_bytes.clone();
+                let text_body = self.result.text_body.clone();
+                container = container.child(self.render_raw_view(
+                    bytes.as_deref(),
+                    text_body.as_deref(),
+                    theme,
+                    cx,
+                ));
+            }
+        }
+
+        container
+    }
+
+    /// Render the PointInspector right-dock for the given source row.
+    ///
+    /// Builds the row-value list from the `QueryResult` columns and the raw row
+    /// at `source.row_idx`, then delegates to `point_inspector_element`.
+    /// "Show in tree" runs `chart_host_scroll_to_row` on click.
+    fn render_point_inspector(
+        &mut self,
+        source: SourceRowRef,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let row_idx = source.row_idx;
+        let row = self.result.rows.get(row_idx);
+
+        let row_values: Vec<(String, String)> = if let Some(row) = row {
+            self.result
+                .columns
+                .iter()
+                .zip(row.iter())
+                .map(|(col, val)| {
+                    use datatab_core::Value as V;
+                    let display = match val {
+                        V::Null => "null".to_string(),
+                        V::Bool(b) => b.to_string(),
+                        V::Int(i) => i.to_string(),
+                        V::Float(f) => format_inspector_float(*f),
+                        V::Text(s) | V::Json(s) | V::Decimal(s) | V::ObjectId(s) => s.clone(),
+                        V::Bytes(b) => format!("<{} bytes>", b.len()),
+                        V::DateTime(dt) => dt.to_rfc3339(),
+                        V::Date(d) => d.to_string(),
+                        V::Time(t) => t.to_string(),
+                        V::Array(a) => format!("[{} items]", a.len()),
+                        V::Document(o) => format!("{{...{} keys}}", o.len()),
+                        V::Unsupported(s) => format!("<unsupported: {}>", s),
+                    };
+                    (col.name.clone(), display)
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+
+        let (series_name, hovered_x, hovered_y) = self
+            .chart
+            .chart_shell
+            .as_ref()
+            .and_then(|s| {
+                let shell = s.read(cx);
+                let chart_entity = shell.chart_view()?.clone();
+                let chart = chart_entity.read(cx);
+                let point = chart.hovered_point()?;
+
+                Some((
+                    chart.series_label(point.series_idx).to_string(),
+                    datatab_components::chart::format_x_value(point.x, chart.x_is_time()),
+                    datatab_components::chart::format_y_value(point.y),
+                ))
+            })
+            .unwrap_or_default();
+
+        let chart_colors = ChartColors::for_current(cx);
+
+        div()
+            .h_full()
+            .flex_shrink_0()
+            .child(point_inspector_element(
+                source,
+                &row_values,
+                &series_name,
+                &hovered_x,
+                &hovered_y,
+                None,
+                None,
+                &chart_colors,
+                cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.chart_host_scroll_to_row(row_idx, window, cx);
+                    cx.notify();
+                }),
+            ))
+    }
+
+    /// Render the legend row below the chart canvas.
+    ///
+    /// Reads series specs, palette colours, and stats from the `ChartView` entity,
+    /// then delegates to `legend_element` with a toggle callback that calls
+    /// `toggle_chart_series_hidden` on this panel.
+    pub(super) fn render_chart_legend_row(
+        &mut self,
+        _theme: &gpui_component::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let Some(shell_entity) = self.chart.chart_shell.as_ref() else {
+            return div().into_any_element();
+        };
+
+        let shell = shell_entity.read(cx);
+        let Some(chart_entity) = shell.chart_view().cloned() else {
+            return div().into_any_element();
+        };
+
+        let cv = chart_entity.read(cx);
+        let series = cv.spec_series().to_vec();
+        let palette = cv.resolved_palette(cx);
+        let stats = cv.series_stats().to_vec();
+        let focused_idx = cv.focused_series_idx();
+
+        let hidden = shell.chart_hidden_series.clone();
+        let panel_entity = cx.entity().clone();
+
+        let on_toggle = move |idx: usize, _window: &mut Window, cx: &mut App| {
+            panel_entity.update(cx, |this, cx| {
+                this.toggle_chart_series_hidden(idx, cx);
+            });
+        };
+
+        let chart_colors = ChartColors::for_current(cx);
+
+        legend_element(
+            &series,
+            &palette,
+            &stats,
+            &hidden,
+            focused_idx,
+            &chart_colors,
+            Some(on_toggle),
+        )
+        .into_any_element()
+    }
+
+    /// Render the degraded-state chart panel when `ensure_chart_view` returned `None`.
+    ///
+    /// Shows a card frame with an icon, title, body text, a result-shape preview,
+    /// Render the name-prompt overlay for "Save chart" on a Collection source.
+    ///
+    /// Reads the name input from `pending_collection_chart_save`. Must only be
+    /// called when `pending_collection_chart_save.is_some()`.
+    fn render_collection_chart_save_overlay(
+        &mut self,
+        theme: &gpui_component::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        use datatab_components::controls::Button;
+        use datatab_components::controls::Input;
+        use datatab_components::primitives::Text;
+        use gpui_component::Sizable;
+
+        #[expect(
+            clippy::expect_used,
+            reason = "the sole call site renders this overlay only when pending_collection_chart_save.is_some(); this function itself does not re-check"
+        )]
+        let name_input = self
+            .pending_collection_chart_save
+            .as_ref()
+            .expect("render_collection_chart_save_overlay called when state is None")
+            .name_input
+            .clone();
+
+        div()
+            .absolute()
+            .inset_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(theme.background.opacity(0.6))
+            .child(
+                div()
+                    .bg(theme.secondary)
+                    .border_1()
+                    .border_color(theme.border)
+                    .p(Spacing::LG)
+                    .w(px(360.0))
+                    .flex()
+                    .flex_col()
+                    .gap(Spacing::SM)
+                    .child(Text::body(datatab_i18n::t!(
+                        "document.data.chart_dock.save.title"
+                    )))
+                    .child(Input::new(&name_input).placeholder(datatab_i18n::t!(
+                        "document.data.chart_dock.save.name_placeholder"
+                    )))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(Spacing::XXS)
+                            .justify_end()
+                            .child(
+                                Button::new(
+                                    "cancel-collection-chart-save",
+                                    datatab_i18n::t!("document.data.chart_dock.save.cancel"),
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, _window, cx| {
+                                        this.cancel_collection_chart_save(cx);
+                                    },
+                                )),
+                            )
+                            .child(
+                                Button::new(
+                                    "confirm-collection-chart-save",
+                                    datatab_i18n::t!("document.data.chart_dock.save.save"),
+                                )
+                                .primary()
+                                .on_click(cx.listener(
+                                    |this, _, _window, cx| {
+                                        this.confirm_collection_chart_save(cx);
+                                    },
+                                )),
+                            ),
+                    ),
+            )
+    }
+
+    /// and two action buttons:
+    /// - "Open Table tab" — switches back to Table mode.
+    /// - "Pick time column…" — toggles `chart_picker_overlay_open`.
+    ///
+    /// When the picker overlay is open, `render_chart_picker_overlay` is shown below
+    /// the card.
+    fn render_chart_degraded(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let chart_colors = ChartColors::for_current(cx);
+
+        let (detection, picker_open) = self
+            .chart
+            .chart_shell
+            .as_ref()
+            .map(|s| {
+                let shell = s.read(cx);
+                (
+                    shell.chart_detection.clone(),
+                    shell.chart_picker_overlay_open,
+                )
+            })
+            .unwrap_or((None, false));
+
+        let (title, body) = crate::labels::chart_degraded_copy(&detection);
+        let can_pick = matches!(
+            &detection,
+            Some(ChartDetection::NoTimeColumn) | Some(ChartDetection::NoNumericSeries) | None
+        );
+
+        // Column shape preview chips.
+        let row_count = self.result.row_count();
+        let col_count = self.result.columns.len();
+        let shape_label: SharedString =
+            crate::labels::chart_dock_shape_label(row_count, col_count).into();
+
+        let col_chips: Vec<AnyElement> = self
+            .result
+            .columns
+            .iter()
+            .take(12)
+            .map(|c| {
+                let kind_label = match c.kind {
+                    ColumnKind::Timestamp => "ts",
+                    ColumnKind::Float => "f64",
+                    ColumnKind::Integer => "i64",
+                    ColumnKind::Text => "str",
+                    ColumnKind::Unknown | _ => "?",
+                };
+                let chip_label: SharedString = format!("{} · {}", c.name, kind_label).into();
+                div()
+                    .px(Spacing::XS)
+                    .py(px(2.0))
+                    .rounded(Radii::SM)
+                    .text_size(ui(10.0))
+                    .text_color(chart_colors.label_fg)
+                    .bg(chart_colors.hover_bg)
+                    .child(chip_label)
+                    .into_any_element()
+            })
+            .collect();
+
+        // Card frame.
+        let card = div()
+            .max_w(px(520.0))
+            .p(Spacing::XL)
+            .rounded(Radii::LG)
+            .border_1()
+            .border_color(chart_colors.panel_border)
+            .bg(chart_colors.panel_bg)
+            .flex()
+            .flex_col()
+            .gap(Spacing::MD)
+            // Icon + title row
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(Spacing::SM)
+                    .child(
+                        Icon::new(AppIcon::CircleAlert)
+                            .size(ui(20.0))
+                            .color(gpui::Hsla {
+                                a: 0.8,
+                                ..ChromeColors::tint(cx.theme())
+                            }),
+                    )
+                    .child(
+                        div()
+                            .text_size(FontSizes::SM)
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(SharedString::from(title)),
+                    ),
+            )
+            // Body text
+            .child(
+                div()
+                    .text_size(FontSizes::SM)
+                    .text_color(chart_colors.label_fg)
+                    .child(SharedString::from(body)),
+            )
+            // Shape preview
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(Spacing::XS)
+                    .child(
+                        div()
+                            .text_size(ui(10.0))
+                            .text_color(chart_colors.muted_fg)
+                            .child(shape_label),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(Spacing::XS)
+                            .children(col_chips),
+                    ),
+            )
+            // Action row
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(Spacing::SM)
+                    // "Open Table tab" ghost button
+                    .child(
+                        div()
+                            .id("cd-open-table")
+                            .px(Spacing::SM)
+                            .py(Spacing::XS)
+                            .rounded(Radii::SM)
+                            .text_size(FontSizes::SM)
+                            .cursor_pointer()
+                            .border_1()
+                            .border_color(chart_colors.pill_border)
+                            .text_color(chart_colors.label_fg)
+                            .hover(|d| d.bg(chart_colors.hover_bg))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.set_result_view_mode(ResultViewMode::Table, cx);
+                            }))
+                            .child(datatab_i18n::t!(
+                                "document.data.chart_dock.degraded.open_table_tab"
+                            )),
+                    )
+                    // "Pick time column…" primary button (only when picker makes sense)
+                    .when(can_pick, |d| {
+                        let label = if picker_open {
+                            datatab_i18n::t!("document.data.chart_dock.degraded.hide_picker")
+                        } else {
+                            datatab_i18n::t!("document.data.chart_dock.degraded.pick_time_column")
+                        };
+                        let primary = cx.theme().primary;
+                        let primary_foreground = cx.theme().primary_foreground;
+                        d.child(
+                            div()
+                                .id("cd-pick-column")
+                                .px(Spacing::SM)
+                                .py(Spacing::XS)
+                                .rounded(Radii::SM)
+                                .text_size(FontSizes::SM)
+                                .cursor_pointer()
+                                .bg(primary.opacity(0.9))
+                                .text_color(primary_foreground)
+                                .hover(move |d| d.bg(primary))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(shell) = &this.chart.chart_shell {
+                                        shell.update(cx, |s, _| {
+                                            s.chart_picker_overlay_open =
+                                                !s.chart_picker_overlay_open;
+                                        });
+                                    }
+                                    cx.notify();
+                                }))
+                                .child(label),
+                        )
+                    }),
+            );
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_start()
+            .p(Spacing::LG)
+            .gap(Spacing::MD)
+            .child(card)
+            // Picker overlay below the card when open.
+            .when(picker_open && can_pick, |d| {
+                d.child(self.render_chart_picker_overlay(cx))
+            })
+    }
+
+    /// Render the manual column picker as an overlay below the degraded card.
+    ///
+    /// Contains the X-axis column selector, Y-axis checkboxes, and Apply button.
+    /// Extracted from the old inline degraded view so the card action button can toggle it.
+    fn render_chart_picker_overlay(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+        let primary = cx.theme().primary;
+        let primary_foreground = cx.theme().primary_foreground;
+        let tint = ChromeColors::tint(cx.theme());
+        let chart_colors = ChartColors::for_current(cx);
+
+        let y_candidates: Vec<(usize, String)> = self
+            .result
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                matches!(
+                    c.kind,
+                    ColumnKind::Float | ColumnKind::Integer | ColumnKind::Unknown
+                )
+            })
+            .map(|(i, c)| (i, c.name.clone()))
+            .collect();
+
+        let x_candidates: Vec<(usize, String)> = self
+            .result
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                matches!(
+                    c.kind,
+                    ColumnKind::Timestamp | ColumnKind::Text | ColumnKind::Unknown
+                )
+            })
+            .map(|(i, c)| (i, c.name.clone()))
+            .collect();
+
+        let (selected_x_col, y_checked) = self
+            .chart
+            .chart_shell
+            .as_ref()
+            .map(|s| {
+                let shell = s.read(cx);
+                (
+                    shell.chart_picker_x_col,
+                    shell.chart_picker_y_checked.clone(),
+                )
+            })
+            .unwrap_or((0, Vec::new()));
+        let any_y_checked = y_checked.iter().any(|&c| c);
+
+        let x_selected_candidate_idx = x_candidates
+            .iter()
+            .position(|(col_idx, _)| *col_idx == selected_x_col)
+            .unwrap_or(0);
+
+        let mut picker = div()
+            .max_w(px(520.0))
+            .p(px(20.0))
+            .rounded(Radii::LG)
+            .border_1()
+            .border_color(chart_colors.panel_border)
+            .bg(chart_colors.panel_bg)
+            .flex()
+            .flex_col()
+            .gap(Spacing::MD);
+
+        if !x_candidates.is_empty() {
+            let x_row =
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(Spacing::XS)
+                    .child(
+                        div()
+                            .text_size(FontSizes::SM)
+                            .child(Text::body(datatab_i18n::t!(
+                                "document.data.chart_dock.picker.x_axis_label"
+                            ))),
+                    )
+                    .child(div().flex().flex_wrap().gap(Spacing::XS).children(
+                        x_candidates.iter().enumerate().map(
+                            |(candidate_idx, (col_idx, col_name))| {
+                                let col_idx = *col_idx;
+                                let is_selected = candidate_idx == x_selected_candidate_idx;
+                                let label = col_name.clone();
+                                div()
+                                    .id(ElementId::Name(format!("chart-x-col-{}", col_idx).into()))
+                                    .px(Spacing::SM)
+                                    .py(Spacing::XS)
+                                    .rounded(Radii::SM)
+                                    .cursor_pointer()
+                                    .text_size(FontSizes::SM)
+                                    .when(is_selected, |d| d.bg(gpui::Hsla { a: 0.2, ..tint }))
+                                    .when(!is_selected, |d| {
+                                        d.hover(|d| d.bg(chart_colors.hover_bg))
+                                    })
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if let Some(shell) = &this.chart.chart_shell {
+                                            shell.update(cx, |s, _| {
+                                                s.chart_picker_x_col = col_idx;
+                                            });
+                                        }
+                                        cx.notify();
+                                    }))
+                                    .child(label)
+                            },
+                        ),
+                    ));
+
+            picker = picker.child(x_row);
+        }
+
+        if !y_candidates.is_empty() {
+            let y_row = div()
+                .flex()
+                .flex_col()
+                .gap(Spacing::XS)
+                .child(
+                    div()
+                        .text_size(FontSizes::SM)
+                        .child(Text::body(datatab_i18n::t!(
+                            "document.data.chart_dock.picker.y_axis_label"
+                        ))),
+                )
+                .child(
+                    div().flex().flex_col().gap(Spacing::XS).children(
+                        y_candidates
+                            .iter()
+                            .enumerate()
+                            .map(|(candidate_idx, (_, col_name))| {
+                                let checked =
+                                    y_checked.get(candidate_idx).copied().unwrap_or(false);
+                                let label = col_name.clone();
+                                Checkbox::new(ElementId::Name(
+                                    format!("chart-y-col-{}", candidate_idx).into(),
+                                ))
+                                .checked(checked)
+                                .label(label)
+                                .on_click(cx.listener(
+                                    move |this, &new_checked, _, cx| {
+                                        if let Some(shell) = &this.chart.chart_shell {
+                                            shell.update(cx, |s, _| {
+                                                if let Some(slot) =
+                                                    s.chart_picker_y_checked.get_mut(candidate_idx)
+                                                {
+                                                    *slot = new_checked;
+                                                }
+                                            });
+                                        }
+                                        cx.notify();
+                                    },
+                                ))
+                            }),
+                    ),
+                );
+
+            picker = picker.child(y_row);
+        }
+
+        // Apply button — enabled only when at least one Y column is checked.
+        let x_col_snapshot = selected_x_col;
+        let y_col_indices: Vec<usize> = y_candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(candidate_idx, (col_idx, _))| {
+                if y_checked.get(candidate_idx).copied().unwrap_or(false) {
+                    Some(*col_idx)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let apply_btn = div()
+            .id("chart-picker-apply")
+            .px(Spacing::MD)
+            .py(Spacing::SM)
+            .rounded(Radii::SM)
+            .text_size(FontSizes::SM)
+            .when(any_y_checked, |d| {
+                d.cursor_pointer()
+                    .bg(primary.opacity(0.9))
+                    .text_color(primary_foreground)
+                    .hover(move |d| d.bg(primary))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(shell) = &this.chart.chart_shell {
+                            let selection = ManualChartSelection {
+                                x_col: x_col_snapshot,
+                                y_cols: y_col_indices.clone(),
+                                group_by: None,
+                            };
+                            shell.update(cx, |s, _| {
+                                s.chart_manual_selection = Some(selection);
+                                s.chart_view = None;
+                                s.chart_view_observer = None;
+                                s.chart_picker_overlay_open = false;
+                            });
+                        }
+                        cx.notify();
+                    }))
+            })
+            .when(!any_y_checked, |d| {
+                d.bg(gpui::Hsla {
+                    a: 0.3,
+                    ..chart_colors.muted_fg
+                })
+                .text_color(gpui::Hsla {
+                    a: 0.7,
+                    ..chart_colors.muted_fg
+                })
+            })
+            .child(datatab_i18n::t!("document.data.chart_dock.picker.apply"));
+
+        picker.child(apply_btn)
+    }
+
+    /// Render the 320px Stats rail shown when `chart_rail_open` is true,
+    /// docked on the right edge of the chart. Used only when the host does
+    /// not take the rail as a workspace island (`side_panels`).
+    ///
+    /// The Configure tab was removed in Phase E (replaced by AxisBar pills).
+    /// Only the Stats tab remains accessible via the Stats toolbar button.
+    fn render_chart_rail(
+        &mut self,
+        theme: &gpui_component::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let body = self.render_chart_rail_content(theme, cx);
+
+        datatab_components::composites::docked_island_frame(theme)
+            .absolute()
+            .top_0()
+            .right_0()
+            .bottom_0()
+            .w(CHART_STATS_RAIL_WIDTH + datatab_components::tokens::IslandMetrics::GAP)
+            .occlude()
+            .child(
+                datatab_components::composites::Island::new()
+                    .flex_1()
+                    .min_h_0()
+                    .child(body),
+            )
+    }
+
+    fn render_chart_rail_content(
+        &mut self,
+        theme: &gpui_component::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let body = self.render_rail_stats_tab(theme, cx).into_any_element();
+
+        div()
+            .flex_grow(1.0)
+            .min_h_0()
+            .overflow_hidden()
+            .child(body)
+            .into_any_element()
+    }
+
+    /// The grid's side panels for a host that forwards them to the
+    /// workspace: the chart stats rail while the chart shows and the rail is
+    /// open. Empty unless the host declared `set_side_panels_hosted`.
+    pub fn side_panels(&mut self, cx: &mut Context<Self>) -> Vec<crate::pane::DocumentSidePanel> {
+        if !self.side_panels_hosted || !self.result_view_mode().shows_chart() {
+            return Vec::new();
+        }
+
+        let rail_open = self
+            .chart
+            .chart_shell
+            .as_ref()
+            .is_some_and(|shell| shell.read(cx).chart_rail_open);
+
+        if !rail_open {
+            return Vec::new();
+        }
+
+        let theme = cx.theme().clone();
+        let content = self.render_chart_rail_content(&theme, cx);
+
+        vec![crate::pane::DocumentSidePanel {
+            id: "grid-chart-stats".into(),
+            width: CHART_STATS_RAIL_WIDTH,
+            content,
+        }]
+    }
+
+    /// Section container helper for the right dock panels.
+    fn dock_section(
+        content: impl IntoElement,
+        theme: &gpui_component::theme::Theme,
+    ) -> impl IntoElement {
+        div()
+            .px(px(14.0))
+            .py(Spacing::MD)
+            .border_b_1()
+            .border_color(theme.border)
+            .child(content)
+    }
+
+    /// Section header label for the right dock panels.
+    /// Renders a muted section label.
+    fn dock_header(label: &str, chart_colors: &ChartColors) -> impl IntoElement {
+        div().mb(Spacing::XXS).child(
+            datatab_components::primitives::Text::label(label.to_owned())
+                .color(chart_colors.muted_fg),
+        )
+    }
+
+    /// Key/value row for the right dock panels.
+    /// `k` is shown muted at 10px, `v` is the value element at 11px.
+    fn dock_kv_row(k: &str, v: impl IntoElement, chart_colors: &ChartColors) -> impl IntoElement {
+        div()
+            .flex()
+            .items_start()
+            .gap(Spacing::SM)
+            .py(px(2.0))
+            .child(
+                div()
+                    .w(px(96.0))
+                    .flex_shrink_0()
+                    .text_size(ui(10.0))
+                    .text_color(chart_colors.muted_fg)
+                    .child(SharedString::from(k.to_string())),
+            )
+            .child(div().flex_1().text_size(ui(11.0)).child(v))
+    }
+
+    #[allow(dead_code)]
+    /// Configure tab body: WHY paragraph, X-column selector, Y-column
+    /// checkboxes with inline avg/last, AXIS & STACKING read-only markers,
+    /// and Reset-to-auto + Apply footer buttons.
+    ///
+    /// Preserved for reference only. Replaced by `AxisBar` as of Phase E.
+    fn render_rail_configure_tab(
+        &mut self,
+        theme: &gpui_component::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        use datatab_core::ColumnKind;
+
+        let chart_colors = ChartColors::for_current(cx);
+        let columns = &self.result.columns;
+        let (num_numeric, num_ts) = count_columns_for_why(columns);
+
+        let x_candidates: Vec<(usize, String)> = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                matches!(
+                    c.kind,
+                    ColumnKind::Timestamp | ColumnKind::Text | ColumnKind::Unknown
+                )
+            })
+            .map(|(i, c)| (i, c.name.clone()))
+            .collect();
+
+        let y_candidates: Vec<(usize, String)> = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| {
+                matches!(
+                    c.kind,
+                    ColumnKind::Float | ColumnKind::Integer | ColumnKind::Unknown
+                )
+            })
+            .map(|(i, c)| (i, c.name.clone()))
+            .collect();
+
+        let (selected_x, y_checked, stats, active_y_cols, detection_ok, has_manual) =
+            self.chart.chart_shell.as_ref().map_or_else(
+                || (0usize, vec![], vec![], vec![], false, false),
+                |s| {
+                    let shell = s.read(cx);
+                    let stats: Vec<Option<SeriesStats>> = shell
+                        .chart_view()
+                        .map(|cv| cv.read(cx).series_stats().to_vec())
+                        .unwrap_or_default();
+
+                    let active_y_cols: Vec<usize> =
+                        if let Some(manual) = &shell.chart_manual_selection {
+                            manual.y_cols.clone()
+                        } else if let Some(ChartDetection::Ok { numeric_cols, .. }) =
+                            &shell.chart_detection
+                        {
+                            numeric_cols.clone()
+                        } else {
+                            vec![]
+                        };
+
+                    let detection_ok =
+                        matches!(&shell.chart_detection, Some(ChartDetection::Ok { .. }));
+                    let has_manual = shell.chart_manual_selection.is_some();
+
+                    (
+                        shell.chart_rail_picker_x_col,
+                        shell.chart_rail_picker_y_checked.clone(),
+                        stats,
+                        active_y_cols,
+                        detection_ok,
+                        has_manual,
+                    )
+                },
+            );
+
+        let any_y_checked = y_checked.iter().any(|&c| c);
+        let reset_enabled = detection_ok || has_manual;
+
+        let why_text = crate::labels::chart_rail_why_text(num_numeric, num_ts);
+
+        div()
+            .id("rail-configure-scroll")
+            .size_full()
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            // WHY THIS PANEL section
+            .child(Self::dock_section(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(Spacing::XS)
+                    .child(Self::dock_header(
+                        &datatab_i18n::t!("document.data.chart_dock.configure.why.title"),
+                        &chart_colors,
+                    ))
+                    .child(
+                        div()
+                            .text_size(ui(11.0))
+                            .text_color(theme.muted_foreground)
+                            .child(SharedString::from(why_text)),
+                    ),
+                theme,
+            ))
+            // TIME COLUMN section
+            .child(Self::dock_section(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(Spacing::XS)
+                    .child(Self::dock_header(
+                        &datatab_i18n::t!("document.data.chart_dock.configure.time_column.title"),
+                        &chart_colors,
+                    ))
+                    .children(x_candidates.iter().enumerate().map(
+                        |(cand_idx, (col_idx, col_name))| {
+                            let col_idx = *col_idx;
+                            let is_selected = cand_idx == selected_x;
+                            let label = col_name.clone();
+                            div()
+                                .id(ElementId::Name(format!("rail-x-col-{}", col_idx).into()))
+                                .px(Spacing::SM)
+                                .py(px(3.0))
+                                .rounded(Radii::SM)
+                                .cursor_pointer()
+                                .text_size(ui(11.0))
+                                .when(is_selected, |d| {
+                                    d.bg(gpui::Hsla {
+                                        a: 0.18,
+                                        ..ChromeColors::tint(cx.theme())
+                                    })
+                                    .text_color(theme.foreground)
+                                })
+                                .when(!is_selected, |d| {
+                                    d.text_color(theme.muted_foreground)
+                                        .hover(|d| d.bg(theme.secondary))
+                                })
+                                .on_click(
+                                    cx.listener(move |this, _, _, cx| {
+                                        if let Some(shell) = &this.chart.chart_shell {
+                                            shell.update(cx, |s, _| {
+                                                s.chart_rail_picker_x_col = cand_idx;
+                                            });
+                                        }
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(label)
+                        },
+                    )),
+                theme,
+            ))
+            // SERIES section
+            .child(Self::dock_section(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(Spacing::XXS)
+                    .child(Self::dock_header(
+                        &datatab_i18n::t!("document.data.chart_dock.configure.series.title"),
+                        &chart_colors,
+                    ))
+                    .children(y_candidates.iter().enumerate().map(
+                        |(cand_idx, (col_idx, col_name))| {
+                            let col_idx = *col_idx;
+                            let checked = y_checked.get(cand_idx).copied().unwrap_or(false);
+                            let label = col_name.clone();
+
+                            // Find this column's series index in active_y_cols.
+                            let series_idx_opt = active_y_cols.iter().position(|&ci| ci == col_idx);
+                            let stat_label = series_idx_opt
+                                .and_then(|si| stats.get(si).copied().flatten())
+                                .map(|s| {
+                                    format!(
+                                        "avg {} · last {}",
+                                        format_y_value(s.avg),
+                                        format_y_value(s.last)
+                                    )
+                                })
+                                .unwrap_or_else(|| "—".to_string());
+
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    Checkbox::new(ElementId::Name(
+                                        format!("rail-y-col-{}", cand_idx).into(),
+                                    ))
+                                    .checked(checked)
+                                    .label(label)
+                                    .on_click(cx.listener(
+                                        move |this, &new_checked, _, cx| {
+                                            if let Some(shell) = &this.chart.chart_shell {
+                                                shell.update(cx, |s, _| {
+                                                    if let Some(slot) = s
+                                                        .chart_rail_picker_y_checked
+                                                        .get_mut(cand_idx)
+                                                    {
+                                                        *slot = new_checked;
+                                                    }
+                                                });
+                                            }
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                                .child(
+                                    div()
+                                        .pl(px(20.0))
+                                        .text_size(FontSizes::XS)
+                                        .text_color(theme.muted_foreground)
+                                        .child(stat_label),
+                                )
+                        },
+                    )),
+                theme,
+            ))
+            // AXIS & STACKING section (read-only, v0.6 placeholders)
+            .child(Self::dock_section(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(Self::dock_header(
+                        &datatab_i18n::t!("document.data.chart_dock.configure.axis_stacking.title"),
+                        &chart_colors,
+                    ))
+                    .child(Self::dock_kv_row(
+                        &datatab_i18n::t!("document.data.chart_dock.configure.axis_stacking.y_axis"),
+                        div().text_size(ui(11.0)).text_color(theme.foreground).child(
+                            datatab_i18n::t!(
+                                "document.data.chart_dock.configure.axis_stacking.y_axis_value"
+                            ),
+                        ),
+                        &chart_colors,
+                    ))
+                    .child(Self::dock_kv_row(
+                        &datatab_i18n::t!("document.data.chart_dock.configure.axis_stacking.stack"),
+                        div()
+                            .text_size(ui(11.0))
+                            .text_color(theme.muted_foreground)
+                            .child(datatab_i18n::t!(
+                                "document.data.chart_dock.configure.axis_stacking.stack_value"
+                            )),
+                        &chart_colors,
+                    ))
+                    .child(Self::dock_kv_row(
+                        &datatab_i18n::t!(
+                            "document.data.chart_dock.configure.axis_stacking.interpolation"
+                        ),
+                        div().text_size(ui(11.0)).text_color(theme.foreground).child(
+                            datatab_i18n::t!(
+                                "document.data.chart_dock.configure.axis_stacking.interpolation_value"
+                            ),
+                        ),
+                        &chart_colors,
+                    )),
+                theme,
+            ))
+            // Footer: Reset + Apply
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .px(px(14.0))
+                    .py(px(10.0))
+                    // Reset-to-auto button
+                    .child(
+                        div()
+                            .id("rail-reset-btn")
+                            .px(Spacing::SM)
+                            .py(gpui::px(3.0))
+                            .rounded(Radii::SM)
+                            .text_size(FontSizes::XS)
+                            .when(reset_enabled, |d| {
+                                d.cursor_pointer()
+                                    .text_color(theme.foreground)
+                                    .hover(|d| d.bg(theme.secondary))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.reset_chart_rail_to_auto(cx);
+                                        }),
+                                    )
+                            })
+                            .when(!reset_enabled, |d| {
+                                d.text_color(theme.muted_foreground).opacity(0.4)
+                            })
+                            .child(datatab_i18n::t!("document.data.chart_dock.configure.reset")),
+                    )
+                    // Apply button
+                    .child(
+                        div()
+                            .id("rail-apply-btn")
+                            .px(Spacing::SM)
+                            .py(gpui::px(3.0))
+                            .rounded(Radii::SM)
+                            .text_size(FontSizes::XS)
+                            .when(any_y_checked, |d| {
+                                let primary = cx.theme().primary;
+                                d.cursor_pointer()
+                                    .bg(primary)
+                                    .text_color(gpui::white())
+                                    .hover(move |d| d.bg(primary))
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.apply_chart_rail_selection(cx);
+                                        }),
+                                    )
+                            })
+                            .when(!any_y_checked, |d| {
+                                d.bg(gpui::Hsla {
+                                    a: 0.3,
+                                    ..chart_colors.muted_fg
+                                })
+                                .text_color(gpui::Hsla {
+                                    a: 0.7,
+                                    ..chart_colors.muted_fg
+                                })
+                            })
+                            .child(datatab_i18n::t!("document.data.chart_dock.toolbar.apply")),
+                    ),
+            )
+    }
+
+    /// Stats tab body: focused-series descriptive statistics and window summary.
+    fn render_rail_stats_tab(
+        &mut self,
+        theme: &gpui_component::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let chart_colors = ChartColors::for_current(cx);
+
+        // Read focus from the live ChartView so hover-driven focus changes
+        // (which only mutate the chart entity's state) update the Stats tab
+        // on the next render. Falling back to the shell's cached index when
+        // the chart entity is not yet built keeps the Reset/rebuild path
+        // working without flicker.
+        let (focused_idx, chart_view_opt) = self
+            .chart
+            .chart_shell
+            .as_ref()
+            .map(|s| {
+                let shell = s.read(cx);
+                let cv = shell.chart_view().cloned();
+                let fi = cv
+                    .as_ref()
+                    .map(|cv| cv.read(cx).focused_series_idx())
+                    .unwrap_or(shell.chart_focused_series_idx);
+                (fi, cv)
+            })
+            .unwrap_or((0, None));
+
+        let (stats_opt, label, color, x_min, x_max, x_is_time) = if let Some(cv) = &chart_view_opt {
+            let view = cv.read(cx);
+            let s = view.series_stats().get(focused_idx).copied().flatten();
+            let label = view.series_label(focused_idx).to_string();
+            let color = view.series_color(focused_idx, cx);
+            let (x_min, x_max) = view.data_x_bounds();
+            let x_is_time = view.x_is_time();
+            (s, label, color, x_min, x_max, x_is_time)
+        } else {
+            // Rail may briefly be open while chart_view is None (e.g. during
+            // rebuild after Apply). Render an empty state.
+            return div()
+                .p_2()
+                .text_size(FontSizes::XS)
+                .text_color(theme.muted_foreground)
+                .child(datatab_i18n::t!(
+                    "document.data.chart_dock.stats.rebuilding"
+                ))
+                .into_any_element();
+        };
+
+        let Some(stats) = stats_opt else {
+            return div()
+                .p_2()
+                .text_size(FontSizes::XS)
+                .text_color(theme.muted_foreground)
+                .child(datatab_i18n::t!("document.data.chart_dock.stats.no_stats"))
+                .into_any_element();
+        };
+
+        let span_ms = x_max - x_min;
+        let start_label = format_x_value(x_min, x_is_time);
+        let end_label = format_x_value(x_max, x_is_time);
+        let span_label = format_span(span_ms);
+        let points_count = self.result.rows.len();
+
+        // Value color per stat:
+        //   min, max, avg  → theme.cyan    (#6FD3D8 on Dark, #0F7C82 on Light)
+        //   p99            → tint (#62D2C8 on Dark, #0B6E6E on Light)
+        //   others         → theme.foreground
+        let cyan_color = theme.cyan;
+        let tint_color = ChromeColors::tint(theme);
+        let cyan_val = |v: f64| -> gpui::AnyElement {
+            div()
+                .text_size(ui(11.0))
+                .text_color(cyan_color)
+                .child(SharedString::from(format_y_value(v)))
+                .into_any_element()
+        };
+        let tint_val = |v: f64| -> gpui::AnyElement {
+            div()
+                .text_size(ui(11.0))
+                .text_color(tint_color)
+                .child(SharedString::from(format_y_value(v)))
+                .into_any_element()
+        };
+        let fg_val = |v: f64| -> gpui::AnyElement {
+            div()
+                .text_size(ui(11.0))
+                .text_color(theme.foreground)
+                .child(SharedString::from(format_y_value(v)))
+                .into_any_element()
+        };
+        let str_val = |s: String| -> gpui::AnyElement {
+            div()
+                .text_size(ui(11.0))
+                .text_color(theme.foreground)
+                .child(SharedString::from(s))
+                .into_any_element()
+        };
+        div()
+            .id("rail-stats-scroll")
+            .size_full()
+            .flex()
+            .flex_col()
+            .overflow_y_scroll()
+            // SERIES header
+            .child(Self::dock_section(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(Spacing::SM)
+                    .child(div().w(px(10.0)).h(px(10.0)).rounded_sm().bg(color))
+                    .child(
+                        div()
+                            .text_size(FontSizes::XS)
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(theme.foreground)
+                            .child(SharedString::from(label)),
+                    ),
+                theme,
+            ))
+            // STATS section
+            .child(Self::dock_section(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(Self::dock_header(
+                        &datatab_i18n::t!("document.data.chart_dock.stats.title"),
+                        &chart_colors,
+                    ))
+                    .child(Self::dock_kv_row("min", cyan_val(stats.min), &chart_colors))
+                    .child(Self::dock_kv_row("max", cyan_val(stats.max), &chart_colors))
+                    .child(Self::dock_kv_row("avg", cyan_val(stats.avg), &chart_colors))
+                    .child(Self::dock_kv_row("p50", fg_val(stats.p50), &chart_colors))
+                    .child(Self::dock_kv_row("p95", fg_val(stats.p95), &chart_colors))
+                    .child(Self::dock_kv_row("p99", tint_val(stats.p99), &chart_colors))
+                    .child(Self::dock_kv_row("last", fg_val(stats.last), &chart_colors)),
+                theme,
+            ))
+            // WINDOW section
+            .child(Self::dock_section(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(Self::dock_header(
+                        &datatab_i18n::t!("document.data.chart_dock.stats.window.title"),
+                        &chart_colors,
+                    ))
+                    .child(Self::dock_kv_row(
+                        &datatab_i18n::t!("document.data.chart_dock.stats.window.start"),
+                        str_val(start_label),
+                        &chart_colors,
+                    ))
+                    .child(Self::dock_kv_row(
+                        &datatab_i18n::t!("document.data.chart_dock.stats.window.end"),
+                        str_val(end_label),
+                        &chart_colors,
+                    ))
+                    .child(Self::dock_kv_row(
+                        &datatab_i18n::t!("document.data.chart_dock.stats.window.span"),
+                        str_val(span_label),
+                        &chart_colors,
+                    ))
+                    .child(Self::dock_kv_row(
+                        &datatab_i18n::t!("document.data.chart_dock.stats.window.points"),
+                        str_val(format!("{}", points_count)),
+                        &chart_colors,
+                    )),
+                theme,
+            ))
+            .into_any_element()
+    }
+
+    fn render_text_view(
+        &self,
+        text: &str,
+        theme: &gpui_component::theme::Theme,
+    ) -> impl IntoElement {
+        self.render_line_based_view("result-text-view", text, theme)
+    }
+
+    fn render_json_view(
+        &self,
+        json: &str,
+        theme: &gpui_component::theme::Theme,
+    ) -> impl IntoElement {
+        self.render_line_based_view("result-json-view", json, theme)
+    }
+
+    fn render_line_based_view(
+        &self,
+        id: &'static str,
+        content: &str,
+        theme: &gpui_component::theme::Theme,
+    ) -> impl IntoElement {
+        const MAX_LINES: usize = 5000;
+
+        let line_count = content.lines().count();
+        let truncated = line_count > MAX_LINES;
+
+        let display_text: SharedString = if truncated {
+            let capped: String = content
+                .lines()
+                .take(MAX_LINES)
+                .collect::<Vec<_>>()
+                .join("\n");
+            SharedString::from(capped)
+        } else {
+            SharedString::from(content.to_string())
+        };
+
+        div()
+            .id(id)
+            .size_full()
+            .p(Spacing::MD)
+            .overflow_y_scroll()
+            .overflow_x_scroll()
+            .bg(theme.background)
+            .child(div().whitespace_nowrap().child(Text::code(display_text)))
+            .when(truncated, |d| {
+                d.child(Text::caption(datatab_i18n::t!(
+                    "document.data.grid.views.truncated",
+                    max_lines = MAX_LINES
+                )))
+            })
+    }
+
+    fn render_raw_view(
+        &self,
+        raw_bytes: Option<&[u8]>,
+        text_body: Option<&str>,
+        theme: &gpui_component::theme::Theme,
+        _cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let hex_dump = if let Some(bytes) = raw_bytes {
+            format_hex_dump(bytes)
+        } else if let Some(text) = text_body {
+            text.to_string()
+        } else {
+            datatab_i18n::t!("document.data.grid.views.empty")
+        };
+
+        div()
+            .id("result-raw-view")
+            .size_full()
+            .p(Spacing::MD)
+            .overflow_y_scroll()
+            .bg(theme.background)
+            .child(div().whitespace_nowrap().child(Text::code(hex_dump)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn render_status_bar(
+        &self,
+        row_count: usize,
+        exec_time: &str,
+        is_paginated: bool,
+        pagination_info: Option<Pagination>,
+        total_pages: Option<u64>,
+        can_prev: bool,
+        can_next: bool,
+        sort_info: Option<(String, SortDirection, bool)>,
+        has_data: bool,
+        uses_result_view: bool,
+        pending_change_count: usize,
+        is_editable: bool,
+        theme: &gpui_component::theme::Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        // A grid of rows that cannot be edited says so next to its row count
+        // (AppByzEditor footer). Document collections count documents instead.
+        let shows_read_only =
+            !is_editable && self.collection.raw.is_none() && !self.result.columns.is_empty();
+
+        let result_shape_label = if uses_result_view && !self.footer_hosts_view_switch() {
+            Some(self.result.shape.clone())
+        } else {
+            None
+        };
+
+        // A table or collection hosts its whole view switch here, Chart
+        // included (AppByzTable footer). A query result switches views from
+        // the `ResultPanel` mode bar above its content, so this row only
+        // offers the shape's other views while one of them is showing, and
+        // never Chart.
+        let footer_hosts_switch = self.footer_hosts_view_switch();
+        let available_modes = if footer_hosts_switch {
+            self.available_result_view_modes(cx)
+        } else if uses_result_view {
+            ResultViewMode::available_for_shape(&self.result.shape)
+        } else {
+            vec![]
+        };
+        let current_result_mode = self.chrome.result_view_mode;
+
+        let show_record_toggle = self.record_view_available();
+        let record_mode = self.chrome.record_mode;
+        let strong = ChromeColors::strong(theme);
+        let muted = theme.muted_foreground;
+        let panel = cx.entity().downgrade();
+
+        let view_switch =
+            (available_modes.len() > 1
+                && (footer_hosts_switch || !current_result_mode.shows_chart()))
+            .then(|| {
+                let items: Vec<SegmentedItem> = available_modes
+                    .iter()
+                    .map(|mode| {
+                        SegmentedItem::new(
+                            SharedString::from(format!("result-view-{}", mode.label())),
+                            if footer_hosts_switch {
+                                crate::labels::table_view_mode_label(*mode)
+                            } else {
+                                crate::labels::result_view_mode_label(*mode)
+                            },
+                        )
+                        .icon(Self::result_mode_icon(*mode))
+                    })
+                    .collect();
+                let modes = available_modes.clone();
+
+                SegmentedControl::new(
+                    items,
+                    SharedString::from(format!("result-view-{}", current_result_mode.label())),
+                    move |selected, _, cx| {
+                        let Some(mode) = modes.iter().copied().find(|mode| {
+                            selected.as_ref() == format!("result-view-{}", mode.label())
+                        }) else {
+                            return;
+                        };
+
+                        let updated = panel.update(cx, |this, cx| {
+                            this.set_result_view_mode(mode, cx);
+                        });
+                        if let Err(error) = updated {
+                            log::debug!("data grid released before its view switch: {error}");
+                        }
+                    },
+                )
+            });
+
+        let footer_item = |icon: AppIcon, label: String| {
+            div()
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap(ResultMetrics::FOOTER_ITEM_GAP)
+                .child(
+                    Icon::new(icon)
+                        .size(ResultMetrics::FOOTER_ICON)
+                        .color(muted),
+                )
+                .child(label)
+        };
+
+        let pager_arrow = |id: &'static str, icon: AppIcon, name: String, enabled: bool| {
+            div()
+                .id(id)
+                .role(Role::Button)
+                .aria_label(name)
+                .flex()
+                .items_center()
+                .text_color(muted)
+                .when(!enabled, |arrow| arrow.opacity(Fields::DISABLED_OPACITY))
+                .when(enabled, |arrow| {
+                    arrow
+                        .cursor_pointer()
+                        .hover(move |arrow| arrow.text_color(strong))
+                })
+                .child(
+                    Icon::new(icon)
+                        .size(ResultMetrics::FOOTER_ICON)
+                        .color(if enabled { theme.foreground } else { muted }),
+                )
+        };
+
+        let pager = pagination_info
+            .clone()
+            .filter(|_| is_paginated)
+            .map(|pagination| {
+                let page = pagination.current_page();
+
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(ResultMetrics::PAGER_GAP)
+                    .font_family(datatab_components::fonts::editor_family(cx))
+                    .child(
+                        pager_arrow(
+                            "prev-page",
+                            AppIcon::ChevronLeft,
+                            datatab_i18n::t!("document.results.actions.results_prev_page"),
+                            can_prev,
+                        )
+                        .when(can_prev, |arrow| {
+                            arrow.on_click(cx.listener(|this, _, window, cx| {
+                                this.go_to_prev_page(window, cx);
+                            }))
+                        }),
+                    )
+                    .child(div().text_color(strong).child(page.to_string()))
+                    .when_some(total_pages, |pager, total| {
+                        pager.child(format!("/ {}", total))
+                    })
+                    .child(
+                        pager_arrow(
+                            "next-page",
+                            AppIcon::ChevronRight,
+                            datatab_i18n::t!("document.results.actions.results_next_page"),
+                            can_next,
+                        )
+                        .when(can_next, |arrow| {
+                            arrow.on_click(cx.listener(|this, _, window, cx| {
+                                this.go_to_next_page(window, cx);
+                            }))
+                        }),
+                    )
+            });
+
+        // Left and right groups share the remaining width equally so the
+        // pager stays centred on the footer regardless of their contents.
+        let left_group = div()
+            .flex()
+            .flex_1()
+            .flex_basis(px(0.))
+            .min_w_0()
+            .overflow_hidden()
+            .items_center()
+            .gap(ResultMetrics::FOOTER_GAP)
+            // Pending-change count — visible only when there are unsaved edits
+            .when(pending_change_count > 0, |d| {
+                d.child(div().flex_shrink_0().text_color(theme.warning).child(
+                    crate::labels::pending_change_count_label(pending_change_count),
+                ))
+            })
+            .when_some(view_switch, |d, switch| d.child(switch))
+            // Grid / record presentation toggle. Mirrors the `i` binding so
+            // the mode is discoverable and reversible with the mouse alone.
+            .when(show_record_toggle, |d| {
+                d.child(
+                    Button::new("record-mode-toggle", crate::labels::record_view_label())
+                        .ghost()
+                        .icon(AppIcon::Columns)
+                        .selected(record_mode)
+                        .tab_stop(false)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.set_record_mode(!this.record_mode(), cx);
+                        })),
+                )
+            })
+            .when_some(result_shape_label, |d, shape| {
+                let label = match &shape {
+                    datatab_core::QueryResultShape::Table => "table",
+                    datatab_core::QueryResultShape::Json => "json",
+                    datatab_core::QueryResultShape::Text => "text",
+                    datatab_core::QueryResultShape::Binary => "binary",
+                };
+                d.child(
+                    div()
+                        .flex_shrink_0()
+                        .font_family(datatab_components::fonts::editor_family(cx))
+                        .child(label),
+                )
+            })
+            .child(footer_item(
+                AppIcon::Rows3,
+                if self.collection.raw.is_some() {
+                    self.document_count_footer()
+                } else {
+                    self.rows_footer(row_count)
+                },
+            ))
+            // A result with rows has no room for the notices in its body, so
+            // the footer carries them, cut to the space it has.
+            .when(!self.is_statement_without_result_set(), |d| {
+                let notices = self.server_notice_lines();
+                d.when(!notices.is_empty(), |d| {
+                    d.child(
+                        div()
+                            .id("footer-server-notices")
+                            .flex()
+                            .min_w_0()
+                            .items_center()
+                            .gap(ResultMetrics::FOOTER_ITEM_GAP)
+                            .child(
+                                Icon::new(AppIcon::TriangleAlert)
+                                    .size(ResultMetrics::FOOTER_ICON)
+                                    .color(cx.theme().warning),
+                            )
+                            .child(div().min_w_0().truncate().child(notices.join(" · "))),
+                    )
+                })
+            })
+            .when(self.offers_count_rows(), |d| {
+                d.child(
+                    Button::new("footer-count-rows", crate::labels::count_rows_label())
+                        .ghost()
+                        .icon(AppIcon::Hash)
+                        .icon_only()
+                        .tab_stop(false)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.request_count_rows(cx);
+                        })),
+                )
+            })
+            .when(self.offers_load_all_rows(), |d| {
+                d.child(
+                    Button::new("footer-load-all-rows", crate::labels::load_all_rows_label())
+                        .ghost()
+                        .icon(AppIcon::FileScan)
+                        .icon_only()
+                        .tab_stop(false)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.request_load_all_rows(cx);
+                        })),
+                )
+            })
+            .when(shows_read_only, |d| {
+                d.child(
+                    footer_item(
+                        AppIcon::Lock,
+                        datatab_i18n::t!("document.data.grid.status.read_only"),
+                    )
+                    .debug_selector(|| "footer-read-only".to_string()),
+                )
+            })
+            .when_some(self.presence_footer(), |d, note| {
+                d.child(div().min_w_0().truncate().child(note))
+            })
+            .when_some(self.document_builder_footer(cx), |d, note| {
+                d.child(
+                    div()
+                        .id("footer-builder-editable")
+                        .min_w_0()
+                        .truncate()
+                        .child(footer_item(AppIcon::Pencil, note)),
+                )
+            })
+            .when_some(sort_info, |d, (col_name, direction, is_server)| {
+                let arrow_icon = match direction {
+                    SortDirection::Ascending => AppIcon::ArrowUp,
+                    SortDirection::Descending => AppIcon::ArrowDown,
+                };
+                let mode = if is_server { "db" } else { "local" };
+                d.child(footer_item(arrow_icon, format!("{} ({})", col_name, mode)))
+            });
+
+        let right_group = div()
+            .flex()
+            .flex_1()
+            .flex_basis(px(0.))
+            .min_w_0()
+            .justify_end()
+            .items_center()
+            .gap(ResultMetrics::FOOTER_GAP)
+            .when(has_data, |d| d.child(self.render_export_button(cx)))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .font_family(datatab_components::fonts::editor_family(cx))
+                    .child(exec_time.to_string()),
+            );
+
+        div()
+            .debug_selector(|| "data-grid-footer".to_string())
+            .flex()
+            .flex_none()
+            .items_center()
+            .gap(ResultMetrics::FOOTER_GAP)
+            .h(ResultMetrics::FOOTER_HEIGHT)
+            .px(ResultMetrics::FOOTER_PADDING_X)
+            .border_t_1()
+            .border_color(theme.border)
+            .bg(theme.background)
+            .text_size(ResultMetrics::FOOTER_FONT)
+            .text_color(muted)
+            .child(left_group)
+            .when_some(pager, |d, pager| d.child(pager.flex_shrink_0()))
+            .child(right_group)
+    }
+
+    /// Icon shown next to each result-view mode chip (Data, Chart, JSON, ...).
+    pub(super) fn result_mode_icon(mode: ResultViewMode) -> AppIcon {
+        match mode {
+            ResultViewMode::Table => AppIcon::Table,
+            ResultViewMode::Chart => AppIcon::ChartSpline,
+            ResultViewMode::Both => AppIcon::Columns,
+            ResultViewMode::Json => AppIcon::Braces,
+            ResultViewMode::Text => AppIcon::ScrollText,
+            ResultViewMode::Raw => AppIcon::Code,
+        }
+    }
+
+    /// The Export button in the footer (secondary, with a chevron) and, when
+    /// open, its menu of save and copy formats.
+    fn render_export_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let menu_open = self.chrome.export_menu_open;
+
+        div()
+            .relative()
+            .flex_shrink_0()
+            .child(
+                Button::new(
+                    "export-trigger",
+                    datatab_i18n::t!("document.data.grid.export.trigger"),
+                )
+                .icon(AppIcon::FileSpreadsheet)
+                .trailing_icon(AppIcon::ChevronDown)
+                .tab_stop(false)
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.export_results(window, cx);
+                })),
+            )
+            .when(menu_open, |d| d.child(self.render_export_menu(cx)))
+    }
+
+    fn render_export_menu(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let entries = self.export_menu_entries();
+        let selected = self.chrome.export_menu_selected;
+        let mut items: Vec<AnyElement> = Vec::with_capacity(entries.len() + 5);
+        let mut section_start = 0;
+
+        for (index, &entry) in entries.iter().enumerate() {
+            let starts_section = entries.get(index.wrapping_sub(1)).is_none_or(|previous| {
+                export_menu_section(*previous) != export_menu_section(entry)
+            });
+
+            if starts_section {
+                if index > 0 {
+                    items.push(render_separator(cx).into_any_element());
+                }
+                items.push(
+                    render_menu_header(&MenuItem::header(export_menu_section_title(entry)), cx)
+                        .into_any_element(),
+                );
+                section_start = index;
+            }
+
+            items.push(self.render_export_menu_row(
+                index,
+                index - section_start,
+                entry,
+                index == selected,
+                cx,
+            ));
+        }
+
+        deferred(
+            menu_frame(cx)
+                .id("export-menu")
+                .absolute()
+                .bottom_full()
+                .right_0()
+                .mb(Spacing::XS)
+                .w(EXPORT_MENU_WIDTH)
+                .occlude()
+                .track_focus(&self.focus.export_menu_focus)
+                // The grid reports the ContextMenu context while the menu is
+                // open, so the menu keys arrive here first.
+                .on_action(cx.listener(
+                    |this, action: &datatab_ui_base::keymap::RunCommand, window, cx| {
+                        let handled =
+                            datatab_ui_base::keymap::run_command(action).is_some_and(|command| {
+                                this.dispatch_export_menu_command(command, window, cx)
+                            });
+
+                        if !handled {
+                            cx.propagate();
+                        }
+                    },
+                ))
+                .children(items),
+        )
+        // Above the backdrop, which shares the deferred layer.
+        .with_priority(2)
+    }
+
+    /// One export menu row. Hovering it highlights it, as the menu keys do.
+    fn render_export_menu_row(
+        &self,
+        index: usize,
+        row_index: usize,
+        entry: ExportMenuEntry,
+        selected: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (id, label, icon) = match entry {
+            ExportMenuEntry::Save(format) => (
+                "export-save",
+                crate::labels::export_format_label(format),
+                AppIcon::Download,
+            ),
+            ExportMenuEntry::Copy(format) => (
+                "export-copy",
+                crate::labels::export_format_label(format),
+                AppIcon::Copy,
+            ),
+            ExportMenuEntry::SaveAll(format) => (
+                "export-all",
+                crate::labels::export_all_format_label(format),
+                AppIcon::Database,
+            ),
+        };
+
+        let mut item = MenuItem::new(label).icon(icon);
+        if !entry.is_enabled() {
+            item = item.disabled();
+        }
+
+        menu_row(
+            SharedString::from(format!("{id}-{row_index}")),
+            &item,
+            selected,
+            cx,
+        )
+        .on_mouse_move(cx.listener(move |this, _, _, cx| {
+            if this.chrome.export_menu_selected != index {
+                this.chrome.export_menu_selected = index;
+                cx.notify();
+            }
+        }))
+        .when(entry.is_enabled(), |row| {
+            row.on_click(cx.listener(move |this, _, window, cx| {
+                this.run_export_menu_entry(entry, window, cx);
+            }))
+        })
+        .into_any_element()
+    }
+
+    /// Full-panel layer under the export menu.
+    ///
+    /// Any press on it closes the menu. Because it also covers the Export
+    /// button, a second click on the button lands here and closes the menu
+    /// rather than reaching the button and reopening it — which is what made
+    /// the button open-only before. Scrolling closes the menu as well.
+    fn render_export_backdrop(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        // The press must end here: the Export button below toggles the menu
+        // on click, so a press that reached it would reopen what this closed.
+        let close = |this: &mut Self, window: &mut Window, cx: &mut Context<Self>| {
+            this.close_export_menu(window, cx);
+            cx.stop_propagation();
+        };
+
+        deferred(
+            div()
+                .id("export-menu-backdrop")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, window, cx| close(this, window, cx)),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, _, window, cx| close(this, window, cx)),
+                )
+                .on_scroll_wheel(cx.listener(move |this, _, window, cx| close(this, window, cx))),
+        )
+        .with_priority(1)
+    }
+}
+
+/// The export menu section an entry is drawn in, so the menu can start a
+/// header where the section changes.
+fn export_menu_section(entry: ExportMenuEntry) -> u8 {
+    match entry {
+        ExportMenuEntry::Save(_) => 0,
+        ExportMenuEntry::Copy(_) => 1,
+        ExportMenuEntry::SaveAll(_) => 2,
+    }
+}
+
+fn export_menu_section_title(entry: ExportMenuEntry) -> String {
+    match entry {
+        ExportMenuEntry::Save(_) => datatab_i18n::t!("document.data.grid.export.save_as_file"),
+        ExportMenuEntry::Copy(_) => datatab_i18n::t!("document.data.grid.export.copy_to_clipboard"),
+        ExportMenuEntry::SaveAll(_) => {
+            datatab_i18n::t!("document.data.grid.export.export_all_rows")
+        }
+    }
+}
+
+/// A small negative value rounds to `-0` once trailing zeros are trimmed, so
+/// zero is normalized explicitly.
+fn format_inspector_float(value: f64) -> String {
+    let formatted = format!("{:.3}", value);
+    let trimmed = formatted.trim_end_matches('0').trim_end_matches('.');
+
+    if trimmed == "-0" {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn format_hex_dump(data: &[u8]) -> String {
+    const BYTES_PER_LINE: usize = 16;
+
+    let mut lines = Vec::new();
+
+    for (offset, chunk) in data.chunks(BYTES_PER_LINE).enumerate() {
+        let hex_part: String = chunk
+            .iter()
+            .enumerate()
+            .map(|(i, b)| {
+                if i == 8 {
+                    format!("  {:02x}", b)
+                } else {
+                    format!(" {:02x}", b)
+                }
+            })
+            .collect();
+
+        let padding = if chunk.len() < BYTES_PER_LINE {
+            let missing = BYTES_PER_LINE - chunk.len();
+            let extra_gap = if chunk.len() <= 8 { 1 } else { 0 };
+            " ".repeat(missing * 3 + extra_gap)
+        } else {
+            String::new()
+        };
+
+        let ascii_part: String = chunk
+            .iter()
+            .map(|b| {
+                if b.is_ascii_graphic() || *b == b' ' {
+                    *b as char
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+
+        lines.push(format!(
+            "{:08x} {}{}  |{}|",
+            offset * BYTES_PER_LINE,
+            hex_part,
+            padding,
+            ascii_part
+        ));
+    }
+
+    if lines.is_empty() {
+        datatab_i18n::t!("document.data.grid.views.empty")
+    } else {
+        lines.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DataGridContentMode;
+    use crate::data_view::DataViewMode;
+
+    #[test]
+    fn inspector_floats_trim_trailing_zeros_and_never_read_negative_zero() {
+        assert_eq!(super::format_inspector_float(21.0), "21");
+        assert_eq!(super::format_inspector_float(12.25), "12.25");
+        assert_eq!(super::format_inspector_float(-7.5), "-7.5");
+        assert_eq!(super::format_inspector_float(0.0), "0");
+        assert_eq!(super::format_inspector_float(-0.0), "0");
+        assert_eq!(super::format_inspector_float(-0.0004), "0");
+    }
+
+    #[test]
+    fn table_mode_with_columns_and_zero_rows_prefers_table_content() {
+        let mode = super::content_mode_for_result(false, DataViewMode::Table, true, false);
+
+        assert_eq!(mode, DataGridContentMode::Table);
+    }
+
+    #[test]
+    fn table_mode_without_columns_uses_empty_fallback() {
+        let mode = super::content_mode_for_result(false, DataViewMode::Table, false, false);
+
+        assert_eq!(mode, DataGridContentMode::EmptyFallback);
+    }
+
+    #[test]
+    fn document_mode_with_columns_and_zero_rows_keeps_empty_fallback() {
+        let mode = super::content_mode_for_result(false, DataViewMode::Document, true, false);
+
+        assert_eq!(mode, DataGridContentMode::EmptyFallback);
+    }
+
+    const DATA_GRID_TOOLBAR_KEYS: &[&str] = &[
+        "document.data.grid.toolbar.refresh",
+        "document.data.grid.toolbar.builder",
+        "document.data.grid.toolbar.switch_to_document",
+        "document.data.grid.toolbar.switch_to_table",
+        "document.data.grid.edit_bar.save",
+        "document.data.grid.edit_bar.revert",
+        "document.shared.refresh.off",
+        "document.shared.refresh.custom",
+    ];
+
+    #[test]
+    fn data_grid_toolbar_keys_resolve_in_english() {
+        for key in DATA_GRID_TOOLBAR_KEYS {
+            let english = datatab_i18n::t!(*key, locale = "en");
+
+            assert!(!english.is_empty(), "empty English translation for {key}");
+            assert_ne!(english, *key, "English translation missing for {key}");
+            assert_ne!(
+                english,
+                format!("en.{key}"),
+                "English translation missing for {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn data_grid_toolbar_refresh_label_is_english() {
+        let english = datatab_i18n::t!("document.data.grid.toolbar.refresh", locale = "en");
+
+        assert_eq!(english, "Refresh");
+    }
+
+    const DATA_GRID_STATUS_EXPORT_KEYS: &[&str] = &[
+        "document.data.grid.editing.aggregated",
+        "document.data.grid.editing.no_primary_key",
+        "document.data.grid.editing.not_single_table",
+        "document.data.grid.loading",
+        "document.data.grid.empty",
+        "document.data.grid.views.table",
+        "document.data.grid.views.chart",
+        "document.data.grid.views.json",
+        "document.data.grid.views.text",
+        "document.data.grid.views.raw",
+        "document.data.grid.views.truncated",
+        "document.data.grid.views.empty",
+        "document.data.grid.status.executed",
+        "document.data.grid.status.affected_rows.one",
+        "document.data.grid.status.affected_rows.many",
+        "document.data.grid.status.rows.one",
+        "document.data.grid.status.rows.many",
+        "document.data.grid.status.pending_changes.one",
+        "document.data.grid.status.pending_changes.many",
+        "document.data.grid.export.trigger",
+        "document.data.grid.export.save_as_file",
+        "document.data.grid.export.copy_to_clipboard",
+        "document.data.grid.export.export_all_rows",
+        "document.data.grid.export.format.csv",
+        "document.data.grid.export.format.json_lines",
+        "document.data.grid.export.format.json_pretty",
+        "document.data.grid.export.format.json_compact",
+        "document.data.grid.export.format.text",
+        "document.data.grid.export.format.binary",
+        "document.data.grid.export.format.hex",
+        "document.data.grid.export.format.base64",
+        "document.data.grid.pending.inserted.one",
+        "document.data.grid.pending.inserted.many",
+        "document.data.grid.pending.updated.one",
+        "document.data.grid.pending.updated.many",
+        "document.data.grid.pending.deleted.one",
+        "document.data.grid.pending.deleted.many",
+    ];
+
+    #[test]
+    fn data_grid_status_export_keys_resolve_in_english() {
+        for key in DATA_GRID_STATUS_EXPORT_KEYS {
+            let english = datatab_i18n::t!(*key, locale = "en");
+
+            assert!(!english.is_empty(), "empty English translation for {key}");
+            assert_ne!(english, *key, "English translation missing for {key}");
+            assert_ne!(
+                english,
+                format!("en.{key}"),
+                "English translation missing for {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn data_grid_export_menu_labels_are_english() {
+        let save_en = datatab_i18n::t!("document.data.grid.export.save_as_file", locale = "en");
+        let copy_en =
+            datatab_i18n::t!("document.data.grid.export.copy_to_clipboard", locale = "en");
+
+        assert_eq!(save_en, "Save loaded rows as file");
+        assert_eq!(copy_en, "Copy loaded rows to clipboard");
+    }
+}

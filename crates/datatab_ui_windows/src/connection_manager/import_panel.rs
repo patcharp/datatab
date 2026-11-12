@@ -1,0 +1,2419 @@
+use std::collections::HashMap;
+
+use datatab_app::portability::{
+    ConfirmSummary, ExternalPersistOutcome, ImportOutcome, ImportPersistence, OwnedDestSnapshot,
+    confirm_summary, default_candidate_includes, mapto_candidates, persist_external_candidate,
+    toggle_candidate_include,
+};
+use datatab_components::controls::{Button, Checkbox, Input, InputEvent, InputState};
+use datatab_components::icons::AppIcon;
+use datatab_components::modals::modal::{Modal, ModalFocus};
+use datatab_components::primitives::{
+    BannerBlock, BannerVariant, SegmentedControl, SegmentedItem, SurfaceRole, Text, surface,
+};
+use datatab_components::tokens::{FontSizes, Spacing};
+use datatab_core::secrecy::SecretString;
+use datatab_core::{AuthProfile, ConnectionProfile, LogErr, ProxyProfile, SshTunnelProfile};
+use datatab_portability::external::{
+    ExternalImportCandidate, ExternalImportOutcome, ExternalImportSkip, ImportInput, ImportSource,
+    importers,
+};
+use datatab_portability::{
+    ConflictChoice, ImportPlan, ParsedBundle, RequiredResolutionKind, ResolutionChoices,
+};
+use datatab_ui_base::AppStateEntity;
+use datatab_ui_base::user_error::{ErrorKind, UserFacingError, report_error};
+use gpui::prelude::*;
+use gpui::*;
+use gpui_component::ActiveTheme;
+use uuid::Uuid;
+
+/// Event emitted by [`ImportConnectionsPanel`] so the connection manager can
+/// switch its view back to the driver picker and refresh the sidebar.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ImportConnectionsPanelEvent {
+    /// The user cancelled or pressed Back from the first step.
+    Cancelled,
+    /// An import run finished (fully or partially) and the user dismissed it.
+    Completed,
+}
+
+/// Segment ids for the per-conflict choice control.
+const CHOICE_REUSE: &str = "reuse";
+const CHOICE_CREATE: &str = "create";
+/// Prefix for "Map to <id>" segment ids; the destination UUID is appended.
+const CHOICE_MAP_PREFIX: &str = "map:";
+
+/// Sentinel segment id for "skip" on auth-profile required references.
+const AUTH_SKIP: &str = "skip";
+/// Prefix for "use destination auth profile <id>" segment ids.
+const AUTH_USE_PREFIX: &str = "use:";
+
+/// Segment id for the native DataTab bundle option in the source picker.
+/// External-client options use the importer's own `id()` as their segment id.
+const SOURCE_BUNDLE: &str = "bundle";
+
+/// Which source the SelectFile step is currently configured for: the native
+/// DataTab bundle format, or one of `datatab_portability::external::importers()`
+/// (identified by that importer's `id()`).
+#[derive(Clone, PartialEq, Debug)]
+enum ImportSourceSelection {
+    Bundle,
+    External(String),
+}
+
+/// Steps of the import flow. Mirrors the previous wizard's state machine, minus
+/// the window chrome.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Step {
+    SelectFile,
+    Preview,
+    Conflicts,
+    RequiredReferences,
+    /// Review checklist for a parsed external-client import (DBeaver, Beekeeper
+    /// Studio, ...), shown instead of Preview/Conflicts/RequiredReferences since
+    /// those candidates carry no conflict-resolution or required-reference state.
+    ExternalReview,
+    Outcome,
+}
+
+/// Bridges `AppState` to the portability `ImportPersistence` seam.
+///
+/// Identical wiring to the previous wizard's persistence adapter; the import
+/// backend itself is unchanged.
+struct AppStatePersistence<'a> {
+    state: &'a mut datatab_app::AppState,
+    registered_drivers: std::collections::HashSet<String>,
+}
+
+impl<'a> AppStatePersistence<'a> {
+    fn new(state: &'a mut datatab_app::AppState) -> Self {
+        let registered_drivers = state.drivers().keys().cloned().collect();
+        Self {
+            state,
+            registered_drivers,
+        }
+    }
+}
+
+impl ImportPersistence for AppStatePersistence<'_> {
+    fn add_auth_profile(&mut self, profile: AuthProfile) {
+        self.state.add_auth_profile(profile);
+    }
+
+    fn add_ssh_tunnel(&mut self, tunnel: SshTunnelProfile) {
+        self.state.add_ssh_tunnel(tunnel);
+    }
+
+    fn add_proxy(&mut self, proxy: ProxyProfile) {
+        self.state.add_proxy(proxy);
+    }
+
+    fn add_connection(
+        &mut self,
+        profile: ConnectionProfile,
+    ) -> datatab_app::portability::ConnectionInsertResult {
+        use datatab_app::portability::ConnectionInsertResult;
+
+        let driver_id = profile.driver_id().to_string();
+        if !self.registered_drivers.contains(&driver_id) {
+            return ConnectionInsertResult::NeedsDriver;
+        }
+
+        let Some(driver) = self.state.drivers().get(&driver_id).cloned() else {
+            return ConnectionInsertResult::NeedsDriver;
+        };
+
+        if let datatab_core::DbConfig::External { values, .. } = &profile.config {
+            match driver.build_config(values) {
+                Ok(config) => {
+                    let mut rebuilt = profile;
+                    rebuilt.config = config;
+                    self.state.add_profile_in_folder(rebuilt, None);
+                    ConnectionInsertResult::Ok
+                }
+                Err(e) => ConnectionInsertResult::ConfigFailed(e.to_string()),
+            }
+        } else {
+            self.state.add_profile_in_folder(profile, None);
+            ConnectionInsertResult::Ok
+        }
+    }
+
+    fn write_secret(&self, secret_ref: &str, secret: &SecretString) -> bool {
+        self.state.facade.secrets.set_by_ref(secret_ref, secret)
+    }
+
+    fn hydrate_auth_secret_fields(
+        &mut self,
+        auth_id: uuid::Uuid,
+        fields: HashMap<String, SecretString>,
+    ) {
+        if let Some(profile) = self
+            .state
+            .facade
+            .auth_profiles
+            .items
+            .iter_mut()
+            .find(|p| p.id == auth_id)
+        {
+            profile.secret_fields = fields;
+        }
+    }
+}
+
+/// Result of a completed import run, rendered by reference (never `.take()`n)
+/// so failure details survive every frame.
+enum ImportRunResult {
+    Outcome(ImportOutcome),
+    Failed(String),
+    /// Outcome of persisting a confirmed selection from an external-client import.
+    External(ExternalPersistOutcome),
+}
+
+/// In-window connection import panel.
+///
+/// Lives INSIDE the connection manager window (rendered when the manager's view
+/// is `View::Import`). It owns the parse -> plan -> resolve -> apply pipeline and
+/// reuses the same leaf components as the export modal. All disk and crypto work
+/// runs on the background executor.
+pub struct ImportConnectionsPanel {
+    app_state: Entity<AppStateEntity>,
+
+    step: Step,
+
+    // Step 1: source picker, shared by both the bundle and external flows.
+    source_selection: ImportSourceSelection,
+
+    // Step 1: external-client file(s). Plain path strings rather than
+    // `InputState` entities, since these fields are Browse-only (no manual
+    // path typing) and the round-trip only ever needs to store the last pick.
+    external_primary_path: Option<String>,
+    external_secondary_path: Option<String>,
+    pending_external_primary_path: Option<String>,
+    pending_external_secondary_path: Option<String>,
+    external_parse_error: Option<String>,
+    is_parsing_external: bool,
+
+    // External-review products: the parsed candidates/skips and one include
+    // flag per candidate, defaulting to included.
+    external_candidates: Vec<ExternalImportCandidate>,
+    external_skips: Vec<ExternalImportSkip>,
+    external_includes: Vec<bool>,
+    is_applying_external: bool,
+
+    // Step 1: file + passphrase.
+    file_input: Entity<InputState>,
+    pending_file_path: Option<String>,
+    /// Set when a Browse attempt found no native picker; drives a one-line muted
+    /// hint so the user types the path instead of seeing a blocking error.
+    native_picker_unavailable: bool,
+    bundle_encrypted: bool,
+    show_passphrase: bool,
+    passphrase_input: Entity<InputState>,
+    parse_error: Option<String>,
+    is_parsing: bool,
+
+    // Plan products. Consumed by `do_apply`; counts survive via `confirm_summary`.
+    parsed_bundle: Option<ParsedBundle>,
+    import_plan: Option<ImportPlan>,
+    confirm_summary: Option<ConfirmSummary>,
+
+    // Conflict resolution choices, keyed by `bundle_local_id`.
+    conflict_choices: HashMap<String, ConflictChoice>,
+
+    // Required-secret inputs, keyed by `(owner_local_id, field)`. Created in
+    // render via the pending flag (needs `&mut Window`).
+    secret_inputs: HashMap<(String, String), Entity<InputState>>,
+    secret_values: HashMap<(String, String), String>,
+    pending_provision_secrets: bool,
+    // Auth-profile picks for AwsReference / AuthProfileRef resolutions.
+    auth_profile_choices: HashMap<(String, String), Uuid>,
+
+    // Apply.
+    is_applying: bool,
+    run_result: Option<ImportRunResult>,
+
+    dest_auth_profiles: Vec<AuthProfile>,
+
+    focus: ModalFocus,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl EventEmitter<ImportConnectionsPanelEvent> for ImportConnectionsPanel {}
+
+impl ImportConnectionsPanel {
+    pub fn new(
+        app_state: Entity<AppStateEntity>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let passphrase_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(datatab_i18n::t!(
+                    "connection_manager.import.placeholder.bundle_passphrase"
+                ))
+                .masked(true)
+        });
+
+        let passphrase_sub = cx.subscribe(&passphrase_input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change | InputEvent::Blur) {
+                this.parse_error = None;
+                cx.notify();
+            }
+        });
+
+        let file_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(datatab_i18n::t!(
+                "connection_manager.import.placeholder.bundle_path"
+            ))
+        });
+
+        let file_sub = cx.subscribe(&file_input, |this, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change | InputEvent::Blur) {
+                this.parse_error = None;
+                cx.notify();
+            }
+        });
+
+        let dest_auth_profiles = app_state.read(cx).list_auth_profiles();
+
+        Self {
+            app_state,
+            step: Step::SelectFile,
+            source_selection: ImportSourceSelection::Bundle,
+            external_primary_path: None,
+            external_secondary_path: None,
+            pending_external_primary_path: None,
+            pending_external_secondary_path: None,
+            external_parse_error: None,
+            is_parsing_external: false,
+            external_candidates: Vec::new(),
+            external_skips: Vec::new(),
+            external_includes: Vec::new(),
+            is_applying_external: false,
+            file_input,
+            pending_file_path: None,
+            native_picker_unavailable: false,
+            bundle_encrypted: false,
+            show_passphrase: false,
+            passphrase_input,
+            parse_error: None,
+            is_parsing: false,
+            parsed_bundle: None,
+            import_plan: None,
+            confirm_summary: None,
+            conflict_choices: HashMap::new(),
+            secret_inputs: HashMap::new(),
+            secret_values: HashMap::new(),
+            pending_provision_secrets: false,
+            auth_profile_choices: HashMap::new(),
+            is_applying: false,
+            run_result: None,
+            dest_auth_profiles,
+            focus: ModalFocus::new(cx),
+            _subscriptions: vec![passphrase_sub, file_sub],
+        }
+    }
+
+    /// Reset the panel to its first step and focus it. Called by the connection
+    /// manager when switching into the import view.
+    pub fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.step = Step::SelectFile;
+        self.source_selection = ImportSourceSelection::Bundle;
+        self.external_primary_path = None;
+        self.external_secondary_path = None;
+        self.pending_external_primary_path = None;
+        self.pending_external_secondary_path = None;
+        self.external_parse_error = None;
+        self.is_parsing_external = false;
+        self.external_candidates.clear();
+        self.external_skips.clear();
+        self.external_includes.clear();
+        self.is_applying_external = false;
+        self.pending_file_path = None;
+        self.native_picker_unavailable = false;
+        self.bundle_encrypted = false;
+        self.show_passphrase = false;
+        self.parse_error = None;
+        self.is_parsing = false;
+        self.parsed_bundle = None;
+        self.import_plan = None;
+        self.confirm_summary = None;
+        self.conflict_choices.clear();
+        self.secret_inputs.clear();
+        self.secret_values.clear();
+        self.pending_provision_secrets = false;
+        self.auth_profile_choices.clear();
+        self.is_applying = false;
+        self.run_result = None;
+        self.dest_auth_profiles = self.app_state.read(cx).list_auth_profiles();
+
+        self.passphrase_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+        self.file_input
+            .update(cx, |state, cx| state.set_value("", window, cx));
+
+        self.focus.focus(None, window, cx);
+        cx.notify();
+    }
+
+    /// Whether a load or an import is running. The panel cannot be dismissed
+    /// until it finishes.
+    fn is_busy(&self) -> bool {
+        self.is_parsing || self.is_parsing_external || self.is_applying || self.is_applying_external
+    }
+
+    /// Whether the current step's primary action may run, the same condition
+    /// that enables its button. On the outcome step the action is Done.
+    fn can_advance(&self, cx: &App) -> bool {
+        match self.step {
+            Step::SelectFile => match &self.source_selection {
+                ImportSourceSelection::Bundle => {
+                    !self.file_input.read(cx).value().trim().is_empty() && !self.is_parsing
+                }
+                ImportSourceSelection::External(_) => {
+                    self.external_primary_path.is_some() && !self.is_parsing_external
+                }
+            },
+            Step::Preview | Step::Outcome => true,
+            Step::Conflicts => self.all_conflicts_resolved(),
+            Step::RequiredReferences => !self.is_applying,
+            Step::ExternalReview => {
+                !self.is_applying_external && self.external_includes.iter().any(|&v| v)
+            }
+        }
+    }
+
+    /// Run the current step's primary action, as its button does. Does
+    /// nothing while [`Self::can_advance`] is false.
+    fn advance(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_advance(cx) {
+            return;
+        }
+
+        match self.step {
+            Step::SelectFile => match self.source_selection {
+                ImportSourceSelection::Bundle => self.do_parse_and_plan(window, cx),
+                ImportSourceSelection::External(_) => self.do_parse_external(window, cx),
+            },
+            Step::Preview => self.advance_from_preview(window, cx),
+            Step::Conflicts => self.advance_from_conflicts(window, cx),
+            Step::RequiredReferences => self.do_apply(window, cx),
+            Step::ExternalReview => self.do_apply_external(window, cx),
+            Step::Outcome => self.dismiss(ImportConnectionsPanelEvent::Completed, cx),
+        }
+    }
+
+    /// Dismiss the panel without importing anything more. Does nothing while
+    /// a load or an import is running.
+    pub fn cancel(&mut self, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            return;
+        }
+
+        self.dismiss(ImportConnectionsPanelEvent::Cancelled, cx);
+    }
+
+    /// Hands focus back and tells the host to hide the panel.
+    fn dismiss(&mut self, event: ImportConnectionsPanelEvent, cx: &mut Context<Self>) {
+        self.focus.restore(cx);
+        cx.emit(event);
+    }
+
+    /// Switches the source picker to the first registered external-client
+    /// importer. Called by the connection manager's "Import from another
+    /// client" footer button, right after `reset`.
+    /// Whether another client, rather than a DataTab bundle, is the source.
+    #[cfg(test)]
+    pub(super) fn external_source_selected(&self) -> bool {
+        matches!(self.source_selection, ImportSourceSelection::External(_))
+    }
+
+    pub fn preselect_external_source(&mut self, cx: &mut Context<Self>) {
+        if let Some(importer) = importers().into_iter().next() {
+            self.source_selection = ImportSourceSelection::External(importer.id().to_string());
+            cx.notify();
+        }
+    }
+
+    /// Whether `importer_id`'s primary input must be read from a filesystem
+    /// path rather than in-memory bytes. Beekeeper Studio's format is a SQLite
+    /// database, so `rusqlite` needs to open it directly from disk (see
+    /// `datatab_portability::external::beekeeper`).
+    ///
+    /// `ConnectionImporter` does not expose this as trait metadata: it is a
+    /// property of the format, not something a caller can discover generically,
+    /// so the UI's file-picking behavior branches on the (small, fixed) set of
+    /// known importer ids rather than on driver identity.
+    fn external_format_uses_path_primary(importer_id: &str) -> bool {
+        importer_id == "beekeeper"
+    }
+
+    /// Whether `importer_id` accepts an optional secondary file. DBeaver splits
+    /// saved credentials into a companion `credentials-config.json`.
+    fn external_format_has_secondary(importer_id: &str) -> bool {
+        importer_id == "dbeaver"
+    }
+
+    fn selected_external_importer_id(&self) -> Option<String> {
+        match &self.source_selection {
+            ImportSourceSelection::External(id) => Some(id.clone()),
+            ImportSourceSelection::Bundle => None,
+        }
+    }
+
+    fn browse_external_file(&mut self, is_secondary: bool, cx: &mut Context<Self>) {
+        if !datatab_ui_base::file_dialog::is_native_file_dialog_available() {
+            self.native_picker_unavailable = true;
+            cx.notify();
+            return;
+        }
+
+        let this = cx.entity().clone();
+        let task = cx.background_executor().spawn(async move {
+            let filter_label = if is_secondary {
+                datatab_i18n::t!("connection_manager.import.external.filter.secondary")
+            } else {
+                datatab_i18n::t!("connection_manager.import.external.filter.primary")
+            };
+
+            rfd::FileDialog::new()
+                .set_title(datatab_i18n::t!(
+                    "connection_manager.import.external.dialog.open_title"
+                ))
+                .add_filter(filter_label, &["*"])
+                .pick_file()
+        });
+
+        cx.spawn(async move |_this, cx| {
+            if let Some(path) = task.await {
+                cx.update(|cx| {
+                    this.update(cx, |this, cx| {
+                        let path = path.to_string_lossy().to_string();
+                        if is_secondary {
+                            this.pending_external_secondary_path = Some(path);
+                        } else {
+                            this.pending_external_primary_path = Some(path);
+                        }
+                        this.external_parse_error = None;
+                        cx.notify();
+                    });
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Parse the selected external-client file(s) on the background executor,
+    /// then advance to the review checklist.
+    fn do_parse_external(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(importer_id) = self.selected_external_importer_id() else {
+            return;
+        };
+        let Some(primary_path) = self.external_primary_path.clone() else {
+            self.external_parse_error = Some(datatab_i18n::t!(
+                "connection_manager.import.external.error.choose_primary_file"
+            ));
+            cx.notify();
+            return;
+        };
+        let secondary_path = self.external_secondary_path.clone();
+
+        self.is_parsing_external = true;
+        self.external_parse_error = None;
+        self.run_result = None;
+        window.focus(self.focus.handle(), cx);
+        cx.notify();
+
+        let this = cx.entity().clone();
+
+        cx.spawn(async move |_this, cx| {
+            let result: Result<ExternalImportOutcome, String> = cx
+                .background_executor()
+                .spawn(async move {
+                    let primary_source = if Self::external_format_uses_path_primary(&importer_id) {
+                        ImportSource::Path(std::path::PathBuf::from(&primary_path))
+                    } else {
+                        match std::fs::read(&primary_path) {
+                            Ok(bytes) => ImportSource::Bytes(bytes),
+                            Err(e) => {
+                                return Err(crate::labels::import_error_cannot_read_file(
+                                    &e.to_string(),
+                                ));
+                            }
+                        }
+                    };
+
+                    let secondary_source = if Self::external_format_has_secondary(&importer_id) {
+                        match secondary_path.as_ref().map(std::fs::read).transpose() {
+                            Ok(bytes) => bytes.map(ImportSource::Bytes),
+                            Err(e) => {
+                                return Err(crate::labels::import_error_cannot_read_file(
+                                    &e.to_string(),
+                                ));
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    let input = match &secondary_source {
+                        Some(secondary) => ImportInput::with_secondary(&primary_source, secondary),
+                        None => ImportInput::new(&primary_source),
+                    };
+
+                    let Some(importer) = importers().into_iter().find(|i| i.id() == importer_id)
+                    else {
+                        return Err(crate::labels::import_error_parse_error(
+                            "unknown import source",
+                        ));
+                    };
+
+                    importer
+                        .parse(&input)
+                        .map_err(|e| crate::labels::import_error_parse_error(&e.to_string()))
+                })
+                .await;
+
+            cx.update(|cx| {
+                this.update(cx, |this, cx| {
+                    this.is_parsing_external = false;
+
+                    match result {
+                        Ok(outcome) => {
+                            this.external_includes =
+                                default_candidate_includes(outcome.candidates.len());
+                            this.external_candidates = outcome.candidates;
+                            this.external_skips = outcome.skips;
+                            this.step = Step::ExternalReview;
+                        }
+                        Err(e) => {
+                            this.external_parse_error = Some(e);
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Persist the user-confirmed selection of external-import candidates
+    /// through the same `AppStatePersistence` seam bundle import uses, then
+    /// move to the outcome step.
+    fn do_apply_external(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let includes = std::mem::take(&mut self.external_includes);
+        let selected: Vec<ExternalImportCandidate> = std::mem::take(&mut self.external_candidates)
+            .into_iter()
+            .zip(includes)
+            .filter_map(|(candidate, include)| include.then_some(candidate))
+            .collect();
+
+        let app_state_entity = self.app_state.clone();
+        let this = cx.entity().clone();
+
+        self.is_applying_external = true;
+        window.focus(self.focus.handle(), cx);
+        cx.notify();
+
+        cx.spawn(async move |_this, cx| {
+            cx.update(|cx| {
+                let outcome = app_state_entity.update(cx, |state, cx| {
+                    let mut deps = AppStatePersistence::new(state);
+                    let mut outcome = ExternalPersistOutcome::default();
+                    for candidate in selected {
+                        persist_external_candidate(candidate, &mut deps, &mut outcome);
+                    }
+                    cx.emit(datatab_ui_base::AppStateChanged);
+                    cx.notify();
+                    outcome
+                });
+
+                if !outcome.secret_failures.is_empty() {
+                    let count = outcome.secret_failures.len();
+                    let msg = crate::labels::import_error_secret_failures_toast(count);
+                    report_error(UserFacingError::new(ErrorKind::Storage, msg), cx);
+                }
+
+                this.update(cx, |this, cx| {
+                    this.is_applying_external = false;
+                    let succeeded = outcome.succeeded.len();
+                    let has_failures = !outcome.secret_failures.is_empty()
+                        || !outcome.needs_driver.is_empty()
+                        || !outcome.config_failures.is_empty();
+
+                    if !has_failures && succeeded > 0 {
+                        datatab_ui_base::toast::Toast::success(
+                            crate::labels::import_status_imported_toast(succeeded),
+                        )
+                        .push(cx);
+                    }
+
+                    this.run_result = Some(ImportRunResult::External(outcome));
+                    this.step = Step::Outcome;
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn browse_input_path(&mut self, cx: &mut Context<Self>) {
+        if datatab_ui_base::file_dialog::is_native_file_dialog_available() {
+            let this = cx.entity().clone();
+            let task = cx.background_executor().spawn(async move {
+                rfd::FileDialog::new()
+                    .set_title(datatab_i18n::t!(
+                        "connection_manager.import.dialog.open_title"
+                    ))
+                    .add_filter(
+                        datatab_i18n::t!("connection_manager.import.filter.toml"),
+                        &["toml"],
+                    )
+                    .add_filter(
+                        datatab_i18n::t!("connection_manager.import.filter.all"),
+                        &["*"],
+                    )
+                    .pick_file()
+            });
+
+            cx.spawn(async move |_this, cx| {
+                if let Some(path) = task.await {
+                    cx.update(|cx| {
+                        this.update(cx, |this, cx| {
+                            this.pending_file_path = Some(path.to_string_lossy().to_string());
+                            cx.notify();
+                        });
+                    });
+                }
+            })
+            .detach();
+        } else {
+            // No native picker: do not block with a red error — the user can
+            // type the path directly. Surface only a one-line muted hint.
+            self.native_picker_unavailable = true;
+            cx.notify();
+        }
+    }
+
+    fn dest_snapshot(&self, cx: &Context<Self>) -> OwnedDestSnapshot {
+        let state = self.app_state.read(cx);
+        OwnedDestSnapshot {
+            auth_profiles: state.list_auth_profiles(),
+            ssh_tunnels: state.ssh_tunnels().to_vec(),
+            proxies: state.proxies().to_vec(),
+            connections: state
+                .connections()
+                .values()
+                .map(|c| c.profile.clone())
+                .collect(),
+        }
+    }
+
+    /// Parse + decrypt + plan the selected bundle on the background executor,
+    /// then advance to the preview step.
+    fn do_parse_and_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let path = self.file_input.read(cx).value().trim().to_string();
+        if path.is_empty() {
+            self.parse_error = Some(datatab_i18n::t!(
+                "connection_manager.import.error.choose_file"
+            ));
+            cx.notify();
+            return;
+        }
+
+        let passphrase = SecretString::from(self.passphrase_input.read(cx).value().to_string());
+        let dest = self.dest_snapshot(cx);
+
+        let this = cx.entity().clone();
+        self.is_parsing = true;
+        self.parse_error = None;
+        self.run_result = None;
+        window.focus(self.focus.handle(), cx);
+        cx.notify();
+
+        cx.spawn(async move |_this, cx| {
+            let result: (bool, Result<(ParsedBundle, ImportPlan), String>) = cx
+                .background_executor()
+                .spawn(async move {
+                    let bytes = match std::fs::read(&path) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            return (
+                                false,
+                                Err(crate::labels::import_error_cannot_read_file(&e.to_string())),
+                            );
+                        }
+                    };
+
+                    let mut parsed = match datatab_portability::import::parse(&bytes) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            return (
+                                false,
+                                Err(crate::labels::import_error_parse_error(&e.to_string())),
+                            );
+                        }
+                    };
+
+                    use datatab_portability::bundle::EncryptionMode;
+                    let is_encrypted =
+                        parsed.bundle.bundle.encryption == EncryptionMode::AgePassphrase;
+
+                    use datatab_core::secrecy::ExposeSecret;
+                    if is_encrypted && passphrase.expose_secret().is_empty() {
+                        return (
+                            true,
+                            Err(datatab_i18n::t!(
+                                "connection_manager.import.error.encrypted_needs_passphrase"
+                            )),
+                        );
+                    }
+
+                    if let Err(e) = datatab_portability::import::decrypt(&mut parsed, &passphrase) {
+                        use datatab_portability::PortabilityError;
+                        let msg = if e.is_encryption_unavailable() {
+                            datatab_i18n::t!(
+                                "connection_manager.import.error.encryption_unavailable"
+                            )
+                        } else if matches!(&e, PortabilityError::Decryption(_)) {
+                            datatab_i18n::t!("connection_manager.import.error.wrong_passphrase")
+                        } else {
+                            crate::labels::import_error_decryption_error(&e.to_string())
+                        };
+                        return (is_encrypted, Err(msg));
+                    }
+
+                    let plan = datatab_portability::import::plan(&parsed, &dest.as_ref_snapshot());
+                    (is_encrypted, Ok((parsed, plan)))
+                })
+                .await;
+
+            let (is_encrypted, outcome) = result;
+
+            cx.update(|cx| {
+                this.update(cx, |this, cx| {
+                    this.is_parsing = false;
+                    this.bundle_encrypted = is_encrypted;
+
+                    match outcome {
+                        Ok((parsed, plan)) => {
+                            let registered = this
+                                .app_state
+                                .read(cx)
+                                .drivers()
+                                .keys()
+                                .cloned()
+                                .collect::<std::collections::HashSet<_>>();
+                            this.confirm_summary =
+                                Some(confirm_summary(&parsed, &plan, &registered));
+
+                            this.parsed_bundle = Some(parsed);
+                            this.import_plan = Some(plan);
+                            this.pending_provision_secrets = true;
+                            this.step = Step::Preview;
+                        }
+                        Err(e) => {
+                            this.parse_error = Some(e);
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    /// Create one masked input per required-secret resolution. Called from render
+    /// via `pending_provision_secrets`, the only path with `&mut Window` after the
+    /// async parse completes.
+    fn provision_secret_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(plan) = &self.import_plan else {
+            return;
+        };
+
+        let secret_keys: Vec<(String, String)> = plan
+            .required_resolutions
+            .iter()
+            .filter(|r| matches!(r.kind, RequiredResolutionKind::Secret))
+            .map(|r| (r.owner_local_id.clone(), r.field.clone()))
+            .collect();
+
+        self.secret_inputs.clear();
+
+        for key in secret_keys {
+            let key_for_sub = key.clone();
+
+            let input = cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder(datatab_i18n::t!(
+                        "connection_manager.import.placeholder.secret_value"
+                    ))
+                    .masked(true)
+            });
+
+            let sub = cx.subscribe(&input, move |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change | InputEvent::Blur) {
+                    let value = this
+                        .secret_inputs
+                        .get(&key_for_sub)
+                        .map(|inp| inp.read(cx).value().to_string())
+                        .unwrap_or_default();
+                    this.secret_values.insert(key_for_sub.clone(), value);
+                    cx.notify();
+                }
+            });
+
+            self._subscriptions.push(sub);
+            self.secret_inputs.insert(key, input);
+        }
+    }
+
+    fn has_conflicts(&self) -> bool {
+        self.import_plan
+            .as_ref()
+            .map(|p| !p.conflicts.is_empty())
+            .unwrap_or(false)
+    }
+
+    fn has_required(&self) -> bool {
+        self.import_plan
+            .as_ref()
+            .map(|p| !p.required_resolutions.is_empty())
+            .unwrap_or(false)
+    }
+
+    fn all_conflicts_resolved(&self) -> bool {
+        let Some(plan) = &self.import_plan else {
+            return true;
+        };
+        plan.conflicts
+            .iter()
+            .all(|c| self.conflict_choices.contains_key(&c.bundle_local_id))
+    }
+
+    /// Advance from preview to the first applicable resolution step, or straight
+    /// to apply when nothing needs resolving.
+    fn advance_from_preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_conflicts() {
+            self.step = Step::Conflicts;
+            cx.notify();
+        } else if self.has_required() {
+            self.step = Step::RequiredReferences;
+            cx.notify();
+        } else {
+            self.do_apply(window, cx);
+        }
+    }
+
+    fn advance_from_conflicts(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.has_required() {
+            self.step = Step::RequiredReferences;
+            cx.notify();
+        } else {
+            self.do_apply(window, cx);
+        }
+    }
+
+    fn build_resolution_choices(&self) -> ResolutionChoices {
+        let secret_values = self
+            .secret_values
+            .iter()
+            .filter(|(_, value)| !value.is_empty())
+            .map(|((owner, field), value)| {
+                (
+                    (owner.clone(), field.clone()),
+                    SecretString::from(value.clone()),
+                )
+            })
+            .collect();
+
+        ResolutionChoices {
+            conflict_choices: self.conflict_choices.clone(),
+            secret_values,
+            auth_profile_choices: self.auth_profile_choices.clone(),
+        }
+    }
+
+    /// Run `apply()` on the background executor, persist through `AppState`, and
+    /// move to the outcome step.
+    fn do_apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(parsed) = self.parsed_bundle.take() else {
+            return;
+        };
+        let Some(plan) = self.import_plan.take() else {
+            return;
+        };
+        let choices = self.build_resolution_choices();
+        let app_state_entity = self.app_state.clone();
+        let this = cx.entity().clone();
+
+        self.is_applying = true;
+        window.focus(self.focus.handle(), cx);
+        cx.notify();
+
+        cx.spawn(async move |_this, cx| {
+            let apply_result = cx
+                .background_executor()
+                .spawn(async move { datatab_portability::import::apply(&parsed, &plan, &choices) })
+                .await;
+
+            cx.update(|cx| match apply_result {
+                Err(e) => {
+                    this.update(cx, |this, cx| {
+                        this.is_applying = false;
+                        this.run_result = Some(ImportRunResult::Failed(
+                            crate::labels::import_error_import_failed(&e.to_string()),
+                        ));
+                        this.step = Step::Outcome;
+                        cx.notify();
+                    });
+                }
+                Ok(actions) => {
+                    let outcome = app_state_entity.update(cx, |state, cx| {
+                        let result = {
+                            let mut deps = AppStatePersistence::new(state);
+                            datatab_app::portability::persist_import_actions(actions, &mut deps)
+                        };
+                        cx.emit(datatab_ui_base::AppStateChanged);
+                        cx.notify();
+                        result
+                    });
+
+                    // Only the first catch site reports through the user-error seam.
+                    if !outcome.secret_failures.is_empty() {
+                        let count = outcome.secret_failures.len();
+                        let msg = crate::labels::import_error_secret_failures_toast(count);
+                        report_error(UserFacingError::new(ErrorKind::Storage, msg), cx);
+                    }
+
+                    this.update(cx, |this, cx| {
+                        this.is_applying = false;
+                        let succeeded = outcome.succeeded.len();
+                        let has_failures = !outcome.secret_failures.is_empty()
+                            || !outcome.needs_driver.is_empty()
+                            || !outcome.config_failures.is_empty()
+                            || !outcome.unresolved_refs.is_empty();
+
+                        if !has_failures {
+                            datatab_ui_base::toast::Toast::success(
+                                crate::labels::import_status_imported_toast(succeeded),
+                            )
+                            .push(cx);
+                        }
+
+                        this.run_result = Some(ImportRunResult::Outcome(outcome));
+                        this.step = Step::Outcome;
+                        cx.notify();
+                    });
+                }
+            });
+        })
+        .detach();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Render
+// ---------------------------------------------------------------------------
+
+impl Render for ImportConnectionsPanel {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(path) = self.pending_file_path.take() {
+            self.file_input
+                .update(cx, |state, cx| state.set_value(path, window, cx));
+        }
+
+        if let Some(path) = self.pending_external_primary_path.take() {
+            self.external_primary_path = Some(path);
+        }
+        if let Some(path) = self.pending_external_secondary_path.take() {
+            self.external_secondary_path = Some(path);
+        }
+
+        if self.pending_provision_secrets {
+            self.pending_provision_secrets = false;
+            self.provision_secret_inputs(window, cx);
+        }
+
+        // Masking is render-driven so the eye toggle can reveal the passphrase.
+        let show_passphrase = self.show_passphrase;
+        self.passphrase_input.update(cx, |state, cx| {
+            state.set_masked(!show_passphrase, window, cx);
+        });
+
+        let body_content: AnyElement = match self.step {
+            Step::SelectFile => self.render_select_file(cx),
+            Step::Preview => self.render_preview(cx),
+            Step::Conflicts => self.render_conflicts(cx),
+            Step::RequiredReferences => self.render_required_references(cx),
+            Step::ExternalReview => self.render_external_review(cx),
+            Step::Outcome => self.render_outcome(cx),
+        };
+
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap(Spacing::MD)
+            .child(body_content)
+            .into_any_element();
+
+        let shell = Modal::new(datatab_i18n::t!("connection_manager.import.modal_title"))
+            .body(body)
+            .footer(self.render_footer(cx))
+            .icon(AppIcon::Download)
+            .width(px(640.0))
+            .focus_handle(self.focus.handle())
+            .on_confirm({
+                let entity = cx.entity().downgrade();
+                move |window, cx| {
+                    entity
+                        .update(cx, |this, cx| this.advance(window, cx))
+                        .log_err();
+                }
+            })
+            .confirm_enabled(self.can_advance(cx));
+
+        // A running load or import cannot be cancelled, so the shell draws no
+        // close button and ignores Escape and backdrop clicks until it ends.
+        let shell = if self.is_busy() {
+            shell
+        } else {
+            shell.on_close({
+                let entity = cx.entity().downgrade();
+                move |_, cx| {
+                    entity.update(cx, |this, cx| this.cancel(cx)).log_err();
+                }
+            })
+        };
+
+        shell.into_any_element()
+    }
+}
+
+impl ImportConnectionsPanel {
+    /// Renders the source picker shared by the bundle and external-client
+    /// flows, followed by that source's own fields.
+    fn render_select_file(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+
+        let mut source_items = vec![SegmentedItem::new(
+            SOURCE_BUNDLE,
+            datatab_i18n::t!("connection_manager.import.source.bundle"),
+        )];
+        for importer in importers() {
+            source_items.push(SegmentedItem::new(
+                importer.id().to_string(),
+                importer.display_name().to_string(),
+            ));
+        }
+
+        let active_source = match &self.source_selection {
+            ImportSourceSelection::Bundle => SOURCE_BUNDLE.to_string(),
+            ImportSourceSelection::External(id) => id.clone(),
+        };
+
+        let entity = cx.entity().clone();
+        let source_control =
+            SegmentedControl::new(source_items, active_source, move |selected, _window, cx| {
+                let selection = if selected.as_ref() == SOURCE_BUNDLE {
+                    ImportSourceSelection::Bundle
+                } else {
+                    ImportSourceSelection::External(selected.to_string())
+                };
+                entity.update(cx, |this, cx| {
+                    this.source_selection = selection;
+                    this.parse_error = None;
+                    this.external_parse_error = None;
+                    this.native_picker_unavailable = false;
+                    cx.notify();
+                });
+            });
+
+        let col = div().flex().flex_col().gap(Spacing::MD).child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(Spacing::XS)
+                .child(
+                    Text::body(datatab_i18n::t!("connection_manager.import.source.label"))
+                        .color(theme.muted_foreground),
+                )
+                .child(source_control),
+        );
+
+        let col = match &self.source_selection {
+            ImportSourceSelection::Bundle => col.child(self.render_bundle_fields(cx)),
+            ImportSourceSelection::External(id) => col.child(self.render_external_fields(id, cx)),
+        };
+
+        col.into_any_element()
+    }
+
+    fn render_bundle_fields(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let entity = cx.entity().clone();
+
+        let browse = Button::new(
+            "import-input-browse",
+            datatab_i18n::t!("connection_manager.action.browse"),
+        )
+        .ghost()
+        .icon(AppIcon::Folder)
+        .icon_only()
+        .on_click(move |_event, _window, cx| {
+            entity.update(cx, |this, cx| this.browse_input_path(cx));
+        });
+
+        let bundle_file_label = datatab_i18n::t!("connection_manager.import.field.bundle_file");
+
+        let file_row = div()
+            .flex()
+            .items_center()
+            .gap(Spacing::XS)
+            .child(
+                div().flex_1().child(
+                    Input::new(&self.file_input)
+                        .id("import-field-bundle_file")
+                        .aria_label(bundle_file_label.clone()),
+                ),
+            )
+            .child(browse);
+
+        let mut file_block = div()
+            .flex()
+            .flex_col()
+            .gap(Spacing::XS)
+            .child(Text::body(bundle_file_label).color(theme.muted_foreground))
+            .child(file_row);
+
+        if self.native_picker_unavailable {
+            file_block = file_block.child(
+                Text::caption(datatab_i18n::t!(
+                    "connection_manager.import.hint.no_native_picker"
+                ))
+                .font_size(FontSizes::XS),
+            );
+        }
+
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(Spacing::MD)
+            .child(file_block)
+            .child(
+                Checkbox::new("import-encrypted-toggle")
+                    .checked(self.bundle_encrypted)
+                    .label(datatab_i18n::t!(
+                        "connection_manager.import.field.bundle_encrypted"
+                    ))
+                    .on_click(cx.listener(|this, checked: &bool, _, cx| {
+                        this.bundle_encrypted = *checked;
+                        cx.notify();
+                    })),
+            );
+
+        if self.bundle_encrypted {
+            let eye_icon = if self.show_passphrase {
+                AppIcon::EyeOff
+            } else {
+                AppIcon::Eye
+            };
+
+            let toggle = Button::new("import-passphrase-eye", "")
+                .ghost()
+                .icon(eye_icon)
+                .icon_only()
+                .aria_label(if self.show_passphrase {
+                    datatab_i18n::t!("connection_manager.import.field.hide_passphrase")
+                } else {
+                    datatab_i18n::t!("connection_manager.import.field.show_passphrase")
+                })
+                .on_click({
+                    let entity = cx.entity().clone();
+                    move |_event, _window, cx| {
+                        entity.update(cx, |this, cx| {
+                            this.show_passphrase = !this.show_passphrase;
+                            cx.notify();
+                        });
+                    }
+                });
+
+            let passphrase_label = datatab_i18n::t!("connection_manager.import.field.passphrase");
+
+            col = col.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(Spacing::XS)
+                    .child(Text::body(passphrase_label.clone()).color(theme.muted_foreground))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(Spacing::XS)
+                            .child(
+                                div().flex_1().child(
+                                    Input::new(&self.passphrase_input)
+                                        .id("import-field-passphrase")
+                                        .aria_label(passphrase_label)
+                                        .secret(true),
+                                ),
+                            )
+                            .child(toggle),
+                    ),
+            );
+        }
+
+        if let Some(err) = self.parse_error.clone() {
+            col = col.child(BannerBlock::new(BannerVariant::Danger, err));
+        }
+
+        col.into_any_element()
+    }
+
+    fn render_external_fields(&self, importer_id: &str, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let has_secondary = Self::external_format_has_secondary(importer_id);
+
+        let primary_label = self.external_primary_path.clone().unwrap_or_else(|| {
+            datatab_i18n::t!("connection_manager.import.external.field.primary_file")
+        });
+
+        let entity = cx.entity().clone();
+        let primary_browse = Button::new(
+            "import-external-primary-browse",
+            datatab_i18n::t!("connection_manager.action.browse"),
+        )
+        .ghost()
+        .icon(AppIcon::Folder)
+        .icon_only()
+        .on_click(move |_event, _window, cx| {
+            entity.update(cx, |this, cx| this.browse_external_file(false, cx));
+        });
+
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(Spacing::XS)
+            .child(
+                Text::body(datatab_i18n::t!(
+                    "connection_manager.import.external.field.primary_file"
+                ))
+                .color(theme.muted_foreground),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(Spacing::XS)
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(FontSizes::SM)
+                            .text_color(theme.foreground)
+                            .child(primary_label),
+                    )
+                    .child(primary_browse),
+            );
+
+        if has_secondary {
+            let secondary_label = self.external_secondary_path.clone().unwrap_or_else(|| {
+                datatab_i18n::t!("connection_manager.import.external.field.secondary_file")
+            });
+
+            let entity = cx.entity().clone();
+            let secondary_browse = Button::new(
+                "import-external-secondary-browse",
+                datatab_i18n::t!("connection_manager.action.browse"),
+            )
+            .ghost()
+            .icon(AppIcon::Folder)
+            .icon_only()
+            .on_click(move |_event, _window, cx| {
+                entity.update(cx, |this, cx| this.browse_external_file(true, cx));
+            });
+
+            col = col
+                .child(
+                    Text::body(datatab_i18n::t!(
+                        "connection_manager.import.external.field.secondary_file"
+                    ))
+                    .color(theme.muted_foreground),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(Spacing::XS)
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(FontSizes::SM)
+                                .text_color(theme.foreground)
+                                .child(secondary_label),
+                        )
+                        .child(secondary_browse),
+                )
+                .child(
+                    Text::caption(datatab_i18n::t!(
+                        "connection_manager.import.external.hint.secondary_optional"
+                    ))
+                    .font_size(FontSizes::XS),
+                );
+        }
+
+        if self.native_picker_unavailable {
+            col = col.child(
+                Text::caption(datatab_i18n::t!(
+                    "connection_manager.import.hint.no_native_picker"
+                ))
+                .font_size(FontSizes::XS),
+            );
+        }
+
+        if let Some(err) = self.external_parse_error.clone() {
+            col = col.child(BannerBlock::new(BannerVariant::Danger, err));
+        }
+
+        col.into_any_element()
+    }
+
+    fn render_external_review(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+
+        let mut col = div().flex().flex_col().gap(Spacing::SM).child(
+            Text::body(datatab_i18n::t!(
+                "connection_manager.import.external.review.intro"
+            ))
+            .color(theme.muted_foreground),
+        );
+
+        if !self.external_skips.is_empty() {
+            let body = self
+                .external_skips
+                .iter()
+                .map(|skip| {
+                    if skip.name.is_empty() {
+                        skip.reason.clone()
+                    } else {
+                        format!("\"{}\": {}", skip.name, skip.reason)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            col = col.child(
+                BannerBlock::new(
+                    BannerVariant::Warning,
+                    crate::labels::import_external_review_skips_intro(self.external_skips.len()),
+                )
+                .with_body(body),
+            );
+        }
+
+        for (index, candidate) in self.external_candidates.iter().enumerate() {
+            col = col.child(self.render_external_candidate_row(index, candidate, cx));
+        }
+
+        col.into_any_element()
+    }
+
+    fn render_external_candidate_row(
+        &self,
+        index: usize,
+        candidate: &ExternalImportCandidate,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let included = self.external_includes.get(index).copied().unwrap_or(false);
+
+        let host_summary = crate::labels::import_external_host_summary(&candidate.config);
+        let kind_label = candidate.kind.display_name();
+        let candidate_label = format!("{} — {kind_label}", candidate.name);
+
+        let secret_status = if let Some(reason) = &candidate.secret_skip_reason {
+            reason.clone()
+        } else if candidate.secret.is_some() {
+            datatab_i18n::t!("connection_manager.import.external.secret.will_store")
+        } else {
+            datatab_i18n::t!("connection_manager.import.external.secret.none")
+        };
+
+        surface(SurfaceRole::Raised, cx)
+            .w_full()
+            .px(Spacing::SM)
+            .py(Spacing::XS)
+            .flex()
+            .flex_col()
+            .gap(Spacing::XS)
+            .id(SharedString::from(format!(
+                "import-external-candidate-{index}"
+            )))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(Spacing::XS)
+                    .child(
+                        Checkbox::new(SharedString::from(format!(
+                            "import-external-candidate-toggle-{index}"
+                        )))
+                        .checked(included)
+                        .aria_label(candidate_label.clone())
+                        .on_click(cx.listener(
+                            move |this, _checked: &bool, _, cx| {
+                                toggle_candidate_include(&mut this.external_includes, index);
+                                cx.notify();
+                            },
+                        )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(FontSizes::SM)
+                                    .text_color(theme.foreground)
+                                    .child(candidate_label),
+                            )
+                            .child(Text::caption(host_summary).font_size(FontSizes::XS)),
+                    ),
+            )
+            .child(Text::caption(secret_status).font_size(FontSizes::XS))
+            .into_any_element()
+    }
+
+    fn render_preview(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let Some(summary) = self.confirm_summary.as_ref() else {
+            return div().into_any_element();
+        };
+
+        let mut counts = surface(SurfaceRole::Raised, cx)
+            .w_full()
+            .px(Spacing::SM)
+            .py(Spacing::XS)
+            .flex()
+            .flex_col()
+            .gap(Spacing::XS);
+
+        for line in [
+            crate::labels::import_preview_count_connections(summary.connection_count),
+            crate::labels::import_preview_count_auth_profiles(summary.auth_profile_count),
+            crate::labels::import_preview_count_ssh_tunnels(summary.ssh_tunnel_count),
+            crate::labels::import_preview_count_proxies(summary.proxy_count),
+        ] {
+            counts = counts.child(
+                div()
+                    .text_size(FontSizes::SM)
+                    .text_color(theme.foreground)
+                    .child(line),
+            );
+        }
+
+        let mut col = div()
+            .flex()
+            .flex_col()
+            .gap(Spacing::SM)
+            .child(
+                Text::body(datatab_i18n::t!("connection_manager.import.preview.intro"))
+                    .color(theme.muted_foreground),
+            )
+            .child(counts);
+
+        if summary.conflict_count > 0 {
+            col = col.child(BannerBlock::new(
+                BannerVariant::Warning,
+                crate::labels::import_preview_conflicts_banner(summary.conflict_count),
+            ));
+        }
+
+        if summary.required_resolution_count > 0 {
+            col = col.child(BannerBlock::new(
+                BannerVariant::Info,
+                crate::labels::import_preview_required_banner(summary.required_resolution_count),
+            ));
+        }
+
+        if summary.has_driver_not_installed {
+            col = col.child(BannerBlock::new(
+                BannerVariant::Warning,
+                datatab_i18n::t!("connection_manager.import.preview.driver_not_installed_banner"),
+            ));
+        }
+
+        col = col.child(
+            BannerBlock::new(
+                BannerVariant::Info,
+                datatab_i18n::t!("connection_manager.import.hint.external_refs"),
+            )
+            .with_body(datatab_i18n::t!(
+                "connection_manager.import.hint.external_refs_body"
+            )),
+        );
+
+        col.into_any_element()
+    }
+
+    fn render_conflicts(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let Some(plan) = &self.import_plan else {
+            return div().into_any_element();
+        };
+
+        let dest = self.dest_snapshot(cx);
+
+        let mut col = div().flex().flex_col().gap(Spacing::SM).child(
+            Text::body(datatab_i18n::t!(
+                "connection_manager.import.conflicts.intro"
+            ))
+            .color(theme.muted_foreground),
+        );
+
+        for conflict in &plan.conflicts {
+            col = col.child(self.render_conflict_row(conflict, &dest, cx));
+        }
+
+        col.into_any_element()
+    }
+
+    fn render_conflict_row(
+        &self,
+        conflict: &datatab_portability::ProfileConflict,
+        dest: &OwnedDestSnapshot,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+
+        let kind_label = crate::labels::import_conflict_kind_label(conflict.kind);
+
+        let candidates = mapto_candidates(conflict.kind, dest);
+        let current = self
+            .conflict_choices
+            .get(&conflict.bundle_local_id)
+            .cloned();
+
+        let mut items = vec![
+            SegmentedItem::new(
+                CHOICE_REUSE,
+                datatab_i18n::t!("connection_manager.import.action.reuse_existing"),
+            ),
+            SegmentedItem::new(
+                CHOICE_CREATE,
+                datatab_i18n::t!("connection_manager.import.action.create_new"),
+            ),
+        ];
+        for (candidate_id, candidate_name) in &candidates {
+            items.push(SegmentedItem::new(
+                format!("{CHOICE_MAP_PREFIX}{candidate_id}"),
+                crate::labels::import_action_map_to(candidate_name),
+            ));
+        }
+
+        let active = match &current {
+            Some(ConflictChoice::Reuse) => CHOICE_REUSE.to_string(),
+            Some(ConflictChoice::CreateNew) => CHOICE_CREATE.to_string(),
+            Some(ConflictChoice::MapTo(id)) => format!("{CHOICE_MAP_PREFIX}{id}"),
+            None => String::new(),
+        };
+
+        let local_id = conflict.bundle_local_id.clone();
+        let entity = cx.entity().clone();
+        let control = SegmentedControl::new(items, active, move |selected, _window, cx| {
+            let choice = parse_conflict_choice(selected.as_ref());
+            let local_id = local_id.clone();
+            entity.update(cx, |this, cx| {
+                if let Some(choice) = choice {
+                    this.conflict_choices.insert(local_id, choice);
+                    cx.notify();
+                }
+            });
+        });
+
+        surface(SurfaceRole::Raised, cx)
+            .w_full()
+            .px(Spacing::SM)
+            .py(Spacing::XS)
+            .flex()
+            .flex_col()
+            .gap(Spacing::XS)
+            .id(SharedString::from(format!(
+                "import-conflict-{}",
+                conflict.bundle_local_id
+            )))
+            .child(
+                div()
+                    .text_size(FontSizes::SM)
+                    .text_color(theme.foreground)
+                    .child(crate::labels::import_conflicts_row_label(
+                        &kind_label,
+                        &conflict.bundle_name,
+                        &conflict.existing_name,
+                    )),
+            )
+            .child(control)
+            .into_any_element()
+    }
+
+    fn render_required_references(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let Some(plan) = &self.import_plan else {
+            return div().into_any_element();
+        };
+
+        let mut col = div().flex().flex_col().gap(Spacing::SM).child(
+            Text::body(datatab_i18n::t!("connection_manager.import.required.intro"))
+                .color(theme.muted_foreground),
+        );
+
+        for resolution in &plan.required_resolutions {
+            col = col.child(self.render_required_row(resolution, cx));
+        }
+
+        col.into_any_element()
+    }
+
+    fn render_required_row(
+        &self,
+        resolution: &datatab_portability::RequiredResolution,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme().clone();
+        let key = (resolution.owner_local_id.clone(), resolution.field.clone());
+
+        let mut row = surface(SurfaceRole::Raised, cx)
+            .w_full()
+            .px(Spacing::SM)
+            .py(Spacing::XS)
+            .flex()
+            .flex_col()
+            .gap(Spacing::XS)
+            .id(SharedString::from(format!(
+                "import-required-{}-{}",
+                resolution.owner_local_id, resolution.field
+            )));
+
+        match &resolution.kind {
+            RequiredResolutionKind::Secret => {
+                let secret_label = crate::labels::import_required_secret_label(
+                    &resolution.owner_name,
+                    &resolution.field,
+                );
+
+                row = row
+                    .child(
+                        div()
+                            .text_size(FontSizes::SM)
+                            .text_color(theme.foreground)
+                            .child(secret_label.clone()),
+                    )
+                    .child(
+                        Text::caption(datatab_i18n::t!(
+                            "connection_manager.import.hint.leave_empty_skip"
+                        ))
+                        .font_size(FontSizes::XS),
+                    );
+
+                if let Some(input) = self.secret_inputs.get(&key) {
+                    row = row.child(
+                        Input::new(input)
+                            .id(SharedString::from(format!(
+                                "import-field-secret-{}-{}",
+                                resolution.owner_local_id, resolution.field
+                            )))
+                            .aria_label(secret_label)
+                            .secret(true),
+                    );
+                }
+            }
+
+            RequiredResolutionKind::AwsReference { provider_id, name } => {
+                let matching: Vec<(Uuid, String)> = self
+                    .dest_auth_profiles
+                    .iter()
+                    .filter(|p| &p.provider_id == provider_id)
+                    .map(|p| (p.id, p.name.clone()))
+                    .collect();
+
+                row = row.child(
+                    div()
+                        .text_size(FontSizes::SM)
+                        .text_color(theme.foreground)
+                        .child(crate::labels::import_required_aws_reference_label(
+                            name,
+                            provider_id,
+                            &resolution.owner_name,
+                        )),
+                );
+
+                row = row.child(self.auth_choice_block(&key, &matching, cx));
+            }
+
+            RequiredResolutionKind::AuthProfileRef => {
+                let all_dest: Vec<(Uuid, String)> = self
+                    .dest_auth_profiles
+                    .iter()
+                    .map(|p| (p.id, p.name.clone()))
+                    .collect();
+
+                row = row.child(
+                    div()
+                        .text_size(FontSizes::SM)
+                        .text_color(theme.foreground)
+                        .child(crate::labels::import_required_auth_profile_ref_label(
+                            &resolution.owner_name,
+                            &resolution.field,
+                        )),
+                );
+
+                row = row.child(self.auth_choice_block(&key, &all_dest, cx));
+            }
+        }
+
+        row.into_any_element()
+    }
+
+    /// Build a "Skip / Use <profile>" picker block for an auth-profile resolution.
+    fn auth_choice_block(
+        &self,
+        key: &(String, String),
+        candidates: &[(Uuid, String)],
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        if candidates.is_empty() {
+            return Text::caption(datatab_i18n::t!(
+                "connection_manager.import.required.no_matching_auth_profile"
+            ))
+            .font_size(FontSizes::XS)
+            .into_any_element();
+        }
+
+        let current = self.auth_profile_choices.get(key).copied();
+
+        let mut items = vec![SegmentedItem::new(
+            AUTH_SKIP,
+            datatab_i18n::t!("connection_manager.import.action.skip"),
+        )];
+        for (id, name) in candidates {
+            items.push(SegmentedItem::new(
+                format!("{AUTH_USE_PREFIX}{id}"),
+                crate::labels::import_action_use_profile(name),
+            ));
+        }
+
+        let active = match current {
+            Some(id) => format!("{AUTH_USE_PREFIX}{id}"),
+            None => AUTH_SKIP.to_string(),
+        };
+
+        let key_for_cb = key.clone();
+        let entity = cx.entity().clone();
+        let control = SegmentedControl::new(items, active, move |selected, _window, cx| {
+            let key = key_for_cb.clone();
+            let pick = parse_auth_choice(selected.as_ref());
+            entity.update(cx, |this, cx| {
+                match pick {
+                    Some(id) => {
+                        this.auth_profile_choices.insert(key, id);
+                    }
+                    None => {
+                        this.auth_profile_choices.remove(&key);
+                    }
+                }
+                cx.notify();
+            });
+        });
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(Spacing::XS)
+            .child(
+                Text::caption(datatab_i18n::t!(
+                    "connection_manager.import.hint.select_profile_or_skip"
+                ))
+                .font_size(FontSizes::XS),
+            )
+            .child(control)
+            .into_any_element()
+    }
+
+    fn render_outcome(&self, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+
+        let mut col = div().flex().flex_col().gap(Spacing::SM);
+
+        match self.run_result.as_ref() {
+            None => {
+                col = col.child(
+                    Text::body(datatab_i18n::t!(
+                        "connection_manager.import.status.complete"
+                    ))
+                    .color(theme.foreground),
+                );
+            }
+            Some(ImportRunResult::Failed(msg)) => {
+                col = col.child(
+                    BannerBlock::new(
+                        BannerVariant::Danger,
+                        datatab_i18n::t!("connection_manager.import.banner.failed"),
+                    )
+                    .with_body(msg.clone()),
+                );
+            }
+            Some(ImportRunResult::Outcome(outcome)) => {
+                if !outcome.succeeded.is_empty() {
+                    col = col.child(BannerBlock::new(
+                        BannerVariant::Success,
+                        crate::labels::import_outcome_succeeded(outcome.succeeded.len()),
+                    ));
+                }
+
+                if !outcome.needs_driver.is_empty() {
+                    let body = outcome
+                        .needs_driver
+                        .iter()
+                        .map(|(name, driver)| format!("\"{name}\" (driver: {driver})"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    col = col.child(
+                        BannerBlock::new(
+                            BannerVariant::Warning,
+                            crate::labels::import_outcome_needs_driver(outcome.needs_driver.len()),
+                        )
+                        .with_body(body),
+                    );
+                }
+
+                if !outcome.config_failures.is_empty() {
+                    let body = outcome
+                        .config_failures
+                        .iter()
+                        .map(|(name, reason)| format!("\"{name}\": {reason}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    col = col.child(
+                        BannerBlock::new(
+                            BannerVariant::Warning,
+                            crate::labels::import_outcome_config_failures(
+                                outcome.config_failures.len(),
+                            ),
+                        )
+                        .with_body(body),
+                    );
+                }
+
+                if !outcome.unresolved_refs.is_empty() {
+                    let body = outcome
+                        .unresolved_refs
+                        .iter()
+                        .map(|name| format!("\"{name}\""))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    col = col.child(
+                        BannerBlock::new(
+                            BannerVariant::Warning,
+                            crate::labels::import_outcome_unresolved_refs(
+                                outcome.unresolved_refs.len(),
+                            ),
+                        )
+                        .with_body(body),
+                    );
+                }
+
+                if !outcome.secret_failures.is_empty() {
+                    col = col.child(BannerBlock::new(
+                        BannerVariant::Warning,
+                        crate::labels::import_outcome_secret_failures(
+                            outcome.secret_failures.len(),
+                        ),
+                    ));
+                }
+            }
+            Some(ImportRunResult::External(outcome)) => {
+                if !outcome.succeeded.is_empty() {
+                    col = col.child(BannerBlock::new(
+                        BannerVariant::Success,
+                        crate::labels::import_outcome_succeeded(outcome.succeeded.len()),
+                    ));
+                }
+
+                if !outcome.needs_driver.is_empty() {
+                    let body = outcome
+                        .needs_driver
+                        .iter()
+                        .map(|(name, driver)| format!("\"{name}\" (driver: {driver})"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    col = col.child(
+                        BannerBlock::new(
+                            BannerVariant::Warning,
+                            crate::labels::import_outcome_needs_driver(outcome.needs_driver.len()),
+                        )
+                        .with_body(body),
+                    );
+                }
+
+                if !outcome.config_failures.is_empty() {
+                    let body = outcome
+                        .config_failures
+                        .iter()
+                        .map(|(name, reason)| format!("\"{name}\": {reason}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    col = col.child(
+                        BannerBlock::new(
+                            BannerVariant::Warning,
+                            crate::labels::import_outcome_config_failures(
+                                outcome.config_failures.len(),
+                            ),
+                        )
+                        .with_body(body),
+                    );
+                }
+
+                if !outcome.secret_failures.is_empty() {
+                    col = col.child(BannerBlock::new(
+                        BannerVariant::Warning,
+                        crate::labels::import_outcome_secret_failures(
+                            outcome.secret_failures.len(),
+                        ),
+                    ));
+                }
+            }
+        }
+
+        col.into_any_element()
+    }
+
+    fn render_footer(&self, cx: &Context<Self>) -> AnyElement {
+        let left = match self.step {
+            Step::SelectFile => Button::new(
+                "import-cancel",
+                datatab_i18n::t!("connection_manager.import.action.cancel"),
+            )
+            .ghost()
+            .disabled(self.is_busy())
+            .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                this.cancel(cx);
+            })),
+            Step::Preview => Button::new(
+                "import-back",
+                datatab_i18n::t!("connection_manager.import.action.back"),
+            )
+            .ghost()
+            .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                this.step = Step::SelectFile;
+                cx.notify();
+            })),
+            Step::Conflicts => Button::new(
+                "import-back",
+                datatab_i18n::t!("connection_manager.import.action.back"),
+            )
+            .ghost()
+            .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                this.step = Step::Preview;
+                cx.notify();
+            })),
+            Step::RequiredReferences => Button::new(
+                "import-back",
+                datatab_i18n::t!("connection_manager.import.action.back"),
+            )
+            .ghost()
+            .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                this.step = if this.has_conflicts() {
+                    Step::Conflicts
+                } else {
+                    Step::Preview
+                };
+                cx.notify();
+            })),
+            Step::ExternalReview => Button::new(
+                "import-back",
+                datatab_i18n::t!("connection_manager.import.action.back"),
+            )
+            .ghost()
+            .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                this.step = Step::SelectFile;
+                cx.notify();
+            })),
+            Step::Outcome => Button::new(
+                "import-done",
+                datatab_i18n::t!("connection_manager.import.action.done"),
+            )
+            .ghost()
+            .on_click(cx.listener(|this, _: &gpui::ClickEvent, _, cx| {
+                this.dismiss(ImportConnectionsPanelEvent::Completed, cx);
+            })),
+        };
+
+        let primary = self.render_primary_button(cx);
+
+        div()
+            .flex()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .child(left)
+            .when_some(primary, |el, btn| el.child(btn))
+            .into_any_element()
+    }
+
+    fn render_primary_button(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let (id, label) = match self.step {
+            Step::SelectFile => {
+                let is_busy = match &self.source_selection {
+                    ImportSourceSelection::Bundle => self.is_parsing,
+                    ImportSourceSelection::External(_) => self.is_parsing_external,
+                };
+                let label = if is_busy {
+                    datatab_i18n::t!("connection_manager.import.status.loading")
+                } else {
+                    datatab_i18n::t!("connection_manager.import.action.load")
+                };
+                ("import-load", label)
+            }
+            Step::Preview => (
+                "import-preview-next",
+                datatab_i18n::t!("connection_manager.import.action.continue_"),
+            ),
+            Step::Conflicts => (
+                "import-conflicts-next",
+                datatab_i18n::t!("connection_manager.import.action.continue_"),
+            ),
+            Step::RequiredReferences => {
+                let label = if self.is_applying {
+                    datatab_i18n::t!("connection_manager.import.status.importing")
+                } else {
+                    datatab_i18n::t!("connection_manager.import.action.import")
+                };
+                ("import-required-apply", label)
+            }
+            Step::ExternalReview => {
+                let included_count = self.external_includes.iter().filter(|&&v| v).count();
+                let label = if self.is_applying_external {
+                    datatab_i18n::t!("connection_manager.import.status.importing")
+                } else {
+                    crate::labels::import_external_action_import_selected(included_count)
+                };
+                ("import-external-apply", label)
+            }
+            Step::Outcome => return None,
+        };
+
+        Some(
+            Button::new(id, label)
+                .primary()
+                .disabled(!self.can_advance(cx))
+                .on_click(cx.listener(|this, _: &gpui::ClickEvent, window, cx| {
+                    this.advance(window, cx);
+                }))
+                .into_any_element(),
+        )
+    }
+}
+
+/// Parse a conflict-choice segment id back into a `ConflictChoice`.
+fn parse_conflict_choice(id: &str) -> Option<ConflictChoice> {
+    if id == CHOICE_REUSE {
+        return Some(ConflictChoice::Reuse);
+    }
+    if id == CHOICE_CREATE {
+        return Some(ConflictChoice::CreateNew);
+    }
+    if let Some(uuid_str) = id.strip_prefix(CHOICE_MAP_PREFIX)
+        && let Ok(uuid) = Uuid::parse_str(uuid_str)
+    {
+        return Some(ConflictChoice::MapTo(uuid));
+    }
+    None
+}
+
+/// Parse an auth-choice segment id; `None` means "skip".
+fn parse_auth_choice(id: &str) -> Option<Uuid> {
+    id.strip_prefix(AUTH_USE_PREFIX)
+        .and_then(|uuid_str| Uuid::parse_str(uuid_str).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    /// Every `connection_manager.import.*` key this panel resolves directly via
+    /// `datatab_i18n::t!`, including the plural `.one`/`.many` variants. Keys backed
+    /// by `crate::labels` helpers are exercised separately by `labels.rs`'s own
+    /// test module, but every leaf key they resolve is still listed here so this
+    /// slice's key coverage is self-contained in one place.
+    const IMPORT_PANEL_KEYS: &[&str] = &[
+        "connection_manager.import.placeholder.bundle_passphrase",
+        "connection_manager.import.placeholder.bundle_path",
+        "connection_manager.import.placeholder.secret_value",
+        "connection_manager.import.dialog.open_title",
+        "connection_manager.import.filter.toml",
+        "connection_manager.import.filter.all",
+        "connection_manager.import.error.choose_file",
+        "connection_manager.import.error.cannot_read_file",
+        "connection_manager.import.error.parse_error",
+        "connection_manager.import.error.encrypted_needs_passphrase",
+        "connection_manager.import.error.encryption_unavailable",
+        "connection_manager.import.error.wrong_passphrase",
+        "connection_manager.import.error.decryption_error",
+        "connection_manager.import.error.import_failed",
+        "connection_manager.import.error.secret_failures_toast.one",
+        "connection_manager.import.error.secret_failures_toast.many",
+        "connection_manager.import.field.bundle_file",
+        "connection_manager.import.field.bundle_encrypted",
+        "connection_manager.import.field.passphrase",
+        "connection_manager.import.field.show_passphrase",
+        "connection_manager.import.field.hide_passphrase",
+        "connection_manager.import.hint.no_native_picker",
+        "connection_manager.import.hint.external_refs",
+        "connection_manager.import.hint.external_refs_body",
+        "connection_manager.import.hint.leave_empty_skip",
+        "connection_manager.import.hint.select_profile_or_skip",
+        "connection_manager.import.modal_title",
+        "connection_manager.import.preview.intro",
+        "connection_manager.import.preview.count.connections.one",
+        "connection_manager.import.preview.count.connections.many",
+        "connection_manager.import.preview.count.auth_profiles.one",
+        "connection_manager.import.preview.count.auth_profiles.many",
+        "connection_manager.import.preview.count.ssh_tunnels.one",
+        "connection_manager.import.preview.count.ssh_tunnels.many",
+        "connection_manager.import.preview.count.proxies.one",
+        "connection_manager.import.preview.count.proxies.many",
+        "connection_manager.import.preview.conflicts_banner.one",
+        "connection_manager.import.preview.conflicts_banner.many",
+        "connection_manager.import.preview.required_banner.one",
+        "connection_manager.import.preview.required_banner.many",
+        "connection_manager.import.preview.driver_not_installed_banner",
+        "connection_manager.import.conflict_kind.auth_profile",
+        "connection_manager.import.conflict_kind.ssh_tunnel",
+        "connection_manager.import.conflict_kind.proxy",
+        "connection_manager.import.conflict_kind.connection",
+        "connection_manager.import.conflicts.intro",
+        "connection_manager.import.conflicts.row_label",
+        "connection_manager.import.required.intro",
+        "connection_manager.import.required.secret_label",
+        "connection_manager.import.required.aws_reference_label",
+        "connection_manager.import.required.auth_profile_ref_label",
+        "connection_manager.import.required.no_matching_auth_profile",
+        "connection_manager.import.status.complete",
+        "connection_manager.import.status.loading",
+        "connection_manager.import.status.importing",
+        "connection_manager.import.status.imported_toast.one",
+        "connection_manager.import.status.imported_toast.many",
+        "connection_manager.import.banner.failed",
+        "connection_manager.import.outcome.succeeded.one",
+        "connection_manager.import.outcome.succeeded.many",
+        "connection_manager.import.outcome.needs_driver.one",
+        "connection_manager.import.outcome.needs_driver.many",
+        "connection_manager.import.outcome.config_failures.one",
+        "connection_manager.import.outcome.config_failures.many",
+        "connection_manager.import.outcome.unresolved_refs.one",
+        "connection_manager.import.outcome.unresolved_refs.many",
+        "connection_manager.import.outcome.secret_failures.one",
+        "connection_manager.import.outcome.secret_failures.many",
+        "connection_manager.import.action.reuse_existing",
+        "connection_manager.import.action.create_new",
+        "connection_manager.import.action.map_to",
+        "connection_manager.import.action.skip",
+        "connection_manager.import.action.use_profile",
+        "connection_manager.import.action.cancel",
+        "connection_manager.import.action.back",
+        "connection_manager.import.action.done",
+        "connection_manager.import.action.load",
+        "connection_manager.import.action.continue_",
+        "connection_manager.import.action.import",
+        "connection_manager.import.source.label",
+        "connection_manager.import.source.bundle",
+        "connection_manager.import.external.dialog.open_title",
+        "connection_manager.import.external.filter.primary",
+        "connection_manager.import.external.filter.secondary",
+        "connection_manager.import.external.field.primary_file",
+        "connection_manager.import.external.field.secondary_file",
+        "connection_manager.import.external.hint.secondary_optional",
+        "connection_manager.import.external.error.choose_primary_file",
+        "connection_manager.import.external.review.intro",
+        "connection_manager.import.external.review.skips_intro.one",
+        "connection_manager.import.external.review.skips_intro.many",
+        "connection_manager.import.external.secret.will_store",
+        "connection_manager.import.external.secret.none",
+        "connection_manager.import.external.action.import_selected.one",
+        "connection_manager.import.external.action.import_selected.many",
+    ];
+
+    #[test]
+    fn import_panel_keys_resolve() {
+        for key in IMPORT_PANEL_KEYS {
+            let value = datatab_i18n::t!(key, locale = "en");
+
+            assert!(!value.is_empty(), "key {key} resolved empty");
+            assert_ne!(value, *key, "key {key} did not resolve");
+            assert_ne!(
+                value,
+                format!("en.{key}"),
+                "key {key} fell back to the raw en-qualified form"
+            );
+        }
+    }
+
+    #[test]
+    fn conflict_kind_labels_are_exhaustive_over_the_enum() {
+        use datatab_portability::ConflictKind;
+
+        for kind in [
+            ConflictKind::AuthProfile,
+            ConflictKind::SshTunnel,
+            ConflictKind::Proxy,
+            ConflictKind::Connection,
+        ] {
+            let label = crate::labels::import_conflict_kind_label(kind);
+            assert!(!label.is_empty(), "{kind:?} resolved an empty label");
+        }
+    }
+}
+
+#[cfg(test)]
+mod keyboard_tests {
+    // Explicit imports rather than the parent glob: combining `use super::*`
+    // with `#[gpui::test]` sends the gpui_macros expansion into unbounded
+    // recursion.
+    use super::{ImportConnectionsPanel, ImportConnectionsPanelEvent, Step};
+    use datatab_storage::bootstrap::StorageRuntime;
+    use datatab_ui_base::AppStateEntity;
+    use datatab_ui_base::modals::test_host::{click_backdrop, has_focus, host_modal};
+    use gpui::{AppContext as _, Entity, FocusHandle, TestAppContext, VisualTestContext};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    type Events = Rc<RefCell<Vec<ImportConnectionsPanelEvent>>>;
+
+    /// Shows the panel on its first step, as the connection manager does.
+    fn open_panel(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<ImportConnectionsPanel>,
+        FocusHandle,
+        &mut VisualTestContext,
+        Events,
+    ) {
+        cx.update(datatab_components::theme::init);
+        cx.update(datatab_ui_base::keymap::init_keymap);
+        let app_state = cx.new(|_| {
+            AppStateEntity::new_with_storage_runtime(
+                StorageRuntime::in_memory().expect("in-memory storage"),
+            )
+            .expect("app state")
+        });
+
+        let (panel, outside, window) = host_modal(cx, move |window, cx| {
+            ImportConnectionsPanel::new(app_state, window, cx)
+        });
+
+        let events: Events = Rc::default();
+        window.update(|window, cx| {
+            let sink = events.clone();
+            cx.subscribe(&panel, move |_, event: &ImportConnectionsPanelEvent, _| {
+                sink.borrow_mut().push(event.clone());
+            })
+            .detach();
+
+            panel.update(cx, |panel, cx| panel.reset(window, cx));
+        });
+        window.run_until_parked();
+
+        (panel, outside, window, events)
+    }
+
+    fn update_panel(
+        window: &mut VisualTestContext,
+        panel: &Entity<ImportConnectionsPanel>,
+        change: impl FnOnce(&mut ImportConnectionsPanel),
+    ) {
+        window.update(|_, cx| {
+            panel.update(cx, |panel, cx| {
+                change(panel);
+                cx.notify();
+            });
+        });
+        window.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn enter_loads_only_once_a_file_is_chosen(cx: &mut TestAppContext) {
+        let (panel, _outside, window, events) = open_panel(cx);
+
+        window.simulate_keystrokes("enter");
+        assert!(window.update(|_, cx| panel.read(cx).parse_error.is_none()));
+
+        window.update(|window, cx| {
+            let input = panel.read(cx).file_input.clone();
+            input.update(cx, |state, cx| {
+                state.set_value("/nonexistent/bundle.toml", window, cx)
+            });
+        });
+        window.run_until_parked();
+        window.simulate_keystrokes("enter");
+        window.run_until_parked();
+
+        // The file does not exist, so loading fails; the error proves Enter
+        // started the load.
+        let (step, parse_error) = window.update(|_, cx| {
+            let panel = panel.read(cx);
+            (panel.step, panel.parse_error.clone())
+        });
+        assert_eq!(step, Step::SelectFile);
+        assert!(parse_error.is_some());
+        assert!(events.borrow().is_empty());
+    }
+
+    #[gpui::test]
+    fn enter_on_the_outcome_step_is_done(cx: &mut TestAppContext) {
+        let (panel, _outside, window, events) = open_panel(cx);
+        update_panel(window, &panel, |panel| panel.step = Step::Outcome);
+
+        window.simulate_keystrokes("enter");
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            [ImportConnectionsPanelEvent::Completed]
+        );
+    }
+
+    #[gpui::test]
+    fn escape_cancels_and_gives_focus_back(cx: &mut TestAppContext) {
+        let (_panel, outside, window, events) = open_panel(cx);
+
+        window.simulate_keystrokes("escape");
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            [ImportConnectionsPanelEvent::Cancelled]
+        );
+        assert!(has_focus(window, &outside));
+    }
+
+    #[gpui::test]
+    fn a_backdrop_click_cancels(cx: &mut TestAppContext) {
+        let (_panel, _outside, window, events) = open_panel(cx);
+
+        click_backdrop(window);
+
+        assert_eq!(
+            events.borrow().as_slice(),
+            [ImportConnectionsPanelEvent::Cancelled]
+        );
+    }
+
+    #[gpui::test]
+    fn a_running_load_ignores_escape_and_the_backdrop(cx: &mut TestAppContext) {
+        let (panel, _outside, window, events) = open_panel(cx);
+        update_panel(window, &panel, |panel| panel.is_parsing = true);
+
+        window.simulate_keystrokes("escape");
+        click_backdrop(window);
+
+        assert!(events.borrow().is_empty());
+    }
+}

@@ -1,0 +1,1080 @@
+use crate::app_state_entity::{AppStateChanged, AppStateEntity, AuthProfileCreated};
+use crate::platform;
+use datatab_components::composites::{RailItem, field_row_vertical, render_wizard_stepper};
+use datatab_components::controls::InputState;
+use datatab_components::controls::{Button, Input};
+use datatab_components::icons::AppIcon;
+use datatab_components::modals::{Modal, modal_frame};
+#[cfg(feature = "aws")]
+use datatab_components::primitives::Icon;
+use datatab_components::primitives::Text;
+#[cfg(feature = "aws")]
+use datatab_components::tokens::PaletteMetrics;
+use datatab_components::tokens::{ChromeColors, ModalMetrics, ui};
+use datatab_core::keymap_types::ContextId;
+use datatab_core::{AuthProfile, LogErr};
+use gpui::prelude::FluentBuilder;
+use gpui::*;
+use gpui_component::ActiveTheme;
+#[cfg(feature = "aws")]
+use gpui_component::scroll::ScrollableElement;
+use uuid::Uuid;
+
+/// Width of the SSO wizard dialog (P1Flows).
+const SSO_WIZARD_WIDTH: Pixels = px(560.0);
+
+/// Height of a discovered account or role row, and of a confirm row. (36 px)
+const SSO_LIST_ROW_HEIGHT: Rems = ui(36.0);
+
+/// Width of the field names on the confirm step.
+const SSO_CONFIRM_LABEL_WIDTH: Pixels = px(120.0);
+
+#[cfg(feature = "aws")]
+use datatab_aws::{
+    AwsSsoAccount, list_sso_account_roles_blocking, list_sso_accounts_blocking, login_sso_blocking,
+};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WizardStep {
+    Start,
+    Account,
+    Role,
+    Confirm,
+}
+
+impl WizardStep {
+    const ALL: [WizardStep; 4] = [
+        WizardStep::Start,
+        WizardStep::Account,
+        WizardStep::Role,
+        WizardStep::Confirm,
+    ];
+
+    fn label(self) -> String {
+        match self {
+            WizardStep::Start => datatab_i18n::t!("sso_wizard.step.start"),
+            WizardStep::Account => datatab_i18n::t!("sso_wizard.step.account"),
+            WizardStep::Role => datatab_i18n::t!("sso_wizard.step.role"),
+            WizardStep::Confirm => datatab_i18n::t!("sso_wizard.step.confirm"),
+        }
+    }
+}
+
+/// Maximum height of the discovered account and role lists; longer lists
+/// scroll inside it so the wizard buttons stay in view.
+#[cfg(feature = "aws")]
+const DISCOVERED_LIST_MAX_HEIGHT: Pixels = px(240.0);
+
+/// Rail entries for the wizard: steps before `current` are completed. The
+/// rail is display-only because Back already walks the steps in order.
+fn sso_rail_items(current: WizardStep) -> Vec<RailItem> {
+    let current_index = WizardStep::ALL
+        .iter()
+        .position(|step| *step == current)
+        .unwrap_or(0);
+
+    WizardStep::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, step)| RailItem {
+            label: SharedString::from(step.label()),
+            completed: index < current_index,
+            current: index == current_index,
+        })
+        .collect()
+}
+
+/// A wizard input with its visible label above it. The label is also the
+/// input's accessible name, and `id` keeps the input addressable across runs.
+fn labeled_input(
+    id: &'static str,
+    label: String,
+    state: &Entity<InputState>,
+    cx: &App,
+) -> gpui::Div {
+    field_row_vertical(
+        label.clone(),
+        Input::new(state).id(id).aria_label(label),
+        cx,
+    )
+}
+
+pub struct SsoWizard {
+    app_state: Entity<AppStateEntity>,
+    visible: bool,
+    step: WizardStep,
+    focus_handle: FocusHandle,
+    input_profile_name: Entity<InputState>,
+    input_start_url: Entity<InputState>,
+    input_region: Entity<InputState>,
+    input_account_id: Entity<InputState>,
+    input_role_name: Entity<InputState>,
+    status: Option<String>,
+
+    #[cfg(feature = "aws")]
+    discovered_accounts: Vec<AwsSsoAccount>,
+    #[cfg(feature = "aws")]
+    discovered_roles: Vec<String>,
+    #[cfg(feature = "aws")]
+    accounts_loading: bool,
+    #[cfg(feature = "aws")]
+    roles_loading: bool,
+}
+
+pub enum SsoWizardEvent {
+    ProfileCreated { profile_id: Uuid },
+}
+
+impl SsoWizard {
+    pub fn new(
+        app_state: Entity<AppStateEntity>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self {
+            app_state,
+            visible: false,
+            step: WizardStep::Start,
+            focus_handle: cx.focus_handle(),
+            input_profile_name: cx
+                .new(|cx| InputState::new(window, cx).placeholder("profile-name")),
+            input_start_url: cx
+                .new(|cx| InputState::new(window, cx).placeholder("https://...awsapps.com/start")),
+            input_region: cx.new(|cx| InputState::new(window, cx).placeholder("us-east-1")),
+            input_account_id: cx.new(|cx| InputState::new(window, cx).placeholder("123456789012")),
+            input_role_name: cx.new(|cx| InputState::new(window, cx).placeholder("ReadOnlyRole")),
+            status: None,
+
+            #[cfg(feature = "aws")]
+            discovered_accounts: Vec::new(),
+            #[cfg(feature = "aws")]
+            discovered_roles: Vec::new(),
+            #[cfg(feature = "aws")]
+            accounts_loading: false,
+            #[cfg(feature = "aws")]
+            roles_loading: false,
+        }
+    }
+
+    pub fn open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.visible = true;
+        self.step = WizardStep::Start;
+        self.status = None;
+        self.focus_handle.focus(window, cx);
+        cx.notify();
+    }
+
+    pub fn close(&mut self, cx: &mut Context<Self>) {
+        self.visible = false;
+        cx.notify();
+    }
+
+    fn next(&mut self, cx: &mut Context<Self>) {
+        self.step = match self.step {
+            WizardStep::Start => WizardStep::Account,
+            WizardStep::Account => WizardStep::Role,
+            WizardStep::Role => WizardStep::Confirm,
+            WizardStep::Confirm => WizardStep::Confirm,
+        };
+        cx.notify();
+    }
+
+    fn back(&mut self, cx: &mut Context<Self>) {
+        self.step = match self.step {
+            WizardStep::Start => WizardStep::Start,
+            WizardStep::Account => WizardStep::Start,
+            WizardStep::Role => WizardStep::Account,
+            WizardStep::Confirm => WizardStep::Role,
+        };
+        cx.notify();
+    }
+
+    fn save_profile(&mut self, cx: &mut Context<Self>) {
+        let profile_name = self.input_profile_name.read(cx).value().trim().to_string();
+        let start_url = self.input_start_url.read(cx).value().trim().to_string();
+        let region = self.input_region.read(cx).value().trim().to_string();
+        let account_id = self.input_account_id.read(cx).value().trim().to_string();
+        let role_name = self.input_role_name.read(cx).value().trim().to_string();
+
+        if profile_name.is_empty() || start_url.is_empty() || region.is_empty() {
+            self.status = Some(datatab_i18n::t!("sso_wizard.status.missing_required"));
+            cx.notify();
+            return;
+        }
+
+        let mut fields = std::collections::HashMap::new();
+        fields.insert("profile_name".to_string(), profile_name.clone());
+        fields.insert("sso_start_url".to_string(), start_url);
+        fields.insert("region".to_string(), region);
+        if !account_id.is_empty() {
+            fields.insert("sso_account_id".to_string(), account_id);
+        }
+        if !role_name.is_empty() {
+            fields.insert("sso_role_name".to_string(), role_name);
+        }
+
+        let profile_id = Uuid::new_v4();
+
+        self.app_state.update(cx, |state, cx| {
+            state.add_auth_profile(AuthProfile {
+                id: profile_id,
+                name: profile_name,
+                provider_id: "aws-sso".to_string(),
+                fields,
+                // AWS SSO profiles carry only non-secret config; no key material.
+                secret_fields: std::collections::HashMap::new(),
+                enabled: true,
+                read_only: false,
+                dangling_origin: None,
+            });
+            cx.emit(AuthProfileCreated { profile_id });
+            cx.emit(AppStateChanged);
+        });
+
+        cx.emit(SsoWizardEvent::ProfileCreated { profile_id });
+
+        self.status = Some(datatab_i18n::t!("sso_wizard.status.profile_created"));
+        self.visible = false;
+        cx.notify();
+    }
+
+    #[cfg(feature = "aws")]
+    fn discover_accounts(&mut self, cx: &mut Context<Self>) {
+        if self.accounts_loading {
+            return;
+        }
+
+        let profile_name = self.input_profile_name.read(cx).value().trim().to_string();
+        let start_url = self.input_start_url.read(cx).value().trim().to_string();
+        let region = self.input_region.read(cx).value().trim().to_string();
+
+        if profile_name.is_empty() || start_url.is_empty() || region.is_empty() {
+            self.status = Some(datatab_i18n::t!(
+                "sso_wizard.status.fill_before_account_discovery"
+            ));
+            cx.notify();
+            return;
+        }
+
+        self.accounts_loading = true;
+        self.status = Some(datatab_i18n::t!("sso_wizard.status.discovering_accounts"));
+        cx.notify();
+
+        let this = cx.entity().clone();
+        let task = cx.background_executor().spawn(async move {
+            let _ = login_sso_blocking(Uuid::nil(), &profile_name, &start_url);
+            list_sso_accounts_blocking(&profile_name, &region, &start_url)
+        });
+
+        cx.spawn(async move |_entity, cx| {
+            let result = task.await;
+            cx.update(|cx| {
+                this.update(cx, |this, cx| {
+                    this.accounts_loading = false;
+                    match result {
+                        Ok(accounts) => {
+                            this.discovered_accounts = accounts;
+                            this.status =
+                                Some(datatab_i18n::t!("sso_wizard.status.accounts_discovered"));
+                        }
+                        Err(error) => {
+                            this.discovered_accounts.clear();
+                            this.status = Some(datatab_i18n::t!(
+                                "sso_wizard.status.accounts_failed",
+                                error = error
+                            ));
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    #[cfg(feature = "aws")]
+    fn discover_roles_for_selected_account(&mut self, cx: &mut Context<Self>) {
+        if self.roles_loading {
+            return;
+        }
+
+        let profile_name = self.input_profile_name.read(cx).value().trim().to_string();
+        let start_url = self.input_start_url.read(cx).value().trim().to_string();
+        let region = self.input_region.read(cx).value().trim().to_string();
+        let account_id = self.input_account_id.read(cx).value().trim().to_string();
+
+        if profile_name.is_empty()
+            || start_url.is_empty()
+            || region.is_empty()
+            || account_id.is_empty()
+        {
+            self.status = Some(datatab_i18n::t!(
+                "sso_wizard.status.fill_before_role_discovery"
+            ));
+            cx.notify();
+            return;
+        }
+
+        self.roles_loading = true;
+        self.status = Some(datatab_i18n::t!("sso_wizard.status.discovering_roles"));
+        cx.notify();
+
+        let this = cx.entity().clone();
+        let task = cx.background_executor().spawn(async move {
+            list_sso_account_roles_blocking(&profile_name, &region, &start_url, &account_id)
+        });
+
+        cx.spawn(async move |_entity, cx| {
+            let result = task.await;
+            cx.update(|cx| {
+                this.update(cx, |this, cx| {
+                    this.roles_loading = false;
+                    match result {
+                        Ok(roles) => {
+                            this.discovered_roles = roles;
+                            this.status =
+                                Some(datatab_i18n::t!("sso_wizard.status.roles_discovered"));
+                        }
+                        Err(error) => {
+                            this.discovered_roles.clear();
+                            this.status = Some(datatab_i18n::t!(
+                                "sso_wizard.status.roles_failed",
+                                error = error
+                            ));
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+}
+
+impl EventEmitter<SsoWizardEvent> for SsoWizard {}
+
+impl Render for SsoWizard {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let title_text = datatab_i18n::t!("sso_wizard.title");
+        let csd_title_bar = platform::render_csd_title_bar(_window, cx, &title_text);
+
+        let content = if !self.visible {
+            div().into_any_element()
+        } else {
+            self.render_visible(_window, cx)
+        };
+
+        div()
+            .size_full()
+            .when_some(csd_title_bar, |el, title_bar| el.child(title_bar))
+            .child(content)
+            .into_any_element()
+    }
+}
+
+/// One discovered account or role in the wizard's framed list: 36 px, the
+/// icon, the strong name and an optional mono detail, with the tint wash and
+/// bar while it is the value in the field above.
+#[cfg(feature = "aws")]
+fn discovered_row(
+    id: impl Into<ElementId>,
+    icon: AppIcon,
+    name: String,
+    detail: Option<String>,
+    selected: bool,
+    cx: &App,
+) -> Stateful<Div> {
+    let theme = cx.theme();
+    let tint = ChromeColors::tint(theme);
+
+    div()
+        .id(id)
+        .relative()
+        .flex()
+        .flex_shrink_0()
+        .items_center()
+        .gap(ModalMetrics::LIST_ROW_GAP)
+        .h(SSO_LIST_ROW_HEIGHT)
+        .px(ModalMetrics::LIST_ROW_PADDING_X)
+        .border_b_1()
+        .border_color(theme.table_row_border)
+        .cursor_pointer()
+        .when(selected, |row| {
+            row.bg(tint.opacity(PaletteMetrics::SELECTED_ALPHA)).child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .bottom_0()
+                    .w(PaletteMetrics::SELECTION_BAR)
+                    .bg(tint),
+            )
+        })
+        .when(!selected, |row| row.hover(|row| row.bg(theme.list_hover)))
+        .child(
+            Icon::new(icon)
+                .size(ModalMetrics::LIST_ICON)
+                .color(if selected {
+                    tint
+                } else {
+                    theme.muted_foreground
+                }),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_color(ChromeColors::strong(theme))
+                .child(name),
+        )
+        .when_some(detail, |row, detail| {
+            row.child(
+                div()
+                    .flex_shrink_0()
+                    .font_family(datatab_components::fonts::editor_family(cx))
+                    .text_size(ModalMetrics::LIST_DETAIL_FONT)
+                    .text_color(theme.muted_foreground)
+                    .child(detail),
+            )
+        })
+}
+
+/// A 12-digit AWS account id in groups of four (`1234 5678 9012`); any
+/// other value is returned unchanged.
+#[cfg_attr(not(feature = "aws"), allow(dead_code))]
+fn grouped_account_id(account_id: &str) -> String {
+    if account_id.len() != 12 || !account_id.chars().all(|c| c.is_ascii_digit()) {
+        return account_id.to_string();
+    }
+
+    format!(
+        "{} {} {}",
+        &account_id[0..4],
+        &account_id[4..8],
+        &account_id[8..12]
+    )
+}
+
+impl SsoWizard {
+    fn render_step(&self, cx: &mut Context<Self>) -> AnyElement {
+        match self.step {
+            WizardStep::Start => div()
+                .flex()
+                .flex_col()
+                .gap(ModalMetrics::BODY_GAP)
+                .child(labeled_input(
+                    "sso-field-profile-name",
+                    datatab_i18n::t!("sso_wizard.field.profile_name"),
+                    &self.input_profile_name,
+                    cx,
+                ))
+                .child(labeled_input(
+                    "sso-field-start-url",
+                    datatab_i18n::t!("sso_wizard.field.start_url"),
+                    &self.input_start_url,
+                    cx,
+                ))
+                .child(labeled_input(
+                    "sso-field-region",
+                    datatab_i18n::t!("sso_wizard.field.region"),
+                    &self.input_region,
+                    cx,
+                ))
+                .into_any_element(),
+            WizardStep::Account => self.render_account_step(cx),
+            WizardStep::Role => self.render_role_step(cx),
+            WizardStep::Confirm => {
+                let rows = [
+                    (
+                        datatab_i18n::t!("sso_wizard.field.profile_name"),
+                        &self.input_profile_name,
+                    ),
+                    (
+                        datatab_i18n::t!("sso_wizard.field.start_url"),
+                        &self.input_start_url,
+                    ),
+                    (
+                        datatab_i18n::t!("sso_wizard.field.region"),
+                        &self.input_region,
+                    ),
+                    (
+                        datatab_i18n::t!("sso_wizard.field.account_id"),
+                        &self.input_account_id,
+                    ),
+                    (
+                        datatab_i18n::t!("sso_wizard.field.role_name"),
+                        &self.input_role_name,
+                    ),
+                ];
+
+                let theme = cx.theme();
+
+                modal_frame(cx)
+                    .children(rows.into_iter().map(|(label, input)| {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(ModalMetrics::LIST_ROW_GAP)
+                            .h(SSO_LIST_ROW_HEIGHT)
+                            .px(ModalMetrics::LIST_ROW_PADDING_X)
+                            .border_b_1()
+                            .border_color(theme.table_row_border)
+                            .child(
+                                div()
+                                    .w(SSO_CONFIRM_LABEL_WIDTH)
+                                    .flex_shrink_0()
+                                    .text_color(theme.muted_foreground)
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_family(datatab_components::fonts::editor_family(cx))
+                                    .text_size(ModalMetrics::CODE_FONT)
+                                    .text_color(ChromeColors::strong(theme))
+                                    .child(input.read(cx).value().to_string()),
+                            )
+                    }))
+                    .into_any_element()
+            }
+        }
+    }
+
+    fn render_account_step(&self, cx: &mut Context<Self>) -> AnyElement {
+        #[cfg_attr(not(feature = "aws"), allow(unused_mut))]
+        let mut step = div()
+            .flex()
+            .flex_col()
+            .gap(ModalMetrics::BODY_GAP)
+            .child(labeled_input(
+                "sso-field-account-id",
+                datatab_i18n::t!("sso_wizard.field.account_id"),
+                &self.input_account_id,
+                cx,
+            ));
+
+        #[cfg(feature = "aws")]
+        {
+            let value = self.input_account_id.read(cx).value().trim().to_string();
+            let query = value.to_lowercase();
+
+            let filtered_accounts = self
+                .discovered_accounts
+                .iter()
+                .filter(|account| {
+                    query.is_empty()
+                        || account.account_id == value
+                        || account.account_id.to_lowercase().contains(&query)
+                        || account.account_name.to_lowercase().contains(&query)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+
+            let discover_label = if self.accounts_loading {
+                datatab_i18n::t!("sso_wizard.account.discovering")
+            } else {
+                datatab_i18n::t!("sso_wizard.account.discover_button")
+            };
+
+            step = step
+                .child(
+                    div().flex().child(
+                        Button::new("sso-wizard-discover-accounts", discover_label)
+                            .icon(AppIcon::RefreshCcw)
+                            .disabled(self.accounts_loading)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.discover_accounts(cx);
+                            })),
+                    ),
+                )
+                .when(
+                    !self.accounts_loading
+                        && !self.discovered_accounts.is_empty()
+                        && filtered_accounts.is_empty(),
+                    |step| {
+                        step.child(Text::caption(datatab_i18n::t!(
+                            "sso_wizard.account.no_matches"
+                        )))
+                    },
+                )
+                .when(!filtered_accounts.is_empty(), |step| {
+                    step.child(
+                        modal_frame(cx).child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .max_h(DISCOVERED_LIST_MAX_HEIGHT)
+                                .overflow_y_scrollbar()
+                                .id("sso-wizard-account-list")
+                                .children(filtered_accounts.iter().enumerate().map(
+                                    |(index, account)| {
+                                        let account_id = account.account_id.clone();
+                                        let selected = account.account_id == value;
+
+                                        discovered_row(
+                                            ("sso-account", index),
+                                            AppIcon::Server,
+                                            account.account_name.clone(),
+                                            Some(grouped_account_id(&account.account_id)),
+                                            selected,
+                                            cx,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.input_account_id.update(cx, |state, cx| {
+                                                    state.set_value(account_id.clone(), window, cx);
+                                                });
+                                                cx.notify();
+                                            }),
+                                        )
+                                    },
+                                )),
+                        ),
+                    )
+                });
+        }
+
+        step.into_any_element()
+    }
+
+    fn render_role_step(&self, cx: &mut Context<Self>) -> AnyElement {
+        #[cfg_attr(not(feature = "aws"), allow(unused_mut))]
+        let mut step = div()
+            .flex()
+            .flex_col()
+            .gap(ModalMetrics::BODY_GAP)
+            .child(labeled_input(
+                "sso-field-role-name",
+                datatab_i18n::t!("sso_wizard.field.role_name"),
+                &self.input_role_name,
+                cx,
+            ));
+
+        #[cfg(feature = "aws")]
+        {
+            let value = self.input_role_name.read(cx).value().trim().to_string();
+            let query = value.to_lowercase();
+
+            let filtered_roles = self
+                .discovered_roles
+                .iter()
+                .filter(|role| {
+                    query.is_empty() || **role == value || role.to_lowercase().contains(&query)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+
+            let discover_label = if self.roles_loading {
+                datatab_i18n::t!("sso_wizard.role.discovering")
+            } else {
+                datatab_i18n::t!("sso_wizard.role.discover_button")
+            };
+
+            step = step
+                .child(
+                    div().flex().child(
+                        Button::new("sso-wizard-discover-roles", discover_label)
+                            .icon(AppIcon::RefreshCcw)
+                            .disabled(self.roles_loading)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.discover_roles_for_selected_account(cx);
+                            })),
+                    ),
+                )
+                .when(
+                    !self.roles_loading
+                        && !self.discovered_roles.is_empty()
+                        && filtered_roles.is_empty(),
+                    |step| {
+                        step.child(Text::caption(datatab_i18n::t!(
+                            "sso_wizard.role.no_matches"
+                        )))
+                    },
+                )
+                .when(!filtered_roles.is_empty(), |step| {
+                    step.child(
+                        modal_frame(cx).child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .max_h(DISCOVERED_LIST_MAX_HEIGHT)
+                                .overflow_y_scrollbar()
+                                .id("sso-wizard-role-list")
+                                .children(filtered_roles.iter().enumerate().map(
+                                    |(index, role)| {
+                                        let role_name = role.clone();
+                                        let selected = *role == value;
+
+                                        discovered_row(
+                                            ("sso-role", index),
+                                            AppIcon::KeyRound,
+                                            role.clone(),
+                                            None,
+                                            selected,
+                                            cx,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |this, _, window, cx| {
+                                                this.input_role_name.update(cx, |state, cx| {
+                                                    state.set_value(role_name.clone(), window, cx);
+                                                });
+                                                cx.notify();
+                                            }),
+                                        )
+                                    },
+                                )),
+                        ),
+                    )
+                });
+        }
+
+        step.into_any_element()
+    }
+
+    fn render_visible(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let close_entity = cx.entity().downgrade();
+        let close = move |_window: &mut Window, cx: &mut App| {
+            close_entity.update(cx, |this, cx| this.close(cx)).log_err();
+        };
+
+        let is_confirm = matches!(self.step, WizardStep::Confirm);
+
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap(ModalMetrics::BODY_GAP)
+            .child(render_wizard_stepper(&sso_rail_items(self.step), cx))
+            .child(self.render_step(cx))
+            .when_some(self.status.clone(), |body, status| {
+                body.child(Text::caption(status))
+            });
+
+        let footer = div()
+            .flex()
+            .items_center()
+            .gap(ModalMetrics::FOOTER_GAP)
+            .child(
+                Button::new("sso-wizard-back", datatab_i18n::t!("sso_wizard.back"))
+                    .icon(AppIcon::ChevronLeft)
+                    .disabled(matches!(self.step, WizardStep::Start))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.back(cx);
+                    })),
+            )
+            .child(
+                Button::new(
+                    "sso-wizard-next",
+                    if is_confirm {
+                        datatab_i18n::t!("sso_wizard.save")
+                    } else {
+                        datatab_i18n::t!("sso_wizard.next")
+                    },
+                )
+                .primary()
+                .icon(if is_confirm {
+                    AppIcon::Save
+                } else {
+                    AppIcon::ChevronRight
+                })
+                .on_click(cx.listener(|this, _, _, cx| {
+                    if matches!(this.step, WizardStep::Confirm) {
+                        this.save_profile(cx);
+                    } else {
+                        this.next(cx);
+                    }
+                })),
+            );
+
+        Modal::new(datatab_i18n::t!("sso_wizard.title"))
+            .id("sso-wizard")
+            .focus_handle(&self.focus_handle)
+            .on_close(close)
+            .key_context(ContextId::SqlPreviewModal.as_gpui_context())
+            .icon(AppIcon::Cable)
+            .width(SSO_WIZARD_WIDTH)
+            .body(body)
+            .footer(footer)
+            .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "aws")]
+    use super::{AwsSsoAccount, DISCOVERED_LIST_MAX_HEIGHT};
+    use super::{SsoWizard, WizardStep, grouped_account_id, sso_rail_items};
+    #[cfg(feature = "aws")]
+    use gpui::FrameAction;
+    use gpui::{AccessibilityFrame, FrameObserver, Role, TestAppContext};
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    /// Keeps the latest rendered accessibility frame of the window it observes.
+    #[derive(Default)]
+    struct FrameCapture(Mutex<Option<AccessibilityFrame>>);
+
+    impl FrameObserver for FrameCapture {
+        fn accessibility_updated(&self, frame: &AccessibilityFrame) {
+            *self.0.lock().expect("frame capture lock") = Some(frame.clone());
+        }
+    }
+
+    /// Opens the wizard in a test window, moves it to `step`, lets `prepare`
+    /// adjust its state, and returns the latest rendered frame.
+    fn render_wizard(
+        step: WizardStep,
+        prepare: impl FnOnce(&mut SsoWizard) + 'static,
+        cx: &mut TestAppContext,
+    ) -> AccessibilityFrame {
+        cx.update(gpui_component::init);
+        let app_state = crate::object_tree::test_support::test_app_state(cx);
+
+        let capture = Arc::new(FrameCapture::default());
+        let capture_for_window = capture.clone();
+        let (_wizard, visual) = cx.add_window_view(move |window, cx| {
+            window.observe_frames(&capture_for_window);
+
+            let mut wizard = SsoWizard::new(app_state, window, cx);
+            wizard.open(window, cx);
+            wizard.step = step;
+            prepare(&mut wizard);
+
+            window.refresh();
+            wizard
+        });
+        visual.run_until_parked();
+
+        capture
+            .0
+            .lock()
+            .expect("frame capture lock")
+            .clone()
+            .expect("the window rendered a frame")
+    }
+
+    /// Checks that every `(id, label)` pair is a text input addressed by `id`
+    /// whose accessible name is `label`, and that `label` is visible text.
+    fn assert_labeled_inputs(frame: &AccessibilityFrame, expected: &[(&str, String)]) {
+        let text_inputs: HashMap<String, Option<String>> = frame
+            .nodes()
+            .filter_map(|(_, node)| {
+                let accessible = frame.accessibility_node(node)?;
+                (accessible.role() == Role::TextInput).then(|| {
+                    (
+                        node.id().to_owned(),
+                        accessible.label().map(ToOwned::to_owned),
+                    )
+                })
+            })
+            .collect();
+
+        for (id, label) in expected {
+            assert_eq!(
+                text_inputs.get(*id),
+                Some(&Some(label.clone())),
+                "input {id} in {text_inputs:?}"
+            );
+            assert!(
+                frame
+                    .nodes()
+                    .any(|(_, node)| node.content_text().contains(label.as_str())),
+                "label {label} is not visible"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn start_step_inputs_have_visible_labels_ids_and_names(cx: &mut TestAppContext) {
+        let frame = render_wizard(WizardStep::Start, |_| {}, cx);
+
+        assert_labeled_inputs(
+            &frame,
+            &[
+                (
+                    "sso-field-profile-name",
+                    datatab_i18n::t!("sso_wizard.field.profile_name"),
+                ),
+                (
+                    "sso-field-start-url",
+                    datatab_i18n::t!("sso_wizard.field.start_url"),
+                ),
+                (
+                    "sso-field-region",
+                    datatab_i18n::t!("sso_wizard.field.region"),
+                ),
+            ],
+        );
+    }
+
+    #[gpui::test]
+    fn account_step_input_has_visible_label_id_and_name(cx: &mut TestAppContext) {
+        let frame = render_wizard(WizardStep::Account, |_| {}, cx);
+
+        assert_labeled_inputs(
+            &frame,
+            &[(
+                "sso-field-account-id",
+                datatab_i18n::t!("sso_wizard.field.account_id"),
+            )],
+        );
+    }
+
+    #[gpui::test]
+    fn role_step_input_has_visible_label_id_and_name(cx: &mut TestAppContext) {
+        let frame = render_wizard(WizardStep::Role, |_| {}, cx);
+
+        assert_labeled_inputs(
+            &frame,
+            &[(
+                "sso-field-role-name",
+                datatab_i18n::t!("sso_wizard.field.role_name"),
+            )],
+        );
+    }
+
+    #[gpui::test]
+    fn steps_render_in_the_shared_wizard_stepper(cx: &mut TestAppContext) {
+        let frame = render_wizard(WizardStep::Role, |_| {}, cx);
+
+        for (index, step) in WizardStep::ALL.iter().enumerate() {
+            let step_id = format!("wizard-step-{index}");
+            let entry = frame
+                .nodes()
+                .find(|(_, node)| node.id() == step_id)
+                .map(|(_, node)| node)
+                .unwrap_or_else(|| panic!("stepper entry {step_id} is rendered"));
+
+            assert!(
+                entry.content_text().contains(step.label().as_str()),
+                "stepper entry {step_id} shows {}",
+                step.label()
+            );
+        }
+    }
+
+    #[test]
+    fn twelve_digit_account_ids_are_grouped_by_four() {
+        assert_eq!(grouped_account_id("123456789012"), "1234 5678 9012");
+        assert_eq!(grouped_account_id("12345"), "12345");
+        assert_eq!(grouped_account_id("abcdefghijkl"), "abcdefghijkl");
+    }
+
+    #[test]
+    fn rail_marks_steps_before_the_current_one_completed() {
+        let items = sso_rail_items(WizardStep::Role);
+
+        let states: Vec<(bool, bool)> = items
+            .iter()
+            .map(|item| (item.completed, item.current))
+            .collect();
+
+        assert_eq!(
+            states,
+            vec![(true, false), (true, false), (false, true), (false, false)]
+        );
+    }
+
+    /// Checks that the scrollable list `id`, filled with more rows than fit,
+    /// stops growing at the list height cap and that its scroll area takes
+    /// scrolling.
+    #[cfg(feature = "aws")]
+    fn assert_bounded_scroll_list(frame: &AccessibilityFrame, id: &str) {
+        let node = |node_id: String| {
+            frame
+                .nodes()
+                .map(|(_, node)| node)
+                .find(|node| node.id() == node_id)
+                .unwrap_or_else(|| panic!("{node_id} is rendered"))
+        };
+
+        let list_height = node(id.to_string()).bounds().size.height;
+        assert_eq!(
+            list_height, DISCOVERED_LIST_MAX_HEIGHT,
+            "{id} should fill the height cap and scroll the rest"
+        );
+
+        let area = node(format!("{id}-area"));
+        assert!(
+            area.actions().contains(&FrameAction::Scroll),
+            "{id} does not scroll: {:?}",
+            area.actions()
+        );
+    }
+
+    #[cfg(feature = "aws")]
+    #[gpui::test]
+    fn discovered_accounts_scroll_inside_a_bounded_list(cx: &mut TestAppContext) {
+        let frame = render_wizard(
+            WizardStep::Account,
+            |wizard| {
+                wizard.discovered_accounts = (0..60)
+                    .map(|index| AwsSsoAccount {
+                        account_id: format!("{index:012}"),
+                        account_name: format!("account-{index}"),
+                        email_address: None,
+                    })
+                    .collect();
+            },
+            cx,
+        );
+
+        assert_bounded_scroll_list(&frame, "sso-wizard-account-list");
+    }
+
+    #[cfg(feature = "aws")]
+    #[gpui::test]
+    fn discovered_roles_scroll_inside_a_bounded_list(cx: &mut TestAppContext) {
+        let frame = render_wizard(
+            WizardStep::Role,
+            |wizard| {
+                wizard.discovered_roles = (0..60).map(|index| format!("Role{index}")).collect();
+            },
+            cx,
+        );
+
+        assert_bounded_scroll_list(&frame, "sso-wizard-role-list");
+    }
+
+    const SSO_WIZARD_KEYS: &[&str] = &[
+        "sso_wizard.title",
+        "sso_wizard.step.start",
+        "sso_wizard.step.account",
+        "sso_wizard.step.role",
+        "sso_wizard.step.confirm",
+        "sso_wizard.field.profile_name",
+        "sso_wizard.field.start_url",
+        "sso_wizard.field.region",
+        "sso_wizard.field.account_id",
+        "sso_wizard.field.role_name",
+        "sso_wizard.account.discovering",
+        "sso_wizard.account.discover_button",
+        "sso_wizard.account.no_matches",
+        "sso_wizard.role.discovering",
+        "sso_wizard.role.discover_button",
+        "sso_wizard.role.no_matches",
+        "sso_wizard.back",
+        "sso_wizard.next",
+        "sso_wizard.save",
+        "sso_wizard.status.missing_required",
+        "sso_wizard.status.fill_before_account_discovery",
+        "sso_wizard.status.discovering_accounts",
+        "sso_wizard.status.accounts_discovered",
+        "sso_wizard.status.accounts_failed",
+        "sso_wizard.status.fill_before_role_discovery",
+        "sso_wizard.status.discovering_roles",
+        "sso_wizard.status.roles_discovered",
+        "sso_wizard.status.roles_failed",
+        "sso_wizard.status.profile_created",
+    ];
+
+    #[test]
+    fn sso_wizard_catalog_keys_resolve() {
+        for key in SSO_WIZARD_KEYS.iter().copied() {
+            let value = datatab_i18n::t!(key, locale = "en");
+
+            assert!(!value.is_empty(), "empty translation for {key}");
+            assert_ne!(value, key, "missing translation for {key}");
+        }
+    }
+}

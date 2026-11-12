@@ -1,0 +1,447 @@
+use datatab_app::keymap::Command;
+use gpui::*;
+
+use super::context_menu::KvMenuTarget;
+use super::{KeyValueFocusMode, KvValueViewMode};
+
+impl super::KeyValueDocument {
+    pub fn dispatch_command(
+        &mut self,
+        cmd: Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // Tab and Shift+Tab move through a dialog's form like J and K, and
+        // never reach the workspace, which would move focus behind it.
+        let (form_cmd, owns_tab) = match cmd {
+            Command::CycleFocusForward => (Command::SelectNext, true),
+            Command::CycleFocusBackward => (Command::SelectPrev, true),
+            other => (other, false),
+        };
+
+        if self.new_key_modal.read(cx).is_visible() {
+            let handled = self
+                .new_key_modal
+                .update(cx, |modal, cx| modal.dispatch_command(form_cmd, window, cx));
+
+            if !self.new_key_modal.read(cx).is_visible() {
+                self.focus_mode = KeyValueFocusMode::List;
+                self.focus_handle.focus(window, cx);
+                cx.notify();
+            }
+
+            return handled || owns_tab;
+        }
+
+        if self.add_member_modal.read(cx).is_visible() {
+            let handled = self
+                .add_member_modal
+                .update(cx, |modal, cx| modal.dispatch_command(form_cmd, window, cx));
+
+            if !self.add_member_modal.read(cx).is_visible() {
+                self.focus_mode = KeyValueFocusMode::ValuePanel;
+                self.focus_handle.focus(window, cx);
+                cx.notify();
+            }
+
+            return handled || owns_tab;
+        }
+
+        if self.context_menu.is_some() {
+            return self.dispatch_menu_command(cmd, window, cx);
+        }
+
+        if self.bulk_delete.is_some() {
+            return match cmd {
+                Command::Cancel => {
+                    self.close_bulk_delete(window, cx);
+                    true
+                }
+                Command::Execute => {
+                    self.confirm_bulk_delete(cx);
+                    true
+                }
+                _ => false,
+            };
+        }
+
+        if self.expiry_editor.is_some() {
+            return match cmd {
+                Command::Cancel => {
+                    self.close_expiry_editor(window, cx);
+                    true
+                }
+                Command::Execute => {
+                    self.apply_expiry_editor(window, cx);
+                    true
+                }
+                _ => false,
+            };
+        }
+
+        match cmd {
+            // -- Context menu --
+            Command::OpenContextMenu => {
+                let target = match self.focus_mode {
+                    KeyValueFocusMode::ValuePanel => KvMenuTarget::Value,
+                    _ => KvMenuTarget::Key,
+                };
+                let position = self.keyboard_menu_position(target, window);
+                self.open_context_menu(target, position, window, cx);
+                true
+            }
+
+            // -- Panel switching (h/l) --
+            Command::ColumnLeft => {
+                if self.focus_mode == KeyValueFocusMode::ValuePanel {
+                    if self.is_document_view_active()
+                        && let Some(ts) = &self.document_tree_state
+                    {
+                        let cursor = ts.read(cx).cursor().cloned();
+                        let is_expanded = cursor
+                            .as_ref()
+                            .map(|id| ts.read(cx).is_expanded(id))
+                            .unwrap_or(false);
+                        let is_root = cursor
+                            .as_ref()
+                            .map(|id| id.parent().is_none())
+                            .unwrap_or(true);
+
+                        if is_expanded || !is_root {
+                            ts.update(cx, |s, cx| s.handle_left(cx));
+                            return true;
+                        }
+                    }
+
+                    self.focus_mode = KeyValueFocusMode::List;
+                    cx.notify();
+                } else if let Some((prefix, true)) = self.folder_at_cursor() {
+                    self.toggle_folder(&prefix, cx);
+                }
+                true
+            }
+            Command::ColumnRight => {
+                if self.focus_mode != KeyValueFocusMode::ValuePanel
+                    && let Some((prefix, expanded)) = self.folder_at_cursor()
+                {
+                    if !expanded {
+                        self.toggle_folder(&prefix, cx);
+                    }
+                    return true;
+                }
+
+                if self.focus_mode == KeyValueFocusMode::List && self.selected_value.is_some() {
+                    self.focus_mode = KeyValueFocusMode::ValuePanel;
+
+                    if self.is_document_view_active()
+                        && let Some(ts) = &self.document_tree_state
+                        && ts.read(cx).cursor().is_none()
+                    {
+                        ts.update(cx, |s, cx| s.move_to_first(cx));
+                    } else if self.selected_member_index.is_none()
+                        && !self.cached_members.is_empty()
+                    {
+                        self.selected_member_index = Some(0);
+                    }
+
+                    cx.notify();
+                } else if self.focus_mode == KeyValueFocusMode::ValuePanel
+                    && self.is_document_view_active()
+                    && let Some(ts) = &self.document_tree_state
+                {
+                    ts.update(cx, |s, cx| s.handle_right(cx));
+                }
+                true
+            }
+
+            // -- Vertical navigation (j/k) --
+            Command::SelectNext => {
+                match self.focus_mode {
+                    KeyValueFocusMode::ValuePanel => {
+                        if self.is_document_view_active() {
+                            if let Some(ts) = &self.document_tree_state {
+                                ts.update(cx, |s, cx| {
+                                    s.move_cursor(
+                                        datatab_components::components::document_tree::TreeDirection::Down,
+                                        cx,
+                                    );
+                                });
+                            }
+                        } else {
+                            self.move_member_selection(1, cx);
+                        }
+                    }
+                    _ => {
+                        self.focus_mode = KeyValueFocusMode::List;
+                        self.move_selection(1, cx);
+                    }
+                }
+                true
+            }
+            Command::SelectPrev => {
+                match self.focus_mode {
+                    KeyValueFocusMode::ValuePanel => {
+                        if self.is_document_view_active() {
+                            if let Some(ts) = &self.document_tree_state {
+                                ts.update(cx, |s, cx| {
+                                    s.move_cursor(
+                                        datatab_components::components::document_tree::TreeDirection::Up,
+                                        cx,
+                                    );
+                                });
+                            }
+                        } else {
+                            self.move_member_selection(-1, cx);
+                        }
+                    }
+                    _ => {
+                        self.focus_mode = KeyValueFocusMode::List;
+                        self.move_selection(-1, cx);
+                    }
+                }
+                true
+            }
+            Command::SelectFirst => {
+                match self.focus_mode {
+                    KeyValueFocusMode::ValuePanel => {
+                        if self.is_document_view_active() {
+                            if let Some(ts) = &self.document_tree_state {
+                                ts.update(cx, |s, cx| s.move_to_first(cx));
+                            }
+                        } else if !self.cached_members.is_empty() {
+                            self.selected_member_index = Some(0);
+                            cx.notify();
+                        }
+                    }
+                    _ => {
+                        self.focus_mode = KeyValueFocusMode::List;
+                        self.move_selection_to_edge(false, cx);
+                    }
+                }
+                true
+            }
+            Command::SelectLast => {
+                match self.focus_mode {
+                    KeyValueFocusMode::ValuePanel => {
+                        if self.is_document_view_active() {
+                            if let Some(ts) = &self.document_tree_state {
+                                ts.update(cx, |s, cx| s.move_to_last(cx));
+                            }
+                        } else if !self.cached_members.is_empty() {
+                            self.selected_member_index = Some(self.cached_members.len() - 1);
+                            cx.notify();
+                        }
+                    }
+                    _ => {
+                        self.focus_mode = KeyValueFocusMode::List;
+                        self.move_selection_to_edge(true, cx);
+                    }
+                }
+                true
+            }
+            Command::ExpandCollapse => {
+                if self.focus_mode != KeyValueFocusMode::ValuePanel
+                    && let Some((prefix, _)) = self.folder_at_cursor()
+                {
+                    self.toggle_folder(&prefix, cx);
+                    return true;
+                }
+
+                if self.focus_mode == KeyValueFocusMode::ValuePanel
+                    && self.is_document_view_active()
+                    && let Some(ts) = &self.document_tree_state
+                {
+                    let cursor = ts.read(cx).cursor().cloned();
+                    if let Some(id) = cursor {
+                        ts.update(cx, |s, cx| s.toggle_expand(&id, cx));
+                    }
+                }
+                true
+            }
+
+            // -- Actions --
+            Command::Delete => {
+                if self.focus_mode == KeyValueFocusMode::ValuePanel {
+                    if let Some(idx) = self.selected_member_index {
+                        self.request_delete_member(idx, cx);
+                    }
+                } else if self.folder_at_cursor().is_none() {
+                    self.request_delete_key(cx);
+                }
+                true
+            }
+            Command::Rename => {
+                self.start_rename(window, cx);
+                true
+            }
+            Command::FocusSearch | Command::FocusToolbar => {
+                let target_input = if self.focus_mode == KeyValueFocusMode::ValuePanel {
+                    &self.members_filter_input
+                } else {
+                    &self.filter_input
+                };
+                target_input.update(cx, |input, cx| input.focus(window, cx));
+                self.focus_mode = KeyValueFocusMode::TextInput;
+                cx.notify();
+                true
+            }
+            Command::FocusUp => {
+                self.focus_mode = KeyValueFocusMode::TextInput;
+                self.filter_input
+                    .update(cx, |input, cx| input.focus(window, cx));
+                cx.notify();
+                true
+            }
+            Command::FocusDown => {
+                self.focus_mode = KeyValueFocusMode::List;
+                self.focus_handle.focus(window, cx);
+                cx.notify();
+                true
+            }
+            Command::Cancel => {
+                if self.console_has_pending(cx) {
+                    self.cancel_console_command(cx);
+                } else if self.bulk_actions_open {
+                    self.bulk_actions_open = false;
+                } else if self.pending_key_delete.is_some() {
+                    self.cancel_delete_key(cx);
+                } else if self.pending_member_delete.is_some() {
+                    self.cancel_delete_member(cx);
+                } else if self.string_edit_input.is_some() {
+                    self.cancel_string_edit(cx);
+                    self.focus_handle.focus(window, cx);
+                } else if self.renaming_index.is_some() {
+                    self.cancel_rename(cx);
+                    self.focus_handle.focus(window, cx);
+                } else if self.editing_member_index.is_some() {
+                    self.cancel_member_edit(cx);
+                    self.focus_handle.focus(window, cx);
+                } else if self.runner.cancel_primary(cx) {
+                    self.last_error = None;
+                } else {
+                    self.focus_mode = KeyValueFocusMode::List;
+                    self.focus_handle.focus(window, cx);
+                }
+                cx.notify();
+                true
+            }
+            Command::Execute => {
+                // In the console's input, Enter already answers through the
+                // input itself.
+                if self.focus_mode != KeyValueFocusMode::TextInput && self.console_has_pending(cx) {
+                    self.confirm_console_command(cx);
+                    return true;
+                }
+                if self.pending_key_delete.is_some() {
+                    self.confirm_delete_key(cx);
+                    return true;
+                }
+                if self.pending_member_delete.is_some() {
+                    self.confirm_delete_member(cx);
+                    return true;
+                }
+                if self.focus_mode != KeyValueFocusMode::ValuePanel
+                    && let Some((prefix, _)) = self.folder_at_cursor()
+                {
+                    self.toggle_folder(&prefix, cx);
+                    return true;
+                }
+
+                if self.focus_mode == KeyValueFocusMode::ValuePanel {
+                    if self.is_document_view_active() {
+                        if let Some(ts) = &self.document_tree_state {
+                            ts.update(cx, |s, cx| s.start_edit_at_cursor(window, cx));
+                        }
+                        return true;
+                    }
+
+                    if self.is_stream_type() {
+                        return true;
+                    }
+                    if self.is_structured_type() {
+                        if let Some(idx) = self.selected_member_index {
+                            self.start_member_edit(idx, window, cx);
+                        }
+                    } else {
+                        self.start_string_edit(window, cx);
+                    }
+                    return true;
+                }
+                self.start_string_edit(window, cx);
+                true
+            }
+            Command::ResultsNextPage | Command::PageDown => {
+                if self.focus_mode == KeyValueFocusMode::ValuePanel
+                    && self.is_document_view_active()
+                {
+                    if let Some(ts) = &self.document_tree_state {
+                        ts.update(cx, |s, cx| s.page_down(20, cx));
+                    }
+                } else if self.focus_mode == KeyValueFocusMode::ValuePanel {
+                    if self.can_load_more_ranged() {
+                        self.load_more_ranged(cx);
+                    }
+                } else if cmd == Command::ResultsNextPage {
+                    self.load_more_keys(cx);
+                } else {
+                    self.focus_mode = KeyValueFocusMode::List;
+                    self.move_selection(20, cx);
+                }
+                true
+            }
+            Command::ResultsPrevPage | Command::PageUp => {
+                if self.focus_mode == KeyValueFocusMode::ValuePanel
+                    && self.is_document_view_active()
+                {
+                    if let Some(ts) = &self.document_tree_state {
+                        ts.update(cx, |s, cx| s.page_up(20, cx));
+                    }
+                } else if cmd == Command::PageUp && self.focus_mode != KeyValueFocusMode::ValuePanel
+                {
+                    self.focus_mode = KeyValueFocusMode::List;
+                    self.move_selection(-20, cx);
+                }
+                true
+            }
+            Command::ResultsAddRow => {
+                // Open the dialog here rather than deferring to render: a
+                // modal made visible during this document's render would be
+                // seen by the window root one frame late, when the root has
+                // already computed the key context for the frame, so Tab on
+                // the very next keystroke would fall through to the root.
+                if self.focus_mode == KeyValueFocusMode::ValuePanel && self.is_structured_type() {
+                    if let Some(key_type) = self.selected_key_type() {
+                        self.add_member_modal
+                            .update(cx, |modal, cx| modal.open(key_type, window, cx));
+                    }
+                } else {
+                    self.new_key_modal
+                        .update(cx, |modal, cx| modal.open(window, cx));
+                }
+                cx.notify();
+                true
+            }
+            Command::ResultsCopyRow => {
+                let text = match self.focus_mode {
+                    KeyValueFocusMode::ValuePanel => self
+                        .selected_member_index
+                        .and_then(|idx| self.cached_members.get(idx))
+                        .map(|m| m.display.clone()),
+                    _ => self
+                        .selected_index
+                        .and_then(|idx| self.keys.get(idx))
+                        .map(|entry| entry.key.clone()),
+                };
+                if let Some(text) = text {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+                true
+            }
+            Command::RefreshSchema => {
+                self.reload_keys(cx);
+                true
+            }
+            _ => false,
+        }
+    }
+}

@@ -1,0 +1,29 @@
+[package]
+name = "datatab_mcp"
+publish = false
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+datatab_storage.workspace = true
+
+[dependencies]
+datatab_approval.workspace = true
+datatab_audit.workspace = true
+datatab_core.workspace = true
+datatab_policy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,137 @@
+#![allow(dead_code)]
+
+use uuid::Uuid;
+
+pub use datatab_core::document_id::DocumentId;
+
+/// Supported document types.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DocumentKind {
+    /// SQL script with editor + embedded results.
+    Script,
+    /// Data grid (table browser or promoted result).
+    Data,
+    // Legacy (kept for compatibility during migration)
+    SqlQuery,
+    TableView,
+    // v0.4+ (Redis)
+    RedisKeyBrowser,
+    RedisKey,
+    RedisConsole,
+    // v0.5+ (MongoDB)
+    MongoCollection,
+    // Global audit viewer
+    Audit,
+    // Schema relationship diagram
+    SchemaViz,
+    // Standalone chart document
+    Chart,
+    // Dashboard document (named collection of chart panels)
+    Dashboard,
+    // Schema diff & apply document
+    SchemaDiff,
+    // Object-storage buckets table (connection root for DatabaseCategory::ObjectStorage)
+    ObjectStorageBuckets,
+    // Object-storage bucket browser (prefix/object tree opened from the buckets table)
+    ObjectBrowser,
+    // A single object-storage text object opened in its own editor tab
+    ObjectEditor,
+    // Offline analysis report for a driver's native dump/export file
+    DumpAnalysis,
+    // A delimited text file (CSV or TSV) opened as a table
+    Delimited,
+    // A Parquet file opened read-only as a paged table
+    Parquet,
+    // A spreadsheet workbook (xlsx, xlsm, xls, ods) opened one sheet at a time
+    Spreadsheet,
+    // MCP approvals queue (agent calls parked for a person)
+    McpApprovals,
+    // Migrate-data wizard (table -> table, cross-connection)
+    MigrateWizard,
+    // Native command console in its own tab (driver-agnostic)
+    Console,
+    // One store of a secret-store connection (DatabaseCategory::SecretStore)
+    SecretStore,
+}
+
+/// Source kind for DataDocument (affects icon and behavior).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DataSourceKind {
+    /// Table browser (server-side pagination).
+    #[default]
+    Table,
+    Collection,
+    /// Promoted query result (static data).
+    QueryResult,
+}
+
+/// Document icon (enum for type-safety).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DocumentIcon {
+    Sql,
+    Script,
+    Table,
+    Redis,
+    RedisKey,
+    Terminal,
+    Mongo,
+    Collection,
+    Audit,
+    SchemaViz,
+    Chart,
+    Dashboard,
+    Buckets,
+    ObjectBrowser,
+    DumpAnalysis,
+    McpApprovals,
+    Migrate,
+    SecretStore,
+}
+
+impl DocumentIcon {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Sql => "file-code",
+            Self::Script => "file-text",
+            Self::Table => "table",
+            Self::Redis => "key-round",
+            Self::RedisKey => "key",
+            Self::Terminal => "terminal",
+            Self::Mongo => "database",
+            Self::Collection => "box",
+            Self::Audit => "shield",
+            Self::SchemaViz => "layers",
+            Self::Chart => "bar-chart-2",
+            Self::Dashboard => "layout-dashboard",
+            Self::Buckets => "box",
+            Self::ObjectBrowser => "folder-open",
+            Self::DumpAnalysis => "hard-drive",
+            Self::McpApprovals => "bot",
+            Self::Migrate => "arrow-up-down",
+            Self::SecretStore => "lock",
+        }
+    }
+}
+
+/// Document state.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum DocumentState {
+    #[default]
+    Clean,
+    Modified,
+    Executing,
+    Loading,
+    Error,
+}
+
+/// Metadata snapshot for TabBar (cheap Clone).
+#[derive(Clone, Debug)]
+pub struct DocumentMetaSnapshot {
+    pub id: DocumentId,
+    pub kind: DocumentKind,
+    pub title: String,
+    pub icon: DocumentIcon,
+    pub state: DocumentState,
+    pub closable: bool,
+    pub connection_id: Option<Uuid>,
+}

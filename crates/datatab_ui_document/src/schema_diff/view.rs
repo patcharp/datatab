@@ -1,0 +1,3990 @@
+//! `SchemaDiffDocument` — the schema-diff & apply document.
+//!
+//! Resolves two schema sources (live-to-live by default, snapshot-to-live as a
+//! secondary mode), renders the per-table diff with a three-level risk badge and
+//! selection checkboxes, previews the driver-generated DDL read-only, and applies
+//! the selected changes through `DdlApplyExecutor` behind a hard-confirm gate.
+//! Changes the driver cannot express are surfaced explicitly, never dropped.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+use datatab_app::keymap::{Command, ContextId};
+use datatab_components::common::time_range::{TimestampDisplayMode, format_timestamp_ms};
+use datatab_components::composites::{RailMark, RailNav, rail_scroll_area};
+use datatab_components::icons::AppIcon;
+use datatab_components::modals::{
+    ModalMutationConfirmHard, MutationConfirmHardRequest, MutationConfirmOutcome,
+};
+use datatab_components::primitives::{Badge, BadgeTone, Icon, Text};
+use datatab_components::tokens::{ChromeColors, Fields, FontSizes, Heights, Radii, Spacing};
+use datatab_core::{
+    ConnectedProfile, Connection, EventSink, ExecutionClassification, MutationPolicy,
+    QueryLanguage, ReadOnlyReason, RefreshPolicy, RiskedChange, SchemaChange,
+    TableCreationMetadata, TableInfo, TableRef, diff_schema,
+};
+use datatab_storage::error::StorageError;
+use datatab_storage::repositories::sch_schema_snapshots::{
+    SchemaSnapshotRepo, SchemaSnapshotSummary,
+};
+use datatab_ui_base::sql_preview_modal::SqlPreviewModal;
+use datatab_ui_base::toast::{PendingToast, flush_pending_toast};
+use datatab_ui_base::user_error::{ErrorKind, UserFacingError, report_error, report_error_async};
+use datatab_ui_base::{AppStateChanged, AppStateEntity};
+use gpui::prelude::*;
+use gpui::*;
+use gpui_component::ActiveTheme;
+use uuid::Uuid;
+
+use super::apply::{
+    DdlApplyDeps, DdlApplyExecutor, FrozenDdlApply, TableLevelAction,
+    build_statements_for_table_action,
+};
+use super::diff_source::{
+    DiffMode, PartitionedChanges, ReferenceTarget, RiskBadge, SourcePicker, TableActionOutcome,
+    UnsupportedChange, classify_table_action, live_reference_ready,
+    partition_table_changes_for_route, resolve_same_connection_shallow,
+    same_connection_reference_databases,
+};
+use crate::handle::DocumentEvent;
+use crate::types::{DocumentIcon, DocumentId, DocumentKind, DocumentMetaSnapshot, DocumentState};
+
+fn load_existing_profile_snapshots(
+    repo: &SchemaSnapshotRepo,
+    profile_id: &str,
+    database: Option<&str>,
+) -> Result<Vec<SchemaSnapshotSummary>, StorageError> {
+    if !repo.profile_exists(profile_id)? {
+        return Ok(Vec::new());
+    }
+    repo.list(profile_id, database)
+}
+
+#[allow(clippy::too_many_arguments)] // Keep every completion identity explicit at the foreground boundary.
+fn apply_snapshot_load_result(
+    snapshots: &mut Vec<SchemaSnapshotSummary>,
+    requested_ticket: u64,
+    current_ticket: u64,
+    mode: DiffMode,
+    requested_profile: Uuid,
+    current_profile: Uuid,
+    requested_database: Option<&str>,
+    current_database: Option<&str>,
+    profile_exists: bool,
+    result: &Result<Vec<SchemaSnapshotSummary>, StorageError>,
+) -> bool {
+    if requested_ticket != current_ticket
+        || mode != DiffMode::SnapshotVsLive
+        || requested_profile != current_profile
+        || requested_database != current_database
+        || !profile_exists
+    {
+        return false;
+    }
+    if let Ok(loaded) = result {
+        *snapshots = loaded.clone();
+    }
+    true
+}
+
+fn invalidate_snapshot_profile_if_missing(
+    snapshots: &mut Vec<SchemaSnapshotSummary>,
+    selected: &mut Option<Uuid>,
+    ticket: &mut u64,
+    profile: Uuid,
+    profiles: &[Uuid],
+) -> bool {
+    if profiles.contains(&profile) {
+        return false;
+    }
+    *ticket = ticket.wrapping_add(1);
+    snapshots.clear();
+    *selected = None;
+    true
+}
+
+/// One table's slice of the diff, grouped for rendering.
+pub(super) struct TableDiffGroup {
+    table: TableRef,
+    /// Human header, e.g. "public.users".
+    header: String,
+    /// Changes the driver can apply, with a stable index used for selection.
+    pub(super) applicable: Vec<RiskedChange>,
+    /// Changes surfaced explicitly as unsupported (never applied).
+    unsupported: Vec<UnsupportedChange>,
+    /// Present for whole-table add/remove (`TableChange::TableAdded`/
+    /// `TableRemoved`), which carry no per-column `RiskedChange` of their own.
+    pub(super) table_action: Option<TableActionOutcome>,
+}
+
+impl TableDiffGroup {
+    fn is_empty(&self) -> bool {
+        self.applicable.is_empty() && self.unsupported.is_empty() && self.table_action.is_none()
+    }
+}
+
+/// One table's selected work: individual column/index changes plus, if
+/// selected, the whole-table action and its risk (for approval-routing
+/// classification).
+#[derive(Clone)]
+struct SelectedTableWork {
+    table: TableRef,
+    changes: Vec<RiskedChange>,
+    table_action: Option<(TableLevelAction, ExecutionClassification)>,
+}
+
+/// Explicit lifecycle of the diff computation. Separates a genuine failure
+/// (`Error`) from a clean, successful comparison that simply found no
+/// differences (`Empty`); the two were previously conflated behind a single
+/// `status_message`, which made an identical-schema result render as an error.
+enum ComputeState {
+    /// No comparison has run yet.
+    Idle,
+    /// A comparison (or an apply that re-runs the comparison) is in progress.
+    Loading,
+    /// The comparison failed with a fatal error to surface to the user.
+    Error(String),
+    /// The comparison succeeded and found no differences.
+    Empty,
+    /// The comparison succeeded and produced at least one diff group.
+    Diff,
+}
+
+/// Maps the compute lifecycle onto the document chrome state. A clean no-diff
+/// result (`Empty`) is a healthy `Clean` state — NOT an error — which is the
+/// whole point of separating `Empty` from `Error`.
+fn document_state_for(state: &ComputeState) -> DocumentState {
+    match state {
+        ComputeState::Loading => DocumentState::Loading,
+        ComputeState::Error(_) => DocumentState::Error,
+        ComputeState::Idle | ComputeState::Empty | ComputeState::Diff => DocumentState::Clean,
+    }
+}
+
+/// Successful multi-table apply summary (FIX-6 aggregate reporting).
+struct ApplyRunOutcome {
+    statements_applied: usize,
+    tables_applied: usize,
+}
+
+/// Multi-table apply failure carrying the running progress so the user learns
+/// how many tables committed before the stop and which one failed.
+struct ApplyRunFailure {
+    failed_table: String,
+    tables_applied: usize,
+    statements_applied: usize,
+    message: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreparationContext {
+    mode: DiffMode,
+    reference: Option<ReferenceTarget>,
+    snapshot: Option<Uuid>,
+    profile_id: Uuid,
+    database: Option<String>,
+    target_schema_fingerprint: String,
+    target_connection_identity: usize,
+    reference_connection_identity: Option<usize>,
+    reference_database: Option<String>,
+    reference_schema: Option<String>,
+    policy: MutationPolicy,
+
+    selection: Vec<(usize, usize)>,
+    table_actions: Vec<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PreparationBinding {
+    ticket: u64,
+    context: PreparationContext,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ComputeBinding {
+    ticket: u64,
+    context: PreparationContext,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReferenceContextDetails {
+    connection_identity: Option<usize>,
+    database: Option<String>,
+    schema_fingerprint: String,
+}
+
+fn schema_identity_from_serialized(
+    serialized: Result<String, serde_json::Error>,
+) -> Result<String, String> {
+    serialized.map_err(|error| {
+        let message = format!("Could not serialize complete schema metadata for identity: {error}");
+        log::error!("{message}");
+        message
+    })
+}
+
+fn schema_fingerprint(tables: &[TableInfo]) -> Result<String, String> {
+    schema_identity_from_serialized(serde_json::to_string(tables))
+}
+
+fn same_connection_reference_context(
+    database: String,
+    tables: &[TableInfo],
+    connection_identity: usize,
+) -> Result<ReferenceContextDetails, String> {
+    Ok(ReferenceContextDetails {
+        connection_identity: Some(connection_identity),
+        database: Some(database.clone()),
+        schema_fingerprint: schema_fingerprint(tables)?,
+    })
+}
+
+fn other_connection_shallow(
+    connection: &ConnectedProfile,
+    selected_database: Option<String>,
+) -> Result<(Option<String>, Vec<TableInfo>), String> {
+    let database = selected_database.or_else(|| connection.active_database.clone());
+    let database_name = database
+        .as_deref()
+        .ok_or_else(|| "The selected reference database is unavailable.".to_string())?;
+    let tables = resolve_same_connection_shallow(&connection.database_schemas, database_name)?;
+    Ok((database, tables))
+}
+
+fn other_connection_reference_context(
+    database: Option<String>,
+    tables: &[TableInfo],
+    connection_identity: usize,
+) -> Result<ReferenceContextDetails, String> {
+    Ok(ReferenceContextDetails {
+        connection_identity: Some(connection_identity),
+        database,
+        schema_fingerprint: schema_fingerprint(tables)?,
+    })
+}
+
+fn snapshot_reference_context(
+    database: Option<String>,
+    fingerprint: String,
+    tables: &[TableInfo],
+) -> Result<ReferenceContextDetails, String> {
+    Ok(ReferenceContextDetails {
+        connection_identity: None,
+        database,
+        schema_fingerprint: format!("{fingerprint}:{}", schema_fingerprint(tables)?),
+    })
+}
+
+fn binding_is_current(
+    active_ticket: u64,
+    completed_ticket: u64,
+    completed_context: &PreparationContext,
+    current_context: Option<&PreparationContext>,
+) -> bool {
+    active_ticket == completed_ticket && current_context == Some(completed_context)
+}
+
+fn apply_compute_error<Group>(
+    is_current: bool,
+    compute_state: &mut ComputeState,
+    groups: &mut Vec<Group>,
+    selected: &mut HashSet<(usize, usize)>,
+    selected_table_actions: &mut HashSet<usize>,
+    message: String,
+) -> bool {
+    if !is_current {
+        return false;
+    }
+
+    groups.clear();
+    selected.clear();
+    selected_table_actions.clear();
+    *compute_state = ComputeState::Error(message);
+    true
+}
+
+fn audit_event_sink(audit_service: &datatab_audit::AuditService) -> Arc<dyn EventSink> {
+    Arc::new(audit_service.clone())
+}
+
+fn confirmation_binding_for_outcome(
+    open_binding: Option<PreparationBinding>,
+    outcome: &MutationConfirmOutcome,
+    current_context: Option<&PreparationContext>,
+) -> Option<PreparationBinding> {
+    open_binding.filter(|binding| {
+        !matches!(outcome, MutationConfirmOutcome::Cancelled)
+            && current_context == Some(&binding.context)
+    })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ApplyCompletionDisposition {
+    releases_active_binding: bool,
+    publishes_document: bool,
+    releases_loading_state: bool,
+    reports_error_globally: bool,
+}
+
+fn apply_completion_disposition(
+    active_apply: Option<&PreparationBinding>,
+    completed: &PreparationBinding,
+    current_context: Option<&PreparationContext>,
+    is_failure: bool,
+) -> ApplyCompletionDisposition {
+    let releases_active_binding = active_apply == Some(completed);
+    let publishes_document = releases_active_binding && current_context == Some(&completed.context);
+    ApplyCompletionDisposition {
+        releases_active_binding,
+        publishes_document,
+        releases_loading_state: releases_active_binding && !publishes_document,
+        reports_error_globally: is_failure,
+    }
+}
+
+fn release_stale_apply_loading(
+    completion: &ApplyCompletionDisposition,
+    active_compute: Option<&ComputeBinding>,
+    compute_state: &mut ComputeState,
+) -> bool {
+    if completion.releases_loading_state
+        && active_compute.is_none()
+        && matches!(compute_state, ComputeState::Loading)
+    {
+        *compute_state = ComputeState::Idle;
+        true
+    } else {
+        false
+    }
+}
+
+struct PreparedApplyBatch {
+    binding: PreparationBinding,
+    tables: Vec<FrozenDdlApply>,
+    preview: String,
+    warnings: Vec<String>,
+}
+
+enum PreparationState {
+    Idle,
+    Pending(PreparationBinding),
+    Ready(PreparedApplyBatch),
+}
+
+fn schema_diff_is_busy(
+    compute_state: &ComputeState,
+    preparation: &PreparationState,
+    in_flight_apply: Option<&PreparationBinding>,
+) -> bool {
+    matches!(compute_state, ComputeState::Loading)
+        || matches!(preparation, PreparationState::Pending { .. })
+        || in_flight_apply.is_some()
+}
+
+struct PendingPreview {
+    binding: PreparationBinding,
+    sql: String,
+}
+
+struct PendingConfirmation {
+    binding: PreparationBinding,
+    request: MutationConfirmHardRequest,
+}
+
+enum PreparedAction {
+    Preview,
+    Confirm {
+        summary: String,
+        require_opt_in: bool,
+    },
+}
+
+/// The schema-diff & apply document entity.
+pub struct SchemaDiffDocument {
+    id: DocumentId,
+    app_state: Entity<AppStateEntity>,
+
+    /// Live target: the connection DDL is applied to. This side is `before` in
+    /// the diff, so changes describe how to transform the target into the
+    /// reference schema.
+    profile_id: Uuid,
+    database: Option<String>,
+    title: String,
+
+    picker: SourcePicker,
+    /// Reference side chosen in `LiveVsLive` mode: either another database on
+    /// this same connection or a different open relational connection.
+    reference: Option<ReferenceTarget>,
+    /// Database names known on the target's own connection, used to offer
+    /// same-connection reference databases. Loaded off the UI thread.
+    connection_databases: Vec<String>,
+    groups: Vec<TableDiffGroup>,
+    /// Selected applicable changes as `(group_index, applicable_index)`.
+    selected: HashSet<(usize, usize)>,
+    /// Selected whole-table actions, as `group_index`.
+    selected_table_actions: HashSet<usize>,
+    /// Snapshot summaries for the target profile/database, loaded when the
+    /// snapshot-to-live mode is selected.
+    snapshots: Vec<SchemaSnapshotSummary>,
+    snapshot_load_ticket: u64,
+    #[cfg(test)]
+    snapshot_load_pause: Option<std::sync::mpsc::Sender<()>>,
+    #[cfg(test)]
+    snapshot_load_done: Option<std::sync::mpsc::Sender<()>>,
+
+    compute_state: ComputeState,
+    active_compute: Option<ComputeBinding>,
+    compute_ticket: u64,
+    pending_toast: Option<PendingToast>,
+
+    sql_preview_modal: Entity<SqlPreviewModal>,
+    confirm_modal: Entity<ModalMutationConfirmHard>,
+
+    pending_preview: Option<PendingPreview>,
+    pending_confirm: Option<PendingConfirmation>,
+    pending_apply: Option<PreparationBinding>,
+    open_confirmation: Option<PreparationBinding>,
+    in_flight_apply: Option<PreparationBinding>,
+    preparation: PreparationState,
+    preparation_ticket: u64,
+    pending_prepared_action: Option<PreparedAction>,
+
+    focus_handle: FocusHandle,
+    /// Keyboard cursor over the picker, the diff rows and the footer.
+    pub(super) rail: RailNav<Self>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl SchemaDiffDocument {
+    pub fn new(
+        profile_id: Uuid,
+        database: Option<String>,
+        app_state: Entity<AppStateEntity>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let sql_preview_modal = cx.new(|cx| SqlPreviewModal::new(app_state.clone(), window, cx));
+        let confirm_modal = cx.new(|cx| ModalMutationConfirmHard::new(window, cx));
+
+        let confirm_sub = cx.subscribe(
+            &confirm_modal,
+            |this, _modal, outcome: &MutationConfirmOutcome, cx| {
+                this.on_confirm_outcome(outcome.clone(), cx);
+            },
+        );
+
+        let app_state_sub =
+            cx.subscribe(&app_state, |this: &mut Self, _, _: &AppStateChanged, cx| {
+                this.invalidate_preparation_if_context_changed(cx);
+                this.invalidate_compute_if_context_changed(cx);
+                let profiles: Vec<Uuid> = this
+                    .app_state
+                    .read(cx)
+                    .profiles()
+                    .iter()
+                    .map(|p| p.id)
+                    .collect();
+                if invalidate_snapshot_profile_if_missing(
+                    &mut this.snapshots,
+                    &mut this.picker.selected_snapshot,
+                    &mut this.snapshot_load_ticket,
+                    this.profile_id,
+                    &profiles,
+                ) {
+                    this.reset_after_reference_change();
+                    cx.notify();
+                }
+            });
+
+        let title = match &database {
+            Some(db) => datatab_i18n::t!("document.schema_diff.view.title", database = db),
+            None => datatab_i18n::t!("document.schema_diff.view.title_default"),
+        };
+
+        let mut document = Self {
+            id: DocumentId::new(),
+            app_state,
+            profile_id,
+            database,
+            title,
+            picker: SourcePicker::default(),
+            reference: None,
+            connection_databases: Vec::new(),
+            groups: Vec::new(),
+            selected: HashSet::new(),
+            selected_table_actions: HashSet::new(),
+            snapshots: Vec::new(),
+            snapshot_load_ticket: 0,
+            #[cfg(test)]
+            snapshot_load_pause: None,
+            #[cfg(test)]
+            snapshot_load_done: None,
+            compute_state: ComputeState::Idle,
+            active_compute: None,
+            compute_ticket: 0,
+            pending_toast: None,
+            sql_preview_modal,
+            confirm_modal,
+            pending_preview: None,
+            pending_confirm: None,
+            pending_apply: None,
+            open_confirmation: None,
+            in_flight_apply: None,
+            preparation: PreparationState::Idle,
+            preparation_ticket: 0,
+            pending_prepared_action: None,
+
+            focus_handle: cx.focus_handle(),
+            rail: RailNav::default(),
+            _subscriptions: vec![confirm_sub, app_state_sub],
+        };
+
+        document.load_connection_databases(cx);
+        document
+    }
+
+    /// Loads the target connection's database names off the UI thread so the
+    /// picker can offer same-connection reference databases. Enriches the
+    /// already-cached database names with the full server listing; a listing
+    /// failure degrades gracefully to whatever is cached rather than surfacing
+    /// an error, since this only populates a picker. When nothing is selected
+    /// yet and the connection has more than one database, the first other
+    /// database is pre-selected — the common comparison case.
+    fn load_connection_databases(&mut self, cx: &mut Context<Self>) {
+        let Some(connected) = self.app_state.read(cx).connections().get(&self.profile_id) else {
+            return;
+        };
+
+        let connection = Arc::clone(&connected.connection);
+        let mut baseline: Vec<String> = connected.database_schemas.keys().cloned().collect();
+        if let Some(active) = &connected.active_database
+            && !baseline.contains(active)
+        {
+            baseline.push(active.clone());
+        }
+
+        let task = cx.background_executor().spawn(async move {
+            connection
+                .list_databases()
+                .map(|dbs| dbs.into_iter().map(|d| d.name).collect::<Vec<String>>())
+        });
+
+        cx.spawn(async move |this, cx| {
+            let listed = task.await;
+            cx.update(|cx| {
+                this.update(cx, |doc, cx| {
+                    let mut names = baseline;
+                    if let Ok(listed) = listed {
+                        for name in listed {
+                            if !names.contains(&name) {
+                                names.push(name);
+                            }
+                        }
+                    }
+                    names.sort();
+                    names.dedup();
+                    doc.connection_databases = names;
+
+                    if doc.reference.is_none() {
+                        let candidates = same_connection_reference_databases(
+                            &doc.connection_databases,
+                            doc.database.as_deref(),
+                        );
+                        if let Some(first) = candidates.into_iter().next() {
+                            doc.reference = Some(ReferenceTarget::SameConnectionDatabase(first));
+                        }
+                    }
+
+                    cx.notify();
+                })
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    // ── Document API (mirrored by the pane) ───────────────────────────────
+
+    pub fn id(&self) -> DocumentId {
+        self.id
+    }
+
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    pub fn state(&self) -> DocumentState {
+        document_state_for(&self.compute_state)
+    }
+
+    pub(super) fn picker(&self) -> &SourcePicker {
+        &self.picker
+    }
+
+    pub(super) fn groups(&self) -> &[TableDiffGroup] {
+        &self.groups
+    }
+
+    pub(super) fn focus_handle_ref(&self) -> &FocusHandle {
+        &self.focus_handle
+    }
+
+    pub(super) fn is_busy(&self) -> bool {
+        schema_diff_is_busy(
+            &self.compute_state,
+            &self.preparation,
+            self.in_flight_apply.as_ref(),
+        )
+    }
+
+    pub fn connection_id(&self) -> Option<Uuid> {
+        Some(self.profile_id)
+    }
+
+    /// The Results keys drive the document's cursor (see `keyboard.rs`).
+    pub fn active_context(&self) -> ContextId {
+        ContextId::Results
+    }
+
+    pub fn current_refresh_policy(&self) -> RefreshPolicy {
+        RefreshPolicy::Manual
+    }
+
+    pub fn apply_refresh_policy(&mut self, _policy: RefreshPolicy, _cx: &mut Context<Self>) {}
+
+    pub fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_handle.focus(window, cx);
+    }
+
+    pub fn dispatch_command(
+        &mut self,
+        cmd: Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.keyboard_command(cmd, window, cx)
+    }
+
+    /// Dedup match: same target profile + database.
+    pub fn matches_schema_diff(&self, profile_id: Uuid, database: Option<&str>) -> bool {
+        self.profile_id == profile_id && self.database.as_deref() == database
+    }
+
+    // ── Source picker ─────────────────────────────────────────────────────
+
+    pub(super) fn set_mode(&mut self, mode: DiffMode, cx: &mut Context<Self>) {
+        self.invalidate_active_compute();
+        if self.picker.mode == mode {
+            return;
+        }
+        self.invalidate_preparation();
+        self.picker.mode = mode;
+        self.compute_state = ComputeState::Idle;
+        self.groups.clear();
+        self.selected.clear();
+        self.selected_table_actions.clear();
+        match mode {
+            DiffMode::SnapshotVsLive => self.load_snapshots(cx),
+            DiffMode::LiveVsLive => {
+                self.snapshot_load_ticket = self.snapshot_load_ticket.wrapping_add(1);
+                self.snapshots.clear();
+                self.picker.selected_snapshot = None;
+                if self.connection_databases.is_empty() {
+                    self.load_connection_databases(cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn load_snapshots(&mut self, cx: &mut Context<Self>) {
+        self.snapshot_load_ticket = self.snapshot_load_ticket.wrapping_add(1);
+        let ticket = self.snapshot_load_ticket;
+        self.snapshots.clear();
+        self.picker.selected_snapshot = None;
+        cx.notify();
+
+        let profile = self.profile_id;
+        let profile_id = profile.to_string();
+        let database = self.database.clone();
+        let repo = Arc::clone(&self.app_state.read(cx).inner.schema_snapshot_repo);
+        let task = cx.background_executor().spawn(async move {
+            load_existing_profile_snapshots(&repo, &profile_id, database.as_deref())
+        });
+        let requested_database = self.database.clone();
+        #[cfg(test)]
+        let pause = self.snapshot_load_pause.take();
+        #[cfg(test)]
+        let done = self.snapshot_load_done.take();
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            #[cfg(test)]
+            if let Some(entered) = pause {
+                entered.send(()).expect("snapshot load pause receiver");
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(60))
+                    .await;
+            }
+            let update_result = cx.update(|cx| {
+                this.update(cx, |doc, cx| {
+                    let profile_exists = doc
+                        .app_state
+                        .read(cx)
+                        .profiles()
+                        .iter()
+                        .any(|p| p.id == profile);
+                    if !apply_snapshot_load_result(
+                        &mut doc.snapshots,
+                        ticket,
+                        doc.snapshot_load_ticket,
+                        doc.picker.mode,
+                        profile,
+                        doc.profile_id,
+                        requested_database.as_deref(),
+                        doc.database.as_deref(),
+                        profile_exists,
+                        &result,
+                    ) {
+                        return;
+                    }
+                    if let Err(error) = result {
+                        report_error(
+                            UserFacingError::new(
+                                ErrorKind::Storage,
+                                format!(
+                                    "{}: {error}",
+                                    datatab_i18n::t!(
+                                        "document.schema_diff.toast.snapshot_load_failed"
+                                    )
+                                ),
+                            ),
+                            cx,
+                        );
+                    }
+                    cx.notify();
+                })
+            });
+            #[cfg(test)]
+            if let Some(done) = done {
+                update_result.as_ref().expect("snapshot foreground update");
+                done.send(()).expect("snapshot load completion receiver");
+            }
+            update_result.ok();
+        })
+        .detach();
+    }
+
+    pub(super) fn select_snapshot(&mut self, snapshot_id: Uuid, cx: &mut Context<Self>) {
+        if !self
+            .app_state
+            .read(cx)
+            .profiles()
+            .iter()
+            .any(|p| p.id == self.profile_id)
+        {
+            return;
+        }
+        self.invalidate_active_compute();
+        self.invalidate_preparation();
+        self.picker.selected_snapshot = Some(snapshot_id);
+        self.compute_state = ComputeState::Idle;
+        self.groups.clear();
+        self.selected.clear();
+        self.selected_table_actions.clear();
+        cx.notify();
+    }
+
+    /// Selects another database on the target's own connection as the reference.
+    pub(super) fn select_same_connection_database(
+        &mut self,
+        database: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.invalidate_active_compute();
+        self.picker.mode = DiffMode::LiveVsLive;
+        self.invalidate_preparation();
+        self.reference = Some(ReferenceTarget::SameConnectionDatabase(database));
+        self.reset_after_reference_change();
+        cx.notify();
+    }
+
+    /// Selects a different open relational connection as the reference.
+    pub(super) fn select_reference_connection(
+        &mut self,
+        other_profile_id: Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        self.invalidate_active_compute();
+        self.picker.mode = DiffMode::LiveVsLive;
+        self.invalidate_preparation();
+        self.reference = Some(ReferenceTarget::OtherConnection {
+            profile_id: other_profile_id,
+            database: None,
+        });
+        self.reset_after_reference_change();
+        cx.notify();
+    }
+
+    fn reset_after_reference_change(&mut self) {
+        self.invalidate_active_compute();
+        self.invalidate_preparation();
+        self.compute_state = ComputeState::Idle;
+        self.groups.clear();
+        self.selected.clear();
+        self.selected_table_actions.clear();
+    }
+
+    // ── Diff computation ──────────────────────────────────────────────────
+
+    fn compute_binding_is_current(&self, binding: &ComputeBinding, cx: &Context<Self>) -> bool {
+        binding_is_current(
+            self.compute_ticket,
+            binding.ticket,
+            &binding.context,
+            self.preparation_context(cx).ok().flatten().as_ref(),
+        )
+    }
+
+    fn invalidate_active_compute(&mut self) {
+        if self.active_compute.take().is_some() {
+            self.compute_ticket = self.compute_ticket.wrapping_add(1);
+            if matches!(self.compute_state, ComputeState::Loading) {
+                self.compute_state = ComputeState::Idle;
+            }
+        }
+    }
+
+    fn invalidate_compute_if_context_changed(&mut self, cx: &mut Context<Self>) {
+        let Some(binding) = self.active_compute.as_ref() else {
+            return;
+        };
+        let current = self.preparation_context(cx);
+        if !binding_is_current(
+            self.compute_ticket,
+            binding.ticket,
+            &binding.context,
+            current.as_ref().ok().and_then(Option::as_ref),
+        ) {
+            self.invalidate_active_compute();
+            if let Err(message) = current {
+                self.compute_state = ComputeState::Error(message.clone());
+                report_error(UserFacingError::new(ErrorKind::Driver, message), cx);
+            }
+            cx.notify();
+        }
+    }
+
+    pub(super) fn compute_diff(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_active_compute();
+        self.invalidate_preparation();
+        let reference = self.reference.clone();
+        let state = self.app_state.read(cx);
+
+        let Some(target) = state.connections().get(&self.profile_id) else {
+            self.compute_state = ComputeState::Error(datatab_i18n::t!(
+                "document.schema_diff.toast.connection_unavailable"
+            ));
+            cx.notify();
+            return;
+        };
+
+        let target_connection = Arc::clone(&target.connection);
+        let target_shallow: Vec<TableInfo> = target
+            .schema
+            .as_ref()
+            .map(|s| s.tables().to_vec())
+            .unwrap_or_default();
+        let target_db = self.database.clone();
+
+        // Resolve the reference side into a Send-friendly plan.
+        let reference_plan = match self.picker.mode {
+            DiffMode::LiveVsLive => match &reference {
+                None => {
+                    self.compute_state = ComputeState::Error(datatab_i18n::t!(
+                        "document.schema_diff.toast.reference_not_picked"
+                    ));
+                    cx.notify();
+                    return;
+                }
+                Some(ReferenceTarget::SameConnectionDatabase(db)) => {
+                    // Same connection, different database: reuse the target
+                    // connection Arc and pull the reference database's cached
+                    // shallow tables. A database whose schema is not loaded yet
+                    // is refused rather than compared as empty, which would
+                    // otherwise read as dropping every table.
+                    match resolve_same_connection_shallow(&target.database_schemas, db) {
+                        Ok(shallow) => SidePlan::Live {
+                            connection: Arc::clone(&target_connection),
+                            database: Some(db.clone()),
+                            shallow,
+                        },
+                        Err(message) => {
+                            self.compute_state = ComputeState::Error(message);
+                            cx.notify();
+                            return;
+                        }
+                    }
+                }
+                Some(ReferenceTarget::OtherConnection {
+                    profile_id,
+                    database,
+                }) => {
+                    let Some(other) = state.connections().get(profile_id) else {
+                        self.compute_state = ComputeState::Error(datatab_i18n::t!(
+                            "document.schema_diff.toast.reference_connection_disconnected"
+                        ));
+                        cx.notify();
+                        return;
+                    };
+                    match other_connection_shallow(other, database.clone()) {
+                        Ok((other_db, shallow)) => SidePlan::Live {
+                            connection: Arc::clone(&other.connection),
+                            database: other_db,
+                            shallow,
+                        },
+                        Err(message) => {
+                            self.compute_state = ComputeState::Error(message);
+                            cx.notify();
+                            return;
+                        }
+                    }
+                }
+            },
+            DiffMode::SnapshotVsLive => {
+                let Some(snapshot_id) = self.picker.selected_snapshot else {
+                    self.compute_state = ComputeState::Error(datatab_i18n::t!(
+                        "document.schema_diff.toast.snapshot_not_picked"
+                    ));
+                    cx.notify();
+                    return;
+                };
+                match state.schema_snapshots.get(&snapshot_id.to_string()) {
+                    Ok(Some(record)) => SidePlan::Resolved {
+                        tables: record.tables,
+                        creation_metadata: record.creation_metadata,
+                    },
+                    Ok(None) => {
+                        self.compute_state = ComputeState::Error(datatab_i18n::t!(
+                            "document.schema_diff.toast.snapshot_missing"
+                        ));
+                        cx.notify();
+                        return;
+                    }
+                    Err(e) => {
+                        self.compute_state = ComputeState::Error(datatab_i18n::t!(
+                            "document.schema_diff.toast.snapshot_load_failed",
+                            error = e.to_string()
+                        ));
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+        };
+
+        self.compute_state = ComputeState::Loading;
+        cx.notify();
+
+        let context = match self.preparation_context(cx) {
+            Ok(Some(context)) => context,
+            Ok(None) => {
+                self.compute_state = ComputeState::Error(
+                    "The selected schema context is no longer available.".to_string(),
+                );
+                cx.notify();
+                return;
+            }
+            Err(message) => {
+                self.compute_state = ComputeState::Error(message.clone());
+                report_error(UserFacingError::new(ErrorKind::Driver, message), cx);
+                cx.notify();
+                return;
+            }
+        };
+        self.compute_ticket = self.compute_ticket.wrapping_add(1);
+        let binding = ComputeBinding {
+            ticket: self.compute_ticket,
+            context,
+        };
+        self.active_compute = Some(binding.clone());
+
+        let target_db_for_task = target_db.clone();
+
+        let task = cx.background_executor().spawn(async move {
+            // `before` = target live (DDL applies here); `after` = reference.
+            // A failed `table_details` on EITHER side aborts the comparison
+            // with a clear error instead of silently degrading to a
+            // column-less entry, which would produce a wrong/destructive diff.
+            let (before, _) = deep_resolve(
+                &*target_connection,
+                target_db_for_task.as_deref(),
+                &target_shallow,
+                false,
+            )?;
+            let (after, reference_metadata) = match reference_plan {
+                SidePlan::Live {
+                    connection,
+                    database,
+                    shallow,
+                } => deep_resolve(&*connection, database.as_deref(), &shallow, true)?,
+                SidePlan::Resolved {
+                    tables,
+                    creation_metadata,
+                } => (tables, reference_metadata_from_snapshot(creation_metadata)),
+            };
+
+            let table_changes = diff_schema(&before, &after);
+            Ok::<Vec<TableDiffGroup>, String>(build_groups(
+                &*target_connection,
+                table_changes,
+                &reference_metadata,
+            ))
+        });
+
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            cx.update(|cx| {
+                this.update(cx, |doc, cx| {
+                    match result {
+                        Ok(groups) => {
+                            if !doc.compute_binding_is_current(&binding, cx) {
+                                return;
+                            }
+                            doc.active_compute = None;
+                            doc.groups = groups;
+                            doc.selected = doc.default_selection();
+                            doc.selected_table_actions = doc.default_table_action_selection();
+                            doc.compute_state = if doc.groups.is_empty() {
+                                ComputeState::Empty
+                            } else {
+                                ComputeState::Diff
+                            };
+                        }
+                        Err(message) => {
+                            let is_current = doc.compute_binding_is_current(&binding, cx);
+                            if !apply_compute_error(
+                                is_current,
+                                &mut doc.compute_state,
+                                &mut doc.groups,
+                                &mut doc.selected,
+                                &mut doc.selected_table_actions,
+                                message.clone(),
+                            ) {
+                                return;
+                            }
+                            doc.active_compute = None;
+                            report_error(UserFacingError::new(ErrorKind::Driver, message), cx);
+                        }
+                    }
+                    cx.notify();
+                })
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Default selection = every applicable change checked.
+    fn default_selection(&self) -> HashSet<(usize, usize)> {
+        let mut set = HashSet::new();
+        for (group_index, group) in self.groups.iter().enumerate() {
+            for change_index in 0..group.applicable.len() {
+                set.insert((group_index, change_index));
+            }
+        }
+        set
+    }
+
+    /// Default selection = every applicable whole-table action checked,
+    /// mirroring `default_selection`'s "select every applicable change" rule.
+    fn default_table_action_selection(&self) -> HashSet<usize> {
+        self.groups
+            .iter()
+            .enumerate()
+            .filter_map(|(index, group)| {
+                matches!(
+                    group.table_action,
+                    Some(TableActionOutcome::Applicable { .. })
+                )
+                .then_some(index)
+            })
+            .collect()
+    }
+
+    pub(super) fn toggle_selection(
+        &mut self,
+        group_index: usize,
+        change_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.invalidate_preparation();
+        let key = (group_index, change_index);
+        if !self.selected.remove(&key) {
+            self.selected.insert(key);
+        }
+        cx.notify();
+    }
+
+    pub(super) fn toggle_table_action_selection(
+        &mut self,
+        group_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.invalidate_preparation();
+        if !self.selected_table_actions.remove(&group_index) {
+            self.selected_table_actions.insert(group_index);
+        }
+        cx.notify();
+    }
+
+    /// Collects the selected applicable changes and whole-table actions,
+    /// grouped by table.
+    fn selected_changes_by_table(&self) -> Vec<SelectedTableWork> {
+        let mut out: Vec<SelectedTableWork> = Vec::new();
+
+        for (group_index, group) in self.groups.iter().enumerate() {
+            let mut picked = Vec::new();
+            for (change_index, change) in group.applicable.iter().enumerate() {
+                if self.selected.contains(&(group_index, change_index)) {
+                    picked.push(change.clone());
+                }
+            }
+
+            let table_action = if self.selected_table_actions.contains(&group_index) {
+                match &group.table_action {
+                    Some(TableActionOutcome::Applicable { action, risk }) => {
+                        Some((action.clone(), *risk))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            if !picked.is_empty() || table_action.is_some() {
+                out.push(SelectedTableWork {
+                    table: group.table.clone(),
+                    changes: picked,
+                    table_action,
+                });
+            }
+        }
+
+        out
+    }
+
+    fn has_destructive_selection(&self) -> bool {
+        for (group_index, group) in self.groups.iter().enumerate() {
+            for (change_index, change) in group.applicable.iter().enumerate() {
+                if self.selected.contains(&(group_index, change_index))
+                    && RiskBadge::from_classification(change.risk) == RiskBadge::Destructive
+                {
+                    return true;
+                }
+            }
+            if self.selected_table_actions.contains(&group_index)
+                && let Some(TableActionOutcome::Applicable { risk, .. }) = &group.table_action
+                && RiskBadge::from_classification(*risk) == RiskBadge::Destructive
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn preparation_context(
+        &self,
+        cx: &Context<Self>,
+    ) -> Result<Option<PreparationContext>, String> {
+        let Some(connected) = self.app_state.read(cx).connections().get(&self.profile_id) else {
+            return Ok(None);
+        };
+        let reference_context = {
+            let state = self.app_state.read(cx);
+            match self.picker.mode {
+                DiffMode::LiveVsLive => {
+                    let Some(reference) = self.reference.as_ref() else {
+                        return Ok(None);
+                    };
+                    match reference {
+                        ReferenceTarget::SameConnectionDatabase(database) => {
+                            let tables = resolve_same_connection_shallow(
+                                &connected.database_schemas,
+                                database,
+                            )?;
+                            same_connection_reference_context(
+                                database.clone(),
+                                &tables,
+                                Arc::as_ptr(&connected.connection) as *const () as usize,
+                            )?
+                        }
+                        ReferenceTarget::OtherConnection {
+                            profile_id,
+                            database,
+                        } => {
+                            let Some(other) = state.connections().get(profile_id) else {
+                                return Ok(None);
+                            };
+                            let (database, tables) =
+                                other_connection_shallow(other, database.clone())?;
+                            other_connection_reference_context(
+                                database,
+                                &tables,
+                                Arc::as_ptr(&other.connection) as *const () as usize,
+                            )?
+                        }
+                    }
+                }
+                DiffMode::SnapshotVsLive => {
+                    let Some(snapshot_id) = self.picker.selected_snapshot else {
+                        return Ok(None);
+                    };
+                    let record = match state.schema_snapshots.get(&snapshot_id.to_string()) {
+                        Ok(Some(record)) => record,
+                        Ok(None) | Err(_) => return Ok(None),
+                    };
+                    snapshot_reference_context(record.database, record.fingerprint, &record.tables)?
+                }
+            }
+        };
+        let mut selection = self.selected.iter().copied().collect::<Vec<_>>();
+        selection.sort_unstable();
+        let mut table_actions = self
+            .selected_table_actions
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        table_actions.sort_unstable();
+        Ok(Some(PreparationContext {
+            mode: self.picker.mode,
+            reference: self.reference.clone(),
+            snapshot: self.picker.selected_snapshot,
+            profile_id: self.profile_id,
+            database: self.database.clone(),
+            target_schema_fingerprint: schema_fingerprint(
+                connected
+                    .schema
+                    .as_ref()
+                    .map_or(&[], |schema| schema.tables()),
+            )?,
+            target_connection_identity: Arc::as_ptr(&connected.connection) as *const () as usize,
+            reference_connection_identity: reference_context.connection_identity,
+            reference_database: reference_context.database,
+            reference_schema: Some(reference_context.schema_fingerprint),
+
+            policy: connected.mutation_policy,
+            selection,
+            table_actions,
+        }))
+    }
+
+    fn preparation_binding_is_current(
+        &self,
+        binding: &PreparationBinding,
+        cx: &Context<Self>,
+    ) -> bool {
+        binding_is_current(
+            self.preparation_ticket,
+            binding.ticket,
+            &binding.context,
+            self.preparation_context(cx).ok().flatten().as_ref(),
+        )
+    }
+
+    fn invalidate_preparation(&mut self) {
+        self.preparation_ticket = self.preparation_ticket.wrapping_add(1);
+        self.preparation = PreparationState::Idle;
+        self.pending_prepared_action = None;
+        self.pending_preview = None;
+        self.pending_confirm = None;
+        self.pending_apply = None;
+        self.open_confirmation = None;
+    }
+
+    fn invalidate_preparation_if_context_changed(&mut self, cx: &mut Context<Self>) {
+        let current = self.preparation_context(cx);
+        let bound = match &self.preparation {
+            PreparationState::Idle => return,
+            PreparationState::Pending(binding) => &binding.context,
+            PreparationState::Ready(batch) => &batch.binding.context,
+        };
+        if current.as_ref().ok().and_then(Option::as_ref) != Some(bound) {
+            self.invalidate_preparation();
+            if let Err(message) = current {
+                report_error(UserFacingError::new(ErrorKind::Driver, message), cx);
+            }
+            cx.notify();
+        }
+    }
+
+    fn prepare_selected(&mut self, action: PreparedAction, cx: &mut Context<Self>) {
+        let selected = self.selected_changes_by_table();
+        if selected.is_empty() {
+            self.pending_toast = Some(PendingToast {
+                message: datatab_i18n::t!("document.schema_diff.toast.select_at_least_one"),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
+        let context = match self.preparation_context(cx) {
+            Ok(Some(context)) => context,
+            Ok(None) => {
+                self.pending_toast = Some(PendingToast {
+                    message: datatab_i18n::t!("document.schema_diff.toast.connection_unavailable"),
+                    is_error: true,
+                });
+                cx.notify();
+                return;
+            }
+            Err(message) => {
+                report_error(UserFacingError::new(ErrorKind::Driver, message), cx);
+                cx.notify();
+                return;
+            }
+        };
+        let (connection, event_sink, connection_id, driver_id, policy, read_only_reason) = {
+            let state = self.app_state.read(cx);
+            #[expect(
+                clippy::expect_used,
+                reason = "preparation_context above returned Some, which requires connections() to contain profile_id; both reads happen in the same synchronous call"
+            )]
+            let connected = state
+                .connections()
+                .get(&self.profile_id)
+                .expect("context checked connection");
+            (
+                Arc::clone(&connected.connection),
+                audit_event_sink(state.audit_service()),
+                self.profile_id.to_string(),
+                connected.connection.metadata().id.clone(),
+                connected.mutation_policy,
+                connected.read_only_reason,
+            )
+        };
+        if matches!(policy, MutationPolicy::ReadOnly) {
+            self.pending_toast = Some(PendingToast {
+                message: read_only_toast_message(read_only_reason),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
+        if matches!(policy, MutationPolicy::ApprovalRequired) {
+            self.invalidate_preparation();
+            if matches!(action, PreparedAction::Confirm { .. }) {
+                self.route_to_approval(&selected, cx);
+            } else {
+                self.pending_toast = Some(PendingToast {
+                    message: datatab_i18n::t!("document.schema_diff.toast.approval_unavailable"),
+                    is_error: true,
+                });
+                cx.notify();
+            }
+            return;
+        }
+        if let PreparationState::Ready(batch) = &self.preparation
+            && batch.binding.context == context
+        {
+            self.activate_prepared_action(action, cx);
+            return;
+        }
+        if matches!(&self.preparation, PreparationState::Pending(pending) if pending.context == context)
+        {
+            self.pending_prepared_action = Some(action);
+            return;
+        }
+        self.invalidate_preparation();
+        self.preparation_ticket = self.preparation_ticket.wrapping_add(1);
+        let ticket = self.preparation_ticket;
+        self.preparation = PreparationState::Pending(PreparationBinding {
+            ticket,
+            context: context.clone(),
+        });
+        self.pending_prepared_action = Some(action);
+        let task_context = context.clone();
+        let executors = selected
+            .into_iter()
+            .map(|work| {
+                build_executor_for_work(
+                    work,
+                    DdlApplyDeps {
+                        connection: Arc::clone(&connection),
+                        event_sink: Some(Arc::clone(&event_sink)),
+                        connection_id: connection_id.clone(),
+                        driver_id: driver_id.clone(),
+                        policy: MutationPolicy::Allowed,
+                        read_only_reason: None,
+                    },
+                )
+            })
+            .collect();
+        let task = cx.background_executor().spawn(async move {
+            let tables =
+                DdlApplyExecutor::prepare_all(executors).map_err(|error| error.to_string())?;
+            let statements = tables
+                .iter()
+                .flat_map(FrozenDdlApply::preview_statements)
+                .collect::<Vec<_>>();
+            let warnings = tables
+                .iter()
+                .flat_map(FrozenDdlApply::preview_warnings)
+                .collect::<Vec<_>>();
+            Ok::<_, String>(PreparedApplyBatch {
+                binding: PreparationBinding {
+                    ticket,
+                    context: task_context,
+                },
+                tables,
+                preview: statements.join(";\n\n") + ";",
+                warnings,
+            })
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            cx.update(|cx| {
+                this.update(cx, |doc, cx| {
+                    let current = doc.preparation_context(cx);
+                    if !binding_is_current(
+                        doc.preparation_ticket,
+                        ticket,
+                        &context,
+                        current.ok().flatten().as_ref(),
+                    ) {
+                        return;
+                    }
+                    match result {
+                        Ok(batch) => {
+                            doc.preparation = PreparationState::Ready(batch);
+                            if let Some(action) = doc.pending_prepared_action.take() {
+                                doc.activate_prepared_action(action, cx);
+                            }
+                        }
+                        Err(error) => {
+                            doc.preparation = PreparationState::Idle;
+                            doc.pending_prepared_action = None;
+                            report_error(
+                                UserFacingError::new(
+                                    ErrorKind::Driver,
+                                    datatab_i18n::t!(
+                                        "document.schema_diff.toast.ddl_build_failed",
+                                        error = error
+                                    ),
+                                ),
+                                cx,
+                            );
+                        }
+                    }
+                    cx.notify();
+                })
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn activate_prepared_action(&mut self, action: PreparedAction, cx: &mut Context<Self>) {
+        let PreparationState::Ready(batch) = &self.preparation else {
+            return;
+        };
+        let preview = format_cached_preview(&batch.preview, &batch.warnings);
+        match action {
+            PreparedAction::Preview => {
+                self.pending_preview = Some(PendingPreview {
+                    binding: batch.binding.clone(),
+                    sql: preview,
+                });
+            }
+            PreparedAction::Confirm {
+                summary,
+                require_opt_in,
+            } => {
+                self.pending_confirm = Some(PendingConfirmation {
+                    binding: batch.binding.clone(),
+                    request: MutationConfirmHardRequest {
+                        summary,
+                        type_to_confirm: "APPLY".to_string(),
+                        sql_preview: preview,
+                        sample_rows: None,
+                        sample_columns: Vec::new(),
+                        require_opt_in,
+                    },
+                })
+            }
+        }
+        cx.notify();
+    }
+
+    // ── Preview ───────────────────────────────────────────────────────────
+
+    pub(super) fn open_preview(&mut self, cx: &mut Context<Self>) {
+        self.prepare_selected(PreparedAction::Preview, cx);
+    }
+
+    // ── Apply (hard-confirm gated) ────────────────────────────────────────
+
+    pub(super) fn request_apply(&mut self, cx: &mut Context<Self>) {
+        let selected = self.selected_changes_by_table();
+        if selected.is_empty() {
+            self.pending_toast = Some(PendingToast {
+                message: datatab_i18n::t!(
+                    "document.schema_diff.toast.select_at_least_one_to_apply"
+                ),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
+
+        let total: usize = selected
+            .iter()
+            .map(|work| work.changes.len() + work.table_action.is_some() as usize)
+            .sum();
+        let target = self
+            .database
+            .clone()
+            .unwrap_or_else(|| datatab_i18n::t!("document.schema_diff.summary.this_connection"));
+        let summary = datatab_i18n::t!(
+            "document.schema_diff.summary.apply",
+            count = total,
+            target = target
+        );
+        self.prepare_selected(
+            PreparedAction::Confirm {
+                summary,
+                require_opt_in: self.has_destructive_selection(),
+            },
+            cx,
+        );
+    }
+
+    fn on_confirm_outcome(&mut self, outcome: MutationConfirmOutcome, cx: &mut Context<Self>) {
+        let binding = confirmation_binding_for_outcome(
+            self.open_confirmation.take(),
+            &outcome,
+            self.preparation_context(cx).ok().flatten().as_ref(),
+        );
+        let Some(binding) = binding else {
+            return;
+        };
+        if !self.preparation_binding_is_current(&binding, cx)
+            || matches!(outcome, MutationConfirmOutcome::Cancelled)
+        {
+            return;
+        }
+        self.pending_apply = Some(binding);
+        cx.notify();
+    }
+
+    fn run_apply(&mut self, binding: PreparationBinding, cx: &mut Context<Self>) {
+        let context = match self.preparation_context(cx) {
+            Ok(Some(context)) => context,
+            Ok(None) => {
+                self.pending_toast = Some(PendingToast {
+                    message: datatab_i18n::t!("document.schema_diff.toast.connection_unavailable"),
+                    is_error: true,
+                });
+                cx.notify();
+                return;
+            }
+            Err(message) => {
+                report_error(UserFacingError::new(ErrorKind::Driver, message), cx);
+                cx.notify();
+                return;
+            }
+        };
+        let (policy, read_only_reason) = {
+            let state = self.app_state.read(cx);
+            let Some(connected) = state.connections().get(&self.profile_id) else {
+                self.pending_toast = Some(PendingToast {
+                    message: datatab_i18n::t!("document.schema_diff.toast.connection_unavailable"),
+                    is_error: true,
+                });
+                cx.notify();
+                return;
+            };
+            (connected.mutation_policy, connected.read_only_reason)
+        };
+        if matches!(policy, MutationPolicy::ReadOnly) {
+            self.invalidate_preparation();
+            self.pending_toast = Some(PendingToast {
+                message: read_only_toast_message(read_only_reason),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
+        if matches!(policy, MutationPolicy::ApprovalRequired) {
+            self.invalidate_preparation();
+            self.pending_toast = Some(PendingToast {
+                message: datatab_i18n::t!("document.schema_diff.toast.approval_unavailable"),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
+        let preparation = std::mem::replace(&mut self.preparation, PreparationState::Idle);
+        let PreparationState::Ready(batch) = preparation else {
+            self.pending_toast = Some(PendingToast {
+                message: datatab_i18n::t!(
+                    "document.schema_diff.toast.ddl_build_failed",
+                    error = "the confirmed preview is no longer available"
+                ),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        };
+        if batch.binding.context != context || batch.binding != binding {
+            self.invalidate_preparation();
+            self.pending_toast = Some(PendingToast {
+                message: datatab_i18n::t!(
+                    "document.schema_diff.toast.ddl_build_failed",
+                    error = "the schema diff context changed before confirmation"
+                ),
+                is_error: true,
+            });
+            cx.notify();
+            return;
+        }
+        self.preparation_ticket = self.preparation_ticket.wrapping_add(1);
+        self.compute_state = ComputeState::Loading;
+        self.in_flight_apply = Some(binding.clone());
+        let total_tables = batch.tables.len();
+        let task = cx.background_executor().spawn(async move {
+            FrozenDdlApply::execute_all(batch.tables)
+                .map(|outcome| ApplyRunOutcome {
+                    statements_applied: outcome.statements_applied,
+                    tables_applied: outcome.tables_applied,
+                })
+                .map_err(|failure| ApplyRunFailure {
+                    failed_table: qualified(&failure.failed_table),
+                    tables_applied: failure.tables_applied,
+                    statements_applied: failure.statements_applied,
+                    message: failure.error.to_string(),
+                })
+        });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            if let Err(failure) = &result {
+                let remaining = total_tables.saturating_sub(failure.tables_applied + 1);
+                report_error_async(
+                    UserFacingError::new(
+                        ErrorKind::Driver,
+                        datatab_i18n::t!(
+                            "document.schema_diff.toast.apply_partial_failure",
+                            applied = failure.tables_applied,
+                            total = total_tables,
+                            statements = failure.statements_applied,
+                            table = failure.failed_table.as_str(),
+                            error = failure.message.as_str(),
+                            remaining = remaining
+                        ),
+                    ),
+                    cx,
+                );
+            }
+            cx.update(|cx| {
+                this.update(cx, |doc, cx| {
+                    let completion = apply_completion_disposition(
+                        doc.in_flight_apply.as_ref(),
+                        &binding,
+                        doc.preparation_context(cx).ok().flatten().as_ref(),
+                        result.is_err(),
+                    );
+                    if completion.releases_active_binding {
+                        doc.in_flight_apply = None;
+                    }
+                    if !completion.publishes_document {
+                        release_stale_apply_loading(
+                            &completion,
+                            doc.active_compute.as_ref(),
+                            &mut doc.compute_state,
+                        );
+                        if completion.releases_active_binding {
+                            cx.notify();
+                        }
+                        return;
+                    }
+                    match result {
+                        Ok(outcome) => {
+                            doc.pending_toast = Some(PendingToast {
+                                message: datatab_i18n::t!(
+                                    "document.schema_diff.toast.applied",
+                                    statements = outcome.statements_applied,
+                                    tables = outcome.tables_applied
+                                ),
+                                is_error: false,
+                            });
+                            doc.compute_state = ComputeState::Idle;
+                            doc.groups.clear();
+                            doc.selected.clear();
+                            doc.selected_table_actions.clear();
+                        }
+                        Err(_) => {
+                            doc.compute_state = if doc.groups.is_empty() {
+                                ComputeState::Empty
+                            } else {
+                                ComputeState::Diff
+                            };
+                        }
+                    }
+                    cx.notify();
+                })
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    #[cfg(feature = "mcp")]
+    fn route_to_approval(&mut self, selected: &[SelectedTableWork], cx: &mut Context<Self>) {
+        let classification = selected
+            .iter()
+            .flat_map(|w| {
+                w.changes
+                    .iter()
+                    .map(|c| c.risk)
+                    .chain(w.table_action.as_ref().map(|(_, risk)| *risk))
+            })
+            .fold(ExecutionClassification::AdminSafe, |acc, risk| {
+                acc.max(risk)
+            });
+
+        let payload = serde_json::json!({
+            "profile_id": self.profile_id.to_string(),
+            "database": self.database,
+            "change_count": selected
+                .iter()
+                .map(|w| w.changes.len() + w.table_action.is_some() as usize)
+                .sum::<usize>(),
+        });
+        let connection_id = self.profile_id.to_string();
+
+        let enqueue = self.app_state.update(cx, |app, _| {
+            app.request_mcp_execution(
+                "user".to_string(),
+                connection_id,
+                "schema_diff.apply".to_string(),
+                classification,
+                payload,
+            )
+        });
+
+        match enqueue {
+            Ok(_) => {
+                self.pending_toast = Some(PendingToast {
+                    message: datatab_i18n::t!("document.schema_diff.toast.approval_queued"),
+                    is_error: false,
+                });
+            }
+            Err(e) => {
+                self.pending_toast = Some(PendingToast {
+                    message: datatab_i18n::t!(
+                        "document.schema_diff.toast.approval_queue_failed",
+                        error = e.to_string()
+                    ),
+                    is_error: true,
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    #[cfg(not(feature = "mcp"))]
+    fn route_to_approval(&mut self, _selected: &[SelectedTableWork], cx: &mut Context<Self>) {
+        self.pending_toast = Some(PendingToast {
+            message: datatab_i18n::t!("document.schema_diff.toast.approval_unavailable"),
+            is_error: true,
+        });
+        cx.notify();
+    }
+}
+
+/// Qualified-name key `(schema, table)` for reference-side creation metadata.
+type ReferenceMetadataMap = HashMap<(Option<String>, String), TableCreationMetadata>;
+
+/// Send-friendly resolution plan for one side of the diff.
+enum SidePlan {
+    Live {
+        connection: Arc<dyn Connection>,
+        database: Option<String>,
+        shallow: Vec<TableInfo>,
+    },
+    Resolved {
+        tables: Vec<TableInfo>,
+        creation_metadata: Vec<TableCreationMetadata>,
+    },
+}
+
+/// Back-fills full column/index detail for every shallow table via
+/// `table_details`. A failure is propagated as an error rather than silently
+/// degrading to the column-less shallow entry: a missing column set would make
+/// the diff engine see every column as dropped, producing a wrong and
+/// potentially destructive apply plan. Aborting the whole comparison is the
+/// only safe response.
+fn deep_resolve(
+    connection: &dyn Connection,
+    database: Option<&str>,
+    shallow: &[TableInfo],
+    collect_metadata: bool,
+) -> Result<(Vec<TableInfo>, ReferenceMetadataMap), String> {
+    let db = database.unwrap_or_default();
+    let mut resolved = Vec::with_capacity(shallow.len());
+    let mut creation_metadata: ReferenceMetadataMap = HashMap::new();
+
+    for table in shallow {
+        let details = connection
+            .table_details(db, table.schema.as_deref(), &table.name)
+            .map_err(|e| {
+                format!(
+                    "Failed to load column details for {}: {e}. The comparison was aborted to avoid a wrong diff.",
+                    qualified(&TableRef {
+                        schema: table.schema.clone(),
+                        name: table.name.clone(),
+                    })
+                )
+            })?;
+
+        // Reference-side creation metadata (identity, PK order, blockers)
+        // travels beside the table detail. Only collected for the reference
+        // side: the diff target never supplies generation metadata. A driver
+        // without introspection returns `Ok(None)`, which metadata-aware
+        // target drivers refuse at generation time; an introspection error is
+        // treated the same way so a metadata gap can never abort an otherwise
+        // correct column diff, and still fails closed at generation.
+        if collect_metadata
+            && let Ok(Some(metadata)) =
+                connection.table_creation_metadata(db, table.schema.as_deref(), &table.name)
+        {
+            creation_metadata.insert((details.schema.clone(), details.name.clone()), metadata);
+        }
+
+        resolved.push(details);
+    }
+
+    Ok((resolved, creation_metadata))
+}
+
+/// Indexes a snapshot's stored creation metadata by qualified table name.
+/// Snapshot metadata is a standalone list (only tables the driver could
+/// describe carry entries), so the map — not list position — is the binding.
+fn reference_metadata_from_snapshot(
+    creation_metadata: Vec<TableCreationMetadata>,
+) -> ReferenceMetadataMap {
+    creation_metadata
+        .into_iter()
+        .map(|metadata| ((metadata.schema.clone(), metadata.table.clone()), metadata))
+        .collect()
+}
+
+/// Turns raw `TableChange`s into render groups, partitioning modified tables via
+/// the target driver's code generator and probing whole-table add/remove
+/// through the driver's table-level generation seams
+/// (`generate_code_with_creation_metadata` for creates, legacy `generate_code`
+/// for drops).
+fn build_groups(
+    connection: &dyn Connection,
+    table_changes: Vec<datatab_core::TableChange>,
+    reference_metadata: &ReferenceMetadataMap,
+) -> Vec<TableDiffGroup> {
+    use datatab_core::TableChange;
+
+    let code_generator = connection.code_generator();
+    let mut groups = Vec::new();
+
+    for change in table_changes {
+        match change {
+            TableChange::TableAdded(info) => {
+                let table = TableRef {
+                    schema: info.schema.clone(),
+                    name: info.name.clone(),
+                };
+                // The reference side's creation metadata rides with the added
+                // table so the TARGET connection can generate faithfully; a
+                // metadata gap arrives as `None` and metadata-aware drivers
+                // refuse rather than flattening identity or key order.
+                let metadata = reference_metadata
+                    .get(&(info.schema.clone(), info.name.clone()))
+                    .cloned();
+                let action = TableLevelAction::Create(Box::new(info), metadata);
+                let probe = build_statements_for_table_action(connection, &action);
+                let outcome = classify_table_action(action, probe);
+                groups.push(TableDiffGroup {
+                    header: qualified(&table),
+                    table,
+                    applicable: Vec::new(),
+                    unsupported: Vec::new(),
+                    table_action: Some(outcome),
+                });
+            }
+            TableChange::TableRemoved(table) => {
+                let action = TableLevelAction::Drop(table.clone());
+                let probe = build_statements_for_table_action(connection, &action);
+                let outcome = classify_table_action(action, probe);
+                groups.push(TableDiffGroup {
+                    header: qualified(&table),
+                    table,
+                    applicable: Vec::new(),
+                    unsupported: Vec::new(),
+                    table_action: Some(outcome),
+                });
+            }
+            TableChange::TableModified { table, changes } => {
+                let PartitionedChanges {
+                    applicable,
+                    unsupported,
+                } = partition_table_changes_for_route(
+                    &table,
+                    &changes,
+                    code_generator,
+                    connection.table_alter_planner().is_some(),
+                );
+                groups.push(TableDiffGroup {
+                    header: qualified(&table),
+                    table,
+                    applicable,
+                    unsupported,
+                    table_action: None,
+                });
+            }
+        }
+    }
+
+    groups.retain(|g| !g.is_empty());
+    groups
+}
+
+/// Builds a `DdlApplyExecutor` for one table's selected work, attaching the
+/// whole-table action when present.
+fn build_executor_for_work(work: SelectedTableWork, deps: DdlApplyDeps) -> DdlApplyExecutor {
+    let executor = DdlApplyExecutor::new(work.table, work.changes, deps);
+    match work.table_action {
+        Some((action, _risk)) => executor.with_table_action(action),
+        None => executor,
+    }
+}
+
+/// Text for the `run_apply` refusal toast when the connection is read-only,
+/// differentiated by why it is read-only. Mirrors
+/// `apply::read_only_message`'s reason branching under the `toast.*` key
+/// family so the two refusal surfaces never drift.
+///
+/// `None` falls back to the generic message: `ConnectedProfile` only sets
+/// `read_only_reason` when `mutation_policy` is `ReadOnly`, but a `None`
+/// reason on a `ReadOnly` policy is still handled instead of panicking.
+fn read_only_toast_message(reason: Option<ReadOnlyReason>) -> String {
+    match reason {
+        Some(ReadOnlyReason::ProfileSetting) => {
+            datatab_i18n::t!("document.schema_diff.toast.read_only_profile")
+        }
+        Some(ReadOnlyReason::ServerEnforced) => {
+            datatab_i18n::t!("document.schema_diff.toast.read_only_server")
+        }
+        None => datatab_i18n::t!("document.schema_diff.toast.read_only"),
+    }
+}
+
+fn format_cached_preview(sql: &str, warnings: &[String]) -> String {
+    let warning_lines = warnings
+        .iter()
+        .map(|warning| {
+            format!(
+                "-- {}: {warning}",
+                datatab_i18n::t!("document.schema_diff.status.preview_warning")
+            )
+        })
+        .collect::<Vec<_>>();
+    if warning_lines.is_empty() {
+        sql.to_string()
+    } else {
+        format!("{}\n\n{sql}", warning_lines.join("\n"))
+    }
+}
+
+fn qualified(table: &TableRef) -> String {
+    match &table.schema {
+        Some(schema) => format!("{schema}.{}", table.name),
+        None => table.name.clone(),
+    }
+}
+
+impl Focusable for SchemaDiffDocument {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
+impl EventEmitter<DocumentEvent> for SchemaDiffDocument {}
+
+fn badge_tone(badge: RiskBadge) -> BadgeTone {
+    match badge {
+        RiskBadge::Safe => BadgeTone::Success,
+        RiskBadge::Warning => BadgeTone::Warning,
+        RiskBadge::Destructive => BadgeTone::Danger,
+    }
+}
+
+impl SchemaDiffDocument {
+    pub(super) fn can_compute(&self) -> bool {
+        match self.picker.mode {
+            DiffMode::LiveVsLive => live_reference_ready(&self.reference),
+            DiffMode::SnapshotVsLive => self.picker.selected_snapshot.is_some(),
+        }
+    }
+
+    fn primary_button(
+        &self,
+        id: &'static str,
+        label: String,
+        enabled: bool,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        let (primary, primary_foreground) = {
+            let theme = cx.theme();
+            (theme.primary, theme.primary_foreground)
+        };
+        div()
+            .id(id)
+            .px(Spacing::MD)
+            .py(Spacing::SM)
+            .rounded(Radii::SM)
+            .bg(primary)
+            .text_size(FontSizes::SM)
+            .when(enabled, |d| d.cursor_pointer().hover(|h| h.opacity(0.9)))
+            .when(!enabled, |d| d.opacity(0.4))
+            .child(Text::caption(label).color(primary_foreground))
+            .when(enabled, move |d| {
+                d.on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
+            })
+    }
+
+    fn secondary_button(
+        &self,
+        id: &'static str,
+        label: String,
+        enabled: bool,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> impl IntoElement {
+        let (secondary, muted) = {
+            let theme = cx.theme();
+            (theme.secondary, theme.muted)
+        };
+        div()
+            .id(id)
+            .px(Spacing::MD)
+            .py(Spacing::SM)
+            .rounded(Radii::SM)
+            .bg(secondary)
+            .when(enabled, |d| d.cursor_pointer().hover(move |h| h.bg(muted)))
+            .when(!enabled, |d| d.opacity(0.4))
+            .child(Text::body(label).font_size(FontSizes::SM))
+            .when(enabled, move |d| {
+                d.on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)))
+            })
+    }
+
+    fn render_source_picker(&self, mark: &RailMark, cx: &mut Context<Self>) -> impl IntoElement {
+        let border = cx.theme().border;
+        let mode = self.picker.mode;
+
+        let mode_toggle = mark.fixed_row(
+            super::keyboard::MODE_ROW,
+            div()
+                .flex()
+                .items_center()
+                .gap(Spacing::SM)
+                .child(mark.ring_element(
+                    super::keyboard::MODE_ROW,
+                    super::keyboard::MODE_LIVE_FIELD,
+                    self.mode_chip(
+                        "mode-live",
+                        datatab_i18n::t!("document.schema_diff.view.mode.live"),
+                        mode == DiffMode::LiveVsLive,
+                        DiffMode::LiveVsLive,
+                        cx,
+                    ),
+                ))
+                .child(mark.ring_element(
+                    super::keyboard::MODE_ROW,
+                    super::keyboard::MODE_SNAPSHOT_FIELD,
+                    self.mode_chip(
+                        "mode-snapshot",
+                        datatab_i18n::t!("document.schema_diff.view.mode.snapshot"),
+                        mode == DiffMode::SnapshotVsLive,
+                        DiffMode::SnapshotVsLive,
+                        cx,
+                    ),
+                )),
+        );
+
+        let reference = match mode {
+            DiffMode::LiveVsLive => self.render_live_reference_list(mark, cx).into_any_element(),
+            DiffMode::SnapshotVsLive => self.render_snapshot_list(mark, cx).into_any_element(),
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(Spacing::SM)
+            .p(Spacing::MD)
+            .border_b_1()
+            .border_color(border)
+            .child(
+                Text::body_sm(datatab_i18n::t!(
+                    "document.schema_diff.view.compare_against"
+                ))
+                .muted_foreground(),
+            )
+            .child(mode_toggle)
+            .child(reference)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(Spacing::SM)
+                    .child(mark.ring_element(
+                        super::keyboard::COMPUTE_ROW,
+                        super::keyboard::COMPUTE_FIELD,
+                        self.primary_button(
+                            "compute-diff",
+                            datatab_i18n::t!("document.schema_diff.action.compute_diff"),
+                            self.can_compute() && !self.is_busy(),
+                            cx,
+                            |this, _w, cx| this.compute_diff(cx),
+                        ),
+                    )),
+            )
+    }
+
+    fn mode_chip(
+        &self,
+        id: &'static str,
+        label: String,
+        active: bool,
+        mode: DiffMode,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (primary, primary_foreground, secondary, muted) = {
+            let theme = cx.theme();
+            (
+                theme.primary,
+                theme.primary_foreground,
+                theme.secondary,
+                theme.muted,
+            )
+        };
+        div()
+            .id(id)
+            .px(Spacing::SM)
+            .py(Spacing::XS)
+            .rounded(Radii::SM)
+            .cursor_pointer()
+            .when(active, |d| d.bg(primary).text_color(primary_foreground))
+            .when(!active, |d| d.bg(secondary).hover(move |h| h.bg(muted)))
+            .child(if active {
+                Text::caption(label).color(primary_foreground)
+            } else {
+                Text::caption(label)
+            })
+            .on_click(cx.listener(move |this, _, _, cx| this.set_mode(mode, cx)))
+    }
+
+    /// One selectable reference row (a database or a connection), styled the
+    /// same way regardless of which group it belongs to.
+    /// One selectable reference row (a database, a connection or a
+    /// snapshot). Its element id doubles as its keyboard cursor row id.
+    fn reference_option_row(
+        &self,
+        id: SharedString,
+        label: String,
+        selected: bool,
+        mark: &RailMark,
+        cx: &mut Context<Self>,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+    ) -> AnyElement {
+        let (tint, muted) = {
+            let theme = cx.theme();
+            (ChromeColors::tint(theme), theme.muted)
+        };
+        let row = div()
+            .id(id.clone())
+            .px(Spacing::SM)
+            .py(Spacing::XS)
+            .rounded(Radii::SM)
+            .cursor_pointer()
+            .when(selected, |d| d.bg(tint.opacity(0.15)))
+            .hover(move |h| h.bg(muted))
+            .child(Text::body(label))
+            .on_click(cx.listener(move |this, _, window, cx| on_click(this, window, cx)));
+
+        mark.fixed_row(&id, row).into_any_element()
+    }
+
+    /// The other databases of the target's connection and the other open
+    /// relational connections, in the order the picker lists them.
+    pub(super) fn live_reference_candidates(&self, cx: &App) -> (Vec<String>, Vec<(Uuid, String)>) {
+        let database_candidates = same_connection_reference_databases(
+            &self.connection_databases,
+            self.database.as_deref(),
+        );
+
+        let connection_candidates: Vec<(Uuid, String)> = self
+            .app_state
+            .read(cx)
+            .connections()
+            .iter()
+            .filter(|(id, connected)| {
+                **id != self.profile_id
+                    && connected.connection.metadata().category
+                        == datatab_core::DatabaseCategory::Relational
+            })
+            .map(|(id, connected)| (*id, connected.profile.name.clone()))
+            .collect();
+
+        (database_candidates, connection_candidates)
+    }
+
+    /// The snapshots the picker lists, as `(id, label)`; none when the target
+    /// profile is gone.
+    pub(super) fn snapshot_options(&self, cx: &App) -> Vec<(Uuid, String)> {
+        let profile_exists = self
+            .app_state
+            .read(cx)
+            .profiles()
+            .iter()
+            .any(|p| p.id == self.profile_id);
+
+        if !profile_exists {
+            return Vec::new();
+        }
+
+        self.snapshots
+            .iter()
+            .filter_map(|summary| {
+                let snapshot_id = Uuid::parse_str(&summary.id).ok()?;
+                let label = format!(
+                    "{}  ·  {:?}",
+                    format_captured_at(summary.captured_at),
+                    summary.depth
+                );
+                Some((snapshot_id, label))
+            })
+            .collect()
+    }
+
+    fn render_live_reference_list(
+        &self,
+        mark: &RailMark,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (database_candidates, connection_candidates) = self.live_reference_candidates(cx);
+
+        if database_candidates.is_empty() && connection_candidates.is_empty() {
+            return div()
+                .child(
+                    Text::caption(datatab_i18n::t!("document.schema_diff.view.source.empty"))
+                        .muted_foreground(),
+                )
+                .into_any_element();
+        }
+
+        let mut sections: Vec<AnyElement> = Vec::new();
+
+        if !database_candidates.is_empty() {
+            let mut rows: Vec<AnyElement> = vec![
+                Text::body_sm(datatab_i18n::t!(
+                    "document.schema_diff.view.source.database_section"
+                ))
+                .muted_foreground()
+                .into_any_element(),
+            ];
+            for database in database_candidates {
+                let selected = matches!(
+                    &self.reference,
+                    Some(ReferenceTarget::SameConnectionDatabase(chosen)) if chosen == &database
+                );
+                let database_for_click = database.clone();
+                rows.push(self.reference_option_row(
+                    SharedString::from(format!("ref-db-{database}")),
+                    database,
+                    selected,
+                    mark,
+                    cx,
+                    move |this, _w, cx| {
+                        this.select_same_connection_database(database_for_click.clone(), cx)
+                    },
+                ));
+            }
+            sections.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(Spacing::XS)
+                    .children(rows)
+                    .into_any_element(),
+            );
+        }
+
+        if !connection_candidates.is_empty() {
+            let mut rows: Vec<AnyElement> = vec![
+                Text::body_sm(datatab_i18n::t!(
+                    "document.schema_diff.view.source.connection_section"
+                ))
+                .muted_foreground()
+                .into_any_element(),
+            ];
+            for (id, name) in connection_candidates {
+                let selected = matches!(
+                    &self.reference,
+                    Some(ReferenceTarget::OtherConnection { profile_id, .. }) if *profile_id == id
+                );
+                rows.push(self.reference_option_row(
+                    SharedString::from(format!("ref-conn-{id}")),
+                    name,
+                    selected,
+                    mark,
+                    cx,
+                    move |this, _w, cx| this.select_reference_connection(id, cx),
+                ));
+            }
+            sections.push(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(Spacing::XS)
+                    .children(rows)
+                    .into_any_element(),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(Spacing::SM)
+            .children(sections)
+            .into_any_element()
+    }
+
+    fn render_snapshot_list(&self, mark: &RailMark, cx: &mut Context<Self>) -> impl IntoElement {
+        let options = self.snapshot_options(cx);
+
+        if options.is_empty() {
+            return div()
+                .child(
+                    Text::caption(datatab_i18n::t!(
+                        "document.schema_diff.view.source.no_snapshots"
+                    ))
+                    .muted_foreground(),
+                )
+                .into_any_element();
+        }
+
+        let rows: Vec<AnyElement> = options
+            .into_iter()
+            .map(|(snapshot_id, label)| {
+                let selected = self.picker.selected_snapshot == Some(snapshot_id);
+                self.reference_option_row(
+                    SharedString::from(format!("snap-{snapshot_id}")),
+                    label,
+                    selected,
+                    mark,
+                    cx,
+                    move |this, _w, cx| this.select_snapshot(snapshot_id, cx),
+                )
+            })
+            .collect();
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(Spacing::XS)
+            .children(rows)
+            .into_any_element()
+    }
+
+    fn render_diff_list(&self, mark: &RailMark, cx: &mut Context<Self>) -> AnyElement {
+        if matches!(self.preparation, PreparationState::Pending { .. }) {
+            return diff_message_container()
+                .child(
+                    Text::body(datatab_i18n::t!("document.schema_diff.status.preparing"))
+                        .muted_foreground(),
+                )
+                .into_any_element();
+        }
+        let background = cx.theme().background;
+
+        match &self.compute_state {
+            ComputeState::Loading => {
+                return diff_message_container()
+                    .child(
+                        Text::body(datatab_i18n::t!("document.schema_diff.status.computing"))
+                            .muted_foreground(),
+                    )
+                    .into_any_element();
+            }
+            ComputeState::Idle => {
+                return diff_message_container()
+                    .child(
+                        Text::body(datatab_i18n::t!("document.schema_diff.status.idle"))
+                            .muted_foreground(),
+                    )
+                    .into_any_element();
+            }
+            ComputeState::Error(message) => {
+                return diff_message_container()
+                    .child(Text::body(message.clone()).danger())
+                    .into_any_element();
+            }
+            ComputeState::Empty => {
+                return diff_message_container()
+                    .child(
+                        Text::body(datatab_i18n::t!("document.schema_diff.status.empty"))
+                            .muted_foreground(),
+                    )
+                    .into_any_element();
+            }
+            ComputeState::Diff => {}
+        }
+
+        let mut groups: Vec<AnyElement> = Vec::with_capacity(self.groups.len());
+        for index in 0..self.groups.len() {
+            groups.push(self.render_group(index, mark, cx));
+        }
+
+        rail_scroll_area(
+            &self.rail,
+            "schema-diff-list-scroll",
+            div()
+                .flex()
+                .flex_col()
+                .gap(Spacing::SM)
+                .p(Spacing::MD)
+                .children(groups),
+        )
+        .bg(background)
+        .into_any_element()
+    }
+
+    // group_index comes from 0..self.groups.len() at the only call site.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "the only call site passes index from 0..self.groups.len()"
+    )]
+    fn render_group(
+        &self,
+        group_index: usize,
+        mark: &RailMark,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let border = cx.theme().border;
+        let group = &self.groups[group_index];
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+
+        for (change_index, change) in group.applicable.iter().enumerate() {
+            rows.push(self.render_change_row(group_index, change_index, change, mark, cx));
+        }
+
+        for unsupported in &group.unsupported {
+            rows.push(render_unsupported_row(unsupported));
+        }
+
+        if let Some(outcome) = &group.table_action {
+            rows.push(self.render_table_action_row(group_index, outcome, mark, cx));
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(Spacing::XS)
+            .p(Spacing::SM)
+            .rounded(Radii::MD)
+            .border_1()
+            .border_color(border)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(Spacing::SM)
+                    .child(Icon::new(AppIcon::Table).size(Heights::ICON_SM).muted())
+                    .child(Text::body(group.header.clone()).font_weight(FontWeight::MEDIUM)),
+            )
+            .children(rows)
+            .into_any_element()
+    }
+
+    fn render_change_row(
+        &self,
+        group_index: usize,
+        change_index: usize,
+        change: &RiskedChange,
+        mark: &RailMark,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (border, primary, primary_foreground) = {
+            let theme = cx.theme();
+            (theme.border, theme.primary, theme.primary_foreground)
+        };
+        let checked = self.selected.contains(&(group_index, change_index));
+        let badge = RiskBadge::from_classification(change.risk);
+        let description = crate::labels::schema_change_description(&change.change);
+
+        let checkbox = div()
+            .id(SharedString::from(format!(
+                "chk-{group_index}-{change_index}"
+            )))
+            .role(Role::CheckBox)
+            .aria_label(description.clone())
+            .aria_toggled(if checked {
+                Toggled::True
+            } else {
+                Toggled::False
+            })
+            .size(Fields::CHECKBOX_SIZE)
+            .rounded(Radii::SM)
+            .border_1()
+            .border_color(border)
+            .cursor_pointer()
+            .when(checked, |d| d.bg(primary))
+            .when(checked, |d| {
+                d.child(
+                    Icon::new(AppIcon::Check)
+                        .size(Fields::CHECK_MARK)
+                        .color(primary_foreground),
+                )
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_selection(group_index, change_index, cx)
+            }));
+
+        let row_id = super::keyboard::change_row_id(group_index, change_index);
+        mark.row(
+            &row_id,
+            div()
+                .flex()
+                .items_center()
+                .gap(Spacing::SM)
+                .py(Spacing::XS)
+                .child(checkbox)
+                .child(Badge::new(badge.label(), badge_tone(badge)))
+                .child(Text::body(description)),
+        )
+        .into_any_element()
+    }
+
+    fn render_table_action_row(
+        &self,
+        group_index: usize,
+        outcome: &TableActionOutcome,
+        mark: &RailMark,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        match outcome {
+            TableActionOutcome::Applicable { action, risk } => {
+                let (border, primary, primary_foreground) = {
+                    let theme = cx.theme();
+                    (theme.border, theme.primary, theme.primary_foreground)
+                };
+                let checked = self.selected_table_actions.contains(&group_index);
+                let badge = RiskBadge::from_classification(*risk);
+                let description = crate::labels::table_action_description(action);
+
+                let checkbox = div()
+                    .id(SharedString::from(format!("chk-table-{group_index}")))
+                    .role(Role::CheckBox)
+                    .aria_label(description.clone())
+                    .aria_toggled(if checked {
+                        Toggled::True
+                    } else {
+                        Toggled::False
+                    })
+                    .size(Fields::CHECKBOX_SIZE)
+                    .rounded(Radii::SM)
+                    .border_1()
+                    .border_color(border)
+                    .cursor_pointer()
+                    .when(checked, |d| d.bg(primary))
+                    .when(checked, |d| {
+                        d.child(
+                            Icon::new(AppIcon::Check)
+                                .size(Fields::CHECK_MARK)
+                                .color(primary_foreground),
+                        )
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_table_action_selection(group_index, cx)
+                    }));
+
+                let row_id = super::keyboard::table_action_row_id(group_index);
+                mark.row(
+                    &row_id,
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(Spacing::SM)
+                        .py(Spacing::XS)
+                        .child(checkbox)
+                        .child(Badge::new(badge.label(), badge_tone(badge)))
+                        .child(Text::body(description)),
+                )
+                .into_any_element()
+            }
+            TableActionOutcome::Unsupported {
+                is_create,
+                reason,
+                followup,
+                ..
+            } => {
+                let description = if *is_create {
+                    datatab_i18n::t!("document.schema_diff.view.unsupported_action.create")
+                } else {
+                    datatab_i18n::t!("document.schema_diff.view.unsupported_action.drop")
+                };
+                let mut reason_text = reason.clone();
+                if let Some(followup) = followup {
+                    reason_text = format!("{reason_text} (see {followup})");
+                }
+
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(Spacing::SM)
+                    .py(Spacing::XS)
+                    .child(Badge::new(
+                        datatab_i18n::t!("document.schema_diff.status.unsupported"),
+                        BadgeTone::Neutral,
+                    ))
+                    .child(Text::body(description))
+                    .child(Text::caption(reason_text).muted_foreground())
+                    .into_any_element()
+            }
+        }
+    }
+
+    fn render_footer(&self, mark: &RailMark, cx: &mut Context<Self>) -> impl IntoElement {
+        let border = cx.theme().border;
+        let has_selection = self.has_selection();
+
+        div()
+            .flex()
+            .items_center()
+            .justify_end()
+            .gap(Spacing::SM)
+            .px(Spacing::MD)
+            .py(Spacing::SM)
+            .border_t_1()
+            .border_color(border)
+            .child(mark.ring_element(
+                super::keyboard::FOOTER_ROW,
+                super::keyboard::PREVIEW_FIELD,
+                self.secondary_button(
+                    "preview-ddl",
+                    datatab_i18n::t!("document.schema_diff.action.preview_ddl"),
+                    has_selection && !self.is_busy(),
+                    cx,
+                    |this, _w, cx| this.open_preview(cx),
+                ),
+            ))
+            .child(mark.ring_element(
+                super::keyboard::FOOTER_ROW,
+                super::keyboard::APPLY_FIELD,
+                self.primary_button(
+                    "apply-ddl",
+                    datatab_i18n::t!("document.schema_diff.action.apply"),
+                    has_selection && !self.is_busy(),
+                    cx,
+                    |this, _w, cx| this.request_apply(cx),
+                ),
+            ))
+    }
+
+    /// Whether any change or whole-table action is checked.
+    pub(super) fn has_selection(&self) -> bool {
+        !self.selected.is_empty() || !self.selected_table_actions.is_empty()
+    }
+}
+
+fn diff_message_container() -> Div {
+    div()
+        .flex_1()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .p(Spacing::LG)
+}
+
+fn render_unsupported_row(unsupported: &UnsupportedChange) -> AnyElement {
+    let mut reason = unsupported.reason.clone();
+    if let Some(followup) = &unsupported.followup {
+        reason = format!("{reason} (see {followup})");
+    }
+
+    div()
+        .flex()
+        .items_center()
+        .gap(Spacing::SM)
+        .py(Spacing::XS)
+        .child(Badge::new(
+            datatab_i18n::t!("document.schema_diff.status.unsupported"),
+            BadgeTone::Neutral,
+        ))
+        .child(Text::body(crate::labels::schema_change_description(
+            &unsupported.change,
+        )))
+        .child(Text::caption(reason).muted_foreground())
+        .into_any_element()
+}
+
+fn format_captured_at(millis: i64) -> String {
+    format!(
+        "captured {}",
+        format_timestamp_ms(millis, TimestampDisplayMode::Local)
+    )
+}
+
+impl Render for SchemaDiffDocument {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some(preview) = self.pending_preview.take()
+            && self.preparation_binding_is_current(&preview.binding, cx)
+        {
+            self.sql_preview_modal.update(cx, |modal, cx| {
+                modal.open_query_preview(QueryLanguage::Sql, "DDL", preview.sql, window, cx);
+            });
+        }
+
+        if let Some(confirmation) = self.pending_confirm.take()
+            && self.preparation_binding_is_current(&confirmation.binding, cx)
+        {
+            self.open_confirmation = Some(confirmation.binding.clone());
+            self.confirm_modal.update(cx, |modal, cx| {
+                modal.open(confirmation.request, window, cx);
+            });
+        }
+
+        if let Some(binding) = self.pending_apply.take() {
+            self.run_apply(binding, cx);
+        }
+
+        flush_pending_toast(self.pending_toast.take(), window, cx);
+
+        let theme = cx.theme().clone();
+        let focus_handle = self.focus_handle.clone();
+
+        let rows = super::keyboard::rail_rows(self, cx);
+        let mark = self.rail.mark(&rows, focus_handle.is_focused(window), cx);
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .bg(theme.background)
+            .track_focus(&focus_handle)
+            .child(self.render_source_picker(&mark, cx))
+            .child(self.render_diff_list(&mark, cx))
+            .child(self.render_footer(&mark, cx))
+            .child(self.sql_preview_modal.clone())
+            .child(self.confirm_modal.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Import only what the tests need — deliberately NOT `use super::*`, which
+    // would re-glob `gpui::*` into this module and trigger pathological
+    // `#[test]` macro-expansion recursion in this GPUI-heavy crate.
+    use super::SchemaDiffDocument;
+    use super::{
+        ComputeBinding, ComputeState, PreparationBinding, PreparationContext, PreparationState,
+        ReferenceMetadataMap, TableDiffGroup, apply_completion_disposition,
+        apply_snapshot_load_result, binding_is_current, build_groups, deep_resolve,
+        document_state_for, invalidate_snapshot_profile_if_missing,
+        load_existing_profile_snapshots, read_only_toast_message, release_stale_apply_loading,
+        schema_diff_is_busy,
+    };
+    use std::collections::HashMap;
+
+    use crate::schema_diff::apply::TableLevelAction;
+    use crate::schema_diff::diff_source::{DiffMode, ReferenceTarget, TableActionOutcome};
+    use crate::types::DocumentState;
+    use datatab_core::{
+        CodeGenerator, ColumnInfo, Connection, ConstraintInfo, ConstraintKind, DatabaseCategory,
+        DbError, DbKind, DefaultSqlDialect, DriverCapabilities, DriverMetadata,
+        DriverMetadataBuilder, ForeignKeyInfo, IndexData, IndexInfo, MutationPolicy,
+        NoOpCodeGenerator, QueryHandle, QueryLanguage, QueryRequest, QueryResult, ReadOnlyReason,
+        SchemaLoadingStrategy, SchemaSnapshot, SqlDialect, TableCreationMetadata, TableInfo,
+    };
+    use datatab_core::{ConnectionProfile, DbConfig, SchemaSnapshotRecord, SnapshotDepth};
+    use datatab_storage::bootstrap::StorageRuntime;
+    use datatab_storage::repositories::sch_schema_snapshots::SchemaSnapshotRepo;
+    use datatab_ui_base::AppStateEntity;
+    use gpui::{AppContext, TestAppContext, WindowOptions};
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+    use uuid::Uuid;
+
+    #[gpui::test]
+    fn schema_diff_scheduled_mode_switch_discards_completion(cx: &mut TestAppContext) {
+        scheduled_snapshot_completion(cx, false);
+    }
+
+    #[gpui::test]
+    fn schema_diff_scheduled_profile_deletion_discards_completion(cx: &mut TestAppContext) {
+        scheduled_snapshot_completion(cx, true);
+    }
+
+    fn scheduled_snapshot_completion(cx: &mut TestAppContext, delete_profile: bool) {
+        cx.update(gpui_component::init);
+        cx.update(datatab_components::theme::init);
+        let app_state = cx.update(|cx| {
+            cx.new(|_| {
+                AppStateEntity::new_with_storage_runtime(
+                    StorageRuntime::in_memory().expect("storage"),
+                )
+                .expect("app state")
+            })
+        });
+        let profile = ConnectionProfile::new("test", DbConfig::default_sqlite());
+        let profile_id = profile.id;
+        app_state.update(cx, |state, _| state.add_profile_in_folder(profile, None));
+        let repo = cx.update(|cx| Arc::clone(&app_state.read(cx).inner.schema_snapshot_repo));
+        repo.insert(&SchemaSnapshotRecord {
+            id: Uuid::now_v7(),
+            profile_id,
+            database: Some("db".into()),
+            captured_at: 1,
+            fingerprint: "fingerprint".into(),
+            depth: SnapshotDepth::Shallow,
+            tables: Vec::new(),
+            creation_metadata: Vec::new(),
+        })
+        .expect("snapshot");
+        let window = cx
+            .update(|cx| {
+                cx.open_window(WindowOptions::default(), |window, cx| {
+                    cx.new(|cx| {
+                        SchemaDiffDocument::new(
+                            profile_id,
+                            Some("db".into()),
+                            app_state.clone(),
+                            window,
+                            cx,
+                        )
+                    })
+                })
+            })
+            .expect("window");
+        let (entered, received) = mpsc::channel();
+        let (completed, completion) = mpsc::channel();
+        window
+            .update(cx, |doc, _, cx| {
+                doc.snapshot_load_pause = Some(entered);
+                doc.snapshot_load_done = Some(completed);
+                doc.set_mode(DiffMode::SnapshotVsLive, cx);
+            })
+            .expect("start load");
+        cx.run_until_parked();
+        received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("background read completed");
+        if delete_profile {
+            app_state.update(cx, |state, cx| {
+                state.remove_profile(0).expect("remove profile");
+                cx.emit(datatab_ui_base::AppStateChanged);
+            });
+            assert!(
+                !repo
+                    .profile_exists(&profile_id.to_string())
+                    .expect("profile lookup")
+            );
+        } else {
+            window
+                .update(cx, |doc, _, cx| doc.set_mode(DiffMode::LiveVsLive, cx))
+                .expect("switch mode");
+        }
+        cx.executor().advance_clock(Duration::from_secs(60));
+        cx.run_until_parked();
+        completion
+            .recv_timeout(Duration::from_secs(5))
+            .expect("foreground snapshot completion finished");
+        window
+            .read_with(cx, |doc, _| assert!(doc.snapshots.is_empty()))
+            .expect("stale completion discarded");
+        if delete_profile {
+            assert_eq!(
+                app_state.read_with(cx, |state, _| state.unread_error_count),
+                0
+            );
+        } else {
+            window
+                .update(cx, |doc, _, cx| doc.set_mode(DiffMode::SnapshotVsLive, cx))
+                .expect("reload");
+            cx.run_until_parked();
+            window
+                .read_with(cx, |doc, _| assert_eq!(doc.snapshots.len(), 1))
+                .expect("current completion applied");
+        }
+    }
+
+    #[test]
+    fn schema_diff_deleted_profile_invalidates_loaded_snapshots() {
+        let profile = Uuid::now_v7();
+        let mut snapshots = vec![
+            datatab_storage::repositories::sch_schema_snapshots::SchemaSnapshotSummary {
+                id: Uuid::now_v7().to_string(),
+                profile_id: profile.to_string(),
+                database: None,
+                captured_at: 1,
+                fingerprint: "fp".into(),
+                depth: datatab_core::SnapshotDepth::Shallow,
+            },
+        ];
+        let mut selected = Uuid::parse_str(&snapshots[0].id).ok();
+        let mut ticket = 1;
+        let profiles = vec![profile];
+        assert!(!invalidate_snapshot_profile_if_missing(
+            &mut snapshots,
+            &mut selected,
+            &mut ticket,
+            profile,
+            &profiles,
+        ));
+        assert_eq!(snapshots.len(), 1);
+        assert!(invalidate_snapshot_profile_if_missing(
+            &mut snapshots,
+            &mut selected,
+            &mut ticket,
+            profile,
+            &[],
+        ));
+        assert!(snapshots.is_empty());
+        assert_eq!(selected, None);
+        assert_eq!(ticket, 2);
+    }
+
+    #[test]
+    fn schema_diff_snapshot_completion_requires_current_context() {
+        let profile = Uuid::now_v7();
+        let other_profile = Uuid::now_v7();
+        let summary = datatab_storage::repositories::sch_schema_snapshots::SchemaSnapshotSummary {
+            id: Uuid::now_v7().to_string(),
+            profile_id: profile.to_string(),
+            database: Some("db".into()),
+            captured_at: 1,
+            fingerprint: "fp".into(),
+            depth: datatab_core::SnapshotDepth::Shallow,
+        };
+        let mut snapshots = Vec::new();
+        for (ticket, mode, current_profile, database, exists) in [
+            (2, DiffMode::SnapshotVsLive, profile, Some("db"), true),
+            (1, DiffMode::LiveVsLive, profile, Some("db"), true),
+            (1, DiffMode::SnapshotVsLive, profile, Some("db"), false),
+            (1, DiffMode::SnapshotVsLive, other_profile, Some("db"), true),
+            (1, DiffMode::SnapshotVsLive, profile, Some("other"), true),
+        ] {
+            assert!(!apply_snapshot_load_result(
+                &mut snapshots,
+                1,
+                ticket,
+                mode,
+                profile,
+                current_profile,
+                Some("db"),
+                database,
+                exists,
+                &Ok(vec![summary.clone()]),
+            ));
+            assert!(snapshots.is_empty());
+        }
+        assert!(apply_snapshot_load_result(
+            &mut snapshots,
+            1,
+            1,
+            DiffMode::SnapshotVsLive,
+            profile,
+            profile,
+            Some("db"),
+            Some("db"),
+            true,
+            &Ok(vec![summary.clone()]),
+        ));
+        assert_eq!(snapshots, vec![summary]);
+    }
+
+    #[test]
+    fn schema_diff_snapshot_picker_excludes_deleted_profile_and_propagates_lookup_error() {
+        let runtime = StorageRuntime::in_memory().expect("storage");
+        let connection = Arc::new(Mutex::new(runtime.open_datatab_db().expect("connection")));
+        let repo = SchemaSnapshotRepo::new(Arc::clone(&connection));
+        let profile = Uuid::now_v7();
+        let profile_id = profile.to_string();
+        {
+            let conn = connection.lock().expect("lock");
+            conn.execute(
+                "INSERT INTO cfg_connection_profiles (id, name) VALUES (?1, 'test')",
+                [&profile_id],
+            )
+            .expect("insert profile");
+        }
+        let record = datatab_core::SchemaSnapshotRecord {
+            id: Uuid::now_v7(),
+            profile_id: profile,
+            database: None,
+            captured_at: 1,
+            fingerprint: "fingerprint".into(),
+            depth: datatab_core::SnapshotDepth::Shallow,
+            tables: Vec::new(),
+            creation_metadata: Vec::new(),
+        };
+        repo.insert(&record).expect("insert snapshot");
+        assert_eq!(repo.list(&profile_id, None).expect("direct list").len(), 1);
+        assert_eq!(
+            load_existing_profile_snapshots(&repo, &profile_id, None)
+                .expect("picker list")
+                .len(),
+            1
+        );
+        connection
+            .lock()
+            .expect("lock")
+            .execute(
+                "DELETE FROM cfg_connection_profiles WHERE id = ?1",
+                [&profile_id],
+            )
+            .expect("delete profile");
+        assert_eq!(
+            repo.list(&profile_id, None)
+                .expect("orphan directly listable")
+                .len(),
+            1
+        );
+        assert!(
+            load_existing_profile_snapshots(&repo, &profile_id, None)
+                .expect("picker must exclude orphan")
+                .is_empty()
+        );
+        connection
+            .lock()
+            .expect("lock")
+            .execute("DROP TABLE cfg_connection_profiles", [])
+            .expect("drop profiles");
+        assert!(load_existing_profile_snapshots(&repo, &profile_id, None).is_err());
+    }
+
+    // ── FIX-2: identical-schema comparison is Empty (Clean), not Error ──────
+
+    #[test]
+    fn empty_compute_state_is_clean_not_error() {
+        assert_eq!(
+            document_state_for(&ComputeState::Empty),
+            DocumentState::Clean,
+            "a clean no-diff result must not render as an error"
+        );
+    }
+
+    #[test]
+    fn error_and_loading_states_map_distinctly() {
+        assert_eq!(
+            document_state_for(&ComputeState::Error("boom".to_string())),
+            DocumentState::Error
+        );
+        assert_eq!(
+            document_state_for(&ComputeState::Loading),
+            DocumentState::Loading
+        );
+        assert_eq!(
+            document_state_for(&ComputeState::Idle),
+            DocumentState::Clean
+        );
+        assert_eq!(
+            document_state_for(&ComputeState::Diff),
+            DocumentState::Clean
+        );
+    }
+
+    // ── FIX-3: deep_resolve propagates table_details failures ───────────────
+
+    struct DeepResolveFake {
+        meta: DriverMetadata,
+        dialect: DefaultSqlDialect,
+        codegen: NoOpCodeGenerator,
+        fail_table_details: bool,
+        creation_metadata: Option<TableCreationMetadata>,
+    }
+
+    impl DeepResolveFake {
+        fn new(fail_table_details: bool) -> Self {
+            let meta = DriverMetadataBuilder::new(
+                "test",
+                "Test",
+                DatabaseCategory::Relational,
+                QueryLanguage::Sql,
+            )
+            .capabilities(DriverCapabilities::empty())
+            .build();
+            Self {
+                meta,
+                dialect: DefaultSqlDialect,
+                codegen: NoOpCodeGenerator,
+                fail_table_details,
+                creation_metadata: None,
+            }
+        }
+
+        fn with_creation_metadata(
+            fail_table_details: bool,
+            creation_metadata: Option<TableCreationMetadata>,
+        ) -> Self {
+            Self {
+                creation_metadata,
+                ..Self::new(fail_table_details)
+            }
+        }
+    }
+
+    impl Connection for DeepResolveFake {
+        fn metadata(&self) -> &DriverMetadata {
+            &self.meta
+        }
+        fn ping(&self) -> Result<(), DbError> {
+            Ok(())
+        }
+        fn close(&mut self) -> Result<(), DbError> {
+            Ok(())
+        }
+        fn execute(&self, _req: &QueryRequest) -> Result<QueryResult, DbError> {
+            Ok(QueryResult::empty())
+        }
+        fn cancel(&self, _handle: &QueryHandle) -> Result<(), DbError> {
+            Ok(())
+        }
+        fn schema(&self) -> Result<SchemaSnapshot, DbError> {
+            Err(DbError::NotSupported("stub".to_string()))
+        }
+        fn kind(&self) -> DbKind {
+            DbKind::Postgres
+        }
+        fn schema_loading_strategy(&self) -> SchemaLoadingStrategy {
+            SchemaLoadingStrategy::SingleDatabase
+        }
+        fn dialect(&self) -> &dyn SqlDialect {
+            &self.dialect
+        }
+        fn code_generator(&self) -> &dyn CodeGenerator {
+            &self.codegen
+        }
+        fn table_creation_metadata(
+            &self,
+            _database: &str,
+            _schema: Option<&str>,
+            _table: &str,
+        ) -> Result<Option<TableCreationMetadata>, DbError> {
+            Ok(self.creation_metadata.clone())
+        }
+
+        fn generate_code_with_creation_metadata(
+            &self,
+            _generator_id: &str,
+            table: &TableInfo,
+            _creation_metadata: Option<&TableCreationMetadata>,
+        ) -> Result<String, DbError> {
+            Ok(format!("CREATE TABLE {} (id INT)", table.name))
+        }
+
+        fn table_details(
+            &self,
+            _database: &str,
+            schema: Option<&str>,
+            table: &str,
+        ) -> Result<TableInfo, DbError> {
+            if self.fail_table_details {
+                return Err(DbError::NotSupported("cannot introspect".to_string()));
+            }
+            Ok(TableInfo {
+                name: table.to_string(),
+                schema: schema.map(str::to_string),
+                columns: Some(vec![ColumnInfo {
+                    name: "id".to_string(),
+                    type_name: "integer".to_string(),
+                    nullable: false,
+                    is_primary_key: true,
+                    default_value: None,
+                    enum_values: None,
+                }]),
+                indexes: None,
+                foreign_keys: None,
+                constraints: None,
+                sample_fields: None,
+                presentation: Default::default(),
+                child_items: None,
+                storage_hints: None,
+                pseudo_columns: Box::default(),
+            })
+        }
+    }
+
+    fn shallow_table(name: &str) -> TableInfo {
+        TableInfo {
+            name: name.to_string(),
+            schema: Some("public".to_string()),
+            // Deliberately column-less: this is the shallow entry the old code
+            // silently degraded to on failure.
+            columns: None,
+            indexes: None,
+            foreign_keys: None,
+            constraints: None,
+            sample_fields: None,
+            presentation: Default::default(),
+            child_items: None,
+            storage_hints: None,
+            pseudo_columns: Box::default(),
+        }
+    }
+
+    #[test]
+    fn schema_identity_changes_when_only_an_index_changes() {
+        let without_index = shallow_table("users");
+        let mut with_index = without_index.clone();
+        with_index.indexes = Some(IndexData::Relational(vec![IndexInfo {
+            name: "users_email_idx".to_string(),
+            columns: vec!["email".to_string()],
+            is_unique: true,
+            is_primary: false,
+        }]));
+
+        assert_ne!(
+            super::schema_fingerprint(&[without_index]),
+            super::schema_fingerprint(&[with_index]),
+            "schema context identity must include indexes"
+        );
+    }
+
+    #[test]
+    fn schema_identity_distinguishes_none_empty_defaults_foreign_keys_and_constraints() {
+        let none_loaded = shallow_table("users");
+        let mut empty_loaded = none_loaded.clone();
+        empty_loaded.columns = Some(Vec::new());
+        empty_loaded.indexes = Some(IndexData::Relational(Vec::new()));
+        empty_loaded.foreign_keys = Some(Vec::new());
+        empty_loaded.constraints = Some(Vec::new());
+
+        assert_ne!(
+            super::schema_fingerprint(std::slice::from_ref(&none_loaded)),
+            super::schema_fingerprint(&[empty_loaded.clone()]),
+            "None and an explicitly loaded empty collection must remain distinct"
+        );
+
+        let mut with_metadata = empty_loaded;
+        with_metadata.columns = Some(vec![ColumnInfo {
+            name: "account_id".to_string(),
+            type_name: "integer".to_string(),
+            nullable: false,
+            is_primary_key: false,
+            default_value: Some("0".to_string()),
+            enum_values: None,
+        }]);
+        with_metadata.foreign_keys = Some(vec![ForeignKeyInfo {
+            name: "users_account_fk".to_string(),
+            columns: vec!["account_id".to_string()],
+            referenced_table: "accounts".to_string(),
+            referenced_schema: Some("public".to_string()),
+            referenced_columns: vec!["id".to_string()],
+            on_delete: Some("CASCADE".to_string()),
+            on_update: Some("RESTRICT".to_string()),
+        }]);
+        with_metadata.constraints = Some(vec![ConstraintInfo {
+            name: "users_account_check".to_string(),
+            kind: ConstraintKind::Check,
+            columns: Vec::new(),
+            check_clause: Some("account_id >= 0".to_string()),
+        }]);
+
+        assert_ne!(
+            super::schema_fingerprint(&[none_loaded]),
+            super::schema_fingerprint(&[with_metadata]),
+            "defaults, foreign-key actions, and constraints must affect identity"
+        );
+    }
+
+    #[test]
+    fn schema_context_marker() {
+        assert!(schema_context_with_reference().reference.is_some());
+    }
+
+    fn schema_context_with_reference() -> PreparationContext {
+        PreparationContext {
+            mode: DiffMode::LiveVsLive,
+            reference: Some(ReferenceTarget::OtherConnection {
+                profile_id: Uuid::from_u128(2),
+                database: Some("reference".to_string()),
+            }),
+            snapshot: None,
+            profile_id: Uuid::from_u128(1),
+            database: Some("target".to_string()),
+            target_schema_fingerprint: "target-schema".to_string(),
+            target_connection_identity: 10,
+            reference_connection_identity: Some(20),
+            reference_database: Some("reference".to_string()),
+            reference_schema: Some("reference-schema".to_string()),
+            policy: MutationPolicy::Allowed,
+            selection: vec![(0, 1)],
+            table_actions: vec![2],
+        }
+    }
+
+    #[test]
+    fn preparation_context_covers_selected_source_and_snapshot_variants() {
+        let baseline = schema_context_with_reference();
+
+        let mut selected = baseline.clone();
+        selected.selection.clear();
+        assert_ne!(baseline, selected);
+
+        let mut source = baseline.clone();
+        source.reference = Some(ReferenceTarget::SameConnectionDatabase(
+            "reference".to_string(),
+        ));
+        assert_ne!(baseline, source);
+
+        let mut reference_connection = baseline.clone();
+        reference_connection.reference_connection_identity = Some(21);
+        assert_ne!(baseline, reference_connection);
+
+        let mut database = baseline.clone();
+        database.database = None;
+        assert_ne!(baseline, database);
+
+        let mut schema = baseline.clone();
+        schema.reference_schema = Some("changed-schema".to_string());
+        assert_ne!(baseline, schema);
+
+        let mut snapshot = baseline.clone();
+        snapshot.mode = DiffMode::SnapshotVsLive;
+        snapshot.snapshot = Some(Uuid::from_u128(3));
+        assert_ne!(baseline, snapshot);
+    }
+
+    #[test]
+    fn completion_binding_requires_the_current_ticket_and_context() {
+        let current = schema_context_with_reference();
+        assert!(binding_is_current(7, 7, &current, Some(&current)));
+        assert!(!binding_is_current(8, 7, &current, Some(&current)));
+
+        let mut changed = current.clone();
+        changed.reference_database = Some("other".to_string());
+        assert!(!binding_is_current(7, 7, &current, Some(&changed)));
+    }
+
+    #[test]
+    fn current_error_completion_clears_results_but_stale_error_preserves_them() {
+        let mut state = ComputeState::Loading;
+        let mut groups = vec!["old result"];
+        let mut selected = std::collections::HashSet::from([(0, 0)]);
+        let mut selected_table_actions = std::collections::HashSet::from([0]);
+
+        assert!(super::apply_compute_error(
+            true,
+            &mut state,
+            &mut groups,
+            &mut selected,
+            &mut selected_table_actions,
+            "current failure".to_string(),
+        ));
+        assert!(groups.is_empty());
+        assert!(selected.is_empty());
+        assert!(selected_table_actions.is_empty());
+        assert!(matches!(state, ComputeState::Error(message) if message == "current failure"));
+
+        state = ComputeState::Loading;
+        groups = vec!["new result"];
+        selected = std::collections::HashSet::from([(1, 2)]);
+        selected_table_actions = std::collections::HashSet::from([1]);
+
+        assert!(!super::apply_compute_error(
+            false,
+            &mut state,
+            &mut groups,
+            &mut selected,
+            &mut selected_table_actions,
+            "stale failure".to_string(),
+        ));
+        assert!(matches!(state, ComputeState::Loading));
+        assert_eq!(groups, ["new result"]);
+        assert_eq!(selected, std::collections::HashSet::from([(1, 2)]));
+        assert_eq!(selected_table_actions, std::collections::HashSet::from([1]));
+    }
+
+    #[test]
+    fn apply_completion_releases_only_its_stale_loading_ownership() {
+        let current = schema_context_with_reference();
+        let completed = PreparationBinding {
+            ticket: 7,
+            context: current.clone(),
+        };
+        let newer_apply = PreparationBinding {
+            ticket: 8,
+            context: current.clone(),
+        };
+
+        let current_completion =
+            apply_completion_disposition(Some(&completed), &completed, Some(&current), true);
+        assert_eq!(
+            current_completion,
+            super::ApplyCompletionDisposition {
+                releases_active_binding: true,
+                publishes_document: true,
+                releases_loading_state: false,
+                reports_error_globally: true,
+            }
+        );
+
+        let mut changed = current.clone();
+        changed.reference_database = Some("changed".to_string());
+        for context in [Some(&changed), None] {
+            for is_failure in [false, true] {
+                let completion =
+                    apply_completion_disposition(Some(&completed), &completed, context, is_failure);
+                assert!(completion.releases_active_binding);
+                assert!(!completion.publishes_document);
+                assert!(completion.releases_loading_state);
+                assert_eq!(completion.reports_error_globally, is_failure);
+
+                let mut state = ComputeState::Loading;
+                assert!(release_stale_apply_loading(&completion, None, &mut state));
+                assert!(matches!(state, ComputeState::Idle));
+                assert!(
+                    !schema_diff_is_busy(&state, &PreparationState::Idle, None),
+                    "a stale apply completion must release the busy signal"
+                );
+            }
+        }
+
+        let stale_completion =
+            apply_completion_disposition(Some(&completed), &completed, Some(&changed), false);
+        let active_compute = ComputeBinding {
+            ticket: 9,
+            context: current.clone(),
+        };
+        let mut state = ComputeState::Loading;
+        assert!(!release_stale_apply_loading(
+            &stale_completion,
+            Some(&active_compute),
+            &mut state,
+        ));
+        assert!(matches!(state, ComputeState::Loading));
+
+        let newer_apply_completion =
+            apply_completion_disposition(Some(&newer_apply), &completed, Some(&current), true);
+        assert!(!newer_apply_completion.releases_active_binding);
+        assert!(!newer_apply_completion.releases_loading_state);
+        assert!(newer_apply_completion.reports_error_globally);
+        assert!(!release_stale_apply_loading(
+            &newer_apply_completion,
+            None,
+            &mut state,
+        ));
+        assert!(matches!(state, ComputeState::Loading));
+        assert!(schema_diff_is_busy(
+            &state,
+            &PreparationState::Idle,
+            Some(&newer_apply),
+        ));
+    }
+
+    #[test]
+    fn schema_identity_rejects_serialization_errors() {
+        let serialization_error = serde_json::from_str::<serde_json::Value>("{")
+            .expect_err("the fixture must fail to parse");
+
+        assert!(super::schema_identity_from_serialized(Err(serialization_error)).is_err());
+    }
+
+    #[test]
+    fn deep_resolve_propagates_table_details_error() {
+        let connection = DeepResolveFake::new(true);
+        let shallow = vec![shallow_table("users")];
+
+        let result = deep_resolve(&connection, Some("app"), &shallow, false);
+
+        assert!(
+            result.is_err(),
+            "a failed table_details must abort the comparison, not degrade to the shallow entry"
+        );
+        assert!(result.unwrap_err().contains("users"));
+    }
+
+    #[test]
+    fn deep_resolve_backfills_columns_on_success() {
+        let connection = DeepResolveFake::new(false);
+        let shallow = vec![shallow_table("users")];
+
+        let (resolved, _) = deep_resolve(&connection, Some("app"), &shallow, false)
+            .expect("resolution should succeed when table_details succeeds");
+
+        assert_eq!(resolved.len(), 1);
+        assert!(
+            resolved[0].columns.is_some(),
+            "the resolved table must carry the fetched columns, not the column-less shallow entry"
+        );
+    }
+
+    // ── DBF-161: reference creation metadata forwarding ─────────────────
+
+    fn users_creation_metadata() -> TableCreationMetadata {
+        TableCreationMetadata {
+            schema: Some("public".to_string()),
+            table: "users".to_string(),
+            completeness: datatab_core::MetadataCompleteness::Complete,
+            identity: Some(datatab_core::IdentitySpec {
+                column: "id".to_string(),
+                seed: "1".to_string(),
+                increment: "1".to_string(),
+            }),
+            primary_key: Some(datatab_core::PrimaryKeySpec {
+                columns: vec!["id".to_string()],
+            }),
+            blockers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn deep_resolve_collects_reference_creation_metadata_by_qualified_name() {
+        let connection =
+            DeepResolveFake::with_creation_metadata(false, Some(users_creation_metadata()));
+        let shallow = vec![shallow_table("users")];
+
+        let (_, metadata) = deep_resolve(&connection, Some("app"), &shallow, true)
+            .expect("resolution should succeed");
+
+        assert_eq!(
+            metadata.get(&(Some("public".to_string()), "users".to_string())),
+            Some(&users_creation_metadata()),
+            "the reference side's creation metadata must be collected for generation"
+        );
+    }
+
+    #[test]
+    fn deep_resolve_skips_metadata_collection_when_not_requested() {
+        let connection =
+            DeepResolveFake::with_creation_metadata(false, Some(users_creation_metadata()));
+        let shallow = vec![shallow_table("users")];
+
+        let (_, metadata) = deep_resolve(&connection, Some("app"), &shallow, false)
+            .expect("resolution should succeed");
+
+        assert!(
+            metadata.is_empty(),
+            "the diff target side must not pay for reference-side metadata"
+        );
+    }
+
+    #[test]
+    fn build_groups_attaches_reference_metadata_to_table_added_actions() {
+        let connection = DeepResolveFake::new(false);
+        let mut metadata_map = HashMap::new();
+        metadata_map.insert(
+            (Some("public".to_string()), "orders".to_string()),
+            users_creation_metadata(),
+        );
+
+        let info = TableInfo {
+            name: "orders".to_string(),
+            schema: Some("public".to_string()),
+            columns: Some(Vec::new()),
+            indexes: None,
+            foreign_keys: None,
+            constraints: None,
+            sample_fields: None,
+            presentation: Default::default(),
+            child_items: None,
+            storage_hints: None,
+            pseudo_columns: Box::default(),
+        };
+        let changes = vec![datatab_core::TableChange::TableAdded(info)];
+
+        let groups = build_groups(&connection, changes, &metadata_map);
+
+        match &groups[0].table_action {
+            Some(TableActionOutcome::Applicable { action, .. }) => match action {
+                TableLevelAction::Create(_, attached) => assert_eq!(
+                    attached.as_ref(),
+                    Some(&users_creation_metadata()),
+                    "the Create action must carry the reference side's creation metadata"
+                ),
+                TableLevelAction::Drop(_) => panic!("expected a Create action"),
+            },
+            other => panic!("expected an applicable table action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn snapshot_metadata_binds_by_qualified_name_not_list_position() {
+        // Snapshot metadata is a standalone list covering only the tables the
+        // driver could describe; binding must be by (schema, table), and a
+        // table without an entry must resolve to no metadata.
+        let other = TableCreationMetadata {
+            table: "other".to_string(),
+            ..users_creation_metadata()
+        };
+        let map = super::reference_metadata_from_snapshot(vec![other]);
+
+        assert_eq!(
+            map.get(&(Some("public".to_string()), "users".to_string())),
+            None,
+            "metadata must not be bound by list position"
+        );
+        assert_eq!(
+            map.get(&(Some("public".to_string()), "other".to_string())),
+            Some(&TableCreationMetadata {
+                table: "other".to_string(),
+                ..users_creation_metadata()
+            })
+        );
+    }
+
+    #[test]
+    fn build_groups_leaves_table_added_without_metadata_unattached() {
+        let connection = DeepResolveFake::new(false);
+        let metadata_map = HashMap::new();
+
+        let info = TableInfo {
+            name: "orders".to_string(),
+            schema: Some("public".to_string()),
+            columns: Some(Vec::new()),
+            indexes: None,
+            foreign_keys: None,
+            constraints: None,
+            sample_fields: None,
+            presentation: Default::default(),
+            child_items: None,
+            storage_hints: None,
+            pseudo_columns: Box::default(),
+        };
+        let changes = vec![datatab_core::TableChange::TableAdded(info)];
+
+        let groups = build_groups(&connection, changes, &metadata_map);
+
+        match &groups[0].table_action {
+            Some(TableActionOutcome::Applicable { action, .. }) => match action {
+                TableLevelAction::Create(_, attached) => assert!(
+                    attached.is_none(),
+                    "no reference metadata must arrive as None so metadata-aware drivers refuse"
+                ),
+                TableLevelAction::Drop(_) => panic!("expected a Create action"),
+            },
+            other => panic!("expected an applicable table action, got {other:?}"),
+        }
+    }
+
+    // ── i18n: schema-diff view chrome keys ──────────────────────────────────
+
+    const SCHEMA_DIFF_VIEW_KEYS: &[&str] = &[
+        "document.schema_diff.action.apply",
+        "document.schema_diff.action.compute_diff",
+        "document.schema_diff.action.preview_ddl",
+        "document.schema_diff.status.computing",
+        "document.schema_diff.status.empty",
+        "document.schema_diff.status.idle",
+        "document.schema_diff.status.unsupported",
+        "document.schema_diff.view.compare_against",
+        "document.schema_diff.view.mode.live",
+        "document.schema_diff.view.mode.snapshot",
+        "document.schema_diff.view.source.connection_section",
+        "document.schema_diff.view.source.database_section",
+        "document.schema_diff.view.source.empty",
+        "document.schema_diff.view.source.no_snapshots",
+        "document.schema_diff.view.title",
+        "document.schema_diff.view.title_default",
+        "document.schema_diff.view.unsupported_action.create",
+        "document.schema_diff.view.unsupported_action.drop",
+    ];
+
+    #[test]
+    fn schema_diff_view_keys_resolve_in_english() {
+        for key in SCHEMA_DIFF_VIEW_KEYS {
+            let value = datatab_i18n::t!(*key, locale = "en");
+
+            assert!(!value.is_empty(), "{key} resolved empty in en");
+            assert_ne!(value, *key, "{key} resolved to its own key in en");
+            assert_ne!(value, format!("en.{key}"), "{key} missing from en catalog");
+        }
+    }
+
+    #[test]
+    fn schema_diff_title_interpolates_database_name() {
+        let title = datatab_i18n::t!("document.schema_diff.view.title", database = "app_db");
+
+        assert!(
+            title.contains("app_db"),
+            "title must interpolate the database name: {title}"
+        );
+    }
+
+    #[test]
+    fn schema_diff_status_unsupported_is_english() {
+        let en = datatab_i18n::t!("document.schema_diff.status.unsupported", locale = "en");
+
+        assert_eq!(en, "Unsupported");
+    }
+
+    #[test]
+    fn schema_diff_action_compute_diff_is_english() {
+        let en = datatab_i18n::t!("document.schema_diff.action.compute_diff", locale = "en");
+
+        assert_eq!(en, "Compute Diff");
+    }
+
+    // ── i18n: apply.rs / diff_source.rs / pane.rs toasts and errors ────────
+
+    const SCHEMA_DIFF_TOAST_AND_SUMMARY_KEYS: &[&str] = &[
+        "document.schema_diff.apply.read_only",
+        "document.schema_diff.apply.read_only_profile",
+        "document.schema_diff.apply.read_only_server",
+        "document.schema_diff.summary.apply",
+        "document.schema_diff.summary.this_connection",
+        "document.schema_diff.toast.applied",
+        "document.schema_diff.toast.apply_partial_failure",
+        "document.schema_diff.toast.approval_queue_failed",
+        "document.schema_diff.toast.approval_queued",
+        "document.schema_diff.toast.approval_unavailable",
+        "document.schema_diff.toast.connection_unavailable",
+        "document.schema_diff.toast.ddl_build_failed",
+        "document.schema_diff.toast.read_only",
+        "document.schema_diff.toast.read_only_profile",
+        "document.schema_diff.toast.read_only_server",
+        "document.schema_diff.toast.reference_connection_disconnected",
+        "document.schema_diff.toast.reference_not_picked",
+        "document.schema_diff.toast.select_at_least_one",
+        "document.schema_diff.toast.select_at_least_one_to_apply",
+        "document.schema_diff.toast.snapshot_load_failed",
+        "document.schema_diff.toast.snapshot_missing",
+        "document.schema_diff.toast.snapshot_not_picked",
+    ];
+
+    #[test]
+    fn schema_diff_toast_keys_resolve_in_english() {
+        for key in SCHEMA_DIFF_TOAST_AND_SUMMARY_KEYS {
+            let value = datatab_i18n::t!(*key, locale = "en");
+
+            assert!(!value.is_empty(), "{key} resolved empty in en");
+            assert_ne!(value, *key, "{key} resolved to its own key in en");
+            assert_ne!(value, format!("en.{key}"), "{key} missing from en catalog");
+        }
+    }
+
+    #[test]
+    fn schema_diff_toast_read_only_is_english() {
+        let en = datatab_i18n::t!("document.schema_diff.toast.read_only", locale = "en");
+
+        assert_eq!(
+            en,
+            "This connection is read-only. Schema changes are not allowed."
+        );
+    }
+
+    #[test]
+    fn schema_diff_apply_read_only_matches_toast_read_only_in_english() {
+        // apply.rs and view.rs surface the same read-only refusal
+        // independently; both must resolve to the same English text.
+        let apply = datatab_i18n::t!("document.schema_diff.apply.read_only", locale = "en");
+        let toast = datatab_i18n::t!("document.schema_diff.toast.read_only", locale = "en");
+
+        assert_eq!(apply, toast);
+    }
+
+    #[test]
+    fn schema_diff_apply_read_only_reason_variants_match_toast_variants_in_english() {
+        // The reason-aware `apply.read_only_profile`/`apply.read_only_server`
+        // keys must stay textually identical to their `toast.*` counterparts,
+        // for the same reason the generic `read_only` pair is kept in sync.
+        for suffix in ["profile", "server"] {
+            let apply = datatab_i18n::t!(
+                &format!("document.schema_diff.apply.read_only_{suffix}"),
+                locale = "en"
+            );
+            let toast = datatab_i18n::t!(
+                &format!("document.schema_diff.toast.read_only_{suffix}"),
+                locale = "en"
+            );
+
+            assert_eq!(
+                apply, toast,
+                "read_only_{suffix} text drifted between surfaces"
+            );
+        }
+    }
+
+    #[test]
+    fn read_only_toast_message_selects_profile_key_for_profile_setting() {
+        let value = read_only_toast_message(Some(ReadOnlyReason::ProfileSetting));
+
+        assert_eq!(
+            value,
+            datatab_i18n::t!("document.schema_diff.toast.read_only_profile")
+        );
+    }
+
+    #[test]
+    fn read_only_toast_message_selects_server_key_for_server_enforced() {
+        let value = read_only_toast_message(Some(ReadOnlyReason::ServerEnforced));
+
+        assert_eq!(
+            value,
+            datatab_i18n::t!("document.schema_diff.toast.read_only_server")
+        );
+    }
+
+    #[test]
+    fn read_only_toast_message_falls_back_to_generic_key_when_reason_missing() {
+        let value = read_only_toast_message(None);
+
+        assert_eq!(
+            value,
+            datatab_i18n::t!("document.schema_diff.toast.read_only")
+        );
+    }
+
+    #[test]
+    fn schema_diff_toast_applied_interpolates_counts() {
+        let message = datatab_i18n::t!(
+            "document.schema_diff.toast.applied",
+            statements = 3,
+            tables = 2
+        );
+
+        assert!(message.contains('3'));
+        assert!(message.contains('2'));
+    }
+
+    #[test]
+    fn schema_diff_toast_apply_partial_failure_interpolates_every_placeholder() {
+        let message = datatab_i18n::t!(
+            "document.schema_diff.toast.apply_partial_failure",
+            applied = 1,
+            total = 3,
+            statements = 4,
+            table = "public.orders",
+            error = "connection reset",
+            remaining = 2
+        );
+
+        assert!(message.contains("public.orders"));
+        assert!(message.contains("connection reset"));
+    }
+
+    #[test]
+    fn schema_diff_summary_apply_interpolates_count_and_target() {
+        let message = datatab_i18n::t!(
+            "document.schema_diff.summary.apply",
+            count = 5,
+            target = "app_db"
+        );
+
+        assert!(message.contains('5'));
+        assert!(message.contains("app_db"));
+    }
+
+    #[gpui::test]
+    fn the_selection_checkboxes_are_named_checkboxes(cx: &mut TestAppContext) {
+        use crate::keyboard_test_support::{host_document, init_keyboard_runtime};
+        use datatab_components::accessibility::{
+            FrameCapture, accessibility_node, accessible_name,
+        };
+        use datatab_core::{
+            ColumnSnapshot, ExecutionClassification, RiskedChange, SchemaChange, TableRef,
+        };
+        use gpui::{Entity, Role, Toggled};
+
+        init_keyboard_runtime(cx);
+
+        let app_state = cx.update(|cx| {
+            cx.new(|_| {
+                AppStateEntity::new_with_storage_runtime(
+                    StorageRuntime::in_memory().expect("storage"),
+                )
+                .expect("app state")
+            })
+        });
+        let profile = ConnectionProfile::new("test", DbConfig::default_sqlite());
+        let profile_id = profile.id;
+        app_state.update(cx, |state, _| state.add_profile_in_folder(profile, None));
+
+        let (host, window) = host_document(
+            cx,
+            move |window, cx| {
+                cx.new(|cx| {
+                    SchemaDiffDocument::new(profile_id, Some("db".into()), app_state, window, cx)
+                })
+            },
+            |document, _cx| document.active_context(),
+            |document, command, window, cx| document.dispatch_command(command, window, cx),
+        );
+        let document: Entity<SchemaDiffDocument> =
+            window.update(|_, cx| host.read(cx).document.clone());
+        window.run_until_parked();
+
+        // The test profile has no connection, so the tab's own comparison
+        // never runs; the group and its state are installed directly.
+        let change = SchemaChange::ColumnAdded(ColumnSnapshot {
+            name: "email".to_string(),
+            type_name: "text".to_string(),
+            nullable: true,
+            is_primary_key: false,
+            default_value: None,
+        });
+        let expected = crate::labels::schema_change_description(&change);
+
+        window.update(|_, cx| {
+            document.update(cx, |document, cx| {
+                document.groups = vec![TableDiffGroup {
+                    table: TableRef {
+                        schema: None,
+                        name: "users".to_string(),
+                    },
+                    header: "users".to_string(),
+                    applicable: vec![RiskedChange {
+                        change,
+                        risk: ExecutionClassification::AdminSafe,
+                    }],
+                    unsupported: Vec::new(),
+                    table_action: None,
+                }];
+                document.compute_state = ComputeState::Diff;
+                cx.notify();
+            });
+        });
+        window.run_until_parked();
+
+        let capture = FrameCapture::observe(window);
+        let frame = capture.frame(window);
+
+        assert_eq!(
+            accessible_name(&frame, "chk-0-0"),
+            Some(expected),
+            "the checkbox is named after the change it applies"
+        );
+        let node =
+            accessibility_node(&frame, "chk-0-0").expect("the checkbox is an accessible node");
+        assert_eq!(node.role(), Role::CheckBox);
+        assert_eq!(node.toggled(), Some(Toggled::False));
+
+        window.update(|_, cx| {
+            document.update(cx, |document, cx| document.toggle_selection(0, 0, cx));
+        });
+        let frame = capture.frame(window);
+        let node =
+            accessibility_node(&frame, "chk-0-0").expect("the checkbox is an accessible node");
+
+        assert_eq!(
+            node.toggled(),
+            Some(Toggled::True),
+            "selecting is announced"
+        );
+    }
+}

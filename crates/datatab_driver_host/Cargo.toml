@@ -1,0 +1,56 @@
+[package]
+name = "datatab_driver_host"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+description = "Driver host process for DataTab IPC architecture"
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "datatab-driver-host"
+path = "src/main.rs"
+
+[dependencies]
+datatab_core = { path = "../datatab_core", features = ["tracing-bridge"] }
+datatab_ipc = { path = "../datatab_ipc" }
+interprocess.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+log.workspace = true
+
+[features]
+sqlite = ["datatab_driver_sqlite"]
+postgres = ["datatab_driver_postgres"]
+mysql = ["datatab_driver_mysql"]
+mongodb = ["datatab_driver_mongodb"]
+redis = ["datatab_driver_redis"]
+dynamodb = ["datatab_driver_dynamodb"]
+
+[dependencies.datatab_driver_sqlite]
+path = "../datatab_driver_sqlite"
+optional = true
+
+[dependencies.datatab_driver_postgres]
+path = "../datatab_driver_postgres"
+optional = true
+
+[dependencies.datatab_driver_mysql]
+path = "../datatab_driver_mysql"
+optional = true
+
+[dependencies.datatab_driver_mongodb]
+path = "../datatab_driver_mongodb"
+optional = true
+
+[dependencies.datatab_driver_redis]
+path = "../datatab_driver_redis"
+optional = true
+
+[dependencies.datatab_driver_dynamodb]
+path = "../datatab_driver_dynamodb"
+optional = true
+
+[lints]
+workspace = true

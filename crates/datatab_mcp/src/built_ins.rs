@@ -1,0 +1,213 @@
+use crate::governance_service::{PolicyRoleDto, ToolPolicyDto};
+
+/// ID prefix that marks built-in policies and roles.
+/// Any item whose ID starts with this prefix is considered immutable.
+pub const BUILTIN_ID_PREFIX: &str = "builtin/";
+
+pub fn is_builtin(id: &str) -> bool {
+    id.starts_with(BUILTIN_ID_PREFIX)
+}
+
+/// Execution classes that change data or schema. Built-in policies send them
+/// to approval by default; reading (`metadata`, `read`) runs without asking.
+pub const MUTATING_CLASS_IDS: &[&str] = &[
+    "write",
+    "destructive",
+    "admin_safe",
+    "admin",
+    "admin_destructive",
+];
+
+/// Returns the three built-in policies.
+/// These are prepended to user-defined policies in all list operations.
+///
+/// Reading is allowed; every mutating class a built-in grants requires
+/// approval. None of them lists `approve_execution` or `reject_execution`:
+/// pending executions are resolved by a person in the DataTab UI only.
+pub fn builtin_policies() -> Vec<ToolPolicyDto> {
+    vec![
+        ToolPolicyDto {
+            id: "builtin/read-only".to_string(),
+            allowed_tools: vec![
+                "list_connections".to_string(),
+                "connect".to_string(),
+                "disconnect".to_string(),
+                "get_connection_info".to_string(),
+                "list_databases".to_string(),
+                "list_schemas".to_string(),
+                "list_tables".to_string(),
+                "list_collections".to_string(),
+                "describe_object".to_string(),
+                "select_data".to_string(),
+                "count_records".to_string(),
+                "aggregate_data".to_string(),
+                "explain_query".to_string(),
+                "preview_mutation".to_string(),
+                "list_scripts".to_string(),
+                "get_script".to_string(),
+                "execute_script".to_string(),
+                "query_audit_logs".to_string(),
+                "get_audit_entry".to_string(),
+            ],
+            allowed_classes: vec!["metadata".to_string(), "read".to_string()],
+            approval_classes: Vec::new(),
+        },
+        ToolPolicyDto {
+            id: "builtin/write".to_string(),
+            allowed_tools: vec![
+                "list_connections".to_string(),
+                "connect".to_string(),
+                "disconnect".to_string(),
+                "get_connection_info".to_string(),
+                "list_databases".to_string(),
+                "list_schemas".to_string(),
+                "list_tables".to_string(),
+                "list_collections".to_string(),
+                "describe_object".to_string(),
+                "select_data".to_string(),
+                "count_records".to_string(),
+                "aggregate_data".to_string(),
+                "insert_record".to_string(),
+                "update_records".to_string(),
+                "upsert_record".to_string(),
+                "explain_query".to_string(),
+                "preview_mutation".to_string(),
+                "list_scripts".to_string(),
+                "get_script".to_string(),
+                "create_script".to_string(),
+                "update_script".to_string(),
+                "execute_script".to_string(),
+                "query_audit_logs".to_string(),
+                "get_audit_entry".to_string(),
+            ],
+            allowed_classes: vec!["metadata".to_string(), "read".to_string()],
+            approval_classes: vec!["write".to_string()],
+        },
+        ToolPolicyDto {
+            id: "builtin/admin".to_string(),
+            allowed_tools: vec![
+                "list_connections".to_string(),
+                "connect".to_string(),
+                "disconnect".to_string(),
+                "get_connection_info".to_string(),
+                "list_databases".to_string(),
+                "list_schemas".to_string(),
+                "list_tables".to_string(),
+                "list_collections".to_string(),
+                "describe_object".to_string(),
+                "select_data".to_string(),
+                "count_records".to_string(),
+                "aggregate_data".to_string(),
+                "insert_record".to_string(),
+                "update_records".to_string(),
+                "upsert_record".to_string(),
+                "delete_records".to_string(),
+                "truncate_table".to_string(),
+                "create_table".to_string(),
+                "alter_table".to_string(),
+                "create_index".to_string(),
+                "drop_index".to_string(),
+                "create_type".to_string(),
+                "drop_table".to_string(),
+                "drop_database".to_string(),
+                "explain_query".to_string(),
+                "preview_mutation".to_string(),
+                "list_scripts".to_string(),
+                "get_script".to_string(),
+                "create_script".to_string(),
+                "update_script".to_string(),
+                "delete_script".to_string(),
+                "execute_script".to_string(),
+                "request_execution".to_string(),
+                "list_pending_executions".to_string(),
+                "get_pending_execution".to_string(),
+                "query_audit_logs".to_string(),
+                "get_audit_entry".to_string(),
+                "export_audit_logs".to_string(),
+            ],
+            allowed_classes: vec!["metadata".to_string(), "read".to_string()],
+            approval_classes: MUTATING_CLASS_IDS
+                .iter()
+                .map(|class| class.to_string())
+                .collect(),
+        },
+    ]
+}
+
+/// Returns the three built-in roles, each mapped to its corresponding built-in policy.
+/// Returns a human-readable display name for a built-in ID, or `None` if the ID is not a
+/// known built-in. This is the single source of truth for built-in display names.
+pub fn builtin_display_name(id: &str) -> Option<&'static str> {
+    match id {
+        "builtin/read-only" => Some("Read Only"),
+        "builtin/write" => Some("Write"),
+        "builtin/admin" => Some("Admin"),
+        _ => None,
+    }
+}
+
+pub fn builtin_roles() -> Vec<PolicyRoleDto> {
+    vec![
+        PolicyRoleDto {
+            id: "builtin/read-only".to_string(),
+            policy_ids: vec!["builtin/read-only".to_string()],
+        },
+        PolicyRoleDto {
+            id: "builtin/write".to_string(),
+            policy_ids: vec!["builtin/write".to_string()],
+        },
+        PolicyRoleDto {
+            id: "builtin/admin".to_string(),
+            policy_ids: vec!["builtin/admin".to_string()],
+        },
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MUTATING_CLASS_IDS, builtin_policies};
+
+    fn policy(id: &str) -> crate::ToolPolicyDto {
+        builtin_policies()
+            .into_iter()
+            .find(|policy| policy.id == id)
+            .expect("built-in policy should exist")
+    }
+
+    #[test]
+    fn admin_policy_asks_for_every_mutating_class_and_allows_reading() {
+        let admin = policy("builtin/admin");
+
+        assert_eq!(admin.allowed_classes, vec!["metadata", "read"]);
+        assert_eq!(admin.approval_classes, MUTATING_CLASS_IDS);
+    }
+
+    #[test]
+    fn write_policy_asks_for_write_and_denies_the_other_mutating_classes() {
+        let write = policy("builtin/write");
+
+        assert_eq!(write.allowed_classes, vec!["metadata", "read"]);
+        assert_eq!(write.approval_classes, vec!["write"]);
+    }
+
+    #[test]
+    fn read_only_policy_never_asks_and_denies_every_mutating_class() {
+        let read_only = policy("builtin/read-only");
+
+        assert_eq!(read_only.allowed_classes, vec!["metadata", "read"]);
+        assert!(read_only.approval_classes.is_empty());
+    }
+
+    #[test]
+    fn no_builtin_policy_lets_an_agent_resolve_approvals() {
+        for policy in builtin_policies() {
+            for tool in ["approve_execution", "reject_execution"] {
+                assert!(
+                    !policy.allowed_tools.iter().any(|allowed| allowed == tool),
+                    "{} must not list {tool}",
+                    policy.id
+                );
+            }
+        }
+    }
+}

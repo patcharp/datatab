@@ -1,0 +1,5397 @@
+mod access_tab;
+pub mod export_modal;
+mod form;
+mod hooks_tab;
+pub mod import_panel;
+mod mcp_bindings;
+mod navigation;
+mod render;
+mod render_driver_select;
+mod render_tabs;
+
+pub use export_modal::{ExportBundleModal, ExportBundleModalEvent, ExportTarget};
+
+/// Initial Connection Manager window size: the driver picker board is 1180 px
+/// wide and the connection form board 1000 px tall, so one size fits both
+/// views. Shrunk to the display when it does not fit.
+pub const WINDOW_WIDTH: f32 = 1180.0;
+pub const WINDOW_HEIGHT: f32 = 1000.0;
+
+/// Smallest Connection Manager window; the views scroll below the initial size.
+pub const WINDOW_MIN_WIDTH: f32 = 600.0;
+pub const WINDOW_MIN_HEIGHT: f32 = 500.0;
+
+/// Bounds of a new Connection Manager window, fitted to the primary display.
+pub fn window_bounds(cx: &gpui::App) -> gpui::Bounds<gpui::Pixels> {
+    datatab_ui_base::platform::fitted_window_bounds(WINDOW_WIDTH, WINDOW_HEIGHT, cx)
+}
+pub use import_panel::{ImportConnectionsPanel, ImportConnectionsPanelEvent};
+
+use crate::ssh_host_picker::{SshHostPicker, SshHostsLoaded};
+use crate::ssh_shared::SshAuthSelection;
+use datatab_components::components::form_renderer::{self, FormRendererState};
+use datatab_components::components::multi_select::{MultiSelect, MultiSelectChanged};
+use datatab_components::components::value_source_selector::ValueSourceSelector;
+use datatab_components::controls::{Dropdown, DropdownSelectionChanged};
+use datatab_components::controls::{InputEvent, InputState};
+use datatab_core::access::AccessKind;
+use datatab_core::secrecy::{ExposeSecret, SecretString};
+use datatab_core::{
+    AuthProfile, AuthSessionState, ConnectionHookBindings, ConnectionMcpPolicyBinding, DbConfig,
+    DbDriver, DbKind, DriverCapabilities, DriverFormDef, FormFieldDef, FormFieldKind,
+    GlobalOverrides, LogErr, SshAuthMethod, SshTunnelProfile, ValueRef,
+};
+use datatab_ui_base::platform;
+use datatab_ui_base::sso_wizard::SsoWizard;
+use datatab_ui_base::user_error::{ErrorKind, UserFacingError, report_error};
+use datatab_ui_base::{AppStateEntity, AuthProfileCreated};
+use gpui::*;
+use gpui_component::Root;
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+use uuid::Uuid;
+
+const AUTH_PROFILE_NONE_INDEX: usize = 0;
+
+/// Element id of a connection form input: `cm-field-<field id>`.
+///
+/// `field_id` is the `FormFieldDef.id` of the field, or, for a fixed input
+/// without a form definition, the snake_case id the connection manager already
+/// uses for it (`name`, `ssh_host`, `ssm_region`, ...). The id stays the same
+/// across runs, so UI automation can address the input by it.
+fn cm_field_id(field_id: &str) -> SharedString {
+    format!("cm-field-{field_id}").into()
+}
+
+/// Element id of a Settings tab input: `cm-setting-<field id>`, with the same
+/// `field_id` rule as [`cm_field_id`].
+fn cm_setting_id(field_id: &str) -> SharedString {
+    format!("cm-setting-{field_id}").into()
+}
+
+fn auth_profile_needs_login(
+    provider_supports_login: bool,
+    session_state: Option<&AuthSessionState>,
+) -> bool {
+    provider_supports_login
+        && matches!(
+            session_state,
+            Some(AuthSessionState::Expired) | Some(AuthSessionState::LoginRequired)
+        )
+}
+
+/// Returns the `id` of the first `AuthProfileRef` field found in a form definition,
+/// or `None` if the form has no such field.
+fn auth_profile_ref_field_id_from_form(form: &DriverFormDef) -> Option<String> {
+    for tab in &form.tabs {
+        for section in &tab.sections {
+            for field in &section.fields {
+                if matches!(&field.kind, FormFieldKind::AuthProfileRef { .. }) {
+                    return Some(field.id.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Returns the `id` of the first `AuthProfileRef` field found in the driver's form
+/// definition, or `None` if the driver is absent or has no such field.
+fn auth_profile_ref_field_id(driver: Option<&Arc<dyn DbDriver>>) -> Option<String> {
+    let driver = driver?;
+    auth_profile_ref_field_id_from_form(driver.form_definition())
+}
+
+/// Extracts the current SSL mode id string from a `DbConfig` for display in the UI segmented
+/// control. Returns `None` for configs that have no `ssl_mode` field.
+fn ssl_mode_from_config(config: &DbConfig) -> Option<String> {
+    match config {
+        DbConfig::Postgres { ssl_mode, .. }
+        | DbConfig::MySQL { ssl_mode, .. }
+        | DbConfig::MongoDB { ssl_mode, .. }
+        | DbConfig::Redis { ssl_mode, .. }
+        | DbConfig::SqlServer { ssl_mode, .. } => ssl_mode.clone(),
+        _ => None,
+    }
+}
+
+/// Focus state for driver selection screen
+#[derive(Clone, Copy, PartialEq, Default)]
+enum DriverFocus {
+    #[default]
+    First,
+    Index(usize),
+}
+
+impl DriverFocus {
+    fn index(&self) -> usize {
+        match self {
+            DriverFocus::First => 0,
+            DriverFocus::Index(i) => *i,
+        }
+    }
+}
+
+/// Focus state for form fields (Main tab)
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum FormFocus {
+    // Main tab fields
+    Name,
+    Environment,
+    AccessMethod,
+    UseUri,
+    HostValueSource,
+    Host,
+    Port,
+    DatabaseValueSource,
+    Database,
+    FileBrowse,
+    UserValueSource,
+    User,
+    PasswordValueSource,
+    Password,
+    PasswordToggle,
+    PasswordSave,
+    // SSH tab fields
+    SshEnabled,
+    SshTunnelSelector,
+    SshTunnelClear,
+    /// The shared `~/.ssh/config` host picker of the inline SSH form,
+    /// above the manual host/port/user inputs.
+    SshConfigHost,
+    SshEditInSettings,
+    SshHost,
+    SshPort,
+    SshUser,
+    SshAuthPrivateKey,
+    SshAuthPassword,
+    SshKeyPath,
+    SshKeyBrowse,
+    SshPassphrase,
+    SshSaveSecret,
+    SshPassword,
+    TestSsh,
+    SaveAsTunnel,
+    // Proxy tab fields
+    ProxySelector,
+    ProxyClear,
+    ProxyEditInSettings,
+    SsmInstanceIdValueSource,
+    SsmInstanceId,
+    SsmRegionValueSource,
+    SsmRegion,
+    SsmRemotePortValueSource,
+    SsmRemotePort,
+    SsmAuthProfile,
+    SsmAuthManage,
+    SsmAuthLogin,
+    SsmAuthRefresh,
+    // Settings tab fields
+    SettingsRefreshPolicy,
+    SettingsRefreshInterval,
+    SettingsConfirmDangerous,
+    SettingsRequiresWhere,
+    SettingsRequiresPreview,
+    /// The hook dropdown of a connection phase, above its extra hooks input.
+    SettingsPreConnectHook,
+    SettingsPreConnectHookExtra,
+    SettingsPostConnectHook,
+    SettingsPostConnectHookExtra,
+    SettingsPreDisconnectHook,
+    SettingsPreDisconnectHookExtra,
+    SettingsPostDisconnectHook,
+    SettingsPostDisconnectHookExtra,
+    SettingsDriverField(u8),
+    // MCP tab fields
+    McpEnabled,
+    McpClientFilter,
+    /// A client of the (filtered) trusted client list.
+    McpClient(u8),
+    McpClientAllowed,
+    McpRole,
+    McpExtraRoles,
+    McpPolicy,
+    McpExtraPolicies,
+    /// A stop of the Main tab after the fields the ring names above: a
+    /// driver field without its own variant, then the transport controls
+    /// (see [`MainExtraStop`]), indexed in that order.
+    MainExtra(u8),
+    // Actions (shared between tabs)
+    TestConnection,
+    /// The Copy button of a failed connection test's banner, between Test
+    /// connection and Save while the banner shows.
+    CopyTestError,
+    Save,
+}
+
+use datatab_components::components::form_navigation::FormEditState;
+
+type EditState = FormEditState;
+
+#[derive(Clone, Copy, PartialEq)]
+enum View {
+    DriverSelect,
+    EditForm,
+    Import,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ActiveTab {
+    Main,
+    Access,
+    Settings,
+    Mcp,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+enum AccessTabMode {
+    #[default]
+    Direct,
+    Ssh,
+    Proxy,
+    ManagedSsm,
+}
+
+/// A Main-tab control the keyboard ring reaches through
+/// [`FormFocus::MainExtra`]: a field of the driver's main form that has no
+/// variant of its own, the SSL mode, or a certificate picker.
+#[derive(Clone, Debug)]
+pub(super) enum MainExtraStop {
+    DriverField(Box<FormFieldDef>),
+    SslMode,
+    SslCert(SslCertSlot),
+    NavigatorView,
+    ShowAllDatabases,
+    ReadOnly,
+}
+
+/// Identifies which SSL certificate slot a file picker writes into.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum SslCertSlot {
+    CaCert,
+    ClientCert,
+    ClientKey,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum TestStatus {
+    None,
+    Testing,
+    Success,
+    SuccessWithWarning,
+    Failed,
+}
+
+#[derive(Clone)]
+struct DriverInfo {
+    id: String,
+    icon: datatab_core::Icon,
+    name: String,
+    description: String,
+    category: datatab_core::DatabaseCategory,
+    default_port: Option<u16>,
+    uri_scheme: String,
+    /// Short mono line under the name on the picker card (`:5432`, `file`).
+    picker_hint: String,
+    /// Driver-declared position within its picker section.
+    picker_rank: u16,
+}
+
+const KEYRING_PASSWORD_READ_ERROR: &str =
+    "Could not read the password from the system keyring (it may be locked)";
+
+const KEYRING_SECRETS_READ_ERROR: &str =
+    "Could not read saved secrets from the system keyring (it may be locked)";
+
+type SecretRead = Result<Option<SecretString>, datatab_core::DbError>;
+
+/// Same contract as `SecretManager::get_password`: a store that is not
+/// available holds no secret (`Ok(None)`), a failing read is an error.
+#[allow(clippy::result_large_err)]
+fn read_saved_secret(
+    secret_store: &std::sync::RwLock<Box<dyn datatab_core::SecretStore>>,
+    secret_ref: &str,
+) -> SecretRead {
+    let store = secret_store
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    if !store.is_available() {
+        return Ok(None);
+    }
+
+    store.get(secret_ref)
+}
+
+/// Everything the edit dialog reads from the keyring when it opens. Each read
+/// is independent, so one failure does not hide what the others returned.
+struct SavedSecrets {
+    password: SecretRead,
+    /// The profile's inline SSH secret; `None` when the profile has no inline tunnel.
+    ssh: Option<SecretRead>,
+    /// The bound tunnel profile's secret; `None` when no tunnel saves one.
+    tunnel: Option<SecretRead>,
+}
+
+#[allow(clippy::result_large_err)]
+fn read_saved_secrets(
+    secret_store: &std::sync::RwLock<Box<dyn datatab_core::SecretStore>>,
+    profile: &datatab_core::ConnectionProfile,
+    tunnel: Option<&SshTunnelProfile>,
+) -> SavedSecrets {
+    SavedSecrets {
+        password: read_saved_secret(secret_store, &profile.secret_ref()),
+        ssh: profile
+            .config
+            .ssh_tunnel()
+            .map(|_| read_saved_secret(secret_store, &profile.ssh_secret_ref())),
+        tunnel: tunnel.map(|tunnel| read_saved_secret(secret_store, &tunnel.secret_ref())),
+    }
+}
+
+/// A form action postponed until the keyring read completes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DeferredAction {
+    Save,
+    TestConnection,
+}
+
+impl DeferredAction {
+    /// Save outranks Test Connection: a Test requested after a Save must not
+    /// cancel it, while a Save requested after a Test replaces it.
+    fn merge(pending: Option<Self>, requested: Self) -> Self {
+        match (pending, requested) {
+            (Some(Self::Save), Self::TestConnection) => Self::Save,
+            (_, requested) => requested,
+        }
+    }
+}
+
+/// What the form knows about the password the keyring holds for the profile
+/// being edited.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum StoredPassword {
+    /// The keyring read is still running on the background executor, so an
+    /// empty password field says nothing yet, and saving must not delete the
+    /// saved entry.
+    Loading,
+    /// The keyring answered: the password field shows what it holds, if anything.
+    #[default]
+    Known,
+    /// The form never showed the saved entry: the keyring refused the read,
+    /// or its result was discarded because the field it belonged to changed.
+    /// An empty field says nothing about the entry, and saving must not
+    /// delete it.
+    Unreadable,
+}
+
+/// Driver and credential input widgets for the connection form's main tab.
+struct FormState {
+    selected_driver_id: Option<String>,
+    selected_driver: Option<Arc<dyn DbDriver>>,
+    /// Deployment environment chosen in the Main tab; saved on the profile.
+    environment: Option<datatab_core::ConnectionEnvironment>,
+    /// Chip the arrow keys moved the environment row's cursor to, when it
+    /// differs from the selected one; cleared by any other command.
+    environment_cursor: Option<usize>,
+    /// Sidebar layout chosen in the Main tab; saved on the profile.
+    navigator_view: datatab_core::NavigatorView,
+    /// Whether the sidebar lists every database, or only the one in the
+    /// Database field; saved on the profile.
+    show_all_databases: bool,
+    /// Whether mutations are blocked for the connection; saved on the profile.
+    read_only: bool,
+    form_save_password: bool,
+    form_save_ssh_secret: bool,
+    stored_password: StoredPassword,
+    /// Same meaning as `stored_password`, for the profile's inline SSH secret.
+    stored_ssh_secret: StoredPassword,
+    input_name: Entity<InputState>,
+    /// Filter text for the driver-select picker. Bound to a text input that
+    /// is focused on `/` from anywhere within the picker. The query is read
+    /// directly off the input in `render_driver_select`, so no cached field
+    /// is needed.
+    driver_filter_input: Entity<InputState>,
+    /// Tracks whether the driver-picker filter input currently owns focus.
+    /// Used to decide whether Esc should blur the input or close the window.
+    driver_filter_focused: bool,
+    /// Driver-specific field inputs, keyed by field ID.
+    driver_inputs: HashMap<String, Entity<InputState>>,
+    /// Password is separate due to visibility toggle and save checkbox UI.
+    input_password: Entity<InputState>,
+    host_value_source_selector: Entity<ValueSourceSelector>,
+    database_value_source_selector: Entity<ValueSourceSelector>,
+    user_value_source_selector: Entity<ValueSourceSelector>,
+    password_value_source_selector: Entity<ValueSourceSelector>,
+    /// Checkbox states keyed by field ID (e.g., "use_uri" -> true).
+    checkbox_states: HashMap<String, bool>,
+    /// Selected value of each driver-defined `Select` field, keyed by field
+    /// ID (e.g., "topology" -> "sentinel"). Falls back to the field's
+    /// declared `default_value` when absent.
+    select_values: HashMap<String, String>,
+    /// Active SSL mode id for the TRANSPORT section segmented control.
+    selected_ssl_mode: String,
+    /// SSL certificate path inputs — shown conditionally based on selected_ssl_mode and driver metadata.
+    ssl_ca_cert_input: Entity<InputState>,
+    ssl_client_cert_input: Entity<InputState>,
+    ssl_client_key_input: Entity<InputState>,
+    show_password: bool,
+    show_ssh_passphrase: bool,
+    show_ssh_password: bool,
+    syncing_uri: bool,
+}
+
+/// Manual host/port/user typed into the inline SSH form before an SSH
+/// config alias was picked; restored when the alias is cleared (A7).
+#[derive(Default)]
+struct SshManualValues {
+    host: String,
+    port: String,
+    user: String,
+}
+
+/// SSH tunnel, proxy, and SSM inline connection access widgets.
+struct AccessState {
+    ssh_enabled: bool,
+    ssh_auth_method: SshAuthSelection,
+    selected_ssh_tunnel_id: Option<Uuid>,
+    ssh_tunnel_dropdown: Entity<datatab_components::controls::Dropdown>,
+    ssh_tunnel_uuids: Vec<Uuid>,
+    /// Shared picker of hosts declared in the user's `~/.ssh/config`
+    /// (#837). Applies to the inline SSH form only; a selected saved
+    /// tunnel profile replaces the inline fields.
+    ssh_host_picker: Entity<SshHostPicker>,
+    /// Manual values typed before the active alias, restored on clear.
+    ssh_manual_backup: Option<SshManualValues>,
+    input_ssh_host: Entity<InputState>,
+    input_ssh_port: Entity<InputState>,
+    input_ssh_user: Entity<InputState>,
+    input_ssh_key_path: Entity<InputState>,
+    input_ssh_key_passphrase: Entity<InputState>,
+    input_ssh_password: Entity<InputState>,
+    selected_proxy_id: Option<Uuid>,
+    proxy_dropdown: Entity<Dropdown>,
+    proxy_uuids: Vec<Uuid>,
+    access_method_dropdown: Entity<Dropdown>,
+    access_kind: Option<AccessKind>,
+    access_tab_mode: AccessTabMode,
+    input_ssm_instance_id: Entity<InputState>,
+    ssm_instance_id_value_source_selector: Entity<ValueSourceSelector>,
+    input_ssm_region: Entity<InputState>,
+    ssm_region_value_source_selector: Entity<ValueSourceSelector>,
+    input_ssm_remote_port: Entity<InputState>,
+    ssm_remote_port_value_source_selector: Entity<ValueSourceSelector>,
+    ssm_auth_profile_dropdown: Entity<Dropdown>,
+    ssm_auth_profile_uuids: Vec<Uuid>,
+    selected_ssm_auth_profile_id: Option<Uuid>,
+}
+
+/// Auth profile dropdown and per-session login state.
+struct AuthProfileState {
+    auth_profile_dropdown: Entity<Dropdown>,
+    auth_profile_uuids: Vec<Uuid>,
+    selected_auth_profile_id: Option<Uuid>,
+    auth_profile_session_states: HashMap<Uuid, AuthSessionState>,
+    auth_profile_login_in_progress: bool,
+    auth_profile_action_message: Option<String>,
+    pending_wizard_auth_profile_selection: bool,
+    known_auth_profile_ids: HashSet<Uuid>,
+}
+
+/// Per-connection settings and hooks tab widgets.
+struct SettingsTabState {
+    conn_override_refresh_policy: bool,
+    conn_override_refresh_interval: bool,
+    conn_refresh_policy_dropdown: Entity<Dropdown>,
+    conn_refresh_interval_input: Entity<InputState>,
+    conn_confirm_dangerous_dropdown: Entity<Dropdown>,
+    conn_requires_where_dropdown: Entity<Dropdown>,
+    conn_requires_preview_dropdown: Entity<Dropdown>,
+    conn_pre_hook_dropdown: Entity<Dropdown>,
+    conn_post_hook_dropdown: Entity<Dropdown>,
+    conn_pre_disconnect_hook_dropdown: Entity<Dropdown>,
+    conn_post_disconnect_hook_dropdown: Entity<Dropdown>,
+    conn_pre_hook_extra_input: Entity<InputState>,
+    conn_post_hook_extra_input: Entity<InputState>,
+    conn_pre_disconnect_hook_extra_input: Entity<InputState>,
+    conn_post_disconnect_hook_extra_input: Entity<InputState>,
+    conn_form_state: FormRendererState,
+    conn_form_subscriptions: Vec<Subscription>,
+    conn_loading_settings: bool,
+}
+
+/// MCP governance tab widgets.
+///
+/// `bindings` holds every `ConnectionMcpPolicyBinding` for the connection
+/// being edited, independent of which trusted client is currently selected
+/// in the master-detail list. Widget changes write into the binding for
+/// `selected_actor_id` immediately (see `handle_mcp_binding_field_change`),
+/// so switching the selected client never loses edits.
+struct McpTabState {
+    conn_mcp_enabled: bool,
+    conn_mcp_role_dropdown: Entity<Dropdown>,
+    conn_mcp_role_multi_select: Entity<MultiSelect>,
+    conn_mcp_policy_dropdown: Entity<Dropdown>,
+    conn_mcp_policy_multi_select: Entity<MultiSelect>,
+    #[cfg(feature = "mcp")]
+    conn_mcp_client_filter_input: Entity<InputState>,
+    #[cfg(feature = "mcp")]
+    conn_mcp_client_list_scroll_handle: ScrollHandle,
+    #[cfg(feature = "mcp")]
+    conn_mcp_detail_scroll_handle: ScrollHandle,
+    bindings: Vec<ConnectionMcpPolicyBinding>,
+    selected_actor_id: Option<String>,
+}
+
+/// Deferred actions written by background tasks or event handlers and drained on the next render.
+#[derive(Default)]
+struct PendingActions {
+    proxy_selection: Option<Uuid>,
+    auth_profile_selection: Option<Option<Uuid>>,
+    ssm_auth_profile_selection: Option<Option<Uuid>>,
+    ssh_tunnel_selection: Option<Uuid>,
+    /// Pending SSH config host picker index, drained into the inline form
+    /// on the next render where a `Window` is available.
+    ssh_config_host_selection: Option<usize>,
+    ssh_key_path: Option<String>,
+    file_path: Option<String>,
+    /// Pending cert-file path drained into `ssl_ca_cert_input` on next render.
+    ssl_ca_cert_path: Option<String>,
+    /// Pending cert-file path drained into `ssl_client_cert_input` on next render.
+    ssl_client_cert_path: Option<String>,
+    /// Pending cert-file path drained into `ssl_client_key_input` on next render.
+    ssl_client_key_path: Option<String>,
+}
+
+pub struct ConnectionManagerWindow {
+    app_state: Entity<AppStateEntity>,
+    view: View,
+    /// In-window import panel. Rendered when `view == View::Import`. Holds the
+    /// multi-step import state so it never bloats this struct.
+    import_panel: Entity<ImportConnectionsPanel>,
+    active_tab: ActiveTab,
+    available_drivers: Vec<DriverInfo>,
+    /// Card columns of the driver picker at its last layout; the keyboard
+    /// grid navigation steps by it.
+    driver_grid_columns: usize,
+    editing_profile_id: Option<uuid::Uuid>,
+    /// The pending keyring read of the edited profile's secrets; dropping it
+    /// with the window cancels the apply step.
+    secrets_read_task: Option<Task<()>>,
+    /// Save or Test Connection requested while the keyring read was pending.
+    /// Both would otherwise evaluate a form that is still `Loading`; the
+    /// request runs once the read has been applied.
+    deferred_after_secrets_read: Option<DeferredAction>,
+    /// Secret inputs the user edited while the keyring read was pending. A
+    /// cleared input looks untouched, so emptiness alone cannot tell "never
+    /// typed" from "typed and deleted".
+    inputs_edited_during_read: HashSet<EntityId>,
+
+    validation_errors: Vec<String>,
+    test_status: TestStatus,
+    test_error: Option<String>,
+    /// Enriched test-connection result for the success banner body.
+    test_result: Option<datatab_core::TestConnectionResult>,
+    ssh_test_status: TestStatus,
+    ssh_test_error: Option<String>,
+
+    // Keyboard navigation state
+    focus_handle: FocusHandle,
+    driver_focus: DriverFocus,
+    form_focus: FormFocus,
+    edit_state: EditState,
+
+    // Scroll handle for form content
+    form_scroll_handle: ScrollHandle,
+
+    _subscriptions: Vec<Subscription>,
+
+    // Target folder for new connections
+    target_folder_id: Option<Uuid>,
+
+    form: FormState,
+    access: AccessState,
+    auth_profile: AuthProfileState,
+    settings_tab: SettingsTabState,
+    mcp_tab: McpTabState,
+    pending: PendingActions,
+}
+
+fn value_source_selector(
+    id_prefix: &'static str,
+    secret_providers: &[(String, String)],
+    window: &mut Window,
+    cx: &mut Context<ConnectionManagerWindow>,
+) -> Entity<ValueSourceSelector> {
+    cx.new(|cx| {
+        let mut selector = ValueSourceSelector::new(id_prefix, window, cx);
+        selector.set_external_secret_providers(secret_providers.to_vec(), cx);
+        selector
+    })
+}
+
+impl ConnectionManagerWindow {
+    fn sync_secret_providers(&mut self, cx: &mut Context<Self>) {
+        let secret_providers = self.app_state.read(cx).secret_providers();
+
+        for selector in [
+            &self.form.host_value_source_selector,
+            &self.form.database_value_source_selector,
+            &self.form.user_value_source_selector,
+            &self.form.password_value_source_selector,
+            &self.access.ssm_instance_id_value_source_selector,
+            &self.access.ssm_region_value_source_selector,
+            &self.access.ssm_remote_port_value_source_selector,
+        ] {
+            selector.update(cx, |selector, cx| {
+                selector.set_external_secret_providers(secret_providers.clone(), cx);
+            });
+        }
+    }
+
+    pub fn new(
+        app_state: Entity<AppStateEntity>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let secret_providers = app_state.read(cx).secret_providers();
+        let available_drivers: Vec<DriverInfo> = app_state
+            .read(cx)
+            .drivers()
+            .iter()
+            .map(|(driver_id, driver)| {
+                let metadata = driver.metadata();
+                DriverInfo {
+                    id: driver_id.clone(),
+                    icon: metadata.icon,
+                    name: driver.display_name().to_string(),
+                    description: driver.description().to_string(),
+                    category: metadata.category,
+                    default_port: metadata.default_port,
+                    uri_scheme: metadata.uri_scheme.clone(),
+                    picker_hint: driver.picker_hint(),
+                    picker_rank: driver.picker_rank(),
+                }
+            })
+            .collect();
+
+        let input_name = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(datatab_i18n::t!(
+                "connection_manager.placeholder.connection_name"
+            ))
+        });
+        let driver_filter_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(datatab_i18n::t!(
+                "connection_manager.driver_select.search_placeholder"
+            ))
+        });
+        let input_password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(datatab_i18n::t!("connection_manager.placeholder.password"))
+                .masked(true)
+        });
+        let host_value_source_selector =
+            value_source_selector("cm-host", &secret_providers, window, cx);
+        let database_value_source_selector =
+            value_source_selector("cm-database", &secret_providers, window, cx);
+        let user_value_source_selector =
+            value_source_selector("cm-user", &secret_providers, window, cx);
+        let password_value_source_selector =
+            value_source_selector("cm-password", &secret_providers, window, cx);
+
+        let input_ssh_host =
+            cx.new(|cx| InputState::new(window, cx).placeholder("bastion.example.com"));
+        let input_ssh_port = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("22")
+                .default_value("22")
+        });
+        let input_ssh_user = cx.new(|cx| InputState::new(window, cx).placeholder("ec2-user"));
+        let input_ssh_key_path =
+            cx.new(|cx| InputState::new(window, cx).placeholder("~/.ssh/id_rsa"));
+        let input_ssh_key_passphrase = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(datatab_i18n::t!(
+                    "connection_manager.placeholder.key_passphrase_optional"
+                ))
+                .masked(true)
+        });
+        let input_ssh_password = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(datatab_i18n::t!(
+                    "connection_manager.placeholder.ssh_password"
+                ))
+                .masked(true)
+        });
+
+        let ssl_ca_cert_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(datatab_i18n::t!(
+                "connection_manager.placeholder.ca_cert_path"
+            ))
+        });
+        let ssl_client_cert_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(datatab_i18n::t!(
+                "connection_manager.placeholder.client_cert_path"
+            ))
+        });
+        let ssl_client_key_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(datatab_i18n::t!(
+                "connection_manager.placeholder.client_key_path"
+            ))
+        });
+
+        let ssh_tunnel_dropdown = cx.new(|_cx| {
+            Dropdown::new("ssh-tunnel-dropdown").placeholder(datatab_i18n::t!(
+                "connection_manager.placeholder.select_ssh_tunnel"
+            ))
+        });
+        let ssh_host_picker = SshHostPicker::load_default(cx);
+        let ssh_config_host_dropdown = ssh_host_picker.read(cx).dropdown().clone();
+        let proxy_dropdown = cx.new(|_cx| {
+            Dropdown::new("proxy-dropdown").placeholder(datatab_i18n::t!(
+                "connection_manager.placeholder.select_proxy"
+            ))
+        });
+
+        let auth_profile_dropdown = cx.new(|_cx| {
+            Dropdown::new("auth-profile-dropdown")
+                .placeholder(datatab_i18n::t!("connection_manager.placeholder.none"))
+        });
+        let access_method_dropdown = cx.new(|_cx| {
+            Dropdown::new("access-method-dropdown")
+                .placeholder(datatab_i18n::t!("connection_manager.access_method.direct"))
+        });
+
+        let input_ssm_instance_id =
+            cx.new(|cx| InputState::new(window, cx).placeholder("i-0123456789abcdef0"));
+        let ssm_instance_id_value_source_selector =
+            value_source_selector("cm-ssm-instance-id", &secret_providers, window, cx);
+        let input_ssm_region = cx.new(|cx| InputState::new(window, cx).placeholder("us-east-1"));
+        let ssm_region_value_source_selector =
+            value_source_selector("cm-ssm-region", &secret_providers, window, cx);
+        let input_ssm_remote_port = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("5432")
+                .default_value("5432")
+        });
+        let ssm_remote_port_value_source_selector =
+            value_source_selector("cm-ssm-remote-port", &secret_providers, window, cx);
+        let ssm_auth_profile_dropdown = cx.new(|_cx| {
+            Dropdown::new("ssm-auth-profile-dropdown").placeholder(datatab_i18n::t!(
+                "connection_manager.placeholder.use_connection_auth_profile"
+            ))
+        });
+
+        let conn_refresh_policy_dropdown = cx.new(|_cx| {
+            Dropdown::new("conn-refresh-policy").placeholder(datatab_i18n::t!(
+                "connection_manager.placeholder.use_driver_default"
+            ))
+        });
+        let conn_refresh_interval_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(datatab_i18n::t!("connection_manager.placeholder.seconds"))
+                .default_value("5")
+        });
+        let conn_confirm_dangerous_dropdown = cx.new(|_cx| {
+            Dropdown::new("conn-confirm-dangerous").placeholder(datatab_i18n::t!(
+                "connection_manager.placeholder.use_driver_default"
+            ))
+        });
+        let conn_requires_where_dropdown = cx.new(|_cx| {
+            Dropdown::new("conn-requires-where").placeholder(datatab_i18n::t!(
+                "connection_manager.placeholder.use_driver_default"
+            ))
+        });
+        let conn_requires_preview_dropdown = cx.new(|_cx| {
+            Dropdown::new("conn-requires-preview").placeholder(datatab_i18n::t!(
+                "connection_manager.placeholder.use_driver_default"
+            ))
+        });
+        let conn_pre_hook_dropdown = cx.new(|_cx| {
+            Dropdown::new("conn-pre-hook")
+                .placeholder(datatab_i18n::t!("connection_manager.placeholder.no_hook"))
+        });
+        let conn_post_hook_dropdown = cx.new(|_cx| {
+            Dropdown::new("conn-post-hook")
+                .placeholder(datatab_i18n::t!("connection_manager.placeholder.no_hook"))
+        });
+        let conn_pre_disconnect_hook_dropdown = cx.new(|_cx| {
+            Dropdown::new("conn-pre-disconnect-hook")
+                .placeholder(datatab_i18n::t!("connection_manager.placeholder.no_hook"))
+        });
+        let conn_post_disconnect_hook_dropdown = cx.new(|_cx| {
+            Dropdown::new("conn-post-disconnect-hook")
+                .placeholder(datatab_i18n::t!("connection_manager.placeholder.no_hook"))
+        });
+        let conn_pre_hook_extra_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(datatab_i18n::t!(
+                "connection_manager.placeholder.extra_hook_ids"
+            ))
+        });
+        let conn_post_hook_extra_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(datatab_i18n::t!(
+                "connection_manager.placeholder.extra_hook_ids"
+            ))
+        });
+        let conn_pre_disconnect_hook_extra_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(datatab_i18n::t!(
+                "connection_manager.placeholder.extra_hook_ids"
+            ))
+        });
+        let conn_post_disconnect_hook_extra_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(datatab_i18n::t!(
+                "connection_manager.placeholder.extra_hook_ids"
+            ))
+        });
+        #[cfg(feature = "mcp")]
+        let conn_mcp_client_filter_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(datatab_i18n::t!(
+                "connection_manager.placeholder.filter_trusted_clients"
+            ))
+        });
+        let conn_mcp_role_dropdown = cx.new(|_cx| {
+            Dropdown::new("conn-mcp-role")
+                .placeholder(datatab_i18n::t!("connection_manager.placeholder.no_role"))
+        });
+        let conn_mcp_role_multi_select = cx.new(|_cx| {
+            MultiSelect::new("conn-mcp-extra-roles").placeholder(datatab_i18n::t!(
+                "connection_manager.placeholder.select_additional_roles"
+            ))
+        });
+        let conn_mcp_policy_dropdown = cx.new(|_cx| {
+            Dropdown::new("conn-mcp-policy")
+                .placeholder(datatab_i18n::t!("connection_manager.placeholder.no_policy"))
+        });
+        let conn_mcp_policy_multi_select = cx.new(|_cx| {
+            MultiSelect::new("conn-mcp-extra-policies").placeholder(datatab_i18n::t!(
+                "connection_manager.placeholder.select_additional_policies"
+            ))
+        });
+
+        let dropdown_subscription = cx.subscribe(
+            &ssh_tunnel_dropdown,
+            |this, _dropdown, event: &DropdownSelectionChanged, cx| {
+                this.handle_ssh_tunnel_dropdown_selection(event, cx);
+            },
+        );
+
+        let ssh_config_host_picker_sub = cx.subscribe(
+            &ssh_host_picker,
+            |_this, _picker, _: &SshHostsLoaded, cx| {
+                // The config hosts arrived off the foreground thread; the
+                // inline form re-renders with them.
+                cx.notify();
+            },
+        );
+
+        let ssh_config_host_dropdown_sub = cx.subscribe(
+            &ssh_config_host_dropdown,
+            |this, _dropdown, event: &DropdownSelectionChanged, cx| {
+                this.handle_ssh_config_host_dropdown_selection(event, cx);
+            },
+        );
+
+        let proxy_dropdown_subscription = cx.subscribe(
+            &proxy_dropdown,
+            |this, _dropdown, event: &DropdownSelectionChanged, cx| {
+                this.handle_proxy_dropdown_selection(event, cx);
+            },
+        );
+
+        let auth_profile_dropdown_sub = cx.subscribe(
+            &auth_profile_dropdown,
+            |this, _dropdown, event: &DropdownSelectionChanged, cx| {
+                this.handle_auth_profile_dropdown_selection(event, cx);
+            },
+        );
+
+        let access_method_dropdown_sub = cx.subscribe(
+            &access_method_dropdown,
+            |this, _dropdown, event: &DropdownSelectionChanged, cx| {
+                this.handle_access_method_dropdown_selection(event, cx);
+            },
+        );
+
+        let ssm_auth_profile_dropdown_sub = cx.subscribe(
+            &ssm_auth_profile_dropdown,
+            |this, _dropdown, event: &DropdownSelectionChanged, cx| {
+                this.handle_ssm_auth_profile_dropdown_selection(event, cx);
+            },
+        );
+
+        let mcp_role_dropdown_sub = cx.subscribe(
+            &conn_mcp_role_dropdown,
+            |this, _dropdown, _event: &DropdownSelectionChanged, cx| {
+                this.handle_mcp_binding_field_change(cx);
+            },
+        );
+
+        let mcp_policy_dropdown_sub = cx.subscribe(
+            &conn_mcp_policy_dropdown,
+            |this, _dropdown, _event: &DropdownSelectionChanged, cx| {
+                this.handle_mcp_binding_field_change(cx);
+            },
+        );
+
+        let mcp_role_multi_select_sub = cx.subscribe(
+            &conn_mcp_role_multi_select,
+            |this, _multi_select, _event: &MultiSelectChanged, cx| {
+                this.handle_mcp_binding_field_change(cx);
+            },
+        );
+
+        let mcp_policy_multi_select_sub = cx.subscribe(
+            &conn_mcp_policy_multi_select,
+            |this, _multi_select, _event: &MultiSelectChanged, cx| {
+                this.handle_mcp_binding_field_change(cx);
+            },
+        );
+
+        #[cfg(feature = "mcp")]
+        let mcp_client_filter_sub = cx.subscribe_in(
+            &conn_mcp_client_filter_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => cx.notify(),
+                InputEvent::Blur => this.exit_edit_mode_on_blur(window, cx),
+                _ => {}
+            },
+        );
+
+        let app_state_changed_sub = cx.subscribe(
+            &app_state,
+            |this, _, _: &datatab_ui_base::AppStateChanged, cx| {
+                this.handle_app_state_changed(cx);
+            },
+        );
+
+        let auth_profile_created_sub =
+            cx.subscribe(&app_state, |this, _, event: &AuthProfileCreated, cx| {
+                this.handle_auth_profile_created(event.profile_id, cx);
+            });
+
+        // Helper to create input subscriptions for handling Enter/Blur
+        fn subscribe_input(
+            cx: &mut Context<ConnectionManagerWindow>,
+            window: &mut Window,
+            input: &Entity<InputState>,
+        ) -> Subscription {
+            cx.subscribe_in(
+                input,
+                window,
+                |this, input, event: &InputEvent, window, cx| match event {
+                    InputEvent::PressEnter {
+                        secondary: false, ..
+                    } => {
+                        this.exit_edit_mode(window, cx);
+                        this.focus_down(cx);
+                    }
+                    InputEvent::Blur => {
+                        this.exit_edit_mode_on_blur(window, cx);
+                    }
+                    InputEvent::Change => {
+                        this.note_edit_during_secrets_read(input.entity_id());
+                    }
+                    _ => {}
+                },
+            )
+        }
+
+        let password_change_sub = cx.subscribe_in(
+            &input_password,
+            window,
+            |this, input, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter {
+                    secondary: false, ..
+                } => {
+                    this.exit_edit_mode(window, cx);
+                    this.focus_down(cx);
+                }
+                InputEvent::Blur => {
+                    this.exit_edit_mode_on_blur(window, cx);
+                }
+                InputEvent::Change => {
+                    this.note_edit_during_secrets_read(input.entity_id());
+                    this.handle_field_change("password", window, cx);
+                }
+                _ => {}
+            },
+        );
+
+        let driver_filter_focus_sub = cx.subscribe_in(
+            &driver_filter_input,
+            window,
+            |this, _, event: &InputEvent, _window, cx| match event {
+                InputEvent::Focus => {
+                    this.form.driver_filter_focused = true;
+                    cx.notify();
+                }
+                InputEvent::Blur => {
+                    this.form.driver_filter_focused = false;
+                    cx.notify();
+                }
+                _ => {}
+            },
+        );
+
+        let import_panel = cx.new(|cx| ImportConnectionsPanel::new(app_state.clone(), window, cx));
+
+        let import_panel_sub = cx.subscribe_in(
+            &import_panel,
+            window,
+            |this, _, event: &ImportConnectionsPanelEvent, window, cx| match event {
+                ImportConnectionsPanelEvent::Cancelled | ImportConnectionsPanelEvent::Completed => {
+                    this.view = View::DriverSelect;
+                    window.focus(&this.focus_handle, cx);
+                    cx.notify();
+                }
+            },
+        );
+
+        #[cfg_attr(not(feature = "mcp"), allow(unused_mut))]
+        let mut subscriptions = vec![
+            import_panel_sub,
+            driver_filter_focus_sub,
+            dropdown_subscription,
+            ssh_config_host_picker_sub,
+            ssh_config_host_dropdown_sub,
+            proxy_dropdown_subscription,
+            auth_profile_dropdown_sub,
+            access_method_dropdown_sub,
+            ssm_auth_profile_dropdown_sub,
+            mcp_role_dropdown_sub,
+            mcp_policy_dropdown_sub,
+            mcp_role_multi_select_sub,
+            mcp_policy_multi_select_sub,
+            app_state_changed_sub,
+            auth_profile_created_sub,
+            subscribe_input(cx, window, &input_name),
+            password_change_sub,
+            subscribe_input(cx, window, &input_ssh_host),
+            subscribe_input(cx, window, &input_ssh_port),
+            subscribe_input(cx, window, &input_ssh_user),
+            subscribe_input(cx, window, &input_ssh_key_path),
+            subscribe_input(cx, window, &input_ssh_key_passphrase),
+            subscribe_input(cx, window, &input_ssh_password),
+            subscribe_input(cx, window, &input_ssm_instance_id),
+            subscribe_input(cx, window, &input_ssm_region),
+            subscribe_input(cx, window, &input_ssm_remote_port),
+            subscribe_input(cx, window, &conn_pre_hook_extra_input),
+            subscribe_input(cx, window, &conn_post_hook_extra_input),
+            subscribe_input(cx, window, &conn_pre_disconnect_hook_extra_input),
+            subscribe_input(cx, window, &conn_post_disconnect_hook_extra_input),
+        ];
+        #[cfg(feature = "mcp")]
+        subscriptions.push(mcp_client_filter_sub);
+
+        let focus_handle = cx.focus_handle();
+        window.focus(&focus_handle, cx);
+
+        Self {
+            app_state: app_state.clone(),
+            view: View::DriverSelect,
+            import_panel,
+            active_tab: ActiveTab::Main,
+            available_drivers,
+            driver_grid_columns: render_driver_select::DEFAULT_GRID_COLUMNS,
+            editing_profile_id: None,
+            secrets_read_task: None,
+            deferred_after_secrets_read: None,
+            inputs_edited_during_read: HashSet::new(),
+            validation_errors: Vec::new(),
+            test_status: TestStatus::None,
+            test_error: None,
+            test_result: None,
+            ssh_test_status: TestStatus::None,
+            ssh_test_error: None,
+            focus_handle,
+            driver_focus: DriverFocus::First,
+            form_focus: FormFocus::Name,
+            edit_state: EditState::Navigating,
+            form_scroll_handle: ScrollHandle::new(),
+            _subscriptions: subscriptions,
+            target_folder_id: None,
+            form: FormState {
+                selected_driver_id: None,
+                selected_driver: None,
+                environment: None,
+                environment_cursor: None,
+                navigator_view: datatab_core::NavigatorView::Advanced,
+                show_all_databases: true,
+                read_only: false,
+                form_save_password: true,
+                form_save_ssh_secret: true,
+                stored_password: StoredPassword::Known,
+                stored_ssh_secret: StoredPassword::Known,
+                input_name,
+                driver_filter_input,
+                driver_filter_focused: false,
+                driver_inputs: HashMap::new(),
+                input_password,
+                host_value_source_selector,
+                database_value_source_selector,
+                user_value_source_selector,
+                password_value_source_selector,
+                checkbox_states: HashMap::new(),
+                select_values: HashMap::new(),
+                selected_ssl_mode: String::new(),
+                ssl_ca_cert_input,
+                ssl_client_cert_input,
+                ssl_client_key_input,
+                show_password: false,
+                show_ssh_passphrase: false,
+                show_ssh_password: false,
+                syncing_uri: false,
+            },
+            access: AccessState {
+                ssh_enabled: false,
+                ssh_auth_method: SshAuthSelection::PrivateKey,
+                selected_ssh_tunnel_id: None,
+                ssh_tunnel_dropdown,
+                ssh_tunnel_uuids: Vec::new(),
+                ssh_host_picker,
+                ssh_manual_backup: None,
+                input_ssh_host,
+                input_ssh_port,
+                input_ssh_user,
+                input_ssh_key_path,
+                input_ssh_key_passphrase,
+                input_ssh_password,
+                selected_proxy_id: None,
+                proxy_dropdown,
+                proxy_uuids: Vec::new(),
+                access_method_dropdown,
+                access_kind: None,
+                access_tab_mode: AccessTabMode::Direct,
+                input_ssm_instance_id,
+                ssm_instance_id_value_source_selector,
+                input_ssm_region,
+                ssm_region_value_source_selector,
+                input_ssm_remote_port,
+                ssm_remote_port_value_source_selector,
+                ssm_auth_profile_dropdown,
+                ssm_auth_profile_uuids: Vec::new(),
+                selected_ssm_auth_profile_id: None,
+            },
+            auth_profile: AuthProfileState {
+                auth_profile_dropdown,
+                auth_profile_uuids: Vec::new(),
+                selected_auth_profile_id: None,
+                auth_profile_session_states: HashMap::new(),
+                auth_profile_login_in_progress: false,
+                auth_profile_action_message: None,
+                pending_wizard_auth_profile_selection: false,
+                known_auth_profile_ids: app_state
+                    .read(cx)
+                    .list_auth_profiles()
+                    .iter()
+                    .map(|profile| profile.id)
+                    .collect(),
+            },
+            settings_tab: SettingsTabState {
+                conn_override_refresh_policy: false,
+                conn_override_refresh_interval: false,
+                conn_refresh_policy_dropdown,
+                conn_refresh_interval_input,
+                conn_confirm_dangerous_dropdown,
+                conn_requires_where_dropdown,
+                conn_requires_preview_dropdown,
+                conn_pre_hook_dropdown,
+                conn_post_hook_dropdown,
+                conn_pre_disconnect_hook_dropdown,
+                conn_post_disconnect_hook_dropdown,
+                conn_pre_hook_extra_input,
+                conn_post_hook_extra_input,
+                conn_pre_disconnect_hook_extra_input,
+                conn_post_disconnect_hook_extra_input,
+                conn_form_state: FormRendererState::default(),
+                conn_form_subscriptions: Vec::new(),
+                conn_loading_settings: false,
+            },
+            mcp_tab: McpTabState {
+                conn_mcp_enabled: false,
+                conn_mcp_role_dropdown,
+                conn_mcp_role_multi_select,
+                conn_mcp_policy_dropdown,
+                conn_mcp_policy_multi_select,
+                #[cfg(feature = "mcp")]
+                conn_mcp_client_filter_input,
+                #[cfg(feature = "mcp")]
+                conn_mcp_client_list_scroll_handle: ScrollHandle::new(),
+                #[cfg(feature = "mcp")]
+                conn_mcp_detail_scroll_handle: ScrollHandle::new(),
+                bindings: Vec::new(),
+                selected_actor_id: None,
+            },
+            pending: PendingActions::default(),
+        }
+    }
+
+    pub fn new_in_folder(
+        app_state: Entity<AppStateEntity>,
+        folder_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut instance = Self::new(app_state, window, cx);
+        instance.target_folder_id = Some(folder_id);
+        instance
+    }
+
+    /// Switch to the in-window import panel, resetting it to its first step.
+    pub(super) fn open_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.import_panel.update(cx, |panel, cx| {
+            panel.reset(window, cx);
+        });
+        self.view = View::Import;
+        cx.notify();
+    }
+
+    /// Switch to the in-window import panel, pre-selecting an external-client
+    /// source (DBeaver, Beekeeper Studio, ...) instead of the native bundle.
+    pub(super) fn open_import_external(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.import_panel.update(cx, |panel, cx| {
+            panel.reset(window, cx);
+            panel.preselect_external_source(cx);
+        });
+        self.view = View::Import;
+        cx.notify();
+    }
+
+    pub fn new_for_edit(
+        app_state: Entity<AppStateEntity>,
+        profile: &datatab_core::ConnectionProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut instance = Self::new(app_state.clone(), window, cx);
+        instance.editing_profile_id = Some(profile.id);
+
+        let driver = app_state.read(cx).driver_for_profile(profile);
+        instance.form.selected_driver = driver.clone();
+        instance.form.selected_driver_id = Some(profile.driver_id());
+        instance.form.form_save_password = profile.save_password;
+        instance.form.environment = profile.environment();
+        instance.form.navigator_view = profile.navigator_view;
+        instance.form.show_all_databases = profile.show_all_databases;
+        instance.form.read_only = profile.read_only_flag;
+        instance.view = View::EditForm;
+
+        if let Some(driver) = &driver {
+            // Restore the SSL mode from the saved config; fall back to the driver's first
+            // declared mode if the config doesn't carry one (e.g. URI mode or non-SSL drivers).
+            instance.form.selected_ssl_mode =
+                ssl_mode_from_config(&profile.config).unwrap_or_else(|| {
+                    driver
+                        .metadata()
+                        .ssl_modes
+                        .and_then(|modes| modes.first())
+                        .map(|m| m.id.to_string())
+                        .unwrap_or_default()
+                });
+
+            let form = driver.form_definition();
+            instance.create_driver_inputs(form, window, cx);
+            let values = driver.extract_values(&profile.config);
+            instance.apply_form_values(&values, form, window, cx);
+
+            // Restore SSL cert paths from saved config.
+            let (root_cert, client_cert, client_key) = match &profile.config {
+                DbConfig::Postgres {
+                    ssl_root_cert_path,
+                    ssl_client_cert_path,
+                    ssl_client_key_path,
+                    ..
+                }
+                | DbConfig::MySQL {
+                    ssl_root_cert_path,
+                    ssl_client_cert_path,
+                    ssl_client_key_path,
+                    ..
+                }
+                | DbConfig::MongoDB {
+                    ssl_root_cert_path,
+                    ssl_client_cert_path,
+                    ssl_client_key_path,
+                    ..
+                }
+                | DbConfig::Redis {
+                    ssl_root_cert_path,
+                    ssl_client_cert_path,
+                    ssl_client_key_path,
+                    ..
+                }
+                | DbConfig::Redshift {
+                    ssl_root_cert_path,
+                    ssl_client_cert_path,
+                    ssl_client_key_path,
+                    ..
+                } => (
+                    ssl_root_cert_path.clone().unwrap_or_default(),
+                    ssl_client_cert_path.clone().unwrap_or_default(),
+                    ssl_client_key_path.clone().unwrap_or_default(),
+                ),
+                DbConfig::SqlServer {
+                    ssl_root_cert_path, ..
+                } => (
+                    ssl_root_cert_path.clone().unwrap_or_default(),
+                    String::new(),
+                    String::new(),
+                ),
+                _ => (String::new(), String::new(), String::new()),
+            };
+
+            if !root_cert.is_empty() {
+                instance.form.ssl_ca_cert_input.update(cx, |state, cx| {
+                    state.set_value(&root_cert, window, cx);
+                });
+            }
+            if !client_cert.is_empty() {
+                instance.form.ssl_client_cert_input.update(cx, |state, cx| {
+                    state.set_value(&client_cert, window, cx);
+                });
+            }
+            if !client_key.is_empty() {
+                instance.form.ssl_client_key_input.update(cx, |state, cx| {
+                    state.set_value(&client_key, window, cx);
+                });
+            }
+        }
+
+        instance.form.input_name.update(cx, |state, cx| {
+            state.set_value(&profile.name, window, cx);
+        });
+
+        instance.load_settings_tab(
+            profile.settings_overrides.as_ref(),
+            profile.connection_settings.as_ref(),
+            profile.hook_bindings.as_ref(),
+            window,
+            cx,
+        );
+
+        instance.mcp_tab.conn_mcp_enabled =
+            profile.mcp_governance.as_ref().is_some_and(|g| g.enabled);
+        instance.mcp_tab.bindings = profile
+            .mcp_governance
+            .as_ref()
+            .map(|governance| governance.policy_bindings.clone())
+            .unwrap_or_default();
+        instance.mcp_tab.selected_actor_id = instance
+            .mcp_tab
+            .bindings
+            .first()
+            .map(|binding| binding.actor_id.clone());
+
+        #[cfg(feature = "mcp")]
+        {
+            let selected_binding = instance.mcp_tab.selected_actor_id.clone().and_then(|id| {
+                instance
+                    .mcp_tab
+                    .bindings
+                    .iter()
+                    .find(|binding| binding.actor_id == id)
+                    .cloned()
+            });
+
+            instance.load_mcp_dropdowns(selected_binding.as_ref(), window, cx);
+        }
+
+        instance.access.selected_proxy_id = profile.proxy_profile_id;
+        instance.auth_profile.selected_auth_profile_id = profile.auth_profile_id;
+        instance.access.selected_ssm_auth_profile_id = None;
+        instance.access.access_kind = profile.access_kind.clone();
+
+        if let Some(AccessKind::Proxy { proxy_profile_id }) = &profile.access_kind {
+            instance
+                .access
+                .selected_proxy_id
+                .get_or_insert(*proxy_profile_id);
+        }
+
+        let mut bound_tunnel: Option<SshTunnelProfile> = None;
+        if let Some(AccessKind::Ssh {
+            ssh_tunnel_profile_id,
+        }) = &profile.access_kind
+        {
+            instance.access.selected_ssh_tunnel_id = Some(*ssh_tunnel_profile_id);
+            instance.access.ssh_enabled = true;
+
+            let selected_tunnel = app_state
+                .read(cx)
+                .ssh_tunnels()
+                .iter()
+                .find(|tunnel| tunnel.id == *ssh_tunnel_profile_id)
+                .cloned();
+
+            if let Some(tunnel) = selected_tunnel {
+                instance.apply_ssh_tunnel(&tunnel, None, window, cx);
+                if tunnel.save_secret {
+                    bound_tunnel = Some(tunnel);
+                }
+            }
+        }
+
+        // Populate SSM fields if access kind is a managed aws-ssm access
+        if let Some(AccessKind::Managed { provider, params }) = &profile.access_kind
+            && provider == "aws-ssm"
+        {
+            let instance_id = params.get("instance_id").cloned().unwrap_or_default();
+            let region = params.get("region").cloned().unwrap_or_default();
+            let remote_port = params.get("remote_port").cloned().unwrap_or_default();
+            let auth_profile_id: Option<uuid::Uuid> =
+                params.get("auth_profile_id").and_then(|s| s.parse().ok());
+
+            instance
+                .access
+                .input_ssm_instance_id
+                .update(cx, |state, cx| {
+                    state.set_value(instance_id, window, cx);
+                });
+            instance.access.input_ssm_region.update(cx, |state, cx| {
+                state.set_value(region, window, cx);
+            });
+            instance
+                .access
+                .input_ssm_remote_port
+                .update(cx, |state, cx| {
+                    state.set_value(remote_port, window, cx);
+                });
+            instance.access.selected_ssm_auth_profile_id = auth_profile_id;
+            if instance.auth_profile.selected_auth_profile_id.is_none() {
+                instance.auth_profile.selected_auth_profile_id = auth_profile_id;
+            }
+        }
+
+        instance.populate_auth_profile_dropdown(cx);
+        instance.refresh_auth_profile_sessions(cx);
+        if let Some(ssh) = profile.config.ssh_tunnel() {
+            instance.access.ssh_enabled = true;
+            instance.access.input_ssh_host.update(cx, |state, cx| {
+                state.set_value(&ssh.host, window, cx);
+            });
+            instance.access.input_ssh_port.update(cx, |state, cx| {
+                state.set_value(ssh.port.to_string(), window, cx);
+            });
+            instance.access.input_ssh_user.update(cx, |state, cx| {
+                state.set_value(&ssh.user, window, cx);
+            });
+
+            // The saved alias, not the cleared manual fields, is the source
+            // of the target (A7): the picker shows it and the manual inputs
+            // stay as the profile stores them — empty while aliased.
+            instance.access.ssh_manual_backup = None;
+            let saved_alias = ssh.ssh_config_host.clone();
+            instance.access.ssh_host_picker.update(cx, |picker, cx| {
+                picker.set_selected_alias(saved_alias.as_deref(), cx);
+            });
+
+            match &ssh.auth_method {
+                datatab_core::SshAuthMethod::PrivateKey { key_path } => {
+                    instance.access.ssh_auth_method = SshAuthSelection::PrivateKey;
+                    if let Some(path) = key_path {
+                        let path_str: String = path.to_string_lossy().into_owned();
+                        instance.access.input_ssh_key_path.update(cx, |state, cx| {
+                            state.set_value(path_str, window, cx);
+                        });
+                    }
+                }
+                datatab_core::SshAuthMethod::Password => {
+                    instance.access.ssh_auth_method = SshAuthSelection::Password;
+                }
+            }
+        }
+
+        instance.start_secrets_read(profile, bound_tunnel, window, cx);
+
+        instance.load_value_source_selectors(profile, window, cx);
+        instance.sync_access_tab_mode_from_state();
+        instance.populate_access_method_dropdown(cx);
+
+        instance
+    }
+
+    fn select_driver(&mut self, driver_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let driver = self.app_state.read(cx).drivers().get(driver_id).cloned();
+        self.form.selected_driver_id = Some(driver_id.to_string());
+        self.form.selected_driver = driver.clone();
+        self.form.form_save_password = true;
+        self.access.ssh_enabled = false;
+        self.access.ssh_auth_method = SshAuthSelection::PrivateKey;
+        self.form.form_save_ssh_secret = true;
+        // A fresh form starts manual: no referenced SSH config alias.
+        self.access.ssh_manual_backup = None;
+        self.access
+            .ssh_host_picker
+            .update(cx, |picker, cx| picker.set_selected_alias(None, cx));
+        self.active_tab = ActiveTab::Main;
+        self.validation_errors.clear();
+        self.test_status = TestStatus::None;
+        self.test_error = None;
+
+        self.auth_profile.selected_auth_profile_id = None;
+        self.access.selected_ssm_auth_profile_id = None;
+        self.access.access_kind = None;
+        self.access.access_tab_mode = AccessTabMode::Direct;
+
+        self.form.input_name.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+
+        if let Some(driver) = driver {
+            // Initialize SSL mode to the driver's first declared ssl mode option, if any.
+            self.form.selected_ssl_mode = driver
+                .metadata()
+                .ssl_modes
+                .and_then(|modes| modes.first())
+                .map(|m| m.id.to_string())
+                .unwrap_or_default();
+
+            self.create_driver_inputs(driver.form_definition(), window, cx);
+        }
+
+        self.reset_value_source_selectors(window, cx);
+
+        self.load_settings_tab(None, None, None, window, cx);
+        self.mcp_tab.bindings = Vec::new();
+        self.mcp_tab.selected_actor_id = None;
+        #[cfg(feature = "mcp")]
+        self.load_mcp_dropdowns(None, window, cx);
+        self.populate_auth_profile_dropdown(cx);
+        self.refresh_auth_profile_sessions(cx);
+        self.populate_access_method_dropdown(cx);
+
+        self.view = View::EditForm;
+        self.edit_state = EditState::Navigating;
+        self.form_focus = FormFocus::Name;
+        window.focus(&self.focus_handle, cx);
+        cx.notify();
+    }
+
+    /// Create input states from the driver's form definition.
+    fn create_driver_inputs(
+        &mut self,
+        form: &DriverFormDef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.form.driver_inputs.clear();
+        self.form.select_values.clear();
+
+        // A select starts on its declared default, so fields gated on its
+        // value are enabled or disabled from the first render, before the
+        // user touches the control.
+        for field in form
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.sections.iter())
+            .flat_map(|section| section.fields.iter())
+            .filter(|field| matches!(field.kind, FormFieldKind::Select { .. }))
+            .filter(|field| !field.default_value.is_empty())
+        {
+            self.form
+                .select_values
+                .insert(field.id.clone(), field.default_value.clone());
+        }
+
+        let fields: Vec<&FormFieldDef> = form
+            .tabs
+            .iter()
+            .filter(|tab| tab.id != "ssh")
+            .flat_map(|tab| tab.sections.iter())
+            .flat_map(|section| section.fields.iter())
+            .filter(|field| field.id != "password")
+            // Select fields are rendered as a segmented control backed by
+            // `self.form.select_values`, not a plain `InputState`.
+            .filter(|field| !matches!(field.kind, FormFieldKind::Select { .. }))
+            .collect();
+
+        for field in fields {
+            let placeholder = &field.placeholder;
+            let default_value = &field.default_value;
+            let is_masked =
+                field.kind == FormFieldKind::Password || field.kind == FormFieldKind::WriteOnly;
+            let field_id = field.id.clone();
+
+            let input = cx.new(|cx| {
+                let mut state = InputState::new(window, cx).placeholder(placeholder);
+                if !default_value.is_empty() {
+                    state = state.default_value(default_value);
+                }
+                if is_masked {
+                    state = state.masked(true);
+                }
+                state
+            });
+
+            let subscription = cx.subscribe_in(
+                &input,
+                window,
+                move |this, _, event: &InputEvent, window, cx| match event {
+                    InputEvent::PressEnter {
+                        secondary: false, ..
+                    } => {
+                        this.exit_edit_mode(window, cx);
+                        this.focus_down(cx);
+                    }
+                    InputEvent::Blur => {
+                        this.exit_edit_mode_on_blur(window, cx);
+                    }
+                    InputEvent::Change => {
+                        this.handle_field_change(&field_id, window, cx);
+                    }
+                    _ => {}
+                },
+            );
+            self._subscriptions.push(subscription);
+
+            self.form.driver_inputs.insert(field.id.to_string(), input);
+        }
+    }
+
+    fn apply_form_values(
+        &mut self,
+        values: &datatab_core::FormValues,
+        form: &DriverFormDef,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for tab in &form.tabs {
+            for section in &tab.sections {
+                for field in &section.fields {
+                    if field.kind == FormFieldKind::Checkbox {
+                        let is_checked =
+                            values.get(&field.id).map(|v| v == "true").unwrap_or(false);
+                        self.form
+                            .checkbox_states
+                            .insert(field.id.clone(), is_checked);
+                    } else if matches!(field.kind, FormFieldKind::Select { .. }) {
+                        let selected = values
+                            .get(&field.id)
+                            .cloned()
+                            .unwrap_or_else(|| field.default_value.clone());
+                        self.form.select_values.insert(field.id.clone(), selected);
+                    }
+                }
+            }
+        }
+
+        for (field_id, value) in values {
+            if let Some(input) = self.form.driver_inputs.get(field_id) {
+                input.update(cx, |state, cx| {
+                    state.set_value(value, window, cx);
+                });
+            }
+        }
+    }
+
+    fn collect_form_values(
+        &self,
+        form: &DriverFormDef,
+        cx: &Context<Self>,
+    ) -> datatab_core::FormValues {
+        let dropdowns = HashMap::new();
+
+        let mut values = form_renderer::collect_values(
+            form,
+            &self.form.driver_inputs,
+            &self.form.checkbox_states,
+            &dropdowns,
+            cx,
+        );
+
+        for (field_id, value) in &self.form.select_values {
+            values.insert(field_id.clone(), value.clone());
+        }
+
+        values
+    }
+
+    /// Reads the saved password and SSH secrets off the UI thread, because a
+    /// locked keyring can block the call. Until it completes the form is
+    /// `Loading`, which keeps saving from deleting an entry the form has not
+    /// seen.
+    fn start_secrets_read(
+        &mut self,
+        profile: &datatab_core::ConnectionProfile,
+        tunnel: Option<SshTunnelProfile>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.form.stored_password = StoredPassword::Loading;
+        self.inputs_edited_during_read.clear();
+        let read_auth_method = self.access.ssh_auth_method;
+        if profile.config.ssh_tunnel().is_some() {
+            self.form.stored_ssh_secret = StoredPassword::Loading;
+        }
+
+        let secret_store = self.app_state.read(cx).secret_store();
+        let profile = profile.clone();
+
+        let read = cx.background_executor().spawn({
+            let profile = profile.clone();
+            let tunnel = tunnel.clone();
+            async move { read_saved_secrets(&secret_store, &profile, tunnel.as_ref()) }
+        });
+
+        self.secrets_read_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let secrets = read.await;
+
+            this.update_in(cx, |this, window, cx| {
+                this.apply_secrets_read(
+                    &profile,
+                    tunnel.as_ref(),
+                    secrets,
+                    read_auth_method,
+                    window,
+                    cx,
+                );
+            })
+            .log_err();
+        }));
+    }
+
+    fn apply_secrets_read(
+        &mut self,
+        profile: &datatab_core::ConnectionProfile,
+        tunnel: Option<&SshTunnelProfile>,
+        secrets: SavedSecrets,
+        read_auth_method: SshAuthSelection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.secrets_read_task = None;
+
+        let mut failures: Vec<(&str, datatab_core::DbError)> = Vec::new();
+
+        match secrets.password {
+            Ok(password) => {
+                self.form.stored_password = StoredPassword::Known;
+
+                // A password that lives behind another source (env, file, ...)
+                // must never land in that source's input, where it would be
+                // saved as the variable name or path.
+                let password_source_is_literal = self
+                    .form
+                    .password_value_source_selector
+                    .read(cx)
+                    .is_literal(cx);
+                let input_is_untouched = self.form.input_password.read(cx).value().is_empty()
+                    && !self
+                        .inputs_edited_during_read
+                        .contains(&self.form.input_password.entity_id());
+                if let Some(password) = password
+                    && password_source_is_literal
+                    && input_is_untouched
+                {
+                    let password = password.expose_secret().to_string();
+                    self.form.input_password.update(cx, |state, cx| {
+                        state.set_value(password, window, cx);
+                    });
+                    // `set_value` emits no Change, so the URI would keep
+                    // showing the connection without its password.
+                    self.sync_fields_to_uri(window, cx);
+                }
+            }
+            Err(error) => {
+                // Unreadable either way, so saving cannot delete an entry the
+                // form never saw; only a profile whose password lives in the
+                // keyring has a failure worth reporting.
+                self.form.stored_password = StoredPassword::Unreadable;
+                if datatab_core::password_lives_in_keyring(profile) {
+                    failures.push(("password", error));
+                } else {
+                    log::warn!(
+                        "Keyring read failed for profile {}, whose password does not live in \
+                         the keyring: {error}",
+                        profile.id
+                    );
+                }
+            }
+        }
+
+        if let Some(result) = secrets.ssh {
+            match result {
+                Ok(secret) if self.access.ssh_auth_method != read_auth_method => {
+                    // The secret belongs to the method that was selected when
+                    // the read started; filling another method's input would
+                    // misplace it. The form never shows the entry, so it stays
+                    // as protected from deletion as an unreadable one.
+                    drop(secret);
+                    self.form.stored_ssh_secret = StoredPassword::Unreadable;
+                }
+                Ok(secret) => {
+                    self.form.stored_ssh_secret = StoredPassword::Known;
+                    if let Some(secret) = secret
+                        && self.fill_empty_ssh_secret_input(read_auth_method, &secret, window, cx)
+                    {
+                        self.form.form_save_ssh_secret = true;
+                    }
+                }
+                Err(error) => {
+                    self.form.stored_ssh_secret = StoredPassword::Unreadable;
+                    failures.push(("SSH secret", error));
+                }
+            }
+        }
+
+        if let (Some(result), Some(tunnel)) = (secrets.tunnel, tunnel) {
+            match result {
+                Ok(secret) => {
+                    // The user may have picked another tunnel while the read ran.
+                    if let Some(secret) = secret
+                        && self.access.selected_ssh_tunnel_id == Some(tunnel.id)
+                    {
+                        let auth_selection = match tunnel.config.auth_method {
+                            SshAuthMethod::PrivateKey { .. } => SshAuthSelection::PrivateKey,
+                            SshAuthMethod::Password => SshAuthSelection::Password,
+                        };
+                        if self.fill_empty_ssh_secret_input(auth_selection, &secret, window, cx) {
+                            self.form.form_save_ssh_secret = tunnel.save_secret;
+                        }
+                    }
+                }
+                Err(error) => failures.push(("SSH tunnel secret", error)),
+            }
+        }
+
+        self.report_secrets_read_failures(failures, cx);
+        self.inputs_edited_during_read.clear();
+        cx.notify();
+
+        match self.deferred_after_secrets_read.take() {
+            Some(DeferredAction::Save) => self.save_profile(window, cx),
+            Some(DeferredAction::TestConnection) => self.test_connection(window, cx),
+            None => {}
+        }
+    }
+
+    fn note_edit_during_secrets_read(&mut self, input: EntityId) {
+        if self.secrets_read_task.is_some() {
+            self.inputs_edited_during_read.insert(input);
+        }
+    }
+
+    /// Records `action` and returns true while the keyring read is pending,
+    /// so the caller must stop: running it now would evaluate `Loading`.
+    pub(super) fn defer_until_secrets_read(&mut self, action: DeferredAction) -> bool {
+        if self.secrets_read_task.is_none() {
+            return false;
+        }
+
+        self.deferred_after_secrets_read = Some(DeferredAction::merge(
+            self.deferred_after_secrets_read,
+            action,
+        ));
+        true
+    }
+
+    /// Fills the SSH secret input for `auth_selection` unless the user typed
+    /// into it first. Returns whether it filled the input.
+    fn fill_empty_ssh_secret_input(
+        &mut self,
+        auth_selection: SshAuthSelection,
+        secret: &SecretString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let input = match auth_selection {
+            SshAuthSelection::PrivateKey => &self.access.input_ssh_key_passphrase,
+            SshAuthSelection::Password => &self.access.input_ssh_password,
+        };
+
+        if !input.read(cx).value().is_empty()
+            || self.inputs_edited_during_read.contains(&input.entity_id())
+        {
+            return false;
+        }
+
+        let value = secret.expose_secret().to_string();
+        input.update(cx, |state, cx| {
+            state.set_value(value, window, cx);
+        });
+        true
+    }
+
+    /// One report for the whole open, however many secrets failed. Only the
+    /// failed secrets' names and the error text go in the cause, never a value.
+    fn report_secrets_read_failures(
+        &self,
+        failures: Vec<(&str, datatab_core::DbError)>,
+        cx: &mut Context<Self>,
+    ) {
+        if failures.is_empty() {
+            return;
+        }
+
+        let only_password = failures.iter().all(|(name, _)| *name == "password");
+        let summary = if only_password {
+            KEYRING_PASSWORD_READ_ERROR
+        } else {
+            KEYRING_SECRETS_READ_ERROR
+        };
+        let cause = failures
+            .iter()
+            .map(|(name, error)| format!("{name}: {error}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        report_error(
+            UserFacingError::new(ErrorKind::Storage, summary).with_cause(cause),
+            cx,
+        );
+    }
+
+    /// Placeholder for the password input. An unreadable keyring says so,
+    /// because an empty field would otherwise read as "no password saved".
+    fn password_placeholder(&self, password_source_is_literal: bool, cx: &Context<Self>) -> String {
+        if password_source_is_literal && self.form.stored_password == StoredPassword::Unreadable {
+            return datatab_i18n::t!("connection_manager.placeholder.password_unreadable");
+        }
+
+        self.form
+            .password_value_source_selector
+            .read(cx)
+            .source_placeholder(cx)
+            .unwrap_or_else(|| self.secret_field_label(cx))
+    }
+
+    /// Label of the canonical secret input for the selected driver.
+    ///
+    /// Drivers can rename the secret (e.g. "API Token" for InfluxDB v2). The
+    /// override depends on current form values so that toggles like a version
+    /// selector flip the label live. Falls back to the generic "Password".
+    fn secret_field_label(&self, cx: &Context<Self>) -> String {
+        let default_label = || datatab_i18n::t!("connection_manager.placeholder.password");
+
+        let Some(driver) = &self.form.selected_driver else {
+            return default_label();
+        };
+
+        let form_values = self.collect_form_values(driver.form_definition(), cx);
+
+        driver
+            .secret_field_label(&form_values)
+            .unwrap_or_else(default_label)
+    }
+
+    fn reset_value_source_selectors(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.form
+            .host_value_source_selector
+            .update(cx, |selector, cx| {
+                let _previous = selector.set_value_ref(None, window, cx);
+            });
+        self.access
+            .ssm_instance_id_value_source_selector
+            .update(cx, |selector, cx| {
+                let _previous = selector.set_value_ref(None, window, cx);
+            });
+        self.access
+            .ssm_region_value_source_selector
+            .update(cx, |selector, cx| {
+                let _previous = selector.set_value_ref(None, window, cx);
+            });
+        self.access
+            .ssm_remote_port_value_source_selector
+            .update(cx, |selector, cx| {
+                let _previous = selector.set_value_ref(None, window, cx);
+            });
+        self.form
+            .database_value_source_selector
+            .update(cx, |selector, cx| {
+                let _previous = selector.set_value_ref(None, window, cx);
+            });
+        self.form
+            .user_value_source_selector
+            .update(cx, |selector, cx| {
+                let _previous = selector.set_value_ref(None, window, cx);
+            });
+        self.form
+            .password_value_source_selector
+            .update(cx, |selector, cx| {
+                let _previous = selector.set_value_ref(None, window, cx);
+            });
+    }
+
+    fn load_value_source_selectors(
+        &mut self,
+        profile: &datatab_core::ConnectionProfile,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.access
+            .ssm_instance_id_value_source_selector
+            .update(cx, |selector, cx| {
+                let primary =
+                    selector.set_value_ref(profile.value_refs.get("ssm_instance_id"), window, cx);
+                if !primary.is_empty() {
+                    self.access.input_ssm_instance_id.update(cx, |state, cx| {
+                        state.set_value(primary.clone(), window, cx);
+                    });
+                }
+            });
+
+        self.access
+            .ssm_region_value_source_selector
+            .update(cx, |selector, cx| {
+                let primary =
+                    selector.set_value_ref(profile.value_refs.get("ssm_region"), window, cx);
+                if !primary.is_empty() {
+                    self.access.input_ssm_region.update(cx, |state, cx| {
+                        state.set_value(primary.clone(), window, cx);
+                    });
+                }
+            });
+
+        self.access
+            .ssm_remote_port_value_source_selector
+            .update(cx, |selector, cx| {
+                let primary =
+                    selector.set_value_ref(profile.value_refs.get("ssm_remote_port"), window, cx);
+                if !primary.is_empty() {
+                    self.access.input_ssm_remote_port.update(cx, |state, cx| {
+                        state.set_value(primary.clone(), window, cx);
+                    });
+                }
+            });
+
+        self.form
+            .host_value_source_selector
+            .update(cx, |selector, cx| {
+                let primary = selector.set_value_ref(profile.value_refs.get("host"), window, cx);
+                if !primary.is_empty()
+                    && let Some(input) = self.form.driver_inputs.get("host")
+                {
+                    input.update(cx, |state, cx| {
+                        state.set_value(primary.clone(), window, cx);
+                    });
+                }
+            });
+
+        self.form
+            .database_value_source_selector
+            .update(cx, |selector, cx| {
+                let primary =
+                    selector.set_value_ref(profile.value_refs.get("database"), window, cx);
+                if !primary.is_empty()
+                    && let Some(input) = self.form.driver_inputs.get("database")
+                {
+                    input.update(cx, |state, cx| {
+                        state.set_value(primary.clone(), window, cx);
+                    });
+                }
+            });
+
+        self.form
+            .user_value_source_selector
+            .update(cx, |selector, cx| {
+                let primary = selector.set_value_ref(profile.value_refs.get("user"), window, cx);
+                if !primary.is_empty()
+                    && let Some(input) = self.form.driver_inputs.get("user")
+                {
+                    input.update(cx, |state, cx| {
+                        state.set_value(primary.clone(), window, cx);
+                    });
+                }
+            });
+
+        self.form
+            .password_value_source_selector
+            .update(cx, |selector, cx| {
+                let primary =
+                    selector.set_value_ref(profile.value_refs.get("password"), window, cx);
+                if !primary.is_empty() {
+                    self.form.input_password.update(cx, |state, cx| {
+                        state.set_value(primary, window, cx);
+                    });
+                }
+            });
+
+        self.sync_fields_to_uri(window, cx);
+    }
+
+    pub(super) fn collect_value_refs(&self, cx: &App) -> HashMap<String, ValueRef> {
+        let mut refs = HashMap::new();
+
+        let ssm_instance_id = self
+            .access
+            .input_ssm_instance_id
+            .read(cx)
+            .value()
+            .to_string();
+        if let Some(value_ref) = self
+            .access
+            .ssm_instance_id_value_source_selector
+            .read(cx)
+            .value_ref(&ssm_instance_id, cx)
+        {
+            refs.insert("ssm_instance_id".to_string(), value_ref);
+        }
+
+        let ssm_region = self.access.input_ssm_region.read(cx).value().to_string();
+        if let Some(value_ref) = self
+            .access
+            .ssm_region_value_source_selector
+            .read(cx)
+            .value_ref(&ssm_region, cx)
+        {
+            refs.insert("ssm_region".to_string(), value_ref);
+        }
+
+        let ssm_remote_port = self
+            .access
+            .input_ssm_remote_port
+            .read(cx)
+            .value()
+            .to_string();
+        if let Some(value_ref) = self
+            .access
+            .ssm_remote_port_value_source_selector
+            .read(cx)
+            .value_ref(&ssm_remote_port, cx)
+        {
+            refs.insert("ssm_remote_port".to_string(), value_ref);
+        }
+
+        let host_value = self
+            .form
+            .driver_inputs
+            .get("host")
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default();
+        if let Some(value_ref) = self
+            .form
+            .host_value_source_selector
+            .read(cx)
+            .value_ref(&host_value, cx)
+        {
+            refs.insert("host".to_string(), value_ref);
+        }
+
+        let database_value = self
+            .form
+            .driver_inputs
+            .get("database")
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default();
+        if let Some(value_ref) = self
+            .form
+            .database_value_source_selector
+            .read(cx)
+            .value_ref(&database_value, cx)
+        {
+            refs.insert("database".to_string(), value_ref);
+        }
+
+        let user_value = self
+            .form
+            .driver_inputs
+            .get("user")
+            .map(|input| input.read(cx).value().to_string())
+            .unwrap_or_default();
+        if let Some(value_ref) = self
+            .form
+            .user_value_source_selector
+            .read(cx)
+            .value_ref(&user_value, cx)
+        {
+            refs.insert("user".to_string(), value_ref);
+        }
+
+        let password_value = self.form.input_password.read(cx).value().to_string();
+        if let Some(value_ref) = self
+            .form
+            .password_value_source_selector
+            .read(cx)
+            .value_ref(&password_value, cx)
+        {
+            refs.insert("password".to_string(), value_ref);
+        }
+
+        refs
+    }
+
+    pub(super) fn has_dynamic_value_ref_for_field(&self, field_id: &str, cx: &App) -> bool {
+        match field_id {
+            "ssm_instance_id" => !self
+                .access
+                .ssm_instance_id_value_source_selector
+                .read(cx)
+                .is_literal(cx),
+            "ssm_region" => !self
+                .access
+                .ssm_region_value_source_selector
+                .read(cx)
+                .is_literal(cx),
+            "ssm_remote_port" => !self
+                .access
+                .ssm_remote_port_value_source_selector
+                .read(cx)
+                .is_literal(cx),
+            "host" => !self.form.host_value_source_selector.read(cx).is_literal(cx),
+            "database" => !self
+                .form
+                .database_value_source_selector
+                .read(cx)
+                .is_literal(cx),
+            "user" => !self.form.user_value_source_selector.read(cx).is_literal(cx),
+            "password" => !self
+                .form
+                .password_value_source_selector
+                .read(cx)
+                .is_literal(cx),
+            _ => false,
+        }
+    }
+
+    fn back_to_driver_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle, cx);
+        self.view = View::DriverSelect;
+        self.form.selected_driver_id = None;
+        self.form.selected_driver = None;
+        self.validation_errors.clear();
+        self.test_status = TestStatus::None;
+        self.test_error = None;
+        cx.notify();
+    }
+
+    fn selected_kind(&self) -> Option<DbKind> {
+        self.form.selected_driver.as_ref().map(|d| d.kind())
+    }
+
+    fn selected_driver_id(&self) -> Option<&str> {
+        self.form.selected_driver_id.as_deref()
+    }
+
+    /// Returns true if this driver uses the server form (host/port/user/database)
+    /// instead of a file-based form (path only).
+    #[allow(dead_code)]
+    fn uses_server_form(&self) -> bool {
+        let Some(driver) = &self.form.selected_driver else {
+            return false;
+        };
+        !driver.form_definition().uses_file_form()
+    }
+
+    /// Returns true if this driver uses a file-based form (path only).
+    fn uses_file_form(&self) -> bool {
+        let Some(driver) = &self.form.selected_driver else {
+            return false;
+        };
+        driver.form_definition().uses_file_form()
+    }
+
+    /// Returns true if this driver supports SSH tunneling.
+    #[allow(dead_code)]
+    fn supports_ssh(&self) -> bool {
+        let Some(driver) = &self.form.selected_driver else {
+            return false;
+        };
+        driver.form_definition().supports_ssh()
+    }
+
+    #[allow(dead_code)]
+    fn supports_proxy(&self) -> bool {
+        !self.uses_file_form()
+    }
+
+    fn input_state_for_field(&self, field_id: &str) -> Option<&Entity<InputState>> {
+        if let Some(input) = self.form.driver_inputs.get(field_id) {
+            return Some(input);
+        }
+
+        if field_id == "password" {
+            return Some(&self.form.input_password);
+        }
+
+        match field_id {
+            "ssh_host" => Some(&self.access.input_ssh_host),
+            "ssh_port" => Some(&self.access.input_ssh_port),
+            "ssh_user" => Some(&self.access.input_ssh_user),
+            "ssh_key_path" => Some(&self.access.input_ssh_key_path),
+            "ssh_passphrase" => Some(&self.access.input_ssh_key_passphrase),
+            "ssh_password" => Some(&self.access.input_ssh_password),
+            _ => None,
+        }
+    }
+
+    /// Check if a field is enabled based on its conditional dependencies.
+    fn is_field_enabled(&self, field: &FormFieldDef) -> bool {
+        form_renderer::is_field_enabled(field, &self.form.checkbox_states, &self.form.select_values)
+    }
+
+    /// The Main-tab controls after the named fields, in the order they are
+    /// drawn: the driver's own fields, then the SSL mode and the certificate
+    /// pickers the selected mode shows, then the navigator view of a driver
+    /// with schemas.
+    pub(super) fn main_extra_stops(&self) -> Vec<MainExtraStop> {
+        let Some(driver) = self.form.selected_driver.as_ref() else {
+            return Vec::new();
+        };
+
+        let form_def = driver.form_definition();
+        let mut stops: Vec<MainExtraStop> = Vec::new();
+        if Self::shows_show_all_databases(driver.as_ref()) {
+            stops.push(MainExtraStop::ShowAllDatabases);
+        }
+        stops.extend(
+            form_def
+                .main_tab()
+                .map(|tab| {
+                    tab.sections
+                        .iter()
+                        .flat_map(|section| section.fields.iter())
+                        .filter(|field| {
+                            field.id != "password"
+                                && Self::field_id_to_focus(&field.id, false).is_none()
+                                && !matches!(field.kind, FormFieldKind::DynamicSelect { .. })
+                        })
+                        .map(|field| MainExtraStop::DriverField(Box::new(field.clone())))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        );
+
+        let metadata = driver.metadata();
+        if metadata.ssl_modes.is_some() {
+            stops.push(MainExtraStop::SslMode);
+
+            if let Some(cert_fields) = &metadata.ssl_cert_fields {
+                let mode = &self.form.selected_ssl_mode;
+
+                if datatab_core::ssl_mode_id_requires_root_cert(mode) {
+                    stops.push(MainExtraStop::SslCert(SslCertSlot::CaCert));
+                }
+
+                if cert_fields.client_cert && datatab_core::ssl_mode_id_is_cert_active(mode) {
+                    stops.push(MainExtraStop::SslCert(SslCertSlot::ClientCert));
+                    stops.push(MainExtraStop::SslCert(SslCertSlot::ClientKey));
+                }
+            }
+        }
+
+        if Self::shows_navigator_view(driver.as_ref()) {
+            stops.push(MainExtraStop::NavigatorView);
+        }
+
+        stops.push(MainExtraStop::ReadOnly);
+
+        stops
+    }
+
+    /// The navigator view only changes the layout of schemas, so it shows
+    /// for drivers that have them.
+    pub(super) fn shows_navigator_view(driver: &dyn DbDriver) -> bool {
+        driver
+            .metadata()
+            .capabilities
+            .contains(DriverCapabilities::SCHEMAS)
+    }
+
+    /// "Show all databases" sits next to the Database field of a driver
+    /// whose server holds several databases.
+    pub(super) fn shows_show_all_databases(driver: &dyn DbDriver) -> bool {
+        driver
+            .metadata()
+            .capabilities
+            .contains(DriverCapabilities::MULTIPLE_DATABASES)
+            && driver.form_definition().main_tab().is_some_and(|tab| {
+                tab.sections
+                    .iter()
+                    .flat_map(|section| section.fields.iter())
+                    .any(|field| field.id == "database" && field.kind == FormFieldKind::Text)
+            })
+    }
+
+    /// The ring stop of the "Show all databases" checkbox.
+    fn main_extra_focus_for_show_all_databases(&self) -> Option<FormFocus> {
+        self.main_extra_focus_where(|stop| matches!(stop, MainExtraStop::ShowAllDatabases))
+    }
+
+    /// The ring stop of the read-only checkbox.
+    fn main_extra_focus_for_read_only(&self) -> Option<FormFocus> {
+        self.main_extra_focus_where(|stop| matches!(stop, MainExtraStop::ReadOnly))
+    }
+
+    /// The ring stop of the navigator view control.
+    fn main_extra_focus_for_navigator_view(&self) -> Option<FormFocus> {
+        self.main_extra_focus_where(|stop| matches!(stop, MainExtraStop::NavigatorView))
+    }
+
+    /// The ring stop of the Main-tab driver field `field_id` when it has no
+    /// variant of its own.
+    fn main_extra_focus_for_field(&self, field_id: &str) -> Option<FormFocus> {
+        self.main_extra_focus_where(
+            |stop| matches!(stop, MainExtraStop::DriverField(field) if field.id == field_id),
+        )
+    }
+
+    /// The ring stop of the SSL mode control.
+    fn main_extra_focus_for_ssl_mode(&self) -> Option<FormFocus> {
+        self.main_extra_focus_where(|stop| matches!(stop, MainExtraStop::SslMode))
+    }
+
+    /// The ring stop of the certificate picker of `slot`.
+    fn main_extra_focus_for_ssl_cert(&self, slot: SslCertSlot) -> Option<FormFocus> {
+        self.main_extra_focus_where(
+            |stop| matches!(stop, MainExtraStop::SslCert(candidate) if *candidate == slot),
+        )
+    }
+
+    fn main_extra_focus_where(
+        &self,
+        matches: impl Fn(&MainExtraStop) -> bool,
+    ) -> Option<FormFocus> {
+        self.main_extra_stops()
+            .iter()
+            .position(matches)
+            .map(|index| FormFocus::MainExtra(index as u8))
+    }
+
+    /// The input that holds the path of a certificate slot.
+    pub(super) fn ssl_cert_input(&self, slot: SslCertSlot) -> &Entity<InputState> {
+        match slot {
+            SslCertSlot::CaCert => &self.form.ssl_ca_cert_input,
+            SslCertSlot::ClientCert => &self.form.ssl_client_cert_input,
+            SslCertSlot::ClientKey => &self.form.ssl_client_key_input,
+        }
+    }
+
+    /// Map a field ID to its FormFocus variant.
+    fn field_id_to_focus(field_id: &str, is_ssh_tab: bool) -> Option<FormFocus> {
+        use FormFocus::*;
+
+        if is_ssh_tab {
+            match field_id {
+                "ssh_enabled" => Some(SshEnabled),
+                "ssh_host" => Some(SshHost),
+                "ssh_port" => Some(SshPort),
+                "ssh_user" => Some(SshUser),
+                "ssh_key_path" => Some(SshKeyPath),
+                "ssh_passphrase" => Some(SshPassphrase),
+                "ssh_password" => Some(SshPassword),
+                _ => None,
+            }
+        } else {
+            match field_id {
+                "use_uri" => Some(UseUri),
+                "host" | "uri" => Some(Host),
+                "port" => Some(Port),
+                "database" | "path" => Some(Database),
+                "user" => Some(User),
+                "password" => Some(Password),
+                _ => None,
+            }
+        }
+    }
+
+    /// Map a FormFocus variant to its field ID.
+    fn focus_to_field_id(focus: FormFocus) -> Option<&'static str> {
+        use FormFocus::*;
+        match focus {
+            Host => Some("host"),
+            Port => Some("port"),
+            Database => Some("database"),
+            User => Some("user"),
+            Password => Some("password"),
+            SshHost => Some("ssh_host"),
+            SshPort => Some("ssh_port"),
+            SshUser => Some("ssh_user"),
+            SshKeyPath => Some("ssh_key_path"),
+            SshPassphrase => Some("ssh_passphrase"),
+            SshPassword => Some("ssh_password"),
+            SsmInstanceId => Some("ssm_instance_id"),
+            SsmRegion => Some("ssm_region"),
+            SsmRemotePort => Some("ssm_remote_port"),
+            _ => None,
+        }
+    }
+
+    fn input_for_focus(&self, focus: FormFocus) -> Option<&Entity<InputState>> {
+        let uri_mode = self
+            .form
+            .checkbox_states
+            .get("use_uri")
+            .copied()
+            .unwrap_or(false);
+
+        if focus == FormFocus::Host && uri_mode {
+            return self.form.driver_inputs.get("uri");
+        }
+
+        if let Some(field_id) = Self::focus_to_field_id(focus)
+            && let Some(input) = self.form.driver_inputs.get(field_id)
+        {
+            return Some(input);
+        }
+
+        match focus {
+            FormFocus::Host => self
+                .form
+                .driver_inputs
+                .get("uri")
+                .or_else(|| self.form.driver_inputs.get("host")),
+            FormFocus::Database => self
+                .form
+                .driver_inputs
+                .get("path")
+                .or_else(|| self.form.driver_inputs.get("database")),
+            _ => None,
+        }
+    }
+
+    /// Populate the MCP role/policy dropdowns from the global governance state and
+    /// optionally pre-select the role/policy from an existing policy binding for the
+    /// currently selected trusted client.
+    #[cfg(feature = "mcp")]
+    fn load_mcp_dropdowns(
+        &mut self,
+        binding: Option<&datatab_core::ConnectionMcpPolicyBinding>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let roles = self.app_state.read(cx).list_mcp_roles().unwrap_or_default();
+        let policies = self
+            .app_state
+            .read(cx)
+            .list_mcp_policies()
+            .unwrap_or_default();
+
+        let mut role_items = vec![datatab_components::controls::DropdownItem::with_value(
+            datatab_i18n::t!("connection_manager.placeholder.no_role"),
+            "",
+        )];
+        role_items.extend(roles.iter().map(|r| {
+            let label = datatab_mcp::builtin_display_name(&r.id)
+                .map(|name| format!("{} (built-in)", name))
+                .unwrap_or_else(|| r.id.clone());
+            datatab_components::controls::DropdownItem::with_value(label, r.id.clone())
+        }));
+
+        let mut policy_items = vec![datatab_components::controls::DropdownItem::with_value(
+            datatab_i18n::t!("connection_manager.placeholder.no_policy"),
+            "",
+        )];
+        policy_items.extend(policies.iter().map(|p| {
+            let label = datatab_mcp::builtin_display_name(&p.id)
+                .map(|name| format!("{} (built-in)", name))
+                .unwrap_or_else(|| p.id.clone());
+            datatab_components::controls::DropdownItem::with_value(label, p.id.clone())
+        }));
+
+        let role_index = binding.and_then(|b| {
+            b.role_ids.first().and_then(|role_id| {
+                role_items
+                    .iter()
+                    .position(|item| item.value.as_ref() == role_id.as_str())
+            })
+        });
+        let policy_index = binding.and_then(|b| {
+            b.policy_ids.first().and_then(|policy_id| {
+                policy_items
+                    .iter()
+                    .position(|item| item.value.as_ref() == policy_id.as_str())
+            })
+        });
+
+        self.mcp_tab.conn_mcp_role_dropdown.update(cx, |d, cx| {
+            d.set_items(role_items, cx);
+            d.set_selected_index(role_index.or(Some(0)), cx);
+        });
+        self.mcp_tab.conn_mcp_policy_dropdown.update(cx, |d, cx| {
+            d.set_items(policy_items.clone(), cx);
+            d.set_selected_index(policy_index.or(Some(0)), cx);
+        });
+
+        // Load MultiSelect components with all available roles/policies
+        let all_role_items: Vec<datatab_components::controls::DropdownItem> = roles
+            .iter()
+            .map(|r| {
+                let label = datatab_mcp::builtin_display_name(&r.id)
+                    .map(|name| format!("{} (built-in)", name))
+                    .unwrap_or_else(|| r.id.clone());
+                datatab_components::controls::DropdownItem::with_value(label, r.id.clone())
+            })
+            .collect();
+
+        let all_policy_items: Vec<datatab_components::controls::DropdownItem> = policies
+            .iter()
+            .map(|p| {
+                let label = datatab_mcp::builtin_display_name(&p.id)
+                    .map(|name| format!("{} (built-in)", name))
+                    .unwrap_or_else(|| p.id.clone());
+                datatab_components::controls::DropdownItem::with_value(label, p.id.clone())
+            })
+            .collect();
+
+        self.mcp_tab
+            .conn_mcp_role_multi_select
+            .update(cx, |ms, cx| {
+                ms.set_items(all_role_items, cx);
+            });
+
+        self.mcp_tab
+            .conn_mcp_policy_multi_select
+            .update(cx, |ms, cx| {
+                ms.set_items(all_policy_items, cx);
+            });
+
+        // Set selected values from the binding, clearing them when there is none
+        // (e.g. the selected client has no binding yet).
+        let extra_roles: Vec<String> = binding
+            .map(|b| b.role_ids.iter().skip(1).cloned().collect())
+            .unwrap_or_default();
+        let extra_policies: Vec<String> = binding
+            .map(|b| b.policy_ids.iter().skip(1).cloned().collect())
+            .unwrap_or_default();
+
+        self.mcp_tab
+            .conn_mcp_role_multi_select
+            .update(cx, |ms, cx| {
+                ms.set_selected_values(&extra_roles, cx);
+            });
+
+        self.mcp_tab
+            .conn_mcp_policy_multi_select
+            .update(cx, |ms, cx| {
+                ms.set_selected_values(&extra_policies, cx);
+            });
+    }
+
+    /// Reads the role/policy dropdown and multi-select widgets and merges each
+    /// pair (primary dropdown + multi-select extras) into a deduped id list,
+    /// primary first.
+    pub(super) fn read_selected_mcp_role_and_policy_ids(
+        &self,
+        cx: &Context<Self>,
+    ) -> (Vec<String>, Vec<String>) {
+        let primary_role = self
+            .mcp_tab
+            .conn_mcp_role_dropdown
+            .read(cx)
+            .selected_value()
+            .map(|v| v.to_string());
+        let extra_roles: Vec<String> = self
+            .mcp_tab
+            .conn_mcp_role_multi_select
+            .read(cx)
+            .selected_values()
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect();
+        let role_ids = mcp_bindings::merge_primary_and_extras(primary_role, extra_roles);
+
+        let primary_policy = self
+            .mcp_tab
+            .conn_mcp_policy_dropdown
+            .read(cx)
+            .selected_value()
+            .map(|v| v.to_string());
+        let extra_policies: Vec<String> = self
+            .mcp_tab
+            .conn_mcp_policy_multi_select
+            .read(cx)
+            .selected_values()
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect();
+        let policy_ids = mcp_bindings::merge_primary_and_extras(primary_policy, extra_policies);
+
+        (role_ids, policy_ids)
+    }
+
+    /// Rewrites the binding for the currently selected trusted client from the
+    /// role/policy dropdown and multi-select widgets. No-op when no client is
+    /// selected. Called on every dropdown/multi-select change so switching the
+    /// selected client (which repopulates these widgets) never loses edits.
+    fn handle_mcp_binding_field_change(&mut self, cx: &mut Context<Self>) {
+        let Some(actor_id) = self.mcp_tab.selected_actor_id.clone() else {
+            return;
+        };
+
+        let (role_ids, policy_ids) = self.read_selected_mcp_role_and_policy_ids(cx);
+
+        mcp_bindings::apply_selection(&mut self.mcp_tab.bindings, &actor_id, role_ids, policy_ids);
+        cx.notify();
+    }
+
+    /// Selects a trusted client in the MCP tab's master-detail list and
+    /// repopulates the role/policy widgets from its existing binding, if any.
+    #[cfg(feature = "mcp")]
+    fn select_mcp_client(&mut self, actor_id: String, window: &mut Window, cx: &mut Context<Self>) {
+        self.mcp_tab.selected_actor_id = Some(actor_id.clone());
+
+        let binding = self
+            .mcp_tab
+            .bindings
+            .iter()
+            .find(|binding| binding.actor_id == actor_id)
+            .cloned();
+
+        self.load_mcp_dropdowns(binding.as_ref(), window, cx);
+        cx.notify();
+    }
+
+    /// Adds or removes the binding for `actor_id`, then repopulates the
+    /// role/policy widgets when that client is the one currently selected.
+    #[cfg(feature = "mcp")]
+    fn set_mcp_client_allowed(
+        &mut self,
+        actor_id: String,
+        allowed: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        mcp_bindings::set_binding_presence(&mut self.mcp_tab.bindings, &actor_id, allowed);
+
+        if self.mcp_tab.selected_actor_id.as_deref() == Some(actor_id.as_str()) {
+            let binding = self
+                .mcp_tab
+                .bindings
+                .iter()
+                .find(|binding| binding.actor_id == actor_id)
+                .cloned();
+
+            self.load_mcp_dropdowns(binding.as_ref(), window, cx);
+        }
+
+        cx.notify();
+    }
+
+    /// Initialize the Settings tab controls from the selected driver's defaults
+    /// and (if editing) the profile's saved overrides.
+    fn load_settings_tab(
+        &mut self,
+        overrides: Option<&GlobalOverrides>,
+        connection_settings: Option<&datatab_core::FormValues>,
+        hook_bindings: Option<&ConnectionHookBindings>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_tab.conn_loading_settings = true;
+        self.settings_tab.conn_form_subscriptions.clear();
+        self.settings_tab.conn_form_state.clear();
+
+        let overrides = overrides.cloned().unwrap_or_default();
+
+        self.settings_tab.conn_override_refresh_policy = overrides.refresh_policy.is_some();
+        self.settings_tab.conn_override_refresh_interval =
+            overrides.refresh_interval_secs.is_some();
+
+        let effective = self.resolve_driver_effective_settings(cx);
+
+        let policy_items = vec![
+            datatab_components::controls::DropdownItem::with_value(
+                datatab_i18n::t!("settings.general.refresh_policy.option.manual"),
+                "manual",
+            ),
+            datatab_components::controls::DropdownItem::with_value(
+                datatab_i18n::t!("settings.general.refresh_policy.option.interval"),
+                "interval",
+            ),
+        ];
+        let policy_index = match overrides.refresh_policy.unwrap_or(effective.refresh_policy) {
+            datatab_core::RefreshPolicySetting::Manual => 0,
+            datatab_core::RefreshPolicySetting::Interval => 1,
+        };
+        self.settings_tab
+            .conn_refresh_policy_dropdown
+            .update(cx, |dropdown, cx| {
+                dropdown.set_items(policy_items, cx);
+                dropdown.set_selected_index(Some(policy_index), cx);
+            });
+
+        let interval_val = overrides
+            .refresh_interval_secs
+            .unwrap_or(effective.refresh_interval_secs);
+        self.settings_tab
+            .conn_refresh_interval_input
+            .update(cx, |input, cx| {
+                input.set_value(interval_val.to_string(), window, cx);
+            });
+
+        let boolean_items = vec![
+            datatab_components::controls::DropdownItem::with_value(
+                datatab_i18n::t!("connection_manager.placeholder.use_driver_default"),
+                "default",
+            ),
+            datatab_components::controls::DropdownItem::with_value(
+                datatab_i18n::t!("connection_manager.overrides.on"),
+                "on",
+            ),
+            datatab_components::controls::DropdownItem::with_value(
+                datatab_i18n::t!("connection_manager.overrides.off"),
+                "off",
+            ),
+        ];
+
+        let bool_index = |opt: Option<bool>| -> usize {
+            match opt {
+                None => 0,
+                Some(true) => 1,
+                Some(false) => 2,
+            }
+        };
+
+        self.settings_tab
+            .conn_confirm_dangerous_dropdown
+            .update(cx, |dropdown, cx| {
+                dropdown.set_items(boolean_items.clone(), cx);
+                dropdown.set_selected_index(Some(bool_index(overrides.confirm_dangerous)), cx);
+            });
+        self.settings_tab
+            .conn_requires_where_dropdown
+            .update(cx, |dropdown, cx| {
+                dropdown.set_items(boolean_items.clone(), cx);
+                dropdown.set_selected_index(Some(bool_index(overrides.requires_where)), cx);
+            });
+        self.settings_tab
+            .conn_requires_preview_dropdown
+            .update(cx, |dropdown, cx| {
+                dropdown.set_items(boolean_items, cx);
+                dropdown.set_selected_index(Some(bool_index(overrides.requires_preview)), cx);
+            });
+
+        let mut hook_items = vec![datatab_components::controls::DropdownItem::with_value(
+            datatab_i18n::t!("connection_manager.placeholder.no_hook"),
+            "",
+        )];
+
+        let hook_definitions = self.app_state.read(cx).hook_definitions().clone();
+
+        let mut hook_names: Vec<String> = hook_definitions.keys().cloned().collect();
+        hook_names.sort();
+        hook_items.extend(hook_names.iter().filter_map(|hook_name| {
+            let definition = hook_definitions.get(hook_name)?;
+            let definition_id = definition.id.clone()?;
+
+            let label = format!("{} - {}", hook_name, definition.summary());
+
+            Some(datatab_components::controls::DropdownItem::with_value(
+                label,
+                definition_id,
+            ))
+        }));
+
+        let id_to_name: HashMap<String, String> = hook_definitions
+            .iter()
+            .filter_map(|(name, definition)| definition.id.clone().map(|id| (id, name.clone())))
+            .collect();
+
+        let display_extra = |ids: &[String]| -> String {
+            ids.iter()
+                .map(|id| id_to_name.get(id).cloned().unwrap_or_else(|| id.clone()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        let (pre_selected, pre_extra_ids) = hook_bindings
+            .map(|bindings| Self::split_primary_and_extra(&bindings.pre_connect))
+            .unwrap_or_default();
+        let (post_selected, post_extra_ids) = hook_bindings
+            .map(|bindings| Self::split_primary_and_extra(&bindings.post_connect))
+            .unwrap_or_default();
+        let (pre_disconnect_selected, pre_disconnect_extra_ids) = hook_bindings
+            .map(|bindings| Self::split_primary_and_extra(&bindings.pre_disconnect))
+            .unwrap_or_default();
+        let (post_disconnect_selected, post_disconnect_extra_ids) = hook_bindings
+            .map(|bindings| Self::split_primary_and_extra(&bindings.post_disconnect))
+            .unwrap_or_default();
+
+        let pre_extra = display_extra(&pre_extra_ids);
+        let post_extra = display_extra(&post_extra_ids);
+        let pre_disconnect_extra = display_extra(&pre_disconnect_extra_ids);
+        let post_disconnect_extra = display_extra(&post_disconnect_extra_ids);
+
+        let selection_index = |selected: &str| {
+            hook_items
+                .iter()
+                .position(|item| item.value.as_ref() == selected)
+                .unwrap_or(0)
+        };
+
+        let pre_index = selection_index(&pre_selected);
+        let post_index = selection_index(&post_selected);
+        let pre_disconnect_index = selection_index(&pre_disconnect_selected);
+        let post_disconnect_index = selection_index(&post_disconnect_selected);
+
+        self.settings_tab
+            .conn_pre_hook_dropdown
+            .update(cx, |dropdown, cx| {
+                dropdown.set_items(hook_items.clone(), cx);
+                dropdown.set_selected_index(Some(pre_index), cx);
+            });
+
+        self.settings_tab
+            .conn_post_hook_dropdown
+            .update(cx, |dropdown, cx| {
+                dropdown.set_items(hook_items.clone(), cx);
+                dropdown.set_selected_index(Some(post_index), cx);
+            });
+
+        self.settings_tab
+            .conn_pre_hook_extra_input
+            .update(cx, |input, cx| {
+                input.set_value(pre_extra, window, cx);
+            });
+
+        self.settings_tab
+            .conn_post_hook_extra_input
+            .update(cx, |input, cx| {
+                input.set_value(post_extra, window, cx);
+            });
+
+        self.settings_tab
+            .conn_pre_disconnect_hook_dropdown
+            .update(cx, |dropdown, cx| {
+                dropdown.set_items(hook_items.clone(), cx);
+                dropdown.set_selected_index(Some(pre_disconnect_index), cx);
+            });
+
+        self.settings_tab
+            .conn_pre_disconnect_hook_extra_input
+            .update(cx, |input, cx| {
+                input.set_value(pre_disconnect_extra, window, cx);
+            });
+
+        self.settings_tab
+            .conn_post_disconnect_hook_dropdown
+            .update(cx, |dropdown, cx| {
+                dropdown.set_items(hook_items, cx);
+                dropdown.set_selected_index(Some(post_disconnect_index), cx);
+            });
+
+        self.settings_tab
+            .conn_post_disconnect_hook_extra_input
+            .update(cx, |input, cx| {
+                input.set_value(post_disconnect_extra, window, cx);
+            });
+
+        if let Some(driver) = &self.form.selected_driver
+            && let Some(schema) = driver.settings_schema()
+        {
+            let values = connection_settings.cloned().unwrap_or_default();
+            self.settings_tab.conn_form_state =
+                form_renderer::create_inputs(&schema, &values, window, cx);
+
+            let mut subscriptions = Vec::new();
+            for input in self.settings_tab.conn_form_state.inputs.values() {
+                subscriptions.push(cx.subscribe_in(
+                    input,
+                    window,
+                    |_this, _, _event: &InputEvent, _window, _cx| {},
+                ));
+            }
+            for dropdown in self.settings_tab.conn_form_state.dropdowns.values() {
+                subscriptions.push(cx.subscribe(
+                    dropdown,
+                    |_this, _dropdown, _event: &DropdownSelectionChanged, _cx| {},
+                ));
+            }
+            self.settings_tab.conn_form_subscriptions = subscriptions;
+        }
+
+        self.settings_tab.conn_loading_settings = false;
+    }
+
+    /// Resolve driver-level effective settings (without connection overrides)
+    /// for showing defaults in the Settings tab.
+    fn resolve_driver_effective_settings(
+        &self,
+        cx: &Context<Self>,
+    ) -> datatab_core::EffectiveSettings {
+        let state = self.app_state.read(cx);
+        if let Some(driver) = &self.form.selected_driver {
+            state.effective_settings(&driver.driver_key())
+        } else {
+            let empty = datatab_core::FormValues::new();
+            datatab_core::EffectiveSettings::resolve(
+                state.general_settings(),
+                None,
+                &empty,
+                None,
+                None,
+            )
+        }
+    }
+
+    /// Collect connection-level global overrides from the Settings tab controls.
+    fn collect_connection_overrides(&self, cx: &Context<Self>) -> Option<GlobalOverrides> {
+        let mut overrides = GlobalOverrides::default();
+
+        if self.settings_tab.conn_override_refresh_policy {
+            let value = self
+                .settings_tab
+                .conn_refresh_policy_dropdown
+                .read(cx)
+                .selected_value()
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+
+            overrides.refresh_policy = Some(if value == "interval" {
+                datatab_core::RefreshPolicySetting::Interval
+            } else {
+                datatab_core::RefreshPolicySetting::Manual
+            });
+        }
+
+        if self.settings_tab.conn_override_refresh_interval {
+            let text = self
+                .settings_tab
+                .conn_refresh_interval_input
+                .read(cx)
+                .value()
+                .to_string();
+
+            if let Ok(secs) = text.parse::<u32>()
+                && secs > 0
+            {
+                overrides.refresh_interval_secs = Some(secs);
+            }
+        }
+
+        fn parse_boolean_dropdown(
+            dropdown: &Entity<Dropdown>,
+            cx: &Context<ConnectionManagerWindow>,
+        ) -> Option<bool> {
+            match dropdown
+                .read(cx)
+                .selected_value()
+                .map(|v| v.to_string())
+                .as_deref()
+            {
+                Some("on") => Some(true),
+                Some("off") => Some(false),
+                _ => None,
+            }
+        }
+
+        overrides.confirm_dangerous =
+            parse_boolean_dropdown(&self.settings_tab.conn_confirm_dangerous_dropdown, cx);
+        overrides.requires_where =
+            parse_boolean_dropdown(&self.settings_tab.conn_requires_where_dropdown, cx);
+        overrides.requires_preview =
+            parse_boolean_dropdown(&self.settings_tab.conn_requires_preview_dropdown, cx);
+
+        if overrides.is_empty() {
+            None
+        } else {
+            Some(overrides)
+        }
+    }
+
+    /// Collect connection-level driver settings from the Settings tab form.
+    ///
+    /// Unchecked checkboxes are stored as `"false"` (not stripped) so they can
+    /// explicitly override a driver-level `"true"` value.
+    fn collect_connection_settings(&self, cx: &Context<Self>) -> Option<datatab_core::FormValues> {
+        let driver = self.form.selected_driver.as_ref()?;
+        let schema = driver.settings_schema()?;
+
+        let collected = form_renderer::collect_values(
+            &schema,
+            &self.settings_tab.conn_form_state.inputs,
+            &self.settings_tab.conn_form_state.checkboxes,
+            &self.settings_tab.conn_form_state.dropdowns,
+            cx,
+        );
+
+        let checkbox_ids: std::collections::HashSet<&str> = schema
+            .tabs
+            .iter()
+            .flat_map(|t| t.sections.iter())
+            .flat_map(|s| s.fields.iter())
+            .filter(|f| matches!(f.kind, FormFieldKind::Checkbox))
+            .map(|f| f.id.as_str())
+            .collect();
+
+        let mut values = collected;
+
+        for (key, val) in values.iter_mut() {
+            if val.is_empty() && checkbox_ids.contains(key.as_str()) {
+                *val = "false".to_string();
+            }
+        }
+
+        values.retain(|k, v| !v.is_empty() || checkbox_ids.contains(k.as_str()));
+
+        if values.is_empty() {
+            None
+        } else {
+            Some(values)
+        }
+    }
+
+    fn collect_hook_bindings(&self, cx: &Context<Self>) -> Option<ConnectionHookBindings> {
+        let (name_to_id, known_ids) = self.hook_id_lookup(cx);
+
+        let pre_connect = Self::merge_hook_ids(
+            self.settings_tab
+                .conn_pre_hook_dropdown
+                .read(cx)
+                .selected_value()
+                .map(|value| value.to_string()),
+            &self.settings_tab.conn_pre_hook_extra_input.read(cx).value(),
+            &name_to_id,
+            &known_ids,
+        );
+
+        let post_connect = Self::merge_hook_ids(
+            self.settings_tab
+                .conn_post_hook_dropdown
+                .read(cx)
+                .selected_value()
+                .map(|value| value.to_string()),
+            &self
+                .settings_tab
+                .conn_post_hook_extra_input
+                .read(cx)
+                .value(),
+            &name_to_id,
+            &known_ids,
+        );
+
+        let pre_disconnect = Self::merge_hook_ids(
+            self.settings_tab
+                .conn_pre_disconnect_hook_dropdown
+                .read(cx)
+                .selected_value()
+                .map(|value| value.to_string()),
+            &self
+                .settings_tab
+                .conn_pre_disconnect_hook_extra_input
+                .read(cx)
+                .value(),
+            &name_to_id,
+            &known_ids,
+        );
+
+        let post_disconnect = Self::merge_hook_ids(
+            self.settings_tab
+                .conn_post_disconnect_hook_dropdown
+                .read(cx)
+                .selected_value()
+                .map(|value| value.to_string()),
+            &self
+                .settings_tab
+                .conn_post_disconnect_hook_extra_input
+                .read(cx)
+                .value(),
+            &name_to_id,
+            &known_ids,
+        );
+
+        if pre_connect.is_empty()
+            && post_connect.is_empty()
+            && pre_disconnect.is_empty()
+            && post_disconnect.is_empty()
+        {
+            return None;
+        }
+
+        Some(ConnectionHookBindings {
+            pre_connect,
+            post_connect,
+            pre_disconnect,
+            post_disconnect,
+        })
+    }
+
+    /// Pushes a validation error for every hook token the user selected or
+    /// typed that does not resolve to a known definition. This runs before
+    /// save so the user learns an unknown entry was ignored, while
+    /// `collect_hook_bindings` still drops those tokens to protect the
+    /// `cfg_hook_bindings` foreign key.
+    fn validate_hook_bindings(&mut self, cx: &Context<Self>) {
+        let (name_to_id, known_ids) = self.hook_id_lookup(cx);
+
+        let phases: [(&str, Option<String>, String); 4] = [
+            (
+                "pre-connect",
+                self.settings_tab
+                    .conn_pre_hook_dropdown
+                    .read(cx)
+                    .selected_value()
+                    .map(|value| value.to_string()),
+                self.settings_tab
+                    .conn_pre_hook_extra_input
+                    .read(cx)
+                    .value()
+                    .to_string(),
+            ),
+            (
+                "post-connect",
+                self.settings_tab
+                    .conn_post_hook_dropdown
+                    .read(cx)
+                    .selected_value()
+                    .map(|value| value.to_string()),
+                self.settings_tab
+                    .conn_post_hook_extra_input
+                    .read(cx)
+                    .value()
+                    .to_string(),
+            ),
+            (
+                "pre-disconnect",
+                self.settings_tab
+                    .conn_pre_disconnect_hook_dropdown
+                    .read(cx)
+                    .selected_value()
+                    .map(|value| value.to_string()),
+                self.settings_tab
+                    .conn_pre_disconnect_hook_extra_input
+                    .read(cx)
+                    .value()
+                    .to_string(),
+            ),
+            (
+                "post-disconnect",
+                self.settings_tab
+                    .conn_post_disconnect_hook_dropdown
+                    .read(cx)
+                    .selected_value()
+                    .map(|value| value.to_string()),
+                self.settings_tab
+                    .conn_post_disconnect_hook_extra_input
+                    .read(cx)
+                    .value()
+                    .to_string(),
+            ),
+        ];
+
+        for (label, primary, extra) in phases {
+            for token in Self::unresolved_hook_tokens(primary, &extra, &name_to_id, &known_ids) {
+                self.validation_errors
+                    .push(crate::labels::form_unknown_hook(label, &token));
+            }
+        }
+    }
+
+    fn split_primary_and_extra(hooks: &[String]) -> (String, Vec<String>) {
+        let Some((first, rest)) = hooks.split_first() else {
+            return (String::new(), Vec::new());
+        };
+
+        (first.clone(), rest.to_vec())
+    }
+
+    /// Builds the name→id and known-id lookups used to resolve hook bindings
+    /// to durable definition ids. `hook_definitions` is keyed by name, while
+    /// each `EditableGlobalHook` carries the persisted definition id.
+    fn hook_id_lookup(&self, cx: &Context<Self>) -> (HashMap<String, String>, HashSet<String>) {
+        let app_state = self.app_state.read(cx);
+        let hook_definitions = app_state.hook_definitions();
+
+        let mut name_to_id = HashMap::new();
+        let mut known_ids = HashSet::new();
+
+        for (name, definition) in hook_definitions.iter() {
+            if let Some(id) = &definition.id {
+                name_to_id.insert(name.clone(), id.clone());
+                known_ids.insert(id.clone());
+            }
+        }
+
+        (name_to_id, known_ids)
+    }
+
+    fn merge_hook_ids(
+        primary: Option<String>,
+        extra_text: &str,
+        name_to_id: &HashMap<String, String>,
+        known_ids: &HashSet<String>,
+    ) -> Vec<String> {
+        let mut ordered = Vec::new();
+
+        if let Some(id) =
+            primary.and_then(|value| Self::resolve_hook_token(&value, name_to_id, known_ids))
+        {
+            ordered.push(id);
+        }
+
+        for token in Self::parse_hook_tokens(extra_text) {
+            if let Some(id) = Self::resolve_hook_token(&token, name_to_id, known_ids)
+                && !ordered.iter().any(|existing| existing == &id)
+            {
+                ordered.push(id);
+            }
+        }
+
+        ordered
+    }
+
+    /// Resolves a user-entered hook token to a durable definition id.
+    ///
+    /// A token already matching a known definition id is accepted as-is; a
+    /// token matching a definition name is mapped to that definition's id.
+    /// Tokens matching neither are dropped so an unknown value can never reach
+    /// the `cfg_hook_bindings` foreign key.
+    fn resolve_hook_token(
+        token: &str,
+        name_to_id: &HashMap<String, String>,
+        known_ids: &HashSet<String>,
+    ) -> Option<String> {
+        let trimmed = token.trim();
+
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        if known_ids.contains(trimmed) {
+            return Some(trimmed.to_string());
+        }
+
+        name_to_id.get(trimmed).cloned()
+    }
+
+    fn parse_hook_tokens(text: &str) -> Vec<String> {
+        text.split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    /// Returns the raw tokens (dropdown selection plus comma-separated extras)
+    /// that resolve to neither a known definition id nor a known definition
+    /// name. `merge_hook_ids` silently drops these to keep the
+    /// `cfg_hook_bindings` foreign key safe, so the form surfaces them here to
+    /// tell the user their entry was ignored instead of failing quietly.
+    fn unresolved_hook_tokens(
+        primary: Option<String>,
+        extra_text: &str,
+        name_to_id: &HashMap<String, String>,
+        known_ids: &HashSet<String>,
+    ) -> Vec<String> {
+        let mut unresolved = Vec::new();
+
+        let tokens = primary
+            .into_iter()
+            .chain(Self::parse_hook_tokens(extra_text));
+
+        for token in tokens {
+            let trimmed = token.trim();
+
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            if Self::resolve_hook_token(trimmed, name_to_id, known_ids).is_none() {
+                unresolved.push(trimmed.to_string());
+            }
+        }
+
+        unresolved
+    }
+
+    /// Returns the number of driver schema fields (for Settings tab navigation).
+    fn settings_driver_field_count(&self) -> u8 {
+        let Some(driver) = &self.form.selected_driver else {
+            return 0;
+        };
+        let Some(schema) = driver.settings_schema() else {
+            return 0;
+        };
+        schema
+            .tabs
+            .iter()
+            .flat_map(|t| t.sections.iter())
+            .flat_map(|s| s.fields.iter())
+            .count() as u8
+    }
+
+    /// Returns the field definition for a driver schema field at the given flat index.
+    fn settings_driver_field_def(&self, idx: u8) -> Option<FormFieldDef> {
+        let driver = self.form.selected_driver.as_ref()?;
+        let schema = driver.settings_schema()?;
+        schema
+            .tabs
+            .iter()
+            .flat_map(|t| t.sections.iter())
+            .flat_map(|s| s.fields.iter())
+            .nth(idx as usize)
+            .cloned()
+    }
+
+    fn handle_field_change(&mut self, field_id: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if self.form.syncing_uri {
+            return;
+        }
+
+        let use_uri = self
+            .form
+            .checkbox_states
+            .get("use_uri")
+            .copied()
+            .unwrap_or(false);
+
+        if field_id == "uri" && use_uri {
+            self.sync_uri_to_fields(window, cx);
+        } else if field_id != "uri" && !use_uri {
+            self.sync_fields_to_uri(window, cx);
+        }
+    }
+
+    pub(super) fn sync_fields_to_uri(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(driver) = &self.form.selected_driver else {
+            return;
+        };
+
+        // When use_uri is checked, the URI field is authoritative — do not
+        // regenerate it from host/port or the form will overwrite a saved
+        // mongodb+srv:// (or any URI-mode) connection with a reconstructed
+        // mongodb://host:port/... string built from fallback fields.
+        let use_uri = self
+            .form
+            .checkbox_states
+            .get("use_uri")
+            .copied()
+            .unwrap_or(false);
+        if use_uri {
+            return;
+        }
+
+        let has_dynamic_refs = self.has_dynamic_value_ref_for_field("host", cx)
+            || self.has_dynamic_value_ref_for_field("database", cx)
+            || self.has_dynamic_value_ref_for_field("user", cx)
+            || self.has_dynamic_value_ref_for_field("password", cx);
+
+        if has_dynamic_refs {
+            if let Some(uri_input) = self.form.driver_inputs.get("uri") {
+                let current = uri_input.read(cx).value().to_string();
+                if !current.is_empty() {
+                    self.form.syncing_uri = true;
+                    uri_input.update(cx, |state, cx| {
+                        state.set_value("", window, cx);
+                    });
+                    self.form.syncing_uri = false;
+                }
+            }
+            return;
+        }
+
+        let form = driver.form_definition();
+        let values = self.collect_form_values(form, cx);
+        let password = self.form.input_password.read(cx).value().to_string();
+
+        let Some(uri) = driver.build_uri(&values, &password) else {
+            return;
+        };
+
+        if let Some(uri_input) = self.form.driver_inputs.get("uri") {
+            let current = uri_input.read(cx).value().to_string();
+            if current != uri {
+                self.form.syncing_uri = true;
+                uri_input.update(cx, |state, cx| {
+                    state.set_value(&uri, window, cx);
+                });
+                self.form.syncing_uri = false;
+            }
+        }
+    }
+
+    pub(super) fn sync_uri_to_fields(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(driver) = &self.form.selected_driver else {
+            return;
+        };
+
+        let Some(uri_input) = self.form.driver_inputs.get("uri") else {
+            return;
+        };
+        let uri_value = uri_input.read(cx).value().to_string();
+
+        if uri_value.is_empty() {
+            return;
+        }
+
+        let Some(parsed) = driver.parse_uri(&uri_value) else {
+            return;
+        };
+
+        self.form.syncing_uri = true;
+
+        for (field_id, value) in &parsed {
+            // `password` lives on its own InputState outside the
+            // driver_inputs map (so it can flow through the secret
+            // pipeline), so route it explicitly. Without this branch the
+            // password silently disappeared when toggling URI → form,
+            // leaving users to save an empty/stale value.
+            if field_id == "password" {
+                let current = self.form.input_password.read(cx).value().to_string();
+                if current != *value {
+                    self.form.input_password.update(cx, |state, cx| {
+                        state.set_value(value, window, cx);
+                    });
+                }
+                continue;
+            }
+
+            if let Some(input) = self.form.driver_inputs.get(field_id.as_str()) {
+                let current = input.read(cx).value().to_string();
+                if current != *value {
+                    input.update(cx, |state, cx| {
+                        state.set_value(value, window, cx);
+                    });
+                }
+            }
+        }
+
+        self.form.syncing_uri = false;
+    }
+
+    // -----------------------------------------------------------------
+    // Auth profile dropdown (T-7.1)
+    // -----------------------------------------------------------------
+
+    /// Populate the auth profile dropdown from the current list of saved profiles.
+    fn populate_auth_profile_dropdown(&mut self, cx: &mut Context<Self>) {
+        let profiles = self.app_state.read(cx).list_auth_profiles();
+
+        // Exclude reference-only providers (e.g. SSO-session blocks): they are
+        // building blocks referenced by other profiles, not selectable as a
+        // connection's own auth profile.
+        let reference_only = self.app_state.read(cx).reference_only_auth_provider_ids();
+
+        let mut auth_items = vec![datatab_components::controls::DropdownItem::with_value(
+            datatab_i18n::t!("connection_manager.placeholder.none"),
+            "",
+        )];
+        let mut ssm_items = vec![datatab_components::controls::DropdownItem::with_value(
+            datatab_i18n::t!("connection_manager.placeholder.use_connection_auth_profile"),
+            "",
+        )];
+
+        self.auth_profile.auth_profile_uuids.clear();
+        self.access.ssm_auth_profile_uuids.clear();
+
+        for profile in &profiles {
+            if !profile.enabled {
+                continue;
+            }
+            if reference_only.contains(&profile.provider_id) {
+                continue;
+            }
+            let session_status = match self
+                .auth_profile
+                .auth_profile_session_states
+                .get(&profile.id)
+            {
+                Some(AuthSessionState::Valid { .. }) => "valid",
+                Some(AuthSessionState::Expired) => "expired",
+                Some(AuthSessionState::LoginRequired) => "login required",
+                None => "checking",
+            };
+            let label = format!(
+                "{} — {} [{}]",
+                profile.provider_id, profile.name, session_status
+            );
+            auth_items.push(datatab_components::controls::DropdownItem::with_value(
+                label,
+                profile.id.to_string(),
+            ));
+            let ssm_label = format!("{} [{}]", profile.name, session_status);
+            ssm_items.push(datatab_components::controls::DropdownItem::with_value(
+                ssm_label,
+                profile.id.to_string(),
+            ));
+            self.auth_profile.auth_profile_uuids.push(profile.id);
+            self.access.ssm_auth_profile_uuids.push(profile.id);
+        }
+
+        auth_items.push(datatab_components::controls::DropdownItem::with_value(
+            datatab_i18n::t!("connection_manager.new_auth_profile"),
+            "__new_auth_profile__",
+        ));
+
+        ssm_items.push(datatab_components::controls::DropdownItem::with_value(
+            datatab_i18n::t!("connection_manager.new_auth_profile"),
+            "__new_auth_profile__",
+        ));
+
+        // If the bound auth-profile UUID is not in the current reflected list,
+        // add a "(profile not found)" placeholder entry so the dropdown shows
+        // something instead of falling back silently to "None".
+        let auth_selected_index = self
+            .auth_profile
+            .selected_auth_profile_id
+            .and_then(|id| {
+                let pos = self
+                    .auth_profile
+                    .auth_profile_uuids
+                    .iter()
+                    .position(|uid| *uid == id);
+                pos.map(|p| p + 1).or_else(|| {
+                    // Bound profile is not reflected — insert a dangling sentinel.
+                    let dangling_label = format!("(profile not found) [{}]", id);
+                    auth_items.push(datatab_components::controls::DropdownItem::with_value(
+                        dangling_label,
+                        id.to_string(),
+                    ));
+                    self.auth_profile.auth_profile_uuids.push(id);
+                    Some(self.auth_profile.auth_profile_uuids.len())
+                })
+            })
+            .unwrap_or(0);
+
+        self.auth_profile
+            .auth_profile_dropdown
+            .update(cx, |dropdown, cx| {
+                dropdown.set_items(auth_items, cx);
+                dropdown.set_selected_index(Some(auth_selected_index), cx);
+            });
+
+        let ssm_selected_index = self
+            .access
+            .selected_ssm_auth_profile_id
+            .and_then(|id| {
+                let pos = self
+                    .access
+                    .ssm_auth_profile_uuids
+                    .iter()
+                    .position(|uid| *uid == id);
+                pos.map(|p| p + 1).or_else(|| {
+                    let dangling_label = format!("(profile not found) [{}]", id);
+                    ssm_items.push(datatab_components::controls::DropdownItem::with_value(
+                        dangling_label,
+                        id.to_string(),
+                    ));
+                    self.access.ssm_auth_profile_uuids.push(id);
+                    Some(self.access.ssm_auth_profile_uuids.len())
+                })
+            })
+            .unwrap_or(0);
+
+        self.access
+            .ssm_auth_profile_dropdown
+            .update(cx, |dropdown, cx| {
+                dropdown.set_items(ssm_items, cx);
+                dropdown.set_selected_index(Some(ssm_selected_index), cx);
+            });
+    }
+
+    fn selected_auth_profile(&self, cx: &App) -> Option<AuthProfile> {
+        let selected_id = self.auth_profile.selected_auth_profile_id?;
+
+        self.app_state
+            .read(cx)
+            .list_auth_profiles()
+            .into_iter()
+            .find(|profile| profile.id == selected_id && profile.enabled)
+    }
+
+    fn refresh_auth_profile_sessions(&mut self, cx: &mut Context<Self>) {
+        let profiles = self
+            .app_state
+            .read(cx)
+            .list_auth_profiles()
+            .into_iter()
+            .filter(|profile| profile.enabled)
+            .collect::<Vec<_>>();
+
+        cx.spawn(async move |entity, cx| {
+            for profile in profiles {
+                let provider = match cx.update(|cx| {
+                    let this = entity.upgrade()?;
+                    this.read(cx)
+                        .app_state
+                        .read(cx)
+                        .auth_provider_by_id(&profile.provider_id)
+                }) {
+                    Some(provider) => provider,
+                    None => continue,
+                };
+
+                let status = provider
+                    .validate_session(&profile)
+                    .await
+                    .unwrap_or(AuthSessionState::LoginRequired);
+
+                cx.update(|cx| {
+                    if let Some(this) = entity.upgrade() {
+                        this.update(cx, |this, cx| {
+                            this.auth_profile
+                                .auth_profile_session_states
+                                .insert(profile.id, status);
+                            this.populate_auth_profile_dropdown(cx);
+                        });
+                    }
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn open_auth_profiles_settings(&mut self, cx: &mut Context<Self>) {
+        self.open_settings_section(crate::settings::SettingsSectionId::AuthProfiles, cx);
+    }
+
+    fn open_sso_wizard(&mut self, cx: &mut Context<Self>) {
+        self.auth_profile.pending_wizard_auth_profile_selection = true;
+        self.auth_profile.known_auth_profile_ids = self
+            .app_state
+            .read(cx)
+            .list_auth_profiles()
+            .iter()
+            .map(|profile| profile.id)
+            .collect();
+
+        let app_state = self.app_state.clone();
+        let bounds = Bounds::centered(None, size(px(720.0), px(620.0)), cx);
+
+        let mut options = WindowOptions {
+            app_id: Some(datatab_core::ReleaseChannel::current().app_id().into()),
+            titlebar: Some(TitlebarOptions {
+                title: Some(datatab_i18n::t!("connection_manager.aws_sso_wizard_title").into()),
+                ..Default::default()
+            }),
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            focus: true,
+            ..Default::default()
+        };
+        platform::apply_window_options(&mut options, 600.0, 500.0);
+
+        if let Err(error) = cx.open_window(options, move |window, cx| {
+            datatab_ui_base::ui_automation::install(window, cx);
+
+            let wizard = cx.new(|cx| {
+                let mut wizard = SsoWizard::new(app_state.clone(), window, cx);
+                wizard.open(window, cx);
+                wizard
+            });
+            cx.new(|cx| Root::new(wizard, window, cx))
+        }) {
+            report_error(
+                UserFacingError::new(
+                    ErrorKind::User,
+                    datatab_i18n::t!("connection_manager.aws_sso_open_failed"),
+                )
+                .with_cause(format!("{error}")),
+                cx,
+            );
+        }
+    }
+
+    fn handle_app_state_changed(&mut self, cx: &mut Context<Self>) {
+        self.sync_secret_providers(cx);
+
+        let current_profiles = self.app_state.read(cx).list_auth_profiles();
+        let current_ids = current_profiles
+            .iter()
+            .map(|profile| profile.id)
+            .collect::<HashSet<_>>();
+
+        if self.auth_profile.pending_wizard_auth_profile_selection {
+            let newest = current_profiles
+                .iter()
+                .rev()
+                .find(|profile| {
+                    !self
+                        .auth_profile
+                        .known_auth_profile_ids
+                        .contains(&profile.id)
+                })
+                .map(|profile| profile.id);
+
+            if let Some(profile_id) = newest {
+                self.auth_profile.selected_auth_profile_id = Some(profile_id);
+
+                if self.access.selected_ssm_auth_profile_id.is_none() {
+                    self.access.selected_ssm_auth_profile_id = Some(profile_id);
+                }
+
+                self.auth_profile.auth_profile_action_message = Some(datatab_i18n::t!(
+                    "connection_manager.auth.profile_created_sso"
+                ));
+            }
+
+            self.auth_profile.pending_wizard_auth_profile_selection = false;
+        }
+
+        self.auth_profile.known_auth_profile_ids = current_ids;
+        self.populate_auth_profile_dropdown(cx);
+        self.refresh_auth_profile_sessions(cx);
+        cx.notify();
+    }
+
+    fn handle_auth_profile_created(&mut self, profile_id: Uuid, cx: &mut Context<Self>) {
+        self.auth_profile.selected_auth_profile_id = Some(profile_id);
+
+        if self.access.selected_ssm_auth_profile_id.is_none() {
+            self.access.selected_ssm_auth_profile_id = Some(profile_id);
+        }
+
+        self.auth_profile.pending_wizard_auth_profile_selection = false;
+        self.auth_profile.auth_profile_action_message = Some(datatab_i18n::t!(
+            "connection_manager.auth.profile_created_wizard"
+        ));
+
+        self.populate_auth_profile_dropdown(cx);
+        self.refresh_auth_profile_sessions(cx);
+        cx.notify();
+    }
+
+    fn refresh_auth_profile_statuses(&mut self, cx: &mut Context<Self>) {
+        self.auth_profile.auth_profile_action_message = Some(datatab_i18n::t!(
+            "connection_manager.auth.refreshing_sessions"
+        ));
+        self.refresh_auth_profile_sessions(cx);
+        cx.notify();
+    }
+
+    fn login_selected_auth_profile(&mut self, cx: &mut Context<Self>) {
+        let Some(profile) = self.selected_auth_profile(cx) else {
+            self.auth_profile.auth_profile_action_message = Some(datatab_i18n::t!(
+                "connection_manager.auth.select_before_login"
+            ));
+            cx.notify();
+            return;
+        };
+
+        let Some(provider) = self
+            .app_state
+            .read(cx)
+            .auth_provider_by_id(&profile.provider_id)
+        else {
+            self.auth_profile.auth_profile_action_message = Some(
+                crate::labels::auth_provider_unavailable(&profile.provider_id),
+            );
+            cx.notify();
+            return;
+        };
+
+        if !provider.capabilities().login.supported {
+            self.auth_profile.auth_profile_action_message = Some(datatab_i18n::t!(
+                "connection_manager.auth.interactive_login_unavailable"
+            ));
+            cx.notify();
+            return;
+        }
+
+        self.auth_profile.auth_profile_login_in_progress = true;
+        self.auth_profile.auth_profile_action_message =
+            Some(crate::labels::auth_login_starting(&profile.name));
+        cx.notify();
+
+        let this = cx.entity().clone();
+
+        cx.spawn(async move |_entity, cx| {
+            let result = provider.login(&profile, Box::new(|_| {})).await;
+
+            cx.update(|cx| {
+                this.update(cx, |this, cx| {
+                    this.auth_profile.auth_profile_login_in_progress = false;
+                    this.auth_profile.auth_profile_action_message = Some(match result {
+                        Ok(_) => {
+                            datatab_i18n::t!("connection_manager.auth.login_completed")
+                        }
+                        Err(error) => crate::labels::auth_login_failed(&error.to_string()),
+                    });
+
+                    this.refresh_auth_profile_sessions(cx);
+                });
+            });
+        })
+        .detach();
+    }
+
+    fn selected_auth_profile_status_text(&self, cx: &App) -> Option<String> {
+        let profile = self.selected_auth_profile(cx)?;
+
+        let status = self
+            .auth_profile
+            .auth_profile_session_states
+            .get(&profile.id)?;
+        let text = match status {
+            AuthSessionState::Valid { expires_at } => {
+                if let Some(expires_at) = expires_at {
+                    return Some(crate::labels::auth_session_status_valid_expires(
+                        &expires_at.to_string(),
+                    ));
+                }
+
+                datatab_i18n::t!("connection_manager.auth.session_status_valid")
+            }
+            AuthSessionState::Expired => {
+                datatab_i18n::t!("connection_manager.auth.session_status_expired")
+            }
+            AuthSessionState::LoginRequired => {
+                datatab_i18n::t!("connection_manager.auth.session_status_login_required")
+            }
+        };
+
+        Some(text)
+    }
+
+    fn selected_auth_profile_is_valid(&self, cx: &App) -> bool {
+        let Some(profile) = self.selected_auth_profile(cx) else {
+            return false;
+        };
+
+        matches!(
+            self.auth_profile
+                .auth_profile_session_states
+                .get(&profile.id),
+            Some(AuthSessionState::Valid { .. })
+        )
+    }
+
+    fn selected_auth_profile_needs_login(&self, cx: &App) -> bool {
+        let Some(profile) = self.selected_auth_profile(cx) else {
+            return false;
+        };
+
+        let provider_supports_login = self
+            .app_state
+            .read(cx)
+            .auth_provider_by_id(&profile.provider_id)
+            .is_some_and(|provider| provider.capabilities().login.supported);
+
+        auth_profile_needs_login(
+            provider_supports_login,
+            self.auth_profile
+                .auth_profile_session_states
+                .get(&profile.id),
+        )
+    }
+
+    fn handle_auth_profile_dropdown_selection(
+        &mut self,
+        event: &DropdownSelectionChanged,
+        cx: &mut Context<Self>,
+    ) {
+        if event.index == AUTH_PROFILE_NONE_INDEX {
+            self.pending.auth_profile_selection = Some(None);
+        } else if event.item.value.as_ref() == "__new_auth_profile__" {
+            self.open_auth_profiles_settings(cx);
+
+            let selected_index = self
+                .auth_profile
+                .selected_auth_profile_id
+                .and_then(|id| {
+                    self.auth_profile
+                        .auth_profile_uuids
+                        .iter()
+                        .position(|uid| *uid == id)
+                        .map(|pos| pos + 1)
+                })
+                .unwrap_or(AUTH_PROFILE_NONE_INDEX);
+
+            self.auth_profile
+                .auth_profile_dropdown
+                .update(cx, |dropdown, cx| {
+                    dropdown.set_selected_index(Some(selected_index), cx);
+                });
+        } else {
+            let uuid_index = event.index - 1;
+            if let Some(&id) = self.auth_profile.auth_profile_uuids.get(uuid_index) {
+                self.pending.auth_profile_selection = Some(Some(id));
+            }
+        }
+        cx.notify();
+    }
+
+    fn apply_pending_auth_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(selection) = self.pending.auth_profile_selection.take() {
+            self.auth_profile.selected_auth_profile_id = selection;
+            self.access.selected_ssm_auth_profile_id = selection;
+
+            self.sync_driver_fields_from_auth_profile(window, cx);
+        }
+    }
+
+    fn sync_driver_fields_from_auth_profile(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let auth_profile_ref_field_id =
+            match auth_profile_ref_field_id(self.form.selected_driver.as_ref()) {
+                Some(id) => id,
+                None => return,
+            };
+
+        let Some(auth_profile_id) = self.auth_profile.selected_auth_profile_id else {
+            return;
+        };
+
+        let selected_profile = self
+            .app_state
+            .read(cx)
+            .list_auth_profiles()
+            .into_iter()
+            .find(|profile| profile.id == auth_profile_id);
+
+        let Some(profile) = selected_profile else {
+            return;
+        };
+
+        let profile_name = profile
+            .fields
+            .get("profile_name")
+            .cloned()
+            .unwrap_or_else(|| profile.name.clone());
+
+        if let Some(input) = self
+            .form
+            .driver_inputs
+            .get(auth_profile_ref_field_id.as_str())
+            .cloned()
+        {
+            input.update(cx, |state, cx| {
+                state.set_value(profile_name, window, cx);
+            });
+        }
+
+        if let Some(region) = profile.fields.get("region").cloned()
+            && let Some(input) = self.form.driver_inputs.get("region").cloned()
+        {
+            input.update(cx, |state, cx| {
+                state.set_value(region, window, cx);
+            });
+        }
+    }
+
+    fn handle_ssm_auth_profile_dropdown_selection(
+        &mut self,
+        event: &DropdownSelectionChanged,
+        cx: &mut Context<Self>,
+    ) {
+        if event.index == 0 {
+            self.pending.ssm_auth_profile_selection = Some(None);
+        } else if event.item.value.as_ref() == "__new_auth_profile__" {
+            self.open_sso_wizard(cx);
+
+            let selected_index = self
+                .access
+                .selected_ssm_auth_profile_id
+                .and_then(|id| {
+                    self.access
+                        .ssm_auth_profile_uuids
+                        .iter()
+                        .position(|uid| *uid == id)
+                        .map(|pos| pos + 1)
+                })
+                .unwrap_or(0);
+
+            self.access
+                .ssm_auth_profile_dropdown
+                .update(cx, |dropdown, cx| {
+                    dropdown.set_selected_index(Some(selected_index), cx);
+                });
+        } else {
+            let uuid_index = event.index - 1;
+            if let Some(&id) = self.access.ssm_auth_profile_uuids.get(uuid_index) {
+                self.pending.ssm_auth_profile_selection = Some(Some(id));
+            }
+        }
+
+        cx.notify();
+    }
+
+    fn apply_pending_ssm_auth_profile(&mut self) {
+        if let Some(selection) = self.pending.ssm_auth_profile_selection.take() {
+            self.access.selected_ssm_auth_profile_id = selection;
+        }
+    }
+
+    pub(super) fn handle_proxy_dropdown_selection(
+        &mut self,
+        event: &DropdownSelectionChanged,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(uuid) = self.access.proxy_uuids.get(event.index).copied() {
+            self.pending.proxy_selection = Some(uuid);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn apply_proxy(
+        &mut self,
+        proxy: &datatab_core::ProxyProfile,
+        _cx: &mut Context<Self>,
+    ) {
+        self.access.selected_proxy_id = Some(proxy.id);
+    }
+
+    pub(super) fn clear_proxy_selection(&mut self, cx: &mut Context<Self>) {
+        self.access.selected_proxy_id = None;
+        cx.notify();
+    }
+
+    pub(super) fn handle_ssh_tunnel_dropdown_selection(
+        &mut self,
+        event: &DropdownSelectionChanged,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(uuid) = self.access.ssh_tunnel_uuids.get(event.index).copied() {
+            self.pending.ssh_tunnel_selection = Some(uuid);
+            cx.notify();
+        }
+    }
+
+    pub(super) fn handle_ssh_config_host_dropdown_selection(
+        &mut self,
+        event: &DropdownSelectionChanged,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending.ssh_config_host_selection = Some(event.index);
+        cx.notify();
+    }
+
+    /// The alias of the `~/.ssh/config` host the inline form references,
+    /// if any.
+    pub(super) fn ssh_config_alias(&self, cx: &App) -> Option<String> {
+        self.access
+            .ssh_host_picker
+            .read(cx)
+            .selected_alias()
+            .map(str::to_string)
+    }
+
+    /// Maps the picker dropdown's selection to the inline form: index 0 is
+    /// the manual entry, any other index stores its alias.
+    pub(super) fn apply_ssh_config_host_index(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let alias = self.access.ssh_host_picker.read(cx).alias_at(index);
+        self.set_ssh_config_host(alias.as_deref(), window, cx);
+    }
+
+    /// Applies an SSH config host selection to the inline form. Picking an
+    /// alias backs up and clears the manual host/port/user inputs (A7);
+    /// choosing the manual entry restores them exactly.
+    pub(super) fn set_ssh_config_host(
+        &mut self,
+        alias: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let was_active = self
+            .access
+            .ssh_host_picker
+            .read(cx)
+            .selected_alias()
+            .is_some();
+        let is_active = alias.is_some();
+
+        if is_active && !was_active {
+            self.access.ssh_manual_backup = Some(SshManualValues {
+                host: self.access.input_ssh_host.read(cx).value().to_string(),
+                port: self.access.input_ssh_port.read(cx).value().to_string(),
+                user: self.access.input_ssh_user.read(cx).value().to_string(),
+            });
+        }
+
+        if is_active {
+            self.access.input_ssh_host.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+            });
+            self.access.input_ssh_port.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+            });
+            self.access.input_ssh_user.update(cx, |state, cx| {
+                state.set_value("", window, cx);
+            });
+        } else if was_active {
+            let backup = self.access.ssh_manual_backup.take().unwrap_or_default();
+            self.access.input_ssh_host.update(cx, |state, cx| {
+                state.set_value(backup.host, window, cx);
+            });
+            self.access.input_ssh_port.update(cx, |state, cx| {
+                state.set_value(backup.port, window, cx);
+            });
+            self.access.input_ssh_user.update(cx, |state, cx| {
+                state.set_value(backup.user, window, cx);
+            });
+        }
+
+        self.access
+            .ssh_host_picker
+            .update(cx, |picker, cx| picker.set_selected_alias(alias, cx));
+        cx.notify();
+    }
+
+    pub(super) fn apply_ssh_tunnel(
+        &mut self,
+        tunnel: &SshTunnelProfile,
+        secret: Option<SecretString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.access.selected_ssh_tunnel_id = Some(tunnel.id);
+        self.access.ssh_enabled = true;
+
+        self.access.input_ssh_host.update(cx, |state, cx| {
+            state.set_value(&tunnel.config.host, window, cx);
+        });
+        self.access.input_ssh_port.update(cx, |state, cx| {
+            state.set_value(tunnel.config.port.to_string(), window, cx);
+        });
+        self.access.input_ssh_user.update(cx, |state, cx| {
+            state.set_value(&tunnel.config.user, window, cx);
+        });
+
+        // An aliased saved tunnel shows its alias in the picker; the manual
+        // inputs keep the profile's (empty) values (A7).
+        self.access.ssh_manual_backup = None;
+        let saved_alias = tunnel.config.ssh_config_host.clone();
+        self.access.ssh_host_picker.update(cx, |picker, cx| {
+            picker.set_selected_alias(saved_alias.as_deref(), cx)
+        });
+
+        match &tunnel.config.auth_method {
+            SshAuthMethod::PrivateKey { key_path } => {
+                self.access.ssh_auth_method = SshAuthSelection::PrivateKey;
+                if let Some(path) = key_path {
+                    self.access.input_ssh_key_path.update(cx, |state, cx| {
+                        state.set_value(path.to_string_lossy().to_string(), window, cx);
+                    });
+                }
+                if let Some(ref passphrase) = secret {
+                    let passphrase = passphrase.expose_secret().to_string();
+                    self.access
+                        .input_ssh_key_passphrase
+                        .update(cx, |state, cx| {
+                            state.set_value(passphrase.clone(), window, cx);
+                        });
+                }
+            }
+            SshAuthMethod::Password => {
+                self.access.ssh_auth_method = SshAuthSelection::Password;
+                if let Some(ref password) = secret {
+                    let password = password.expose_secret().to_string();
+                    self.access.input_ssh_password.update(cx, |state, cx| {
+                        state.set_value(password.clone(), window, cx);
+                    });
+                }
+            }
+        }
+
+        self.form.form_save_ssh_secret = tunnel.save_secret && secret.is_some();
+        self.ssh_test_status = TestStatus::None;
+        self.ssh_test_error = None;
+        cx.notify();
+    }
+
+    pub(super) fn clear_ssh_tunnel_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.access.selected_ssh_tunnel_id = None;
+
+        self.access.input_ssh_host.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+        self.access.input_ssh_port.update(cx, |state, cx| {
+            state.set_value("22", window, cx);
+        });
+        self.access.input_ssh_user.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+        self.access.input_ssh_key_path.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+        self.access
+            .input_ssh_key_passphrase
+            .update(cx, |state, cx| {
+                state.set_value("", window, cx);
+            });
+        self.access.input_ssh_password.update(cx, |state, cx| {
+            state.set_value("", window, cx);
+        });
+
+        // Clearing the tunnel selection also clears any referenced alias:
+        // the inline form starts manual again.
+        self.access.ssh_manual_backup = None;
+        self.access
+            .ssh_host_picker
+            .update(cx, |picker, cx| picker.set_selected_alias(None, cx));
+
+        self.access.ssh_auth_method = SshAuthSelection::PrivateKey;
+        self.form.form_save_ssh_secret = true;
+        self.ssh_test_status = TestStatus::None;
+        self.ssh_test_error = None;
+        cx.notify();
+    }
+
+    pub(super) fn save_current_ssh_as_tunnel(&mut self, cx: &mut Context<Self>) {
+        let Some(config) = self.build_ssh_config(cx) else {
+            return;
+        };
+
+        // With an alias the manual host and user are empty (A7): the
+        // profile is named after the alias instead of an empty "@" pair.
+        let name = match &config.ssh_config_host {
+            Some(alias) => alias.clone(),
+            None => format!("{}@{}", config.user, config.host),
+        };
+        let secret = self.get_ssh_secret(cx);
+
+        let tunnel = SshTunnelProfile {
+            id: Uuid::new_v4(),
+            name,
+            config,
+            save_secret: self.form.form_save_ssh_secret,
+        };
+
+        self.app_state.update(cx, |state, cx| {
+            if tunnel.save_secret
+                && let Some(ref secret) = secret
+            {
+                state.save_ssh_tunnel_secret(&tunnel, &SecretString::from(secret.clone()));
+            }
+            state.add_ssh_tunnel(tunnel.clone());
+            cx.emit(datatab_ui_base::AppStateChanged);
+        });
+
+        self.access.selected_ssh_tunnel_id = Some(tunnel.id);
+        cx.notify();
+    }
+
+    fn effective_ssh_test_target(
+        &self,
+        cx: &Context<Self>,
+    ) -> Option<(datatab_core::SshTunnelConfig, Option<String>)> {
+        if let Some(tunnel_id) = self.access.selected_ssh_tunnel_id {
+            let tunnel = self
+                .app_state
+                .read(cx)
+                .ssh_tunnels()
+                .iter()
+                .find(|candidate| candidate.id == tunnel_id)
+                .cloned()?;
+
+            let secret = self
+                .app_state
+                .read(cx)
+                .get_ssh_tunnel_secret(&tunnel)
+                .map(|secret| secret.expose_secret().to_string());
+
+            return Some((tunnel.config, secret));
+        }
+
+        let ssh_config = self.build_ssh_config(cx)?;
+        let ssh_secret = self.get_ssh_secret(cx);
+
+        Some((ssh_config, ssh_secret))
+    }
+
+    pub(super) fn test_ssh_connection(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.access.ssh_enabled {
+            return;
+        }
+
+        self.ssh_test_status = TestStatus::Testing;
+        self.ssh_test_error = None;
+        cx.notify();
+
+        let Some((ssh_config, ssh_secret)) = self.effective_ssh_test_target(cx) else {
+            self.ssh_test_status = TestStatus::Failed;
+            self.ssh_test_error = Some(datatab_i18n::t!(
+                "connection_manager.auth.ssh_config_incomplete"
+            ));
+            cx.notify();
+            return;
+        };
+
+        let this = cx.entity().clone();
+
+        let task = cx.background_executor().spawn(async move {
+            match datatab_ssh::establish_session(&ssh_config, ssh_secret.as_deref()) {
+                Ok(_session) => Ok(()),
+                Err(e) => Err(format!("{:?}", e)),
+            }
+        });
+
+        cx.spawn(async move |_this, cx| {
+            let result = task.await;
+
+            cx.update(|cx| {
+                this.update(cx, |this, cx| {
+                    match result {
+                        Ok(()) => {
+                            this.ssh_test_status = TestStatus::Success;
+                            this.ssh_test_error = None;
+                        }
+                        Err(e) => {
+                            this.ssh_test_status = TestStatus::Failed;
+                            this.ssh_test_error = Some(e);
+                        }
+                    }
+                    cx.notify();
+                });
+            });
+        })
+        .detach();
+    }
+
+    pub(super) fn browse_ssh_key(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        browse_ssh_key_into(cx, |this, path| {
+            this.pending.ssh_key_path = Some(path);
+        });
+    }
+
+    /// Open a native file picker filtered to common cert/key extensions and write the
+    /// chosen path into the supplied `pending` slot. The slot is drained on the next
+    /// render and applied to the corresponding `InputState`.
+    pub(super) fn browse_ssl_cert(
+        &mut self,
+        slot: SslCertSlot,
+        current_value: Option<String>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = match slot {
+            SslCertSlot::CaCert => datatab_i18n::t!("connection_manager.select_ca_cert"),
+            SslCertSlot::ClientCert => datatab_i18n::t!("connection_manager.select_client_cert"),
+            SslCertSlot::ClientKey => datatab_i18n::t!("connection_manager.select_client_key"),
+        };
+
+        let start_dir = current_value
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .and_then(|v| std::path::Path::new(v).parent().map(|p| p.to_path_buf()))
+            .or_else(dirs::home_dir)
+            .unwrap_or_default();
+
+        let dialog = rfd::AsyncFileDialog::new()
+            .set_title(title)
+            .set_directory(&start_dir)
+            .add_filter(
+                datatab_i18n::t!("connection_manager.filter_certificates"),
+                &["pem", "crt", "cer", "key", "der"],
+            )
+            .add_filter(
+                datatab_i18n::t!("connection_manager.filter_all_files"),
+                &["*"],
+            );
+
+        pick_file_into(dialog, cx, move |this, path| match slot {
+            SslCertSlot::CaCert => {
+                this.pending.ssl_ca_cert_path = Some(path);
+            }
+            SslCertSlot::ClientCert => {
+                this.pending.ssl_client_cert_path = Some(path);
+            }
+            SslCertSlot::ClientKey => {
+                this.pending.ssl_client_key_path = Some(path);
+            }
+        });
+    }
+
+    /// Clear the value of an SSL cert input.
+    pub(super) fn clear_ssl_cert(
+        &mut self,
+        slot: SslCertSlot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let input = match slot {
+            SslCertSlot::CaCert => &self.form.ssl_ca_cert_input,
+            SslCertSlot::ClientCert => &self.form.ssl_client_cert_input,
+            SslCertSlot::ClientKey => &self.form.ssl_client_key_input,
+        };
+        input.update(cx, |state, cx| {
+            state.set_value(String::new(), window, cx);
+        });
+        cx.notify();
+    }
+
+    pub(super) fn browse_file_path(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let current_value = self
+            .form
+            .driver_inputs
+            .get("path")
+            .map(|input| input.read(cx).value().to_string());
+
+        let start_dir = current_value
+            .as_deref()
+            .filter(|v| !v.is_empty())
+            .and_then(|v| {
+                let path = std::path::Path::new(v);
+                path.parent().map(|p| p.to_path_buf())
+            })
+            .or_else(dirs::home_dir)
+            .unwrap_or_default();
+
+        let dialog = rfd::AsyncFileDialog::new()
+            .set_title(datatab_i18n::t!("connection_manager.select_database_file"))
+            .set_directory(&start_dir);
+
+        pick_file_into(dialog, cx, |this, path| {
+            this.pending.file_path = Some(path);
+        });
+    }
+
+    // -----------------------------------------------------------------
+    // Access method dropdown (T-7.2)
+    // -----------------------------------------------------------------
+
+    fn sync_access_tab_mode_from_state(&mut self) {
+        self.access.access_tab_mode =
+            if matches!(self.access.access_kind, Some(AccessKind::Managed { .. })) {
+                AccessTabMode::ManagedSsm
+            } else if self.access.selected_proxy_id.is_some()
+                || matches!(self.access.access_kind, Some(AccessKind::Proxy { .. }))
+            {
+                AccessTabMode::Proxy
+            } else if self.access.ssh_enabled
+                || self.access.selected_ssh_tunnel_id.is_some()
+                || matches!(self.access.access_kind, Some(AccessKind::Ssh { .. }))
+            {
+                AccessTabMode::Ssh
+            } else {
+                AccessTabMode::Direct
+            };
+    }
+
+    /// Populate the access method dropdown with the unified access modes.
+    fn populate_access_method_dropdown(&mut self, cx: &mut Context<Self>) {
+        let items = vec![
+            datatab_components::controls::DropdownItem::with_value(
+                datatab_i18n::t!("connection_manager.access_method.direct"),
+                "direct",
+            ),
+            datatab_components::controls::DropdownItem::with_value(
+                datatab_i18n::t!("connection_manager.access_method.ssh_tunnel"),
+                "ssh",
+            ),
+            datatab_components::controls::DropdownItem::with_value(
+                datatab_i18n::t!("connection_manager.access_method.proxy"),
+                "proxy",
+            ),
+            datatab_components::controls::DropdownItem::with_value(
+                datatab_i18n::t!("connection_manager.access_method.ssm"),
+                "ssm",
+            ),
+        ];
+
+        let selected_index = self.access_tab_mode_to_dropdown_index();
+
+        self.access
+            .access_method_dropdown
+            .update(cx, |dropdown, cx| {
+                dropdown.set_items(items, cx);
+                dropdown.set_selected_index(Some(selected_index), cx);
+            });
+    }
+
+    fn access_tab_mode_to_dropdown_index(&self) -> usize {
+        match self.access.access_tab_mode {
+            AccessTabMode::Direct => 0,
+            AccessTabMode::Ssh => 1,
+            AccessTabMode::Proxy => 2,
+            AccessTabMode::ManagedSsm => 3,
+        }
+    }
+
+    fn handle_access_method_dropdown_selection(
+        &mut self,
+        event: &DropdownSelectionChanged,
+        cx: &mut Context<Self>,
+    ) {
+        self.access.access_tab_mode = match event.index {
+            1 => AccessTabMode::Ssh,
+            2 => AccessTabMode::Proxy,
+            3 => AccessTabMode::ManagedSsm,
+            _ => AccessTabMode::Direct,
+        };
+
+        match self.access.access_tab_mode {
+            AccessTabMode::Direct => {
+                self.access.ssh_enabled = false;
+                self.access.selected_ssh_tunnel_id = None;
+                self.access.selected_proxy_id = None;
+                self.access.access_kind = None;
+            }
+            AccessTabMode::Ssh => {
+                self.access.ssh_enabled = true;
+                self.access.selected_proxy_id = None;
+                self.access.access_kind = None;
+            }
+            AccessTabMode::Proxy => {
+                self.access.ssh_enabled = false;
+                self.access.selected_ssh_tunnel_id = None;
+                self.access.access_kind = None;
+            }
+            AccessTabMode::ManagedSsm => {
+                self.access.ssh_enabled = false;
+                self.access.selected_ssh_tunnel_id = None;
+                self.access.selected_proxy_id = None;
+                self.access.access_kind = Some(self.collect_managed_access_kind(cx));
+            }
+        }
+
+        cx.notify();
+    }
+
+    /// Returns true when SSM Tunnel is the currently selected access method.
+    fn is_ssm_selected(&self) -> bool {
+        self.access.access_tab_mode == AccessTabMode::ManagedSsm
+    }
+
+    /// Collect the current managed (aws-ssm) AccessKind from the inline fields.
+    fn collect_managed_access_kind(&self, cx: &Context<Self>) -> AccessKind {
+        let instance_id = self
+            .access
+            .input_ssm_instance_id
+            .read(cx)
+            .value()
+            .to_string();
+        let region = self.access.input_ssm_region.read(cx).value().to_string();
+        let remote_port = self
+            .access
+            .input_ssm_remote_port
+            .read(cx)
+            .value()
+            .to_string();
+
+        let auth_profile_id = self
+            .access
+            .selected_ssm_auth_profile_id
+            .or(self.auth_profile.selected_auth_profile_id);
+
+        let mut params = std::collections::HashMap::new();
+        params.insert("instance_id".to_string(), instance_id);
+        params.insert("region".to_string(), region);
+        params.insert("remote_port".to_string(), remote_port);
+        if let Some(id) = auth_profile_id {
+            params.insert("auth_profile_id".to_string(), id.to_string());
+        }
+
+        AccessKind::Managed {
+            provider: "aws-ssm".to_string(),
+            params,
+        }
+    }
+}
+
+pub struct DismissEvent;
+
+impl EventEmitter<DismissEvent> for ConnectionManagerWindow {}
+
+/// Opens the SSH private key picker, starting in `~/.ssh`, and hands the picked
+/// path to `apply` on the entity that asked.
+pub(crate) fn browse_ssh_key_into<T: 'static>(
+    cx: &mut Context<T>,
+    apply: impl FnOnce(&mut T, String) + 'static,
+) {
+    let start_dir = dirs::home_dir()
+        .map(|home| home.join(".ssh"))
+        .unwrap_or_default();
+
+    let dialog = rfd::AsyncFileDialog::new()
+        .set_title(datatab_i18n::t!("connection_manager.select_ssh_key_title"))
+        .set_directory(&start_dir);
+
+    pick_file_into(dialog, cx, apply);
+}
+
+/// Shows `dialog` through the shared native picker resolver and hands the
+/// picked path to `apply` on the entity that asked, then re-renders it.
+///
+/// A cancelled picker, or one that returns after the entity was dropped,
+/// changes nothing. A host without a native picker gets the resolver's error
+/// toast.
+fn pick_file_into<T: 'static>(
+    dialog: rfd::AsyncFileDialog,
+    cx: &mut Context<T>,
+    apply: impl FnOnce(&mut T, String) + 'static,
+) {
+    cx.spawn(async move |this, cx| {
+        let picked = datatab_ui_base::file_dialog::pick_existing_file(cx, async move {
+            dialog
+                .pick_file()
+                .await
+                .map(|handle| handle.path().to_path_buf())
+        })
+        .await;
+
+        let Some(path) = picked else {
+            return;
+        };
+
+        let Some(entity) = this.upgrade() else {
+            return;
+        };
+
+        cx.update(|cx| {
+            entity.update(cx, |this, cx| {
+                apply(this, path.to_string_lossy().to_string());
+                cx.notify();
+            });
+        });
+    })
+    .detach();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConnectionManagerWindow;
+    use super::auth_profile_needs_login;
+    use super::auth_profile_ref_field_id_from_form;
+    use datatab_core::AuthSessionState;
+    use std::collections::{HashMap, HashSet};
+
+    // --- parse_hook_tokens ---
+
+    #[test]
+    fn parse_hook_tokens_comma_separated() {
+        let tokens = ConnectionManagerWindow::parse_hook_tokens("pre-check, lint, deploy");
+        assert_eq!(tokens, vec!["pre-check", "lint", "deploy"]);
+    }
+
+    #[test]
+    fn parse_hook_tokens_trims_whitespace() {
+        let tokens = ConnectionManagerWindow::parse_hook_tokens("  a ,  b  , c ");
+        assert_eq!(tokens, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn parse_hook_tokens_skips_empty() {
+        let tokens = ConnectionManagerWindow::parse_hook_tokens(",, a ,, b ,,");
+        assert_eq!(tokens, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn parse_hook_tokens_empty_string() {
+        let tokens = ConnectionManagerWindow::parse_hook_tokens("");
+        assert!(tokens.is_empty());
+    }
+
+    // --- merge_hook_ids ---
+
+    fn known_ids_set<const N: usize>(ids: [&str; N]) -> HashSet<String> {
+        ids.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn merge_hook_ids_primary_plus_extras() {
+        let name_to_id = HashMap::new();
+        let known_ids = known_ids_set(["main", "extra1", "extra2"]);
+
+        let result = ConnectionManagerWindow::merge_hook_ids(
+            Some("main".into()),
+            "extra1, extra2",
+            &name_to_id,
+            &known_ids,
+        );
+
+        assert_eq!(result, vec!["main", "extra1", "extra2"]);
+    }
+
+    #[test]
+    fn merge_hook_ids_deduplicates() {
+        let name_to_id = HashMap::new();
+        let known_ids = known_ids_set(["a", "b", "c"]);
+
+        let result = ConnectionManagerWindow::merge_hook_ids(
+            Some("a".into()),
+            "b, a, c",
+            &name_to_id,
+            &known_ids,
+        );
+
+        assert_eq!(result, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn merge_hook_ids_no_primary() {
+        let name_to_id = HashMap::new();
+        let known_ids = known_ids_set(["x", "y"]);
+
+        let result = ConnectionManagerWindow::merge_hook_ids(None, "x, y", &name_to_id, &known_ids);
+
+        assert_eq!(result, vec!["x", "y"]);
+    }
+
+    #[test]
+    fn merge_hook_ids_empty_primary_is_skipped() {
+        let name_to_id = HashMap::new();
+        let known_ids = known_ids_set(["a"]);
+
+        let result = ConnectionManagerWindow::merge_hook_ids(
+            Some("  ".into()),
+            "a",
+            &name_to_id,
+            &known_ids,
+        );
+
+        assert_eq!(result, vec!["a"]);
+    }
+
+    #[test]
+    fn merge_hook_ids_resolves_names_and_drops_unknown_tokens() {
+        let name_to_id: HashMap<String, String> = [("lint".to_string(), "id-lint".to_string())]
+            .into_iter()
+            .collect();
+        let known_ids = known_ids_set(["id-main", "id-lint"]);
+
+        let result = ConnectionManagerWindow::merge_hook_ids(
+            Some("id-main".into()),
+            "lint, ghost",
+            &name_to_id,
+            &known_ids,
+        );
+
+        assert_eq!(result, vec!["id-main", "id-lint"]);
+    }
+
+    #[test]
+    fn unresolved_hook_tokens_accepts_known_id_and_name() {
+        let name_to_id: HashMap<String, String> = [("lint".to_string(), "id-lint".to_string())]
+            .into_iter()
+            .collect();
+        let known_ids = known_ids_set(["id-main", "id-lint"]);
+
+        let result = ConnectionManagerWindow::unresolved_hook_tokens(
+            Some("id-main".into()),
+            "lint",
+            &name_to_id,
+            &known_ids,
+        );
+
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn unresolved_hook_tokens_reports_unknown_entries() {
+        let name_to_id = HashMap::new();
+        let known_ids = known_ids_set(["id-main"]);
+
+        let result = ConnectionManagerWindow::unresolved_hook_tokens(
+            Some("id-main".into()),
+            "ghost, other",
+            &name_to_id,
+            &known_ids,
+        );
+
+        assert_eq!(result, vec!["ghost", "other"]);
+    }
+
+    #[test]
+    fn unresolved_hook_tokens_ignores_empty_primary() {
+        let name_to_id = HashMap::new();
+        let known_ids = known_ids_set(["id-main"]);
+
+        let result = ConnectionManagerWindow::unresolved_hook_tokens(
+            Some("  ".into()),
+            "id-main",
+            &name_to_id,
+            &known_ids,
+        );
+
+        assert!(result.is_empty());
+    }
+
+    // --- split_primary_and_extra ---
+
+    #[test]
+    fn split_primary_and_extra_multiple() {
+        let hooks = vec!["first".into(), "second".into(), "third".into()];
+        let (primary, extra) = ConnectionManagerWindow::split_primary_and_extra(&hooks);
+        assert_eq!(primary, "first");
+        assert_eq!(extra, vec!["second", "third"]);
+    }
+
+    #[test]
+    fn split_primary_and_extra_single() {
+        let hooks = vec!["only".into()];
+        let (primary, extra) = ConnectionManagerWindow::split_primary_and_extra(&hooks);
+        assert_eq!(primary, "only");
+        assert!(extra.is_empty());
+    }
+
+    #[test]
+    fn split_primary_and_extra_empty() {
+        let hooks: Vec<String> = vec![];
+        let (primary, extra) = ConnectionManagerWindow::split_primary_and_extra(&hooks);
+        assert_eq!(primary, "");
+        assert!(extra.is_empty());
+    }
+
+    #[test]
+    fn auth_profile_login_requires_capability_and_login_state() {
+        assert!(auth_profile_needs_login(
+            true,
+            Some(&AuthSessionState::LoginRequired)
+        ));
+        assert!(auth_profile_needs_login(
+            true,
+            Some(&AuthSessionState::Expired)
+        ));
+        assert!(!auth_profile_needs_login(
+            true,
+            Some(&AuthSessionState::Valid { expires_at: None })
+        ));
+        assert!(!auth_profile_needs_login(
+            false,
+            Some(&AuthSessionState::LoginRequired)
+        ));
+        assert!(!auth_profile_needs_login(true, None));
+    }
+
+    #[test]
+    fn form_has_auth_profile_ref_field_detects_kind() {
+        use datatab_core::{DriverFormDef, FormFieldDef, FormFieldKind, FormSection, FormTab};
+
+        fn make_form(kind: FormFieldKind) -> DriverFormDef {
+            DriverFormDef {
+                tabs: vec![FormTab {
+                    id: "main".to_string(),
+                    label: "Main".to_string(),
+                    sections: vec![FormSection {
+                        title: "Settings".to_string(),
+                        icon: None,
+                        fields: vec![FormFieldDef {
+                            id: "profile".to_string(),
+                            label: "Profile".to_string(),
+                            kind,
+                            placeholder: String::new(),
+                            required: false,
+                            default_value: String::new(),
+                            enabled_when_checked: None,
+                            enabled_when_unchecked: None,
+                            disabled_when_field_set: None,
+                            enabled_when_field_equals: None,
+                            help: None,
+                        }],
+                    }],
+                }],
+            }
+        }
+
+        let auth_ref_form = make_form(FormFieldKind::AuthProfileRef { provider_id: None });
+        assert_eq!(
+            auth_profile_ref_field_id_from_form(&auth_ref_form).as_deref(),
+            Some("profile"),
+            "Form with AuthProfileRef field must return the field id"
+        );
+
+        let text_only_form = make_form(FormFieldKind::Text);
+        assert_eq!(
+            auth_profile_ref_field_id_from_form(&text_only_form),
+            None,
+            "Form with only Text fields must return None"
+        );
+
+        let empty_form = DriverFormDef { tabs: vec![] };
+        assert_eq!(
+            auth_profile_ref_field_id_from_form(&empty_form),
+            None,
+            "Empty form must return None"
+        );
+    }
+
+    const CONNECTION_MANAGER_PLACEHOLDER_KEYS: &[&str] = &[
+        "connection_manager.placeholder.connection_name",
+        "connection_manager.placeholder.password",
+        "connection_manager.placeholder.password_unreadable",
+        "connection_manager.placeholder.key_passphrase_optional",
+        "connection_manager.placeholder.ssh_password",
+        "connection_manager.placeholder.ca_cert_path",
+        "connection_manager.placeholder.client_cert_path",
+        "connection_manager.placeholder.client_key_path",
+        "connection_manager.placeholder.select_ssh_tunnel",
+        "connection_manager.placeholder.select_proxy",
+        "connection_manager.placeholder.none",
+        "connection_manager.placeholder.use_driver_default",
+        "connection_manager.placeholder.no_hook",
+        "connection_manager.placeholder.select_trusted_client",
+        "connection_manager.placeholder.filter_trusted_clients",
+        "connection_manager.placeholder.no_role",
+        "connection_manager.placeholder.no_policy",
+        "connection_manager.access_method.direct",
+        "connection_manager.access_method.ssh_tunnel",
+        "connection_manager.access_method.proxy",
+        "connection_manager.access_method.ssm",
+        "connection_manager.new_auth_profile",
+        "connection_manager.aws_sso_wizard_title",
+        "connection_manager.aws_sso_open_failed",
+        "connection_manager.select_ssh_key_title",
+        "connection_manager.select_ca_cert",
+        "connection_manager.select_client_cert",
+        "connection_manager.select_client_key",
+        "connection_manager.filter_certificates",
+        "connection_manager.filter_all_files",
+        "connection_manager.select_database_file",
+    ];
+
+    #[test]
+    fn connection_manager_placeholder_keys_resolve() {
+        for key in CONNECTION_MANAGER_PLACEHOLDER_KEYS {
+            let value = datatab_i18n::t!(key, locale = "en");
+
+            assert!(!value.is_empty(), "key {key} resolved empty");
+            assert_ne!(value, *key, "key {key} did not resolve");
+            assert_ne!(
+                value,
+                format!("en.{key}"),
+                "key {key} fell back to the raw en-qualified form"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_manager_new_auth_profile_exact_values() {
+        let en = datatab_i18n::t!("connection_manager.new_auth_profile", locale = "en");
+
+        assert_eq!(en, "New auth profile…");
+    }
+
+    #[test]
+    fn access_method_dropdown_item_value_ids_stay_untranslated() {
+        let label = datatab_i18n::t!("connection_manager.access_method.ssh_tunnel", locale = "en");
+        let item = datatab_components::controls::DropdownItem::with_value(label, "ssh");
+
+        assert_eq!(item.value, "ssh", "dropdown item id must stay untranslated");
+    }
+
+    // --- auth flow i18n ---
+
+    const CONNECTION_MANAGER_AUTH_KEYS: &[&str] = &[
+        "connection_manager.auth.profile_created_sso",
+        "connection_manager.auth.profile_created_wizard",
+        "connection_manager.auth.refreshing_sessions",
+        "connection_manager.auth.select_before_login",
+        "connection_manager.auth.provider_unavailable",
+        "connection_manager.auth.interactive_login_unavailable",
+        "connection_manager.auth.login_starting",
+        "connection_manager.auth.login_completed",
+        "connection_manager.auth.login_failed",
+        "connection_manager.auth.session_status_valid_expires",
+        "connection_manager.auth.session_status_valid",
+        "connection_manager.auth.session_status_expired",
+        "connection_manager.auth.session_status_login_required",
+    ];
+
+    #[test]
+    fn connection_manager_auth_keys_resolve() {
+        for key in CONNECTION_MANAGER_AUTH_KEYS {
+            let value = datatab_i18n::t!(key, locale = "en");
+
+            assert!(!value.is_empty(), "key {key} resolved empty");
+            assert_ne!(value, *key, "key {key} did not resolve");
+            assert_ne!(
+                value,
+                format!("en.{key}"),
+                "key {key} fell back to the raw en-qualified form"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_manager_auth_login_completed_exact_english_value() {
+        let en = datatab_i18n::t!("connection_manager.auth.login_completed", locale = "en");
+
+        assert_eq!(en, "Auth-provider login completed.");
+    }
+
+    // --- dialog / tab / driver-select i18n (PR14) ---
+
+    const CONNECTION_MANAGER_DIALOG_KEYS: &[&str] = &[
+        "connection_manager.tab.main",
+        "connection_manager.tab.settings",
+        "connection_manager.tab.mcp",
+        "connection_manager.field.name",
+        "connection_manager.field.ssl_mode",
+        "connection_manager.field.ca_certificate",
+        "connection_manager.field.client_cert",
+        "connection_manager.field.client_key",
+        "connection_manager.section.transport",
+        "connection_manager.banner.correct_following",
+        "connection_manager.banner.testing_connection",
+        "connection_manager.banner.connection_successful",
+        "connection_manager.banner.connection_successful_warnings",
+        "connection_manager.banner.connection_failed",
+        "connection_manager.action.copy",
+        "connection_manager.action.back",
+        "connection_manager.action.test_connection",
+        "connection_manager.action.save",
+        "connection_manager.action.browse",
+        "connection_manager.window_title",
+        "connection_manager.driver_select.search_placeholder",
+        "connection_manager.driver_select.title",
+        "connection_manager.driver_select.subtitle",
+        "connection_manager.driver_select.empty_state",
+        "connection_manager.driver_select.import_from_file",
+        "connection_manager.driver_select.import_from_client",
+        "connection_manager.driver_select.cancel",
+        "connection_manager.driver_select.configure",
+        "connection_manager.driver_select.configure_named",
+        "connection_manager.auth.ssh_config_incomplete",
+    ];
+
+    #[test]
+    fn connection_manager_dialog_keys_resolve() {
+        for key in CONNECTION_MANAGER_DIALOG_KEYS {
+            let value = datatab_i18n::t!(key, locale = "en");
+
+            assert!(!value.is_empty(), "key {key} resolved empty");
+            assert_ne!(value, *key, "key {key} did not resolve");
+            assert_ne!(
+                value,
+                format!("en.{key}"),
+                "key {key} fell back to the raw en-qualified form"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_manager_window_title_exact_values() {
+        let en = datatab_i18n::t!("connection_manager.window_title", locale = "en");
+
+        assert_eq!(en, "Connection Manager");
+    }
+}
+
+#[cfg(test)]
+mod keyboard_coverage_tests {
+    // Explicit imports rather than the parent glob: combining `use super::*`
+    // with `#[gpui::test]` sends the gpui_macros expansion into unbounded
+    // recursion.
+    use super::{AccessTabMode, ActiveTab, ConnectionManagerWindow, View};
+    use crate::keyboard_coverage::CONNECTION_MANAGER;
+    use datatab_storage::bootstrap::StorageRuntime;
+    use datatab_ui_base::AppStateEntity;
+    use datatab_ui_base::keyboard_coverage::{Coverage, FrameCapture};
+    use datatab_ui_base::toast::{ToastGlobal, ToastHost};
+    use gpui::{AppContext as _, TestAppContext, VisualTestContext};
+
+    pub(super) fn open_manager(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::Entity<ConnectionManagerWindow>,
+        &mut VisualTestContext,
+    ) {
+        cx.update(gpui_component::init);
+        cx.update(datatab_components::theme::init);
+        cx.update(datatab_ui_base::keymap::init_keymap);
+        cx.update(|cx| {
+            let host = cx.new(|_| ToastHost::new());
+            cx.set_global(ToastGlobal { host });
+        });
+        let app_state = cx.update(|cx| {
+            cx.new(|_| {
+                AppStateEntity::new_with_storage_runtime(
+                    StorageRuntime::in_memory().expect("test storage runtime"),
+                )
+                .expect("test app state")
+            })
+        });
+
+        let (manager, window) =
+            cx.add_window_view(|window, cx| ConnectionManagerWindow::new(app_state, window, cx));
+        window.update(|window, cx| {
+            let handle = manager.read(cx).focus_handle.clone();
+            window.focus(&handle, cx);
+        });
+        window.run_until_parked();
+
+        (manager, window)
+    }
+
+    /// In the driver list, I opens Import connections and Shift+I Import
+    /// from another client, as the buttons beside Cancel do; Escape returns
+    /// to the list. The driver filter still takes a typed I as text.
+    #[gpui::test]
+    fn i_and_shift_i_open_the_imports_from_the_driver_list(cx: &mut TestAppContext) {
+        let (import, import_external) = ("i", "shift-i");
+
+        let (manager, window) = open_manager(cx);
+        let view = |window: &mut VisualTestContext| window.update(|_, cx| manager.read(cx).view);
+        let external = |window: &mut VisualTestContext| {
+            window.update(|_, cx| {
+                manager
+                    .read(cx)
+                    .import_panel
+                    .read(cx)
+                    .external_source_selected()
+            })
+        };
+
+        window.simulate_keystrokes(import);
+        window.run_until_parked();
+        assert!(view(window) == View::Import, "the import panel shows");
+        assert!(!external(window), "I imports a DataTab bundle");
+
+        window.simulate_keystrokes("escape");
+        window.run_until_parked();
+        assert!(view(window) == View::DriverSelect, "the driver list shows");
+
+        window.simulate_keystrokes(import_external);
+        window.run_until_parked();
+        assert!(view(window) == View::Import, "the import panel shows");
+        assert!(external(window), "Shift+I imports from another client");
+
+        window.simulate_keystrokes("escape");
+        window.update(|window, cx| {
+            let input = manager.read(cx).form.driver_filter_input.clone();
+            input.update(cx, |state, cx| state.focus(window, cx));
+        });
+        window.run_until_parked();
+        window.simulate_keystrokes("i");
+        window.run_until_parked();
+        assert!(view(window) == View::DriverSelect, "the driver list shows");
+        assert_eq!(
+            window.update(|_, cx| manager.read(cx).current_driver_filter(cx)),
+            "i",
+            "I typed into the filter is text"
+        );
+    }
+
+    /// The driver list and every tab of a Postgres form. The keyboard tests
+    /// of the form (`form::tests`, `navigation`) prove the ring reaches each
+    /// control.
+    #[gpui::test]
+    fn the_connection_manager_is_covered(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(datatab_components::theme::init);
+        cx.update(datatab_ui_base::keymap::init_keymap);
+        cx.update(|cx| {
+            let host = cx.new(|_| ToastHost::new());
+            cx.set_global(ToastGlobal { host });
+        });
+        let app_state = cx.update(|cx| {
+            cx.new(|_| {
+                AppStateEntity::new_with_storage_runtime(
+                    StorageRuntime::in_memory().expect("test storage runtime"),
+                )
+                .expect("test app state")
+            })
+        });
+
+        let (manager, window) =
+            cx.add_window_view(|window, cx| ConnectionManagerWindow::new(app_state, window, cx));
+        window.run_until_parked();
+        let capture = FrameCapture::observe(window);
+        let check = |window: &mut VisualTestContext, expected: &str| {
+            let checked = Coverage::new(CONNECTION_MANAGER).assert_covered(&capture.frame(window));
+            assert!(
+                checked.iter().any(|id| id.starts_with(expected)),
+                "{expected} in {checked:?}"
+            );
+        };
+
+        check(window, "cm-driver-card-");
+
+        window.update(|window, cx| {
+            manager.update(cx, |manager, cx| {
+                manager.select_driver("postgres", window, cx)
+            })
+        });
+        window.run_until_parked();
+        check(window, "test-connection");
+
+        for (expected, tab, mode, ssh_enabled) in [
+            (
+                "access-method-dropdown",
+                ActiveTab::Access,
+                AccessTabMode::Direct,
+                false,
+            ),
+            ("ssh-enabled", ActiveTab::Access, AccessTabMode::Ssh, true),
+            (
+                "ssh-config-host-picker",
+                ActiveTab::Access,
+                AccessTabMode::Ssh,
+                true,
+            ),
+            ("tab-access", ActiveTab::Access, AccessTabMode::Proxy, false),
+            (
+                "conn-pre-hook",
+                ActiveTab::Settings,
+                AccessTabMode::Direct,
+                false,
+            ),
+            ("tab-mcp", ActiveTab::Mcp, AccessTabMode::Direct, false),
+        ] {
+            window.update(|_, cx| {
+                manager.update(cx, |manager, cx| {
+                    manager.active_tab = tab;
+                    manager.access.access_tab_mode = mode;
+                    manager.access.ssh_enabled = ssh_enabled;
+                    cx.notify();
+                })
+            });
+            window.run_until_parked();
+            check(window, expected);
+        }
+    }
+}
+
+/// The names the Connection Manager announces. A row that pairs a checkbox
+/// with a value control names the checkbox after what it overrides, because
+/// the value control beside it already carries the plain field label.
+#[cfg(test)]
+mod accessible_name_tests {
+    // Explicit imports rather than the parent glob: combining `use super::*`
+    // with `#[gpui::test]` sends the gpui_macros expansion into unbounded
+    // recursion.
+    use super::keyboard_coverage_tests::open_manager;
+    use super::{ActiveTab, ConnectionManagerWindow};
+    use datatab_components::accessibility::accessible_name;
+    use datatab_ui_base::keyboard_coverage::FrameCapture;
+    use gpui::{Entity, TestAppContext, VisualTestContext};
+
+    fn open_settings_tab(
+        cx: &mut TestAppContext,
+    ) -> (Entity<ConnectionManagerWindow>, &mut VisualTestContext) {
+        let (manager, window) = open_manager(cx);
+        window.update(|window, cx| {
+            manager.update(cx, |manager, cx| {
+                manager.select_driver("postgres", window, cx)
+            });
+        });
+        window.run_until_parked();
+        window.update(|_, cx| {
+            manager.update(cx, |manager, cx| {
+                manager.active_tab = ActiveTab::Settings;
+                cx.notify();
+            });
+        });
+        window.run_until_parked();
+
+        (manager, window)
+    }
+
+    fn override_name(field: &str) -> String {
+        datatab_i18n::t!("settings.general.override_field", field = field)
+    }
+
+    /// The refresh policy and refresh interval rows each hold a checkbox and a
+    /// value control the user can act on separately, so the checkbox says it
+    /// overrides the field instead of repeating the field label.
+    #[gpui::test]
+    fn the_override_checkboxes_are_named_after_what_they_override(cx: &mut TestAppContext) {
+        let (_manager, window) = open_settings_tab(cx);
+        let capture = FrameCapture::observe(window);
+        let frame = capture.frame(window);
+
+        let template = datatab_i18n::t!("settings.general.override_field");
+        assert!(
+            template.contains("%{field}"),
+            "the catalogue must carry the override name template, got {template}"
+        );
+
+        let policy = datatab_i18n::t!("connection_manager.overrides.refresh_policy");
+        let interval = datatab_i18n::t!("connection_manager.overrides.refresh_interval");
+
+        assert_eq!(
+            accessible_name(&frame, "conn-override-refresh-policy"),
+            Some(override_name(&policy)),
+            "the checkbox that enables the refresh policy override"
+        );
+        assert_eq!(
+            accessible_name(&frame, "conn-override-refresh-interval"),
+            Some(override_name(&interval)),
+            "the checkbox that enables the refresh interval override"
+        );
+    }
+}

@@ -1,0 +1,36 @@
+[package]
+name = "datatab_driver_mssql"
+version.workspace = true
+edition.workspace = true
+publish = false
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+datatab_core = { path = "../datatab_core" }
+datatab_ssh = { path = "../datatab_ssh" }
+chrono = { workspace = true }
+futures-util = "0.3"
+hex.workspace = true
+indexmap.workspace = true
+log = "0.4"
+serde_json = { workspace = true }
+sha2.workspace = true
+socket2 = "0.6"
+tiberius = { version = "0.12", default-features = false, features = ["chrono", "tds73", "rustls", "sql-browser-tokio"] }
+tokio = { workspace = true, features = ["net", "io-util", "time", "macros"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+urlencoding = "2"
+
+[dev-dependencies]
+datatab_test_support.workspace = true
+
+[lints]
+workspace = true

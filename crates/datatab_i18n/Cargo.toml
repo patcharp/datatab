@@ -1,0 +1,20 @@
+[package]
+name = "datatab_i18n"
+edition.workspace = true
+publish = false
+version.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+sys-locale = { workspace = true }
+serde_yaml = { workspace = true }

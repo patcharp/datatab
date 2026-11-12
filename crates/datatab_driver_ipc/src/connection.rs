@@ -1,0 +1,1454 @@
+use std::sync::{Arc, OnceLock};
+
+use datatab_core::{
+    CodeGenCapabilities, CodeGeneratorInfo, CollectionBrowseRequest, CollectionCountRequest,
+    Connection, CrudResult, CustomTypeInfo, DatabaseInfo, DbError, DbKind, DbSchemaInfo,
+    DescribeRequest, DocumentDelete, DocumentInsert, DocumentUpdate, DriverCapabilities,
+    DriverMetadata, ExplainRequest, HashDeleteRequest, HashSetRequest, KeyBulkGetRequest,
+    KeyDeleteRequest, KeyExistsRequest, KeyExpireRequest, KeyGetRequest, KeyGetResult,
+    KeyPersistRequest, KeyRenameRequest, KeyScanPage, KeyScanRequest, KeySetRequest, KeyTtlRequest,
+    KeyType, KeyTypeRequest, KeyValueApi, LanguageService, ListPushRequest, ListRemoveRequest,
+    ListSetRequest, QueryHandle, QueryRequest, QueryResult, RootSectionDef, RootSectionPage,
+    RootSectionSource, RowDelete, RowInsert, RowPatch, SchemaColumnInfo, SchemaFeatures,
+    SchemaForeignKeyInfo, SchemaIndexInfo, SchemaLoadingStrategy, SchemaSnapshot, SemanticPlan,
+    SemanticRequest, SetAddRequest, SetRemoveRequest, SqlDialect, StreamAddRequest,
+    StreamDeleteRequest, TableBrowseRequest, TableCountRequest, TableInfo, ViewInfo,
+    ZSetAddRequest, ZSetRemoveRequest,
+};
+use datatab_ipc::driver_protocol::{
+    DriverRequestBody, DriverResponseBody, protocol_carries_request_row_limit,
+    protocol_carries_root_sections,
+};
+use datatab_ipc::{DRIVER_RPC_VERSION, ProtocolVersion};
+
+use crate::transport::RpcClient;
+use uuid::Uuid;
+
+/// IPC-proxied connection that delegates all operations to a remote driver-host.
+pub struct IpcConnection {
+    client: Arc<RpcClient>,
+    session_id: Uuid,
+    kind: DbKind,
+    metadata: DriverMetadata,
+    capabilities: DriverCapabilities,
+    schema_loading_strategy: SchemaLoadingStrategy,
+    schema_features: SchemaFeatures,
+    code_gen_capabilities: CodeGenCapabilities,
+    /// Whether `QueryRequest::limit` is sent to the host instead of refused.
+    forwards_row_limit: bool,
+    /// Whether the remote driver declares root sections on a session that
+    /// carries the v1.9 root section requests.
+    exposes_root_sections: bool,
+    /// The remote declaration, fetched on first use. A driver declares its
+    /// sections once per connection, and the sidebar reads them on every
+    /// rebuild, so a round trip per read would block it on the socket.
+    root_sections: OnceLock<Vec<RootSectionDef>>,
+}
+
+impl IpcConnection {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        client: Arc<RpcClient>,
+        session_id: Uuid,
+        kind: DbKind,
+        metadata: DriverMetadata,
+        capabilities: DriverCapabilities,
+        schema_loading_strategy: SchemaLoadingStrategy,
+        schema_features: SchemaFeatures,
+        code_gen_capabilities: CodeGenCapabilities,
+    ) -> Self {
+        let forwards_row_limit = protocol_carries_request_row_limit(client.selected_version())
+            && metadata.supports(DriverCapabilities::REQUEST_ROW_LIMIT);
+
+        let exposes_root_sections = protocol_carries_root_sections(client.selected_version())
+            && metadata.supports(DriverCapabilities::ROOT_SECTIONS);
+
+        let mut metadata = without_uncertifiable_enforcement(metadata);
+        let mut capabilities = without_request_row_limit(capabilities);
+        if !exposes_root_sections {
+            metadata
+                .capabilities
+                .remove(DriverCapabilities::ROOT_SECTIONS);
+            capabilities.remove(DriverCapabilities::ROOT_SECTIONS);
+        }
+        if forwards_row_limit {
+            metadata
+                .capabilities
+                .insert(DriverCapabilities::REQUEST_ROW_LIMIT);
+            capabilities.insert(DriverCapabilities::REQUEST_ROW_LIMIT);
+        }
+
+        Self {
+            client,
+            session_id,
+            kind,
+            metadata,
+            capabilities,
+            schema_loading_strategy,
+            schema_features,
+            code_gen_capabilities,
+            forwards_row_limit,
+            exposes_root_sections,
+            root_sections: OnceLock::new(),
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn kv_call(&self, body: DriverRequestBody) -> Result<DriverResponseBody, DbError> {
+        self.client
+            .kv_call(self.session_id, body)
+            .map_err(DbError::from)
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn expect_kv_bool(&self, body: DriverRequestBody) -> Result<bool, DbError> {
+        match self.kv_call(body)? {
+            DriverResponseBody::KvBoolResult { value } => Ok(value),
+            DriverResponseBody::Error(e) => Err(DbError::QueryFailed(e.message.into())),
+            _ => Err(DbError::QueryFailed("Unexpected KV response".into())),
+        }
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn expect_ok(&self, body: DriverRequestBody) -> Result<(), DbError> {
+        match self.kv_call(body)? {
+            DriverResponseBody::KvBoolResult { .. }
+            | DriverResponseBody::Pong
+            | DriverResponseBody::SessionClosed => Ok(()),
+            DriverResponseBody::Error(e) => Err(DbError::QueryFailed(e.message.into())),
+            _ => Err(DbError::QueryFailed("Unexpected KV response".into())),
+        }
+    }
+}
+
+impl Connection for IpcConnection {
+    /// The RPC protocol carries no facets, so they come from the category the
+    /// external driver declared.
+    fn collection_facets(
+        &self,
+        _collection: &datatab_core::CollectionRef,
+    ) -> Vec<datatab_core::ObjectFacet> {
+        datatab_core::category_collection_facets(self.metadata().category)
+    }
+
+    fn metadata(&self) -> &DriverMetadata {
+        &self.metadata
+    }
+
+    fn capabilities(&self) -> DriverCapabilities {
+        self.capabilities
+    }
+
+    fn kind(&self) -> DbKind {
+        self.kind
+    }
+
+    fn schema_loading_strategy(&self) -> SchemaLoadingStrategy {
+        self.schema_loading_strategy
+    }
+
+    fn schema_features(&self) -> SchemaFeatures {
+        self.schema_features
+    }
+
+    fn ping(&self) -> Result<(), DbError> {
+        self.client.ping(self.session_id).map_err(DbError::from)
+    }
+
+    fn close(&mut self) -> Result<(), DbError> {
+        self.client
+            .close_session(self.session_id)
+            .map_err(DbError::from)
+    }
+
+    fn execute(&self, req: &QueryRequest) -> Result<QueryResult, DbError> {
+        reject_protected_query(req, self.forwards_row_limit)?;
+        self.client
+            .execute(self.session_id, req)
+            .map_err(DbError::from)
+    }
+
+    fn execute_with_handle(
+        &self,
+        req: &QueryRequest,
+    ) -> Result<(QueryHandle, QueryResult), DbError> {
+        reject_protected_query(req, self.forwards_row_limit)?;
+        let (handle_id, result) = self
+            .client
+            .execute_with_handle(self.session_id, req)
+            .map_err(DbError::from)?;
+
+        Ok((QueryHandle { id: handle_id }, result))
+    }
+
+    fn cancel(&self, handle: &QueryHandle) -> Result<(), DbError> {
+        self.client
+            .cancel(self.session_id, handle.id)
+            .map_err(DbError::from)
+    }
+
+    fn cancel_active(&self) -> Result<(), DbError> {
+        self.client
+            .cancel_active(self.session_id)
+            .map_err(DbError::from)
+    }
+
+    fn cleanup_after_cancel(&self) -> Result<(), DbError> {
+        self.client
+            .cleanup_after_cancel(self.session_id)
+            .map_err(DbError::from)
+    }
+
+    fn schema_snapshot_authority(&self) -> datatab_core::SchemaSnapshotAuthority {
+        // The current RPC protocol does not declare primary snapshot authority.
+        datatab_core::SchemaSnapshotAuthority::Unknown
+    }
+
+    fn schema(&self) -> Result<SchemaSnapshot, DbError> {
+        self.client.schema(self.session_id).map_err(DbError::from)
+    }
+
+    fn list_databases(&self) -> Result<Vec<DatabaseInfo>, DbError> {
+        self.client
+            .list_databases(self.session_id)
+            .map_err(DbError::from)
+    }
+
+    fn schema_for_database(&self, database: &str) -> Result<DbSchemaInfo, DbError> {
+        self.client
+            .schema_for_database(self.session_id, database)
+            .map_err(DbError::from)
+    }
+
+    fn table_details(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+        table: &str,
+    ) -> Result<TableInfo, DbError> {
+        self.client
+            .table_details(self.session_id, database, schema, table)
+            .map_err(DbError::from)
+    }
+
+    fn view_details(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+        view: &str,
+    ) -> Result<ViewInfo, DbError> {
+        self.client
+            .view_details(self.session_id, database, schema, view)
+            .map_err(DbError::from)
+    }
+
+    fn set_active_database(&self, database: Option<&str>) -> Result<(), DbError> {
+        self.client
+            .set_active_database(self.session_id, database)
+            .map_err(DbError::from)
+    }
+
+    fn active_database(&self) -> Option<String> {
+        self.client.active_database(self.session_id).ok().flatten()
+    }
+
+    fn schema_types(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+    ) -> Result<Vec<CustomTypeInfo>, DbError> {
+        self.client
+            .schema_types(self.session_id, database, schema)
+            .map_err(DbError::from)
+    }
+
+    fn schema_indexes(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+    ) -> Result<Vec<SchemaIndexInfo>, DbError> {
+        self.client
+            .schema_indexes(self.session_id, database, schema)
+            .map_err(DbError::from)
+    }
+
+    fn schema_foreign_keys(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+    ) -> Result<Vec<SchemaForeignKeyInfo>, DbError> {
+        self.client
+            .schema_foreign_keys(self.session_id, database, schema)
+            .map_err(DbError::from)
+    }
+
+    fn schema_columns(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+    ) -> Result<Vec<SchemaColumnInfo>, DbError> {
+        ensure_bulk_schema_columns_supported(self.client.selected_version())?;
+
+        self.client
+            .schema_columns(self.session_id, database, schema)
+            .map_err(DbError::from)
+    }
+
+    fn browse_table(&self, request: &TableBrowseRequest) -> Result<QueryResult, DbError> {
+        // The RPC protocol has no way to learn whether a driver reads the
+        // projection, so a projected browse is refused rather than answered
+        // with every column.
+        if !request.columns.is_empty() {
+            return Err(DbError::NotSupported(
+                "Column projection is not supported by external drivers".to_string(),
+            ));
+        }
+
+        self.client
+            .browse_table(self.session_id, request.clone())
+            .map_err(DbError::from)
+    }
+
+    fn count_table(&self, request: &TableCountRequest) -> Result<u64, DbError> {
+        self.client
+            .count_table(self.session_id, request.clone())
+            .map_err(DbError::from)
+    }
+
+    fn browse_collection(&self, request: &CollectionBrowseRequest) -> Result<QueryResult, DbError> {
+        self.client
+            .browse_collection(self.session_id, request.clone())
+            .map_err(DbError::from)
+    }
+
+    fn count_collection(&self, request: &CollectionCountRequest) -> Result<u64, DbError> {
+        self.client
+            .count_collection(self.session_id, request.clone())
+            .map_err(DbError::from)
+    }
+
+    fn explain(&self, request: &ExplainRequest) -> Result<QueryResult, DbError> {
+        self.client
+            .explain(self.session_id, request.clone())
+            .map_err(DbError::from)
+    }
+
+    fn describe_table(&self, request: &DescribeRequest) -> Result<QueryResult, DbError> {
+        self.client
+            .describe_table(self.session_id, request.clone())
+            .map_err(DbError::from)
+    }
+
+    fn plan_semantic_request(&self, request: &SemanticRequest) -> Result<SemanticPlan, DbError> {
+        self.client
+            .plan_semantic_request(self.session_id, request.clone())
+            .map_err(DbError::from)
+    }
+
+    fn update_row(&self, patch: &RowPatch) -> Result<CrudResult, DbError> {
+        self.client
+            .update_row(self.session_id, patch.clone())
+            .map_err(DbError::from)
+    }
+
+    fn insert_row(&self, insert: &RowInsert) -> Result<CrudResult, DbError> {
+        self.client
+            .insert_row(self.session_id, insert.clone())
+            .map_err(DbError::from)
+    }
+
+    fn delete_row(&self, delete: &RowDelete) -> Result<CrudResult, DbError> {
+        self.client
+            .delete_row(self.session_id, delete.clone())
+            .map_err(DbError::from)
+    }
+
+    fn update_document(&self, update: &DocumentUpdate) -> Result<CrudResult, DbError> {
+        self.client
+            .update_document(self.session_id, update.clone())
+            .map_err(DbError::from)
+    }
+
+    fn insert_document(&self, insert: &DocumentInsert) -> Result<CrudResult, DbError> {
+        self.client
+            .insert_document(self.session_id, insert.clone())
+            .map_err(DbError::from)
+    }
+
+    fn delete_document(&self, delete: &DocumentDelete) -> Result<CrudResult, DbError> {
+        self.client
+            .delete_document(self.session_id, delete.clone())
+            .map_err(DbError::from)
+    }
+
+    fn root_section_source(&self) -> Option<&dyn RootSectionSource> {
+        if self.exposes_root_sections {
+            Some(self as &dyn RootSectionSource)
+        } else {
+            None
+        }
+    }
+
+    fn key_value_api(&self) -> Option<&dyn KeyValueApi> {
+        if self.capabilities.contains(DriverCapabilities::KV_SCAN) {
+            Some(self as &dyn KeyValueApi)
+        } else {
+            None
+        }
+    }
+
+    fn dialect(&self) -> &dyn SqlDialect {
+        // The IPC connection uses the default ANSI SQL dialect.
+        // The driver-host does all SQL generation server-side via browse/count/CRUD
+        // methods, so the client-side dialect is only used as a fallback.
+        &datatab_core::DefaultSqlDialect
+    }
+
+    fn language_service(&self) -> &dyn LanguageService {
+        // For IPC connections to external drivers, we use the default SQL language service.
+        // The actual driver provides its own language service for in-process connections.
+        // Client-side dangerous-query detection is limited for external drivers.
+        &datatab_core::SqlLanguageService
+    }
+
+    fn code_gen_capabilities(&self) -> CodeGenCapabilities {
+        self.code_gen_capabilities
+    }
+
+    fn code_generators(&self) -> Vec<CodeGeneratorInfo> {
+        self.client
+            .code_generators(self.session_id)
+            .unwrap_or_default()
+    }
+
+    fn generate_code(&self, generator_id: &str, table: &TableInfo) -> Result<String, DbError> {
+        self.client
+            .generate_code(self.session_id, generator_id, table)
+            .map_err(DbError::from)
+    }
+}
+
+impl RootSectionSource for IpcConnection {
+    /// A failed fetch is returned and not cached, so the next read asks the
+    /// host again.
+    fn sections(&self) -> Result<Vec<RootSectionDef>, DbError> {
+        if let Some(sections) = self.root_sections.get() {
+            return Ok(sections.clone());
+        }
+
+        let sections = self
+            .client
+            .root_sections(self.session_id)
+            .map_err(DbError::from)?;
+        Ok(self.root_sections.get_or_init(|| sections).clone())
+    }
+
+    fn list_items(
+        &self,
+        section_id: &str,
+        page_token: Option<&str>,
+    ) -> Result<RootSectionPage, DbError> {
+        self.client
+            .root_section_items(self.session_id, section_id, page_token)
+            .map_err(DbError::from)
+    }
+
+    fn execute_action(
+        &self,
+        section_id: &str,
+        item_id: &str,
+        action_id: &str,
+    ) -> Result<(), DbError> {
+        self.client
+            .execute_root_section_action(self.session_id, section_id, item_id, action_id)
+            .map_err(DbError::from)
+    }
+}
+
+impl KeyValueApi for IpcConnection {
+    fn scan_keys(&self, request: &KeyScanRequest) -> Result<KeyScanPage, DbError> {
+        match self.kv_call(DriverRequestBody::KvScanKeys {
+            request: request.clone(),
+        })? {
+            DriverResponseBody::KvScanResult { page } => Ok(page),
+            DriverResponseBody::Error(e) => Err(DbError::QueryFailed(e.message.into())),
+            _ => Err(DbError::QueryFailed("Unexpected KV response".into())),
+        }
+    }
+
+    fn key_count(&self, keyspace: Option<u32>) -> Result<u64, DbError> {
+        ensure_key_count_supported(self.client.selected_version())?;
+
+        match self.kv_call(DriverRequestBody::KvKeyCount { keyspace })? {
+            DriverResponseBody::KvKeyCountResult { count } => Ok(count),
+            DriverResponseBody::Error(e) => Err(DbError::QueryFailed(e.message.into())),
+            _ => Err(DbError::QueryFailed("Unexpected KV response".into())),
+        }
+    }
+
+    fn get_key(&self, request: &KeyGetRequest) -> Result<KeyGetResult, DbError> {
+        match self.kv_call(DriverRequestBody::KvGetKey {
+            request: request.clone(),
+        })? {
+            DriverResponseBody::KvGetResult { result } => Ok(result),
+            DriverResponseBody::Error(e) => Err(DbError::QueryFailed(e.message.into())),
+            _ => Err(DbError::QueryFailed("Unexpected KV response".into())),
+        }
+    }
+
+    fn set_key(&self, request: &KeySetRequest) -> Result<(), DbError> {
+        self.expect_ok(DriverRequestBody::KvSetKey {
+            request: request.clone(),
+        })
+    }
+
+    fn delete_key(&self, request: &KeyDeleteRequest) -> Result<bool, DbError> {
+        self.expect_kv_bool(DriverRequestBody::KvDeleteKey {
+            request: request.clone(),
+        })
+    }
+
+    fn exists_key(&self, request: &KeyExistsRequest) -> Result<bool, DbError> {
+        self.expect_kv_bool(DriverRequestBody::KvExistsKey {
+            request: request.clone(),
+        })
+    }
+
+    fn key_type(&self, request: &KeyTypeRequest) -> Result<KeyType, DbError> {
+        match self.kv_call(DriverRequestBody::KvKeyType {
+            request: request.clone(),
+        })? {
+            DriverResponseBody::KvStringResult { value } => serde_json::from_str(&value)
+                .map_err(|e| DbError::QueryFailed(format!("Failed to parse key type: {e}").into())),
+            DriverResponseBody::Error(e) => Err(DbError::QueryFailed(e.message.into())),
+            _ => Err(DbError::QueryFailed("Unexpected KV response".into())),
+        }
+    }
+
+    fn key_ttl(&self, request: &KeyTtlRequest) -> Result<Option<i64>, DbError> {
+        match self.kv_call(DriverRequestBody::KvKeyTtl {
+            request: request.clone(),
+        })? {
+            DriverResponseBody::KvStringResult { value } => serde_json::from_str(&value)
+                .map_err(|e| DbError::QueryFailed(format!("Failed to parse key TTL: {e}").into())),
+            DriverResponseBody::Error(e) => Err(DbError::QueryFailed(e.message.into())),
+            _ => Err(DbError::QueryFailed("Unexpected KV response".into())),
+        }
+    }
+
+    fn expire_key(&self, request: &KeyExpireRequest) -> Result<bool, DbError> {
+        self.expect_kv_bool(DriverRequestBody::KvExpireKey {
+            request: request.clone(),
+        })
+    }
+
+    fn persist_key(&self, request: &KeyPersistRequest) -> Result<bool, DbError> {
+        self.expect_kv_bool(DriverRequestBody::KvPersistKey {
+            request: request.clone(),
+        })
+    }
+
+    fn rename_key(&self, request: &KeyRenameRequest) -> Result<(), DbError> {
+        self.expect_ok(DriverRequestBody::KvRenameKey {
+            request: request.clone(),
+        })
+    }
+
+    fn bulk_get(&self, request: &KeyBulkGetRequest) -> Result<Vec<Option<KeyGetResult>>, DbError> {
+        match self.kv_call(DriverRequestBody::KvBulkGet {
+            request: request.clone(),
+        })? {
+            DriverResponseBody::KvBulkGetResult { results } => Ok(results),
+            DriverResponseBody::Error(e) => Err(DbError::QueryFailed(e.message.into())),
+            _ => Err(DbError::QueryFailed("Unexpected KV response".into())),
+        }
+    }
+
+    fn hash_set(&self, request: &HashSetRequest) -> Result<(), DbError> {
+        self.expect_ok(DriverRequestBody::KvHashSet {
+            request: request.clone(),
+        })
+    }
+
+    fn hash_delete(&self, request: &HashDeleteRequest) -> Result<bool, DbError> {
+        self.expect_kv_bool(DriverRequestBody::KvHashDelete {
+            request: request.clone(),
+        })
+    }
+
+    fn list_set(&self, request: &ListSetRequest) -> Result<(), DbError> {
+        self.expect_ok(DriverRequestBody::KvListSet {
+            request: request.clone(),
+        })
+    }
+
+    fn list_push(&self, request: &ListPushRequest) -> Result<(), DbError> {
+        self.expect_ok(DriverRequestBody::KvListPush {
+            request: request.clone(),
+        })
+    }
+
+    fn list_remove(&self, request: &ListRemoveRequest) -> Result<bool, DbError> {
+        self.expect_kv_bool(DriverRequestBody::KvListRemove {
+            request: request.clone(),
+        })
+    }
+
+    fn set_add(&self, request: &SetAddRequest) -> Result<bool, DbError> {
+        self.expect_kv_bool(DriverRequestBody::KvSetAdd {
+            request: request.clone(),
+        })
+    }
+
+    fn set_remove(&self, request: &SetRemoveRequest) -> Result<bool, DbError> {
+        self.expect_kv_bool(DriverRequestBody::KvSetRemove {
+            request: request.clone(),
+        })
+    }
+
+    fn zset_add(&self, request: &ZSetAddRequest) -> Result<bool, DbError> {
+        self.expect_kv_bool(DriverRequestBody::KvZSetAdd {
+            request: request.clone(),
+        })
+    }
+
+    fn zset_remove(&self, request: &ZSetRemoveRequest) -> Result<bool, DbError> {
+        self.expect_kv_bool(DriverRequestBody::KvZSetRemove {
+            request: request.clone(),
+        })
+    }
+
+    fn stream_add(&self, request: &StreamAddRequest) -> Result<String, DbError> {
+        match self.kv_call(DriverRequestBody::KvStreamAdd {
+            request: request.clone(),
+        })? {
+            DriverResponseBody::KvStringResult { value } => Ok(value),
+            DriverResponseBody::Error(e) => Err(DbError::QueryFailed(e.message.into())),
+            _ => Err(DbError::QueryFailed("Unexpected KV response".into())),
+        }
+    }
+
+    fn stream_delete(&self, request: &StreamDeleteRequest) -> Result<u64, DbError> {
+        match self.kv_call(DriverRequestBody::KvStreamDelete {
+            request: request.clone(),
+        })? {
+            DriverResponseBody::KvU64Result { value } => Ok(value),
+            DriverResponseBody::Error(e) => Err(DbError::QueryFailed(e.message.into())),
+            _ => Err(DbError::QueryFailed("Unexpected KV response".into())),
+        }
+    }
+}
+
+/// Refuses, before anything is sent, what the remote driver cannot be trusted
+/// to enforce. A row limit passes only when `forwards_row_limit` holds: the
+/// session negotiated v1.6 or newer, which reports truncation back, and the
+/// remote driver declares `DriverCapabilities::REQUEST_ROW_LIMIT`.
+#[allow(clippy::result_large_err)]
+fn reject_protected_query(request: &QueryRequest, forwards_row_limit: bool) -> Result<(), DbError> {
+    if (request.limit.is_some() && !forwards_row_limit) || request.statement_timeout.is_some() {
+        return Err(DbError::NotSupported(
+            "IPC drivers cannot certify query limit or statement timeout enforcement".into(),
+        ));
+    }
+    request.refuse_read_only_enforcement("IPC driver")
+}
+
+/// Clears from metadata a driver host reported what an IPC connection refuses
+/// to honour.
+///
+/// `reject_protected_query` refuses every request that asks for read-only
+/// enforcement, and a row limit unless the session can carry it, so this
+/// clears both claims whatever the remote driver declares: a consumer that
+/// trusted them would build exactly the requests this connection turns away.
+/// `IpcConnection::new` restores the row-limit claim once it knows the session
+/// carries the limit. The remote driver keeps its own metadata for its own
+/// clients.
+pub(crate) fn without_uncertifiable_enforcement(mut metadata: DriverMetadata) -> DriverMetadata {
+    metadata.capabilities = without_request_row_limit(metadata.capabilities);
+    if let Some(transactions) = metadata.transactions.as_mut() {
+        transactions.supports_read_only = false;
+    }
+
+    metadata
+}
+
+/// Clears [`DriverCapabilities::REQUEST_ROW_LIMIT`], the claim that
+/// `Connection::execute` enforces `QueryRequest::limit`.
+///
+/// Unless the session carries the limit, an IPC connection refuses any request
+/// that sets one, so it enforces nothing and cannot claim otherwise. A consumer
+/// that sends the editor row limit only to drivers advertising this bit then
+/// builds a limit-less request, the one a remote driver that refuses limits can
+/// still run.
+fn without_request_row_limit(mut capabilities: DriverCapabilities) -> DriverCapabilities {
+    capabilities.remove(DriverCapabilities::REQUEST_ROW_LIMIT);
+    capabilities
+}
+
+/// Whether bulk schema column loads (`SchemaColumns`) are available on the
+/// negotiated driver RPC version. Introduced in v1.4; mirrors
+/// `protocol_supports_semantic_planning` in the transport, which assumes
+/// future major versions stay forward-compatible.
+fn protocol_supports_bulk_schema_columns(version: ProtocolVersion) -> bool {
+    version.major > DRIVER_RPC_VERSION.major
+        || (version.major == DRIVER_RPC_VERSION.major && version.minor >= 4)
+}
+
+/// Refuse bulk schema column loads locally, before anything is sent, when the
+/// negotiated driver RPC version predates the `SchemaColumns` request. The
+/// `NotSupported` error is the established "no bulk path" signal, so consumers
+/// fall back to per-table `table_details` loads.
+#[allow(clippy::result_large_err)]
+fn ensure_bulk_schema_columns_supported(version: ProtocolVersion) -> Result<(), DbError> {
+    if !protocol_supports_bulk_schema_columns(version) {
+        return Err(DbError::NotSupported(
+            "the negotiated driver RPC protocol does not support bulk schema column loads"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether the key count request (`KvKeyCount`) is available on the
+/// negotiated driver RPC version. Introduced in v1.5.
+fn protocol_supports_key_count(version: ProtocolVersion) -> bool {
+    version.major > DRIVER_RPC_VERSION.major
+        || (version.major == DRIVER_RPC_VERSION.major && version.minor >= 5)
+}
+
+/// Refuse key counts locally, before anything is sent, when the negotiated
+/// driver RPC version predates the `KvKeyCount` request. An older host cannot
+/// decode the new variant, so the call must never reach it; `NotSupported`
+/// matches the trait default, which consumers already treat as "no total".
+#[allow(clippy::result_large_err)]
+fn ensure_key_count_supported(version: ProtocolVersion) -> Result<(), DbError> {
+    if !protocol_supports_key_count(version) {
+        return Err(DbError::NotSupported(
+            "the negotiated driver RPC protocol does not support key counts".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IpcConnection, ensure_bulk_schema_columns_supported, ensure_key_count_supported};
+    use crate::transport::RpcClient;
+    use datatab_core::{
+        Connection, DatabaseCategory, DbError, DbKind, DriverCapabilities, DriverMetadataBuilder,
+        KeyValueApi, QueryLanguage, QueryRequest, Value,
+    };
+    use datatab_core::{
+        ExecutionClassification, LocalizedText, RootItemPresentation, RootSectionAction,
+        RootSectionDef, RootSectionItem, RootSectionPage, RootSectionPresentation,
+    };
+    use datatab_ipc::ProtocolVersion;
+    use datatab_ipc::driver_protocol::{
+        DriverRequestBody, DriverResponseBody, DriverRpcError, DriverRpcErrorCode, QueryResultDto,
+        QueryResultShapeDto,
+    };
+    use datatab_ipc::driver_socket_name;
+    use datatab_test_support::{FakeDriverAction, FakeDriverRpcConfig, FakeDriverRpcServer};
+    use std::{sync::Arc, time::Duration};
+    use uuid::Uuid;
+
+    #[test]
+    fn protected_ipc_calls_do_not_reach_transport() {
+        let socket_id = format!("protected-ipc-{}", Uuid::new_v4());
+        let server = FakeDriverRpcServer::start(
+            FakeDriverRpcConfig::new(&socket_id)
+                .with_actions(vec![FakeDriverAction::Pong, FakeDriverAction::Pong]),
+        )
+        .expect("start server");
+        let socket_name = driver_socket_name(&socket_id).expect("socket name");
+        let client = Arc::new(RpcClient::connect(socket_name.borrow()).expect("connect"));
+        let connection = IpcConnection::new(
+            client,
+            Uuid::nil(),
+            DbKind::SQLite,
+            DriverMetadataBuilder::new(
+                "test",
+                "Test",
+                DatabaseCategory::Relational,
+                QueryLanguage::Sql,
+            )
+            .build(),
+            datatab_core::DriverCapabilities::empty(),
+            datatab_core::SchemaLoadingStrategy::SingleDatabase,
+            datatab_core::SchemaFeatures::empty(),
+            datatab_core::CodeGenCapabilities::empty(),
+        );
+
+        let mut timed = QueryRequest::new("SELECT 1");
+        timed.statement_timeout = Some(Duration::ZERO);
+        for request in [
+            QueryRequest::new("SELECT 1").with_limit(0),
+            timed,
+            QueryRequest::new("SELECT 1")
+                .with_read_only(datatab_core::ReadOnlyEnforcement::Required),
+        ] {
+            assert!(matches!(
+                connection.execute(&request),
+                Err(DbError::NotSupported(_))
+            ));
+            assert!(matches!(
+                connection.execute_with_handle(&request),
+                Err(DbError::NotSupported(_))
+            ));
+        }
+        // Both scripted pongs must remain available: neither protected call consumed a frame.
+        assert!(connection.ping().is_ok());
+        assert!(connection.ping().is_ok());
+        server.wait().expect("server completed");
+    }
+
+    #[test]
+    fn ipc_metadata_never_claims_enforcement_it_refuses() {
+        let mut metadata = DriverMetadataBuilder::new(
+            "test",
+            "Test",
+            DatabaseCategory::Relational,
+            QueryLanguage::Sql,
+        )
+        .capabilities(DriverCapabilities::REQUEST_ROW_LIMIT)
+        .build();
+        metadata.transactions = Some(datatab_core::TransactionCapabilities {
+            supports_read_only: true,
+            ..datatab_core::TransactionCapabilities::default()
+        });
+
+        let sanitized = super::without_uncertifiable_enforcement(metadata);
+
+        assert!(!sanitized.enforces_read_only());
+        assert!(!sanitized.supports(DriverCapabilities::REQUEST_ROW_LIMIT));
+    }
+
+    /// A remote driver that declares it enforces a row limit still cannot be
+    /// sent one over a pre-1.6 session, which has no way to report truncation,
+    /// so the connection must not repeat the claim: a consumer that reads it
+    /// back builds a request the connection refuses, and the editor query never
+    /// reaches the driver.
+    #[test]
+    fn pre_v1_6_session_never_advertises_row_limit_enforcement() {
+        let socket_id = format!("row-limit-ipc-{}", Uuid::new_v4());
+        let server = FakeDriverRpcServer::start(
+            FakeDriverRpcConfig::new(&socket_id)
+                .with_protocol_version(ProtocolVersion::new(1, 5))
+                .with_actions(vec![FakeDriverAction::Pong]),
+        )
+        .expect("start server");
+        let socket_name = driver_socket_name(&socket_id).expect("socket name");
+        let client = Arc::new(RpcClient::connect(socket_name.borrow()).expect("connect"));
+        let connection = IpcConnection::new(
+            client,
+            Uuid::nil(),
+            DbKind::SQLite,
+            DriverMetadataBuilder::new(
+                "test",
+                "Test",
+                DatabaseCategory::Relational,
+                QueryLanguage::Sql,
+            )
+            .capabilities(DriverCapabilities::REQUEST_ROW_LIMIT)
+            .build(),
+            DriverCapabilities::REQUEST_ROW_LIMIT,
+            datatab_core::SchemaLoadingStrategy::SingleDatabase,
+            datatab_core::SchemaFeatures::empty(),
+            datatab_core::CodeGenCapabilities::empty(),
+        );
+
+        assert!(
+            !connection
+                .metadata()
+                .supports(DriverCapabilities::REQUEST_ROW_LIMIT)
+        );
+        assert!(!connection.supports(DriverCapabilities::REQUEST_ROW_LIMIT));
+        assert!(
+            !connection
+                .capabilities()
+                .contains(DriverCapabilities::REQUEST_ROW_LIMIT)
+        );
+        assert!(matches!(
+            connection.execute(&QueryRequest::new("SELECT 1").with_limit(500)),
+            Err(DbError::NotSupported(_))
+        ));
+        assert!(matches!(
+            connection.execute_with_handle(&QueryRequest::new("SELECT 1").with_limit(500)),
+            Err(DbError::NotSupported(_))
+        ));
+        // The refusal stayed local: the scripted pong is still available.
+        assert!(connection.ping().is_ok());
+        server.wait().expect("server completed");
+    }
+
+    fn connection_declaring(
+        client: Arc<RpcClient>,
+        metadata_capabilities: DriverCapabilities,
+        capabilities: DriverCapabilities,
+    ) -> IpcConnection {
+        IpcConnection::new(
+            client,
+            Uuid::nil(),
+            DbKind::SQLite,
+            DriverMetadataBuilder::new(
+                "test",
+                "Test",
+                DatabaseCategory::Relational,
+                QueryLanguage::Sql,
+            )
+            .capabilities(metadata_capabilities)
+            .build(),
+            capabilities,
+            datatab_core::SchemaLoadingStrategy::SingleDatabase,
+            datatab_core::SchemaFeatures::empty(),
+            datatab_core::CodeGenCapabilities::empty(),
+        )
+    }
+
+    fn two_row_result() -> QueryResultDto {
+        QueryResultDto {
+            shape: QueryResultShapeDto::Table,
+            columns: Vec::new(),
+            rows: vec![vec![Value::Int(1)], vec![Value::Int(2)]],
+            affected_rows: None,
+            execution_time_ms: 1,
+            text_body: None,
+            raw_bytes: None,
+            next_page_token: None,
+        }
+    }
+
+    #[test]
+    fn v1_6_session_forwards_declared_row_limit_and_surfaces_truncation() {
+        let socket_id = format!("row-limit-v16-{}", Uuid::new_v4());
+        let server = FakeDriverRpcServer::start(
+            FakeDriverRpcConfig::new(&socket_id)
+                .with_protocol_version(ProtocolVersion::new(1, 6))
+                .with_driver_capabilities(DriverCapabilities::REQUEST_ROW_LIMIT)
+                .with_actions(vec![
+                    FakeDriverAction::respond(DriverResponseBody::ExecuteResultWithTruncation {
+                        result: two_row_result(),
+                        rows_truncated: true,
+                    }),
+                    FakeDriverAction::respond(
+                        DriverResponseBody::ExecuteWithHandleResultWithTruncation {
+                            handle_id: Uuid::nil(),
+                            result: two_row_result(),
+                            rows_truncated: true,
+                        },
+                    ),
+                    FakeDriverAction::respond(DriverResponseBody::ExecuteResultWithTruncation {
+                        result: two_row_result(),
+                        rows_truncated: false,
+                    }),
+                    FakeDriverAction::Pong,
+                ]),
+        )
+        .expect("start server");
+        let socket_name = driver_socket_name(&socket_id).expect("socket name");
+        let client = Arc::new(RpcClient::connect(socket_name.borrow()).expect("connect"));
+        let connection = connection_declaring(
+            client,
+            DriverCapabilities::REQUEST_ROW_LIMIT,
+            DriverCapabilities::REQUEST_ROW_LIMIT,
+        );
+
+        assert!(
+            connection
+                .metadata()
+                .supports(DriverCapabilities::REQUEST_ROW_LIMIT)
+        );
+        assert!(connection.supports(DriverCapabilities::REQUEST_ROW_LIMIT));
+        assert!(
+            connection
+                .capabilities()
+                .contains(DriverCapabilities::REQUEST_ROW_LIMIT)
+        );
+
+        let limited = QueryRequest::new("SELECT 1").with_limit(2);
+        let result = connection.execute(&limited).expect("limited execute");
+        assert!(result.rows_truncated());
+        assert_eq!(result.rows.len(), 2);
+
+        let (_handle, result) = connection
+            .execute_with_handle(&limited)
+            .expect("limited execute with handle");
+        assert!(result.rows_truncated());
+
+        let result = connection.execute(&limited).expect("untruncated execute");
+        assert!(!result.rows_truncated());
+
+        // Timeout and read-only enforcement stay refused locally on 1.6.
+        let mut timed = QueryRequest::new("SELECT 1");
+        timed.statement_timeout = Some(Duration::ZERO);
+        for request in [
+            timed,
+            QueryRequest::new("SELECT 1")
+                .with_read_only(datatab_core::ReadOnlyEnforcement::Required),
+        ] {
+            assert!(matches!(
+                connection.execute(&request),
+                Err(DbError::NotSupported(_))
+            ));
+            assert!(matches!(
+                connection.execute_with_handle(&request),
+                Err(DbError::NotSupported(_))
+            ));
+        }
+        assert!(connection.ping().is_ok());
+
+        let limits: Vec<Option<u32>> = server
+            .received_requests()
+            .into_iter()
+            .filter_map(|body| match body {
+                DriverRequestBody::Execute { request }
+                | DriverRequestBody::ExecuteWithHandle { request } => Some(request.limit),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(limits, vec![Some(2), Some(2), Some(2)]);
+        server.wait().expect("server completed");
+    }
+
+    fn result_sets() -> datatab_ipc::driver_protocol::QueryResultSetsDto {
+        use datatab_ipc::driver_protocol::{QueryResultSetsDto, ResultSetDto};
+
+        let labelled = |label: &str, rows_truncated: bool| {
+            let mut result = two_row_result();
+            result.text_body = Some(label.to_string());
+            ResultSetDto {
+                result,
+                rows_truncated,
+            }
+        };
+        QueryResultSetsDto {
+            primary: labelled("primary", true),
+            additional: vec![labelled("second", false), labelled("third", true)],
+        }
+    }
+
+    fn result_set_summary(result: &datatab_core::QueryResult) -> Vec<(Option<&str>, bool, usize)> {
+        result
+            .iter_result_sets()
+            .map(|set| {
+                (
+                    set.text_body.as_deref(),
+                    set.rows_truncated(),
+                    set.rows.len(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn v1_7_session_surfaces_every_result_set_with_its_truncation_flag() {
+        let socket_id = format!("result-sets-v17-{}", Uuid::new_v4());
+        let server = FakeDriverRpcServer::start(
+            FakeDriverRpcConfig::new(&socket_id)
+                .with_protocol_version(ProtocolVersion::new(1, 7))
+                .with_driver_capabilities(DriverCapabilities::REQUEST_ROW_LIMIT)
+                .with_actions(vec![
+                    FakeDriverAction::respond(DriverResponseBody::ExecuteResultSets {
+                        results: result_sets(),
+                    }),
+                    FakeDriverAction::respond(DriverResponseBody::ExecuteWithHandleResultSets {
+                        handle_id: Uuid::nil(),
+                        results: result_sets(),
+                    }),
+                    FakeDriverAction::respond(DriverResponseBody::BrowseResultSets {
+                        results: result_sets(),
+                    }),
+                    FakeDriverAction::respond(DriverResponseBody::BrowseResultSets {
+                        results: result_sets(),
+                    }),
+                ]),
+        )
+        .expect("start server");
+        let socket_name = driver_socket_name(&socket_id).expect("socket name");
+        let client = Arc::new(RpcClient::connect(socket_name.borrow()).expect("connect"));
+        let connection = connection_declaring(
+            client,
+            DriverCapabilities::REQUEST_ROW_LIMIT,
+            DriverCapabilities::REQUEST_ROW_LIMIT,
+        );
+        let expected = vec![
+            (Some("primary"), true, 2),
+            (Some("second"), false, 2),
+            (Some("third"), true, 2),
+        ];
+
+        let limited = QueryRequest::new("SELECT 1; SELECT 2; SELECT 3").with_limit(2);
+        let result = connection.execute(&limited).expect("execute");
+        assert_eq!(result_set_summary(&result), expected);
+
+        let (_handle, result) = connection
+            .execute_with_handle(&limited)
+            .expect("execute with handle");
+        assert_eq!(result_set_summary(&result), expected);
+
+        // Explain and describe share the browse response. A bare table or
+        // collection browse cannot be decoded by the fake server yet (#1042).
+        let table = datatab_core::TableRef::new("events");
+        let result = connection
+            .explain(&datatab_core::ExplainRequest::new(table.clone()))
+            .expect("explain");
+        assert_eq!(result_set_summary(&result), expected);
+
+        let result = connection
+            .describe_table(&datatab_core::DescribeRequest::new(table))
+            .expect("describe table");
+        assert_eq!(result_set_summary(&result), expected);
+
+        server.wait().expect("server completed");
+    }
+
+    #[test]
+    fn v1_6_session_without_declared_row_limit_refuses_limit_locally() {
+        let socket_id = format!("row-limit-undeclared-{}", Uuid::new_v4());
+        let server = FakeDriverRpcServer::start(
+            FakeDriverRpcConfig::new(&socket_id)
+                .with_protocol_version(ProtocolVersion::new(1, 6))
+                .with_actions(vec![FakeDriverAction::Pong]),
+        )
+        .expect("start server");
+        let socket_name = driver_socket_name(&socket_id).expect("socket name");
+        let client = Arc::new(RpcClient::connect(socket_name.borrow()).expect("connect"));
+        // Metadata is the declaration; a capability bit without it is ignored.
+        let connection = connection_declaring(
+            client,
+            DriverCapabilities::empty(),
+            DriverCapabilities::REQUEST_ROW_LIMIT,
+        );
+
+        assert!(
+            !connection
+                .metadata()
+                .supports(DriverCapabilities::REQUEST_ROW_LIMIT)
+        );
+        assert!(!connection.supports(DriverCapabilities::REQUEST_ROW_LIMIT));
+        assert!(matches!(
+            connection.execute(&QueryRequest::new("SELECT 1").with_limit(2)),
+            Err(DbError::NotSupported(_))
+        ));
+        assert!(matches!(
+            connection.execute_with_handle(&QueryRequest::new("SELECT 1").with_limit(2)),
+            Err(DbError::NotSupported(_))
+        ));
+        assert!(connection.ping().is_ok());
+        assert!(
+            server
+                .received_requests()
+                .iter()
+                .all(|body| matches!(body, DriverRequestBody::Ping))
+        );
+        server.wait().expect("server completed");
+    }
+
+    #[test]
+    fn unprotected_ipc_calls_reach_transport() {
+        let socket_id = format!("unprotected-ipc-{}", Uuid::new_v4());
+        let server = FakeDriverRpcServer::start(
+            FakeDriverRpcConfig::new(&socket_id)
+                .with_actions(vec![FakeDriverAction::Pong, FakeDriverAction::Pong]),
+        )
+        .expect("start server");
+        let socket_name = driver_socket_name(&socket_id).expect("socket name");
+        let client = Arc::new(RpcClient::connect(socket_name.borrow()).expect("connect"));
+        let connection = IpcConnection::new(
+            client,
+            Uuid::nil(),
+            DbKind::SQLite,
+            DriverMetadataBuilder::new(
+                "test",
+                "Test",
+                DatabaseCategory::Relational,
+                QueryLanguage::Sql,
+            )
+            .build(),
+            datatab_core::DriverCapabilities::empty(),
+            datatab_core::SchemaLoadingStrategy::SingleDatabase,
+            datatab_core::SchemaFeatures::empty(),
+            datatab_core::CodeGenCapabilities::empty(),
+        );
+        let request = QueryRequest::new("SELECT 1");
+        assert!(connection.execute(&request).is_err());
+        assert!(connection.execute_with_handle(&request).is_err());
+        server
+            .wait()
+            .expect("both calls consumed their scripted responses");
+    }
+
+    #[test]
+    fn bulk_schema_columns_refused_below_v1_4() {
+        let result = ensure_bulk_schema_columns_supported(ProtocolVersion::new(1, 3));
+
+        match result {
+            Err(DbError::NotSupported(message)) => {
+                assert!(message.contains("bulk schema column loads"));
+            }
+            other => panic!("expected NotSupported refusal, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bulk_schema_columns_allowed_from_v1_4() {
+        assert!(ensure_bulk_schema_columns_supported(ProtocolVersion::new(1, 4)).is_ok());
+        assert!(ensure_bulk_schema_columns_supported(ProtocolVersion::new(1, 5)).is_ok());
+    }
+
+    #[test]
+    fn key_count_against_an_older_host_is_not_supported_without_a_frame() {
+        let socket_id = format!("key-count-ipc-{}", Uuid::new_v4());
+        let server = FakeDriverRpcServer::start(
+            FakeDriverRpcConfig::new(&socket_id).with_actions(vec![FakeDriverAction::Pong]),
+        )
+        .expect("start server");
+        let socket_name = driver_socket_name(&socket_id).expect("socket name");
+        let client = Arc::new(RpcClient::connect(socket_name.borrow()).expect("connect"));
+        let connection = IpcConnection::new(
+            client,
+            Uuid::nil(),
+            DbKind::Redis,
+            DriverMetadataBuilder::new(
+                "test",
+                "Test",
+                DatabaseCategory::KeyValue,
+                QueryLanguage::RedisCommands,
+            )
+            .build(),
+            datatab_core::DriverCapabilities::empty(),
+            datatab_core::SchemaLoadingStrategy::SingleDatabase,
+            datatab_core::SchemaFeatures::empty(),
+            datatab_core::CodeGenCapabilities::empty(),
+        );
+
+        assert!(matches!(
+            KeyValueApi::key_count(&connection, None),
+            Err(DbError::NotSupported(_))
+        ));
+        // The scripted pong must remain available: the refused count sent nothing.
+        assert!(connection.ping().is_ok());
+        server.wait().expect("server completed");
+    }
+
+    #[test]
+    fn key_count_refused_below_v1_5() {
+        let result = ensure_key_count_supported(ProtocolVersion::new(1, 4));
+
+        match result {
+            Err(DbError::NotSupported(message)) => {
+                assert!(message.contains("key counts"));
+            }
+            other => panic!("expected NotSupported refusal, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn key_count_allowed_from_v1_5() {
+        assert!(ensure_key_count_supported(ProtocolVersion::new(1, 5)).is_ok());
+        assert!(ensure_key_count_supported(ProtocolVersion::new(1, 6)).is_ok());
+    }
+
+    fn buckets_section() -> RootSectionDef {
+        RootSectionDef {
+            id: "buckets".into(),
+            label: LocalizedText::keyed("sidebar.buckets", "Buckets"),
+            counted_label_key: None,
+            empty_label: LocalizedText::plain("No buckets"),
+            presentation: Some(RootSectionPresentation::ObjectContainerTable),
+            item_presentation: RootItemPresentation::ObjectBrowser,
+            opens_on_profile_activation: true,
+            item_actions: vec![RootSectionAction {
+                id: "delete".into(),
+                label: LocalizedText::plain("Delete bucket"),
+                description: None,
+                classification: ExecutionClassification::AdminDestructive,
+            }],
+        }
+    }
+
+    fn driver_error(message: &str) -> DriverResponseBody {
+        DriverResponseBody::Error(DriverRpcError {
+            code: DriverRpcErrorCode::Driver,
+            message: message.into(),
+            retriable: false,
+        })
+    }
+
+    fn root_section_server(
+        name: &str,
+        version: ProtocolVersion,
+        actions: Vec<FakeDriverAction>,
+    ) -> (FakeDriverRpcServer, IpcConnection) {
+        let socket_id = format!("{name}-{}", Uuid::new_v4());
+        let server = FakeDriverRpcServer::start(
+            FakeDriverRpcConfig::new(&socket_id)
+                .with_protocol_version(version)
+                .with_driver_capabilities(DriverCapabilities::ROOT_SECTIONS)
+                .with_actions(actions),
+        )
+        .expect("start server");
+        let socket_name = driver_socket_name(&socket_id).expect("socket name");
+        let client = Arc::new(RpcClient::connect(socket_name.borrow()).expect("connect"));
+        let connection = connection_declaring(
+            client,
+            DriverCapabilities::ROOT_SECTIONS,
+            DriverCapabilities::ROOT_SECTIONS,
+        );
+        (server, connection)
+    }
+
+    #[test]
+    fn v1_9_session_reaches_the_remote_root_sections_page_and_action() {
+        let page = RootSectionPage {
+            items: vec![RootSectionItem {
+                id: "logs".into(),
+                label: "logs".into(),
+            }],
+            next_page_token: Some("page-3".into()),
+        };
+        let (server, connection) = root_section_server(
+            "root-sections-v19",
+            ProtocolVersion::new(1, 9),
+            vec![
+                FakeDriverAction::respond(DriverResponseBody::RootSections {
+                    sections: vec![buckets_section()],
+                }),
+                FakeDriverAction::respond(DriverResponseBody::RootSectionPage {
+                    page: page.clone(),
+                }),
+                FakeDriverAction::respond(DriverResponseBody::RootSectionActionDone),
+            ],
+        );
+
+        let source = connection
+            .root_section_source()
+            .expect("a declaring v1.9 driver exposes root sections");
+        assert_eq!(
+            source.sections().expect("sections"),
+            vec![buckets_section()]
+        );
+        // The declaration is cached: the second read sends no frame.
+        assert_eq!(
+            source.sections().expect("cached sections"),
+            vec![buckets_section()]
+        );
+        assert_eq!(
+            source
+                .list_items("buckets", Some("page-2"))
+                .expect("list items"),
+            page
+        );
+        source
+            .execute_action("buckets", "logs", "delete")
+            .expect("execute action");
+
+        let requests = server.received_requests();
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        assert!(matches!(requests[0], DriverRequestBody::RootSections));
+        assert!(matches!(
+            &requests[1],
+            DriverRequestBody::RootSectionItems { section_id, page_token }
+                if section_id == "buckets" && page_token.as_deref() == Some("page-2")
+        ));
+        assert!(matches!(
+            &requests[2],
+            DriverRequestBody::ExecuteRootSectionAction { section_id, item_id, action_id }
+                if section_id == "buckets" && item_id == "logs" && action_id == "delete"
+        ));
+        server.wait().expect("server completed");
+    }
+
+    #[test]
+    fn remote_root_section_errors_reach_the_host() {
+        let (server, connection) = root_section_server(
+            "root-sections-errors",
+            ProtocolVersion::new(1, 9),
+            vec![
+                FakeDriverAction::respond(driver_error("listing exploded")),
+                FakeDriverAction::respond(driver_error("delete refused")),
+            ],
+        );
+        let source = connection.root_section_source().expect("root sections");
+
+        match source.list_items("buckets", None) {
+            Err(error) => assert!(error.to_string().contains("listing exploded"), "{error}"),
+            Ok(page) => panic!("expected an error, got {page:?}"),
+        }
+        match source.execute_action("buckets", "logs", "delete") {
+            Err(error) => assert!(error.to_string().contains("delete refused"), "{error}"),
+            Ok(()) => panic!("expected an error"),
+        }
+        server.wait().expect("server completed");
+    }
+
+    #[test]
+    fn a_failed_section_fetch_is_not_cached() {
+        let (server, connection) = root_section_server(
+            "root-sections-retry",
+            ProtocolVersion::new(1, 9),
+            vec![
+                FakeDriverAction::respond(driver_error("not ready")),
+                FakeDriverAction::respond(DriverResponseBody::RootSections {
+                    sections: vec![buckets_section()],
+                }),
+            ],
+        );
+        let source = connection.root_section_source().expect("root sections");
+
+        match source.sections() {
+            Err(error) => assert!(error.to_string().contains("not ready"), "{error}"),
+            Ok(sections) => panic!("expected the host error, got {sections:?}"),
+        }
+        assert_eq!(
+            source.sections().expect("sections after the retry"),
+            vec![buckets_section()]
+        );
+        server.wait().expect("server completed");
+    }
+
+    #[test]
+    fn pre_v1_9_session_hides_root_sections_without_a_frame() {
+        let (server, connection) = root_section_server(
+            "root-sections-v18",
+            ProtocolVersion::new(1, 8),
+            vec![FakeDriverAction::Pong],
+        );
+
+        assert!(connection.root_section_source().is_none());
+        assert!(!connection.supports(DriverCapabilities::ROOT_SECTIONS));
+        assert!(
+            !connection
+                .capabilities()
+                .contains(DriverCapabilities::ROOT_SECTIONS)
+        );
+        assert!(connection.ping().is_ok());
+        assert!(matches!(
+            server.received_requests().as_slice(),
+            [DriverRequestBody::Ping]
+        ));
+        server.wait().expect("server completed");
+    }
+
+    #[test]
+    fn v1_9_driver_without_the_capability_has_no_root_sections() {
+        let socket_id = format!("root-sections-undeclared-{}", Uuid::new_v4());
+        let server = FakeDriverRpcServer::start(
+            FakeDriverRpcConfig::new(&socket_id)
+                .with_protocol_version(ProtocolVersion::new(1, 9))
+                .with_actions(vec![FakeDriverAction::Pong]),
+        )
+        .expect("start server");
+        let socket_name = driver_socket_name(&socket_id).expect("socket name");
+        let client = Arc::new(RpcClient::connect(socket_name.borrow()).expect("connect"));
+        let connection = connection_declaring(
+            client,
+            DriverCapabilities::empty(),
+            DriverCapabilities::empty(),
+        );
+
+        assert!(connection.root_section_source().is_none());
+        assert!(connection.ping().is_ok());
+        server.wait().expect("server completed");
+    }
+}

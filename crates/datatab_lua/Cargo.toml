@@ -1,0 +1,19 @@
+[package]
+name = "datatab_lua"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+datatab_core = { path = "../datatab_core" }
+mlua = { workspace = true, features = ["lua54", "send", "vendored"] }
+log.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true
+tempfile = "3"

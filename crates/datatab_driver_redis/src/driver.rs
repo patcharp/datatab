@@ -1,0 +1,6145 @@
+use std::collections::{HashMap, HashSet};
+use std::sync::LazyLock;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use std::sync::Arc;
+
+use redis::cluster_routing::{RoutingInfo, SingleNodeRoutingInfo};
+
+use datatab_core::secrecy::{ExposeSecret, SecretString};
+
+use crate::language_service::RedisLanguageService;
+use datatab_core::{
+    CancelToken, ColumnKind, ColumnMeta, Connection, ConnectionErrorFormatter, ConnectionExt,
+    ConnectionProfile, DatabaseCategory, DatabaseInfo, DbConfig, DbDriver, DbError, DbKind,
+    DbSchemaInfo, DdlCapabilities, DefaultSqlDialect, DeploymentClass, DiagnosticSeverity,
+    DocumentConnection, DriverCapabilities, DriverFormDef, DriverLimits, DriverMetadata,
+    EditorDiagnostic, ExecutionSourceContext, FormFieldDef, FormFieldKind, FormSection, FormTab,
+    FormValues, FormattedError, HashDeleteRequest, HashSetRequest, Icon, InstanceCatalog,
+    KeyBulkDeleteRequest, KeyBulkGetRequest, KeyDeleteRequest, KeyEntry, KeyExistsRequest,
+    KeyExpireRequest, KeyGetRequest, KeyGetResult, KeyLoadState, KeyMetadata, KeyMetadataRequest,
+    KeyPersistRequest, KeyRenameRequest, KeyScanPage, KeyScanRequest, KeySetRequest, KeySpaceInfo,
+    KeyTtlRequest, KeyType, KeyTypeRequest, KeyValueApi, KeyValueConnection, KeyValueFeatures,
+    KeyValuePrefixRequest, KeyValueSchema, LanguageService, ListEnd, ListPushRequest,
+    ListRemoveRequest, ListSetRequest, LogErr, MutationCapabilities, PaginationStyle,
+    QueryCapabilities, QueryErrorFormatter, QueryGenerator, QueryHandle, QueryLanguage,
+    QueryRequest, QueryResult, RangeOrder, ReadOnlyEnforcement, RelationalConnection,
+    SchemaDropTarget, SchemaLoadingStrategy, SchemaSnapshot, SelectOption, SemanticPlan,
+    SemanticRequest, SetAddRequest, SetCondition, SetRemoveRequest, SqlDialect, SshTunnelConfig,
+    StreamAddRequest, StreamClaimRequest, StreamConsumerGroup, StreamDeleteRequest, StreamEntry,
+    StreamEntryId, StreamGroupsRequest, StreamPendingEntry, StreamPendingRequest, StreamRangePage,
+    StreamRangeRequest, TextPosition, TextPositionRange, TransactionCapabilities, TransferFamily,
+    Value, ValueRepr, WritePrivilege, ZSetAddRequest, ZSetMember, ZSetRangePage, ZSetRangeRequest,
+    ZSetRemoveRequest, field, field_password, field_required, field_use_uri, sanitize_uri, ssh_tab,
+    when_checked, when_field_equals, when_unchecked, with_default,
+};
+use datatab_ssh::{OpenedSshTunnel, SshTunnel};
+
+use crate::transport::{
+    AclCommandAvailability, AclDryRunReply, ClusterScanCursor, ConfiguredTopology,
+    FallbackProbeOutcome, MasterRoleSanity, RedisTransport, RoleClassification, TopologyProbe,
+    classify_acl_command_error, classify_acl_dryrun_reply, classify_fallback_probe_error,
+    classify_role_reply, evaluate_master_role_sanity, is_connection_level_error,
+    parse_cluster_enabled, parse_cluster_slots_masters, parse_configured_topology, parse_node_list,
+    split_host_port, validate_cluster_database,
+};
+use redis::IntoConnectionInfo;
+use redis::sentinel::{SentinelClient, SentinelNodeConnectionInfo, SentinelServerType};
+
+pub static REDIS_FORM: LazyLock<DriverFormDef> = LazyLock::new(|| DriverFormDef {
+    tabs: vec![
+        FormTab {
+            id: "main".into(),
+            label: "Main".into(),
+            sections: vec![
+                FormSection {
+                    title: "Server".into(),
+                    icon: Some(datatab_core::FormSectionIcon::Server),
+                    fields: vec![
+                        field_use_uri(),
+                        when_checked(
+                            field_required(
+                                "uri",
+                                "Connection URI",
+                                FormFieldKind::Text,
+                                "redis://localhost:6379/0",
+                            ),
+                            "use_uri",
+                        ),
+                        when_unchecked(
+                            with_default(
+                                field_required("host", "Host", FormFieldKind::Text, "localhost"),
+                                "localhost",
+                            ),
+                            "use_uri",
+                        ),
+                        when_unchecked(
+                            with_default(
+                                field_required("port", "Port", FormFieldKind::Number, "6379"),
+                                "6379",
+                            ),
+                            "use_uri",
+                        ),
+                        when_unchecked(
+                            with_default(
+                                field("database", "Database Index", FormFieldKind::Number, "0"),
+                                "0",
+                            ),
+                            "use_uri",
+                        ),
+                    ],
+                },
+                FormSection {
+                    title: "Authentication".into(),
+                    icon: Some(datatab_core::FormSectionIcon::Authentication),
+                    fields: vec![
+                        when_unchecked(
+                            field("user", "User", FormFieldKind::Text, "optional"),
+                            "use_uri",
+                        ),
+                        field_password(),
+                    ],
+                },
+                FormSection {
+                    title: "Topology".into(),
+                    icon: Some(datatab_core::FormSectionIcon::Topology),
+                    fields: vec![
+                        with_default(
+                            field(
+                                "topology",
+                                "Topology",
+                                FormFieldKind::Select {
+                                    options: redis_topology_options(),
+                                },
+                                "",
+                            ),
+                            "standalone",
+                        ),
+                        when_field_equals(
+                            field(
+                                "additional_nodes",
+                                "Additional Nodes",
+                                FormFieldKind::Text,
+                                "host1:6379,host2:6379",
+                            ),
+                            "topology",
+                            &["cluster", "sentinel"],
+                        ),
+                        when_field_equals(
+                            field_required(
+                                "sentinel_master_name",
+                                "Sentinel Master Name",
+                                FormFieldKind::Text,
+                                "mymaster",
+                            ),
+                            "topology",
+                            &["sentinel"],
+                        ),
+                    ],
+                },
+            ],
+        },
+        ssh_tab(),
+    ],
+});
+
+fn redis_topology_options() -> Vec<SelectOption> {
+    vec![
+        SelectOption::new("standalone", "Standalone"),
+        SelectOption::new("cluster", "Cluster"),
+        SelectOption::new("sentinel", "Sentinel"),
+    ]
+}
+
+fn plan_redis_mutation(mutation: &datatab_core::MutationRequest) -> Result<SemanticPlan, DbError> {
+    static GENERATOR: crate::command_generator::RedisCommandGenerator =
+        crate::command_generator::RedisCommandGenerator;
+
+    GENERATOR.plan_mutation(mutation).ok_or_else(|| {
+        DbError::NotSupported("Redis semantic planning does not support this mutation".into())
+    })
+}
+
+fn plan_redis_semantic_request(request: &SemanticRequest) -> Result<SemanticPlan, DbError> {
+    match request {
+        SemanticRequest::Mutation(mutation) => plan_redis_mutation(mutation),
+        SemanticRequest::TableBrowse(_)
+        | SemanticRequest::TableCount(_)
+        | SemanticRequest::Aggregate(_)
+        | SemanticRequest::CollectionBrowse(_)
+        | SemanticRequest::CollectionCount(_) => Err(DbError::NotSupported(
+            "Redis semantic planning does not support relational or collection browse/count requests"
+                .into(),
+        )),
+        SemanticRequest::Explain(_) | SemanticRequest::Describe(_) => Err(DbError::NotSupported(
+            "Redis semantic planning does not support explain or describe requests".into(),
+        )),
+    }
+}
+
+/// Redis driver metadata.
+pub static REDIS_METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverMetadata {
+    id: "redis".into(),
+    display_name: "Redis".into(),
+    description: "In-memory key-value database".into(),
+    category: DatabaseCategory::KeyValue,
+    transfer_family: TransferFamily::Incompatible,
+    deployment_class: Some(DeploymentClass::SelfHosted),
+    query_language: QueryLanguage::RedisCommands,
+    capabilities: DriverCapabilities::from_bits_truncate(
+        DriverCapabilities::KEYVALUE_BASE.bits()
+            | DriverCapabilities::MULTIPLE_DATABASES.bits()
+            | DriverCapabilities::KV_TTL.bits()
+            | DriverCapabilities::KV_KEY_TYPES.bits()
+            | DriverCapabilities::KV_VALUE_SIZE.bits()
+            | DriverCapabilities::KV_RENAME.bits()
+            | DriverCapabilities::KV_BULK_GET.bits()
+            | DriverCapabilities::KV_STREAM_RANGE.bits()
+            | DriverCapabilities::KV_STREAM_ADD.bits()
+            | DriverCapabilities::KV_STREAM_DELETE.bits()
+            | DriverCapabilities::AUTHENTICATION.bits()
+            | DriverCapabilities::SSH_TUNNEL.bits()
+            | DriverCapabilities::SSL.bits()
+            | DriverCapabilities::INSTANCE_METRICS.bits()
+            | DriverCapabilities::INSTANCE_INSPECTOR.bits()
+            | DriverCapabilities::CHART_AUTHORING.bits()
+            | DriverCapabilities::NATIVE_CONSOLE.bits()
+            | DriverCapabilities::REQUEST_ROW_LIMIT.bits(),
+    ),
+    default_port: Some(6379),
+    uri_scheme: "redis".into(),
+    icon: Icon::Redis,
+    syntax: None,
+    query: Some(QueryCapabilities {
+        pagination: vec![PaginationStyle::Cursor],
+        where_operators: vec![],
+        supports_order_by: false,
+        order_by_mode: datatab_core::OrderByMode::None,
+        supports_group_by: false,
+        supports_having: false,
+        supports_distinct: false,
+        supports_limit: false,
+        supports_offset: false,
+        supports_joins: false,
+        supports_subqueries: false,
+        supports_union: false,
+        supports_intersect: false,
+        supports_except: false,
+        supports_case_expressions: false,
+        supports_window_functions: false,
+        supports_ctes: false,
+        supports_explain: false,
+        max_query_parameters: 0,
+        max_order_by_columns: 0,
+        max_group_by_columns: 0,
+    }),
+    mutation: Some(MutationCapabilities {
+        supports_insert: true,
+        supports_update: true,
+        supports_delete: true,
+        supports_upsert: false,
+        supports_returning: false,
+        supports_batch: true,
+        supports_bulk_update: false,
+        supports_bulk_delete: true,
+        max_insert_values: 0,
+    }),
+    ddl: Some(DdlCapabilities {
+        supports_create_database: false,
+        supports_drop_database: false,
+        supports_create_table: false,
+        supports_drop_table: false,
+        supports_alter_table: false,
+        supports_create_index: false,
+        supports_drop_index: false,
+        supports_create_view: false,
+        supports_drop_view: false,
+        supports_create_trigger: false,
+        supports_drop_trigger: false,
+        transactional_ddl: false,
+        supports_add_column: false,
+        supports_drop_column: false,
+        supports_rename_column: false,
+        supports_alter_column: false,
+        supports_add_constraint: false,
+        supports_drop_constraint: false,
+    }),
+    transactions: Some(TransactionCapabilities {
+        supports_transactions: true,
+        supported_isolation_levels: vec![],
+        default_isolation_level: None,
+        supports_savepoints: false,
+        supports_nested_transactions: false,
+        // Honoured by DataTab, not by the server: every command of a
+        // `Required` request is checked against the flags the server reports
+        // in `COMMAND INFO` before it is sent; see `crate::read_only`.
+        supports_read_only: true,
+        supports_deferrable: false,
+    }),
+    limits: Some(DriverLimits {
+        max_query_length: 0,
+        max_parameters: 0,
+        max_result_rows: 0,
+        max_connections: 0,
+        max_nested_subqueries: 0,
+        max_identifier_length: 0,
+        max_columns: 0,
+        max_indexes_per_table: 0,
+        max_bulk_insert_rows: 0,
+    }),
+    ssl_modes: Some(&[
+        datatab_core::SslModeOption {
+            id: "off",
+            label: "off",
+        },
+        datatab_core::SslModeOption {
+            id: "on",
+            label: "on (encrypted, server certificate not verified)",
+        },
+        datatab_core::SslModeOption {
+            id: "verify",
+            label: "verify",
+        },
+    ]),
+    ssl_cert_fields: Some(datatab_core::SslCertFields {
+        root_cert: true,
+        client_cert: true,
+    }),
+    classification_override: None,
+    default_chunk_size: None,
+    supports_lock_timeout: false,
+    editor_profile: None,
+});
+
+pub struct RedisDriver;
+
+impl RedisDriver {
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn connect_direct(
+        &self,
+        params: DirectConnectParams<'_>,
+    ) -> Result<Box<dyn Connection>, DbError> {
+        let tls = redis_ssl_mode_to_config(
+            params.ssl_mode,
+            params.ssl_root_cert_path,
+            params.ssl_client_cert_path,
+            params.ssl_client_key_path,
+        )
+        .map_err(DbError::InvalidProfile)?;
+
+        let uri = direct_connection_uri(&tls, params.host, params.port);
+
+        if params.topology == ConfiguredTopology::Sentinel {
+            let sentinel_nodes = build_sentinel_node_uris(&uri, params.additional_nodes);
+
+            return connect_sentinel_master(
+                sentinel_nodes,
+                params.sentinel_master_name,
+                params.user,
+                params.password,
+                params.database,
+                params.ssh_tunnel,
+                |e| format_redis_error(e, params.host, params.port),
+            );
+        }
+
+        if params.topology == ConfiguredTopology::Cluster {
+            validate_cluster_database(params.database)?;
+
+            let mut cluster_connection = build_cluster_connection(
+                &uri,
+                params.additional_nodes,
+                &tls,
+                params.user,
+                params.password,
+            )
+            .map_err(|e| format_redis_error(&e, params.host, params.port))?;
+
+            set_client_name(&mut cluster_connection);
+
+            redis::cmd("PING")
+                .query::<String>(&mut cluster_connection)
+                .map_err(|e| format_redis_error(&e, params.host, params.port))?;
+
+            return Ok(Box::new(RedisConnection {
+                connection: Arc::new(Mutex::new(RedisTransport::Cluster(Box::new(
+                    cluster_connection,
+                )))),
+                active_database: Mutex::new(None),
+                _ssh_tunnel: params.ssh_tunnel,
+            }));
+        }
+
+        let client = match &tls {
+            RedisTlsConfig::Plain | RedisTlsConfig::TlsInsecure => {
+                redis::Client::open(uri.as_str())
+                    .map_err(|e| format_redis_error(&e, params.host, params.port))?
+            }
+            RedisTlsConfig::TlsVerify(certs) => redis::Client::build_with_tls(
+                uri.as_str(),
+                redis::TlsCertificates {
+                    client_tls: certs.client_tls.clone(),
+                    root_cert: certs.root_cert.clone(),
+                },
+            )
+            .map_err(|e| format_redis_error(&e, params.host, params.port))?,
+        };
+
+        let mut connection = client
+            .get_connection()
+            .map_err(|e| format_redis_error(&e, params.host, params.port))?;
+
+        authenticate(&mut connection, params.user, params.password)
+            .map_err(|e| format_redis_error(&e, params.host, params.port))?;
+
+        match detect_topology(&mut connection)
+            .map_err(|e| format_redis_error(&e, params.host, params.port))?
+        {
+            TopologyProbe::Standalone => {
+                if let Some(db) = params.database {
+                    select_db(&mut connection, db)
+                        .map_err(|e| format_redis_error(&e, params.host, params.port))?;
+                }
+
+                set_client_name(&mut connection);
+
+                redis::cmd("PING")
+                    .query::<String>(&mut connection)
+                    .map_err(|e| format_redis_error(&e, params.host, params.port))?;
+
+                Ok(Box::new(RedisConnection {
+                    connection: Arc::new(Mutex::new(RedisTransport::Standalone(Arc::new(
+                        Mutex::new(connection),
+                    )))),
+                    active_database: Mutex::new(params.database),
+                    _ssh_tunnel: params.ssh_tunnel,
+                }))
+            }
+            TopologyProbe::Cluster => {
+                validate_cluster_database(params.database)?;
+
+                let mut cluster_connection =
+                    build_cluster_connection(&uri, &[], &tls, params.user, params.password)
+                        .map_err(|e| format_redis_error(&e, params.host, params.port))?;
+
+                set_client_name(&mut cluster_connection);
+
+                redis::cmd("PING")
+                    .query::<String>(&mut cluster_connection)
+                    .map_err(|e| format_redis_error(&e, params.host, params.port))?;
+
+                Ok(Box::new(RedisConnection {
+                    connection: Arc::new(Mutex::new(RedisTransport::Cluster(Box::new(
+                        cluster_connection,
+                    )))),
+                    active_database: Mutex::new(None),
+                    _ssh_tunnel: params.ssh_tunnel,
+                }))
+            }
+            TopologyProbe::SentinelService => Err(unconfigured_sentinel_topology()),
+        }
+    }
+
+    fn connect_with_uri(
+        &self,
+        params: UriConnectParams<'_>,
+    ) -> Result<Box<dyn Connection>, DbError> {
+        let UriConnectParams {
+            uri,
+            user,
+            password,
+            database,
+            topology,
+            sentinel_master_name,
+            additional_nodes,
+        } = params;
+
+        let has_credentials = uri_authority_has_credentials(uri);
+
+        if topology == ConfiguredTopology::Sentinel {
+            let sentinel_nodes = build_sentinel_node_uris(uri, additional_nodes);
+            let sentinel_password = if has_credentials { None } else { password };
+            let sentinel_user = if has_credentials { None } else { user };
+
+            return connect_sentinel_master(
+                sentinel_nodes,
+                sentinel_master_name,
+                sentinel_user,
+                sentinel_password,
+                database,
+                None,
+                |e| format_redis_uri_error(e, uri),
+            );
+        }
+
+        if topology == ConfiguredTopology::Cluster {
+            validate_cluster_database(database)?;
+
+            // URI mode carries no separate TLS cert configuration; the
+            // scheme (`redis://` / `rediss://`) alone decides TLS, same
+            // as the plain `Client::open(uri)` call above.
+            let cluster_password = if has_credentials { None } else { password };
+            let cluster_user = if has_credentials { None } else { user };
+
+            let mut cluster_connection = build_cluster_connection(
+                uri,
+                additional_nodes,
+                &RedisTlsConfig::Plain,
+                cluster_user,
+                cluster_password,
+            )
+            .map_err(|e| format_redis_uri_error(&e, uri))?;
+
+            set_client_name(&mut cluster_connection);
+
+            redis::cmd("PING")
+                .query::<String>(&mut cluster_connection)
+                .map_err(|e| format_redis_uri_error(&e, uri))?;
+
+            return Ok(Box::new(RedisConnection {
+                connection: Arc::new(Mutex::new(RedisTransport::Cluster(Box::new(
+                    cluster_connection,
+                )))),
+                active_database: Mutex::new(None),
+                _ssh_tunnel: None,
+            }));
+        }
+
+        let client = redis::Client::open(uri).map_err(|e| format_redis_uri_error(&e, uri))?;
+        let mut connection = client
+            .get_connection()
+            .map_err(|e| format_redis_uri_error(&e, uri))?;
+
+        if !has_credentials {
+            authenticate(&mut connection, user, password)
+                .map_err(|e| format_redis_uri_error(&e, uri))?;
+        }
+
+        match detect_topology(&mut connection).map_err(|e| format_redis_uri_error(&e, uri))? {
+            TopologyProbe::Standalone => {
+                if let Some(db) = database {
+                    select_db(&mut connection, db).map_err(|e| format_redis_uri_error(&e, uri))?;
+                }
+
+                set_client_name(&mut connection);
+
+                redis::cmd("PING")
+                    .query::<String>(&mut connection)
+                    .map_err(|e| format_redis_uri_error(&e, uri))?;
+
+                Ok(Box::new(RedisConnection {
+                    connection: Arc::new(Mutex::new(RedisTransport::Standalone(Arc::new(
+                        Mutex::new(connection),
+                    )))),
+                    active_database: Mutex::new(database),
+                    _ssh_tunnel: None,
+                }))
+            }
+            TopologyProbe::Cluster => {
+                validate_cluster_database(database)?;
+
+                // URI mode carries no separate TLS cert configuration; the
+                // scheme (`redis://` / `rediss://`) alone decides TLS, same
+                // as the plain `Client::open(uri)` call above.
+                let cluster_password = if has_credentials { None } else { password };
+                let cluster_user = if has_credentials { None } else { user };
+
+                let mut cluster_connection = build_cluster_connection(
+                    uri,
+                    &[],
+                    &RedisTlsConfig::Plain,
+                    cluster_user,
+                    cluster_password,
+                )
+                .map_err(|e| format_redis_uri_error(&e, uri))?;
+
+                set_client_name(&mut cluster_connection);
+
+                redis::cmd("PING")
+                    .query::<String>(&mut cluster_connection)
+                    .map_err(|e| format_redis_uri_error(&e, uri))?;
+
+                Ok(Box::new(RedisConnection {
+                    connection: Arc::new(Mutex::new(RedisTransport::Cluster(Box::new(
+                        cluster_connection,
+                    )))),
+                    active_database: Mutex::new(None),
+                    _ssh_tunnel: None,
+                }))
+            }
+            TopologyProbe::SentinelService => Err(unconfigured_sentinel_topology()),
+        }
+    }
+
+    fn connect_via_ssh_tunnel(
+        &self,
+        tunnel_config: &SshTunnelConfig,
+        config: &ExtractedRedisConfig,
+        ssh_secret: Option<&str>,
+        password: Option<&str>,
+    ) -> Result<Box<dyn Connection>, DbError> {
+        // Checks the address `connect_direct` builds behind the tunnel, so a
+        // refused profile never logs in to the SSH host. The configured host is
+        // not used here, because one that does not parse would pass the check.
+        if config.topology == ConfiguredTopology::Sentinel {
+            let tls = redis_ssl_mode_to_config(
+                config.ssl_mode.as_deref(),
+                config.ssl_root_cert_path.as_deref(),
+                config.ssl_client_cert_path.as_deref(),
+                config.ssl_client_key_path.as_deref(),
+            )
+            .map_err(DbError::InvalidProfile)?;
+            refuse_sentinel_tls(&[direct_connection_uri(
+                &tls,
+                SSH_TUNNEL_LOCAL_HOST,
+                config.port,
+            )])?;
+        }
+
+        let OpenedSshTunnel { tunnel, .. } =
+            datatab_ssh::open_tunnel(tunnel_config, ssh_secret, &config.host, config.port)?;
+        let local_port = tunnel.local_port();
+
+        self.connect_direct(DirectConnectParams {
+            host: SSH_TUNNEL_LOCAL_HOST,
+            port: local_port,
+            ssl_mode: config.ssl_mode.as_deref(),
+            ssl_root_cert_path: config.ssl_root_cert_path.as_deref(),
+            ssl_client_cert_path: config.ssl_client_cert_path.as_deref(),
+            ssl_client_key_path: config.ssl_client_key_path.as_deref(),
+            user: config.user.as_deref(),
+            password,
+            database: config.database,
+            topology: config.topology,
+            sentinel_master_name: config.sentinel_master_name.as_deref(),
+            additional_nodes: &config.additional_nodes,
+            ssh_tunnel: Some(tunnel),
+        })
+    }
+}
+
+impl Default for RedisDriver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DbDriver for RedisDriver {
+    fn kind(&self) -> DbKind {
+        DbKind::Redis
+    }
+
+    fn metadata(&self) -> &DriverMetadata {
+        &REDIS_METADATA
+    }
+
+    fn driver_key(&self) -> datatab_core::DriverKey {
+        "builtin:redis".into()
+    }
+
+    fn settings_schema(&self) -> Option<Arc<DriverFormDef>> {
+        Some(Arc::new(DriverFormDef {
+            tabs: vec![FormTab {
+                id: "settings".into(),
+                label: "Settings".into(),
+                sections: vec![
+                    FormSection {
+                        title: "Key Scanning".into(),
+                        icon: None,
+                        fields: vec![
+                            FormFieldDef {
+                                id: "scan_batch_size".into(),
+                                label: "Scan batch size".into(),
+                                kind: FormFieldKind::Number,
+                                placeholder: "100".into(),
+                                required: false,
+                                default_value: "100".into(),
+                                enabled_when_checked: None,
+                                enabled_when_unchecked: None,
+                                disabled_when_field_set: None,
+                                enabled_when_field_equals: None,
+                                help: None,
+                            },
+                            FormFieldDef {
+                                id: "key_delimiter".into(),
+                                label: "Key namespace delimiter".into(),
+                                kind: FormFieldKind::Text,
+                                placeholder: ":".into(),
+                                required: false,
+                                default_value: ":".into(),
+                                enabled_when_checked: None,
+                                enabled_when_unchecked: None,
+                                disabled_when_field_set: None,
+                                enabled_when_field_equals: None,
+                                help: Some(
+                                    "Groups keys into folders in the key browser's tree view"
+                                        .into(),
+                                ),
+                            },
+                            FormFieldDef {
+                                id: "stream_preview_limit".into(),
+                                label: "Stream preview limit".into(),
+                                kind: FormFieldKind::Number,
+                                placeholder: "50".into(),
+                                required: false,
+                                default_value: "50".into(),
+                                enabled_when_checked: None,
+                                enabled_when_unchecked: None,
+                                disabled_when_field_set: None,
+                                enabled_when_field_equals: None,
+                                help: None,
+                            },
+                        ],
+                    },
+                    FormSection {
+                        title: "Safety".into(),
+                        icon: None,
+                        fields: vec![FormFieldDef {
+                            id: "allow_flush".into(),
+                            label: "Allow FLUSHALL / FLUSHDB".into(),
+                            kind: FormFieldKind::Checkbox,
+                            placeholder: String::new(),
+                            required: false,
+                            default_value: "false".into(),
+                            enabled_when_checked: None,
+                            enabled_when_unchecked: None,
+                            disabled_when_field_set: None,
+                            enabled_when_field_equals: None,
+                            help: None,
+                        }],
+                    },
+                ],
+            }],
+        }))
+    }
+
+    fn form_definition(&self) -> &DriverFormDef {
+        &REDIS_FORM
+    }
+
+    fn build_config(&self, values: &FormValues) -> Result<DbConfig, DbError> {
+        let use_uri = values.get("use_uri").map(|s| s == "true").unwrap_or(false);
+        let uri = values.get("uri").filter(|s| !s.is_empty()).cloned();
+        let user = values.get("user").filter(|s| !s.is_empty()).cloned();
+        let database = values
+            .get("database")
+            .filter(|s| !s.is_empty())
+            .map(|s| s.parse::<u32>())
+            .transpose()
+            .map_err(|_| DbError::InvalidProfile("Invalid database index".to_string()))?;
+
+        let topology = values.get("topology").filter(|s| !s.is_empty()).cloned();
+        let sentinel_master_name = values
+            .get("sentinel_master_name")
+            .filter(|s| !s.trim().is_empty())
+            .cloned();
+        let additional_nodes = values
+            .get("additional_nodes")
+            .filter(|s| !s.trim().is_empty())
+            .cloned();
+
+        if use_uri {
+            if uri.is_none() {
+                return Err(DbError::InvalidProfile(
+                    "Connection URI is required when using URI mode".to_string(),
+                ));
+            }
+
+            return Ok(DbConfig::Redis {
+                use_uri,
+                uri,
+                host: String::new(),
+                port: 6379,
+                user,
+                database,
+                tls: false,
+                ssl_mode: None,
+                ssl_root_cert_path: None,
+                ssl_client_cert_path: None,
+                ssl_client_key_path: None,
+                ssh_tunnel: None,
+                ssh_tunnel_profile_id: None,
+                topology,
+                sentinel_master_name,
+                additional_nodes,
+            });
+        }
+
+        let host = values
+            .get("host")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| DbError::InvalidProfile("Host is required".to_string()))?
+            .clone();
+        let port = values
+            .get("port")
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| DbError::InvalidProfile("Port is required".to_string()))?
+            .parse::<u16>()
+            .map_err(|_| DbError::InvalidProfile("Invalid port number".to_string()))?;
+
+        Ok(DbConfig::Redis {
+            use_uri,
+            uri: None,
+            host,
+            port,
+            user,
+            database,
+            tls: false,
+            ssl_mode: None,
+            ssl_root_cert_path: None,
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
+            ssh_tunnel: None,
+            ssh_tunnel_profile_id: None,
+            topology,
+            sentinel_master_name,
+            additional_nodes,
+        })
+    }
+
+    fn extract_values(&self, config: &DbConfig) -> FormValues {
+        let mut values = HashMap::new();
+
+        if let DbConfig::Redis {
+            use_uri,
+            uri,
+            host,
+            port,
+            user,
+            database,
+            topology,
+            sentinel_master_name,
+            additional_nodes,
+            ..
+        } = config
+        {
+            values.insert(
+                "use_uri".to_string(),
+                if *use_uri { "true" } else { "" }.to_string(),
+            );
+            values.insert("uri".to_string(), uri.clone().unwrap_or_default());
+            values.insert("host".to_string(), host.clone());
+            values.insert("port".to_string(), port.to_string());
+            values.insert("user".to_string(), user.clone().unwrap_or_default());
+            values.insert(
+                "database".to_string(),
+                database.map(|d| d.to_string()).unwrap_or_default(),
+            );
+            values.insert(
+                "topology".to_string(),
+                topology.clone().unwrap_or_else(|| "standalone".to_string()),
+            );
+            values.insert(
+                "sentinel_master_name".to_string(),
+                sentinel_master_name.clone().unwrap_or_default(),
+            );
+            values.insert(
+                "additional_nodes".to_string(),
+                additional_nodes.clone().unwrap_or_default(),
+            );
+        }
+
+        values
+    }
+
+    fn build_uri(&self, values: &FormValues, password: &str) -> Option<String> {
+        let host = values
+            .get("host")
+            .map(String::as_str)
+            .unwrap_or("localhost");
+        let port = values.get("port").map(String::as_str).unwrap_or("6379");
+        let user = values.get("user").map(String::as_str).unwrap_or("");
+        let db_index = values.get("database").map(String::as_str).unwrap_or("");
+
+        // The form no longer carries a `tls` checkbox — TLS is determined by the
+        // driver-level SSL mode selection (see `connect_with_secrets`). When
+        // building a preview URI we default to plain `redis://`.
+        let scheme = "redis";
+        let auth = if !user.is_empty() {
+            if password.is_empty() {
+                format!("{}@", urlencoding::encode(user))
+            } else {
+                format!(
+                    "{}:{}@",
+                    urlencoding::encode(user),
+                    urlencoding::encode(password)
+                )
+            }
+        } else if !password.is_empty() {
+            format!(":{}@", urlencoding::encode(password))
+        } else {
+            String::new()
+        };
+
+        let path = if db_index.is_empty() {
+            String::new()
+        } else {
+            format!("/{}", db_index)
+        };
+
+        Some(format!("{}://{}{}:{}{}", scheme, auth, host, port, path))
+    }
+
+    fn parse_uri(&self, uri: &str) -> Option<FormValues> {
+        fn decode_lossy(s: &str) -> String {
+            urlencoding::decode(s)
+                .map(std::borrow::Cow::into_owned)
+                .unwrap_or_else(|_| s.to_string())
+        }
+
+        let (scheme, rest) = uri.split_once("://")?;
+        if scheme != "redis" && scheme != "rediss" {
+            return None;
+        }
+
+        let mut values = HashMap::new();
+        values.insert("use_uri".to_string(), "true".to_string());
+        values.insert("uri".to_string(), uri.to_string());
+
+        let (authority, path) = match rest.split_once('/') {
+            Some((a, p)) => (a, p),
+            None => (rest, ""),
+        };
+
+        let host_port = if let Some((auth, hp)) = authority.rsplit_once('@') {
+            if let Some((user, pass)) = auth.split_once(':') {
+                if !user.is_empty() {
+                    values.insert("user".to_string(), decode_lossy(user));
+                }
+                if !pass.is_empty() {
+                    values.insert("password".to_string(), decode_lossy(pass));
+                }
+            } else if !auth.is_empty() {
+                values.insert("user".to_string(), decode_lossy(auth));
+            }
+            hp
+        } else {
+            authority
+        };
+
+        if let Some((host, port)) = host_port.rsplit_once(':') {
+            values.insert("host".to_string(), host.to_string());
+            values.insert("port".to_string(), port.to_string());
+        } else {
+            values.insert("host".to_string(), host_port.to_string());
+            values.insert("port".to_string(), "6379".to_string());
+        }
+
+        let db = path.split('/').next().unwrap_or_default();
+        if !db.is_empty() {
+            values.insert("database".to_string(), db.to_string());
+        }
+
+        Some(values)
+    }
+
+    fn connect_with_secrets(
+        &self,
+        profile: &ConnectionProfile,
+        password: Option<&SecretString>,
+        ssh_secret: Option<&SecretString>,
+    ) -> Result<Box<dyn Connection>, DbError> {
+        let config = extract_redis_config(&profile.config)?;
+
+        let password = password.map(|value| value.expose_secret());
+        let ssh_secret = ssh_secret.map(|value| value.expose_secret());
+
+        if config.use_uri {
+            if config.ssh_tunnel.is_some() {
+                return Err(DbError::InvalidProfile(
+                    "SSH tunnel is not supported when URI mode is enabled for Redis".to_string(),
+                ));
+            }
+
+            return self.connect_with_uri(UriConnectParams {
+                uri: config.uri.as_deref().unwrap_or_default(),
+                user: config.user.as_deref(),
+                password,
+                database: config.database,
+                topology: config.topology,
+                sentinel_master_name: config.sentinel_master_name.as_deref(),
+                additional_nodes: &config.additional_nodes,
+            });
+        }
+
+        if let Some(tunnel_config) = config.ssh_tunnel.as_ref() {
+            self.connect_via_ssh_tunnel(tunnel_config, &config, ssh_secret, password)
+        } else {
+            self.connect_direct(DirectConnectParams {
+                host: &config.host,
+                port: config.port,
+                ssl_mode: config.ssl_mode.as_deref(),
+                ssl_root_cert_path: config.ssl_root_cert_path.as_deref(),
+                ssl_client_cert_path: config.ssl_client_cert_path.as_deref(),
+                ssl_client_key_path: config.ssl_client_key_path.as_deref(),
+                user: config.user.as_deref(),
+                password,
+                database: config.database,
+                topology: config.topology,
+                sentinel_master_name: config.sentinel_master_name.as_deref(),
+                additional_nodes: &config.additional_nodes,
+                ssh_tunnel: None,
+            })
+        }
+    }
+
+    fn test_connection(&self, profile: &ConnectionProfile) -> Result<(), DbError> {
+        let conn = self.connect_with_secrets(profile, None, None)?;
+        conn.ping()
+    }
+
+    fn dump_analyzer(&self) -> Option<Arc<dyn datatab_core::DumpAnalyzer>> {
+        Some(Arc::new(crate::rdb::RdbAnalyzer))
+    }
+}
+
+#[derive(Debug)]
+struct ExtractedRedisConfig {
+    use_uri: bool,
+    uri: Option<String>,
+    host: String,
+    port: u16,
+    user: Option<String>,
+    database: Option<u32>,
+    ssl_mode: Option<String>,
+    ssl_root_cert_path: Option<String>,
+    ssl_client_cert_path: Option<String>,
+    ssl_client_key_path: Option<String>,
+    ssh_tunnel: Option<SshTunnelConfig>,
+    topology: ConfiguredTopology,
+    sentinel_master_name: Option<String>,
+    additional_nodes: Vec<(String, u16)>,
+}
+
+struct DirectConnectParams<'a> {
+    host: &'a str,
+    port: u16,
+    ssl_mode: Option<&'a str>,
+    ssl_root_cert_path: Option<&'a str>,
+    ssl_client_cert_path: Option<&'a str>,
+    ssl_client_key_path: Option<&'a str>,
+    user: Option<&'a str>,
+    password: Option<&'a str>,
+    database: Option<u32>,
+    topology: ConfiguredTopology,
+    sentinel_master_name: Option<&'a str>,
+    additional_nodes: &'a [(String, u16)],
+    ssh_tunnel: Option<SshTunnel>,
+}
+
+struct UriConnectParams<'a> {
+    uri: &'a str,
+    user: Option<&'a str>,
+    password: Option<&'a str>,
+    database: Option<u32>,
+    topology: ConfiguredTopology,
+    sentinel_master_name: Option<&'a str>,
+    additional_nodes: &'a [(String, u16)],
+}
+
+fn extract_redis_config(config: &DbConfig) -> Result<ExtractedRedisConfig, DbError> {
+    match config {
+        DbConfig::Redis {
+            use_uri,
+            uri,
+            host,
+            port,
+            user,
+            database,
+            tls,
+            ssl_mode,
+            ssl_root_cert_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
+            ssh_tunnel,
+            topology,
+            sentinel_master_name,
+            additional_nodes,
+            ..
+        } => {
+            // Migrate the legacy boolean `tls` flag: when older saves don't carry
+            // an `ssl_mode`, fall back to the previous TLS-without-verification
+            // semantics (`tls=true` → `"on"`, `tls=false` → `"off"`).
+            let resolved_ssl_mode = match ssl_mode.clone() {
+                Some(mode) => Some(mode),
+                None => Some(if *tls {
+                    "on".to_string()
+                } else {
+                    "off".to_string()
+                }),
+            };
+
+            let configured_topology = parse_configured_topology(topology.as_deref())?;
+
+            let sentinel_master_name = sentinel_master_name
+                .clone()
+                .filter(|value| !value.trim().is_empty());
+
+            if configured_topology == ConfiguredTopology::Sentinel && sentinel_master_name.is_none()
+            {
+                return Err(DbError::InvalidProfile(
+                    "Redis Sentinel topology requires a master/service name".to_string(),
+                ));
+            }
+
+            let additional_nodes = additional_nodes
+                .as_deref()
+                .map(parse_node_list)
+                .transpose()?
+                .unwrap_or_default();
+
+            Ok(ExtractedRedisConfig {
+                use_uri: *use_uri,
+                uri: uri.clone(),
+                host: host.clone(),
+                port: *port,
+                user: user.clone(),
+                database: *database,
+                ssl_mode: resolved_ssl_mode,
+                ssl_root_cert_path: ssl_root_cert_path.clone(),
+                ssl_client_cert_path: ssl_client_cert_path.clone(),
+                ssl_client_key_path: ssl_client_key_path.clone(),
+                ssh_tunnel: ssh_tunnel.clone(),
+                topology: configured_topology,
+                sentinel_master_name,
+                additional_nodes,
+            })
+        }
+        _ => Err(DbError::InvalidProfile(
+            "Expected Redis configuration".to_string(),
+        )),
+    }
+}
+
+/// Where `connect_via_ssh_tunnel` reaches the server once the tunnel is open.
+const SSH_TUNNEL_LOCAL_HOST: &str = "127.0.0.1";
+
+/// Native TLS configuration derived from an SSL mode id and optional cert paths.
+///
+/// Returned by `redis_ssl_mode_to_config` and consumed by `connect_direct`.
+enum RedisTlsConfig {
+    /// Plain TCP (`redis://`). Used when the mode is `"off"`.
+    Plain,
+    /// TLS without certificate verification (`rediss://...#insecure`). Used when
+    /// the mode is `"on"`.
+    TlsInsecure,
+    /// TLS with verification, optionally with a custom root CA and / or mTLS.
+    TlsVerify(RedisTlsCerts),
+}
+
+impl std::fmt::Debug for RedisTlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RedisTlsConfig::Plain => f.write_str("Plain"),
+            RedisTlsConfig::TlsInsecure => f.write_str("TlsInsecure"),
+            RedisTlsConfig::TlsVerify(_) => f.write_str("TlsVerify"),
+        }
+    }
+}
+
+#[derive(Default)]
+struct RedisTlsCerts {
+    client_tls: Option<redis::ClientTlsConfig>,
+    root_cert: Option<Vec<u8>>,
+}
+
+/// Maps a Redis driver SSL mode id (`"off"` / `"on"` / `"verify"`) to a native
+/// `RedisTlsConfig`. Optional certificate paths are loaded from disk when the
+/// mode requires them.
+///
+/// Returns `Err` with a static message for unknown mode ids or unreadable cert
+/// files.
+fn redis_ssl_mode_to_config(
+    mode_id: Option<&str>,
+    root_cert_path: Option<&str>,
+    client_cert_path: Option<&str>,
+    client_key_path: Option<&str>,
+) -> Result<RedisTlsConfig, String> {
+    let mode = mode_id.unwrap_or("off");
+
+    match mode {
+        "" | "off" => Ok(RedisTlsConfig::Plain),
+        "on" => Ok(RedisTlsConfig::TlsInsecure),
+        "verify" => {
+            let root_cert =
+                match root_cert_path.and_then(non_empty) {
+                    Some(path) => Some(std::fs::read(path).map_err(|e| {
+                        format!("Failed to read Redis root CA at '{}': {}", path, e)
+                    })?),
+                    None => None,
+                };
+
+            let client_tls = match (
+                client_cert_path.and_then(non_empty),
+                client_key_path.and_then(non_empty),
+            ) {
+                (Some(cert), Some(key)) => {
+                    let client_cert = std::fs::read(cert).map_err(|e| {
+                        format!("Failed to read Redis client cert at '{}': {}", cert, e)
+                    })?;
+                    let client_key = std::fs::read(key).map_err(|e| {
+                        format!("Failed to read Redis client key at '{}': {}", key, e)
+                    })?;
+                    Some(redis::ClientTlsConfig {
+                        client_cert,
+                        client_key,
+                    })
+                }
+                (None, None) => None,
+                _ => {
+                    return Err(
+                        "Redis mTLS requires both a client cert and a client key".to_string()
+                    );
+                }
+            };
+
+            Ok(RedisTlsConfig::TlsVerify(RedisTlsCerts {
+                client_tls,
+                root_cert,
+            }))
+        }
+        other => Err(format!("Unknown Redis SSL mode: '{}'", other)),
+    }
+}
+
+/// Builds the base URI for a TLS mode. The Redis crate accepts the `#insecure`
+/// fragment to skip certificate verification when using `rediss://`. For
+/// `verify` mode we feed PEM bytes through `Client::build_with_tls` so the rustls
+/// config trusts the supplied root CA and / or sends the client certificate.
+fn direct_connection_uri(tls: &RedisTlsConfig, host: &str, port: u16) -> String {
+    let scheme = if matches!(tls, RedisTlsConfig::Plain) {
+        "redis"
+    } else {
+        "rediss"
+    };
+    let mut uri = format!("{}://{}:{}/", scheme, host, port);
+    if matches!(tls, RedisTlsConfig::TlsInsecure) {
+        uri.push_str("#insecure");
+    }
+    uri
+}
+
+fn non_empty(s: &str) -> Option<&str> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed)
+    }
+}
+
+pub struct RedisConnection {
+    connection: Arc<Mutex<RedisTransport>>,
+    active_database: Mutex<Option<u32>>,
+    _ssh_tunnel: Option<SshTunnel>,
+}
+
+impl RedisConnection {
+    fn active_db_index(&self) -> Result<Option<u32>, DbError> {
+        self.active_database
+            .lock()
+            .map(|db| *db)
+            .map_err(|e| DbError::query_failed(format!("Lock error: {}", e)))
+    }
+
+    fn set_active_db_index(&self, database: Option<u32>) -> Result<(), DbError> {
+        let mut active = self
+            .active_database
+            .lock()
+            .map_err(|e| DbError::query_failed(format!("Lock error: {}", e)))?;
+        *active = database;
+        Ok(())
+    }
+
+    /// `f` must be callable more than once (`Fn`, not `FnOnce`) so that
+    /// `RedisTransport::with_connection_like` can retry it once against a
+    /// freshly re-resolved Sentinel master after a connection-class failure.
+    fn with_connection<T>(
+        &self,
+        keyspace: Option<u32>,
+        f: impl Fn(&mut dyn redis::ConnectionLike) -> Result<T, DbError>,
+    ) -> Result<T, DbError> {
+        let mut transport = self
+            .connection
+            .lock()
+            .map_err(|e| DbError::query_failed(format!("Lock error: {}", e)))?;
+
+        let active = self.active_db_index()?;
+        let target_db = keyspace.or(active);
+
+        if matches!(&*transport, RedisTransport::Cluster(_)) {
+            validate_cluster_database(target_db)?;
+        }
+
+        transport.with_connection_like(|conn| {
+            if let Some(db) = target_db {
+                select_db(conn, db).map_err(|e| format_redis_query_error(&e))?;
+            }
+
+            let result = f(conn);
+
+            // Restore the active database if we temporarily switched to a different one
+            if keyspace.is_some()
+                && keyspace != active
+                && let Some(db) = active
+            {
+                let _ = select_db(conn, db);
+            }
+
+            result
+        })
+    }
+
+    /// Scans one key page on a standalone, Sentinel or cluster transport,
+    /// checking `cancel` between `SCAN` round trips.
+    fn scan_key_page(
+        &self,
+        request: &KeyScanRequest,
+        cancel: &CancelToken,
+    ) -> Result<KeyScanPage, DbError> {
+        let is_cluster = {
+            let transport = self
+                .connection
+                .lock()
+                .map_err(|e| DbError::query_failed(format!("Lock error: {}", e)))?;
+            matches!(&*transport, RedisTransport::Cluster(_))
+        };
+
+        if is_cluster {
+            return self.scan_keys_cluster(request, cancel);
+        }
+
+        let cursor = request
+            .cursor
+            .as_deref()
+            .unwrap_or("0")
+            .parse::<u64>()
+            .map_err(|_| DbError::InvalidProfile("Invalid key scan cursor".to_string()))?;
+
+        let limit = key_page_limit(request.limit);
+        let filter = request
+            .filter
+            .as_deref()
+            .filter(|filter| !filter.is_empty());
+        let type_name = request.type_filter.and_then(redis_type_name);
+
+        // Budget and page are created inside the closure so a Sentinel retry
+        // restarts the page from `cursor` with a fresh budget.
+        self.with_connection(request.keyspace, |conn| {
+            let mut budget = ScanBudget::for_key_page();
+            let mut page = ScanPageKeys::default();
+
+            let next_cursor = fill_scan_page(
+                cursor,
+                limit,
+                &mut budget,
+                &mut page,
+                cancel,
+                |batch_cursor| {
+                    scan_command(batch_cursor, filter, limit, type_name)
+                        .query::<(u64, Vec<String>)>(conn)
+                        .map_err(|e| format_redis_query_error(&e))
+                },
+            )?;
+
+            let scanned_keys = scanned_key_estimate(budget.round_trips(), limit);
+            let keys = page.into_keys();
+
+            let entries = match request.type_filter.filter(|_| type_name.is_some()) {
+                Some(key_type) => key_entries_of_type(keys, key_type),
+                None => {
+                    let type_names = if keys.is_empty() {
+                        Vec::new()
+                    } else {
+                        let mut pipeline = redis::pipe();
+                        for key in &keys {
+                            pipeline.cmd("TYPE").arg(key);
+                        }
+
+                        pipeline
+                            .query::<Vec<String>>(conn)
+                            .map_err(|e| format_redis_query_error(&e))?
+                    };
+
+                    key_entries_with_types(keys, type_names)?
+                }
+            };
+
+            let next_cursor = if next_cursor == 0 {
+                None
+            } else {
+                Some(next_cursor.to_string())
+            };
+
+            Ok(KeyScanPage {
+                entries,
+                next_cursor,
+                scanned_keys: Some(scanned_keys),
+            })
+        })
+    }
+
+    /// Fans a key scan out across every Redis Cluster master, since a plain
+    /// `SCAN` is unroutable against a `ClusterConnection` (redis-rs has no
+    /// single-node "current" concept for it, unlike single-key commands).
+    ///
+    /// Pending masters are scanned in turn, each one until the page holds
+    /// `request.limit` keys (defaulting to 100) or that node reports cursor
+    /// 0, under one `ScanBudget` shared by the whole page. Each node's
+    /// returned cursor is tracked independently and round-tripped via
+    /// `ClusterScanCursor`; the overall scan is exhausted once every node
+    /// has reported cursor 0.
+    fn scan_keys_cluster(
+        &self,
+        request: &KeyScanRequest,
+        cancel: &CancelToken,
+    ) -> Result<KeyScanPage, DbError> {
+        validate_cluster_database(request.keyspace)?;
+
+        let mut transport = self
+            .connection
+            .lock()
+            .map_err(|e| DbError::query_failed(format!("Lock error: {}", e)))?;
+
+        let RedisTransport::Cluster(conn) = &mut *transport else {
+            return Err(DbError::query_failed(
+                "Redis Cluster scan requested on a non-cluster connection".to_string(),
+            ));
+        };
+        let conn: &mut redis::cluster::ClusterConnection = conn.as_mut();
+
+        let mut cursor_state = match request.cursor.as_deref() {
+            None => ClusterScanCursor::fresh(&fetch_cluster_masters(conn)?),
+            Some(raw) => {
+                let mut decoded = ClusterScanCursor::decode(raw)?;
+                let masters = fetch_cluster_masters(conn)?;
+                let known: HashSet<String> = masters
+                    .iter()
+                    .map(|(host, port)| format!("{host}:{port}"))
+                    .collect();
+                decoded.retain_known_nodes(&known);
+                decoded
+            }
+        };
+
+        if cursor_state.is_exhausted() {
+            return Ok(KeyScanPage {
+                entries: Vec::new(),
+                next_cursor: None,
+                scanned_keys: Some(0),
+            });
+        }
+
+        let limit = key_page_limit(request.limit);
+        let filter = request
+            .filter
+            .as_deref()
+            .filter(|filter| !filter.is_empty());
+        let type_name = request.type_filter.and_then(redis_type_name);
+
+        let mut budget = ScanBudget::for_key_page();
+        let mut page = ScanPageKeys::default();
+
+        for address in cursor_state.addresses() {
+            if budget.has_started() && (page.len() >= limit || budget.is_exhausted()) {
+                break;
+            }
+
+            let (host, port) = split_host_port(&address)?;
+            let node_cursor = cursor_state.cursor_for(&address);
+
+            let next_cursor = fill_scan_page(
+                node_cursor,
+                limit,
+                &mut budget,
+                &mut page,
+                cancel,
+                |batch_cursor| {
+                    let routing = RoutingInfo::SingleNode(SingleNodeRoutingInfo::ByAddress {
+                        host: host.clone(),
+                        port,
+                    });
+
+                    let value = conn
+                        .route_command(
+                            &scan_command(batch_cursor, filter, limit, type_name),
+                            routing,
+                        )
+                        .map_err(|e| format_redis_query_error(&e))?;
+
+                    redis::FromRedisValue::from_redis_value(&value)
+                        .map_err(|e| format_redis_query_error(&e))
+                },
+            )?;
+
+            cursor_state.record_result(&address, next_cursor);
+        }
+
+        let scanned_keys = scanned_key_estimate(budget.round_trips(), limit);
+        let keys = page.into_keys();
+
+        let entries = match request.type_filter.filter(|_| type_name.is_some()) {
+            Some(key_type) => key_entries_of_type(keys, key_type),
+            None => {
+                // The cluster pipeline routes each TYPE to the master that
+                // owns the key's slot and sends one pipeline per node.
+                let type_names = if keys.is_empty() {
+                    Vec::new()
+                } else {
+                    let mut pipeline = redis::cluster::cluster_pipe();
+                    for key in &keys {
+                        pipeline.cmd("TYPE").arg(key);
+                    }
+
+                    pipeline
+                        .query::<Vec<String>>(conn)
+                        .map_err(|e| format_redis_query_error(&e))?
+                };
+
+                key_entries_with_types(keys, type_names)?
+            }
+        };
+
+        Ok(KeyScanPage {
+            entries,
+            next_cursor: cursor_state.encode(),
+            scanned_keys: Some(scanned_keys),
+        })
+    }
+
+    fn is_cluster(&self) -> Result<bool, DbError> {
+        let transport = self
+            .connection
+            .lock()
+            .map_err(|e| DbError::query_failed(format!("Lock error: {}", e)))?;
+
+        Ok(matches!(&*transport, RedisTransport::Cluster(_)))
+    }
+
+    /// Sends `commands` as one pipeline and returns every reply in order.
+    ///
+    /// Against a cluster the commands go through a cluster pipeline, which
+    /// routes each one to the master owning its key.
+    fn query_pipeline(
+        &self,
+        keyspace: Option<u32>,
+        commands: &[redis::Cmd],
+    ) -> Result<Vec<redis::Value>, DbError> {
+        if commands.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if self.is_cluster()? {
+            validate_cluster_database(keyspace)?;
+
+            let mut transport = self
+                .connection
+                .lock()
+                .map_err(|e| DbError::query_failed(format!("Lock error: {}", e)))?;
+
+            let RedisTransport::Cluster(conn) = &mut *transport else {
+                return Err(DbError::query_failed(
+                    "Redis Cluster pipeline requested on a non-cluster connection".to_string(),
+                ));
+            };
+
+            let mut pipeline = redis::cluster::cluster_pipe();
+            for command in commands {
+                pipeline.add_command(command.clone());
+            }
+
+            return pipeline
+                .query::<Vec<redis::Value>>(conn.as_mut())
+                .map_err(|e| format_redis_query_error(&e));
+        }
+
+        self.with_connection(keyspace, |conn| {
+            let mut pipeline = redis::pipe();
+            for command in commands {
+                pipeline.add_command(command.clone());
+            }
+
+            pipeline
+                .query::<Vec<redis::Value>>(conn)
+                .map_err(|e| format_redis_query_error(&e))
+        })
+    }
+
+    /// Sums `DBSIZE` over every Redis Cluster master. `DBSIZE` sent through a
+    /// `ClusterConnection` reaches a single node, so each master is routed to
+    /// by address, as `scan_keys_cluster` does for `SCAN`.
+    fn key_count_cluster(&self, keyspace: Option<u32>) -> Result<u64, DbError> {
+        validate_cluster_database(keyspace)?;
+
+        let mut transport = self
+            .connection
+            .lock()
+            .map_err(|e| DbError::query_failed(format!("Lock error: {}", e)))?;
+
+        let RedisTransport::Cluster(conn) = &mut *transport else {
+            return Err(DbError::query_failed(
+                "Redis Cluster key count requested on a non-cluster connection".to_string(),
+            ));
+        };
+        let conn: &mut redis::cluster::ClusterConnection = conn.as_mut();
+
+        let masters = fetch_cluster_masters(conn)?;
+        fetch_cluster_key_count(conn, &masters)
+    }
+}
+
+impl Connection for RedisConnection {
+    fn metadata(&self) -> &DriverMetadata {
+        &REDIS_METADATA
+    }
+
+    fn ping(&self) -> Result<(), DbError> {
+        self.with_connection(None, |conn| {
+            redis::cmd("PING")
+                .query::<String>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+            Ok(())
+        })
+    }
+
+    fn close(&mut self) -> Result<(), DbError> {
+        Ok(())
+    }
+
+    fn probe_write_privilege(&self) -> WritePrivilege {
+        self.with_connection(None, |conn| Ok(probe_write_privilege_over(conn)))
+            .unwrap_or(WritePrivilege::Unknown)
+    }
+
+    fn instance_catalog(&self) -> Option<Box<dyn InstanceCatalog>> {
+        let transport = self.connection.lock().ok()?;
+        let standalone = transport.standalone()?;
+
+        Some(Box::new(
+            crate::instance_catalog::RedisInstanceCatalog::new_probed(standalone),
+        ))
+    }
+
+    fn execute(&self, req: &QueryRequest) -> Result<QueryResult, DbError> {
+        refuse_unsupported_request_options(req)?;
+        if req.read_only.is_required() && self.is_cluster()? {
+            return Err(DbError::NotSupported(
+                "Redis: read-only enforcement is unsupported on Redis Cluster connections, \
+                 because the node that describes a command may not be the node that runs it; \
+                 the request was rejected before execution"
+                    .to_string(),
+            ));
+        }
+
+        if let Some(source) = req
+            .execution_context
+            .as_ref()
+            .and_then(|ctx| ctx.source.as_ref())
+        {
+            match source {
+                ExecutionSourceContext::InstanceMetricQuery { metric_id, .. } => {
+                    let transport = self.connection.lock().map_err(|_| {
+                        DbError::QueryFailed("redis connection mutex poisoned".to_string().into())
+                    })?;
+                    let standalone = transport.standalone().ok_or_else(|| {
+                        DbError::NotSupported(
+                            "Instance metrics are not supported for Redis Cluster connections"
+                                .to_string(),
+                        )
+                    })?;
+                    let mut conn = standalone.lock().map_err(|_| {
+                        DbError::QueryFailed("redis connection mutex poisoned".to_string().into())
+                    })?;
+                    return crate::instance_catalog::dispatch_metric_series(&mut conn, metric_id);
+                }
+                ExecutionSourceContext::InstanceInspectorQuery { metric_id } => {
+                    let transport = self.connection.lock().map_err(|_| {
+                        DbError::QueryFailed("redis connection mutex poisoned".to_string().into())
+                    })?;
+                    let standalone = transport.standalone().ok_or_else(|| {
+                        DbError::NotSupported(
+                            "Instance inspectors are not supported for Redis Cluster connections"
+                                .to_string(),
+                        )
+                    })?;
+                    let mut conn = standalone.lock().map_err(|_| {
+                        DbError::QueryFailed("redis connection mutex poisoned".to_string().into())
+                    })?;
+                    return crate::instance_catalog::dispatch_inspector_snapshot(
+                        &mut conn, metric_id,
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        let start = Instant::now();
+        let parts = parse_command(req.sql.trim())?;
+
+        if parts.is_empty() {
+            return Ok(QueryResult::empty());
+        }
+
+        let query_db = req
+            .database
+            .as_deref()
+            .map(parse_database_name)
+            .transpose()?;
+
+        let value = self.with_connection(query_db, |conn| {
+            send_parsed_command(conn, &parts, req.read_only)
+        })?;
+
+        Ok(redis_value_to_result(value, start.elapsed(), req.limit))
+    }
+
+    fn cancel(&self, _handle: &QueryHandle) -> Result<(), DbError> {
+        Err(DbError::NotSupported(
+            "Query cancellation not supported for Redis".to_string(),
+        ))
+    }
+
+    fn language_service(&self) -> &dyn LanguageService {
+        &RedisLanguageService
+    }
+
+    fn schema(&self) -> Result<SchemaSnapshot, DbError> {
+        {
+            let mut transport = self
+                .connection
+                .lock()
+                .map_err(|e| DbError::query_failed(format!("Lock error: {}", e)))?;
+
+            if let RedisTransport::Cluster(conn) = &mut *transport {
+                let conn: &mut redis::cluster::ClusterConnection = conn.as_mut();
+                let masters = fetch_cluster_masters(conn)?;
+                let stats = fetch_cluster_keyspace_stats(conn, &masters)?;
+
+                return Ok(SchemaSnapshot::key_value(KeyValueSchema {
+                    keyspaces: vec![KeySpaceInfo {
+                        db_index: 0,
+                        key_count: Some(stats.key_count),
+                        memory_bytes: None,
+                        avg_ttl_seconds: stats.avg_ttl_seconds,
+                    }],
+                    current_keyspace: Some(0),
+                }));
+            }
+        }
+
+        self.with_connection(None, |conn| {
+            let current_db = self.active_db_index()?.unwrap_or(0);
+            let keyspace_stats = fetch_keyspace_stats(conn)?;
+            let db_count = fetch_database_count(conn).ok().unwrap_or_else(|| {
+                keyspace_stats
+                    .keys()
+                    .copied()
+                    .max()
+                    .map(|max| max + 1)
+                    .unwrap_or(current_db + 1)
+            });
+
+            let keyspaces = (0..db_count)
+                .map(|db_index| {
+                    let stats = keyspace_stats.get(&db_index);
+                    // `INFO keyspace` omits empty databases, so a database
+                    // it does not list holds no keys.
+                    KeySpaceInfo {
+                        db_index,
+                        key_count: Some(stats.map_or(0, |s| s.key_count)),
+                        memory_bytes: None,
+                        avg_ttl_seconds: stats.and_then(|s| s.avg_ttl_seconds),
+                    }
+                })
+                .collect();
+
+            Ok(SchemaSnapshot::key_value(KeyValueSchema {
+                keyspaces,
+                current_keyspace: Some(current_db),
+            }))
+        })
+    }
+
+    fn list_databases(&self) -> Result<Vec<DatabaseInfo>, DbError> {
+        let schema = self.schema()?;
+        let current = schema.as_key_value().and_then(|s| s.current_keyspace);
+
+        Ok(schema
+            .keyspaces()
+            .iter()
+            .map(|space| DatabaseInfo {
+                name: format!("db{}", space.db_index),
+                is_current: Some(space.db_index) == current,
+            })
+            .collect())
+    }
+
+    fn schema_for_database(&self, database: &str) -> Result<DbSchemaInfo, DbError> {
+        let db_index = parse_database_name(database)?;
+
+        self.with_connection(Some(db_index), |conn| {
+            redis::cmd("DBSIZE")
+                .query::<u64>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+
+            Ok(DbSchemaInfo {
+                name: database.to_string(),
+                tables: Vec::new(),
+                views: Vec::new(),
+                custom_types: None,
+            })
+        })
+    }
+
+    fn set_active_database(&self, database: Option<&str>) -> Result<(), DbError> {
+        let target = database.map(parse_database_name).transpose()?;
+
+        let mut transport = self
+            .connection
+            .lock()
+            .map_err(|e| DbError::query_failed(format!("Lock error: {}", e)))?;
+
+        if let Some(db) = target {
+            if matches!(&*transport, RedisTransport::Cluster(_)) {
+                validate_cluster_database(Some(db))?;
+            }
+
+            transport.with_connection_like(|conn| {
+                select_db(conn, db).map_err(|e| format_redis_query_error(&e))
+            })?;
+        }
+
+        drop(transport);
+        self.set_active_db_index(target)
+    }
+
+    fn active_database(&self) -> Option<String> {
+        self.active_db_index()
+            .ok()
+            .flatten()
+            .map(|db| format!("db{}", db))
+    }
+
+    fn drop_schema_object(
+        &self,
+        target: &SchemaDropTarget,
+        _cascade: bool,
+        _if_exists: bool,
+    ) -> Result<(), DbError> {
+        Err(DbError::NotSupported(format!(
+            "Redis does not support dropping schema objects via drop_schema_object (requested {:?} '{}')",
+            target.kind, target.name
+        )))
+    }
+
+    fn kind(&self) -> DbKind {
+        DbKind::Redis
+    }
+
+    fn schema_loading_strategy(&self) -> SchemaLoadingStrategy {
+        SchemaLoadingStrategy::LazyPerDatabase
+    }
+
+    fn key_value_api(&self) -> Option<&dyn KeyValueApi> {
+        Some(self)
+    }
+
+    fn dialect(&self) -> &dyn SqlDialect {
+        static DIALECT: DefaultSqlDialect = DefaultSqlDialect;
+        &DIALECT
+    }
+
+    fn query_generator(&self) -> Option<&dyn QueryGenerator> {
+        static GENERATOR: crate::command_generator::RedisCommandGenerator =
+            crate::command_generator::RedisCommandGenerator;
+        Some(&GENERATOR)
+    }
+
+    fn plan_semantic_request(&self, request: &SemanticRequest) -> Result<SemanticPlan, DbError> {
+        plan_redis_semantic_request(request)
+    }
+
+    fn build_truncate_sql(&self, _table: &str) -> Result<String, DbError> {
+        // Redis doesn't support TRUNCATE - use FLUSHDB with caution
+        Ok(TRUNCATE_STATEMENT.to_string())
+    }
+
+    fn build_drop_index_sql(
+        &self,
+        _index_name: &str,
+        _table_name: Option<&str>,
+        _if_exists: bool,
+    ) -> Result<String, DbError> {
+        // Redis doesn't have named indexes like SQL databases
+        Ok(DROP_INDEX_STATEMENT.to_string())
+    }
+
+    fn version_query(&self) -> Result<&'static str, DbError> {
+        // Redis uses INFO command, not SQL
+        Ok(VERSION_QUERY)
+    }
+
+    fn supports_transactional_ddl(&self) -> bool {
+        false
+    }
+}
+
+impl KeyValueConnection for RedisConnection {}
+
+/// SQL/command text of `build_truncate_sql`, kept as a constant so the exact
+/// text is testable without a live server.
+const TRUNCATE_STATEMENT: &str = "FLUSHDB";
+
+/// SQL/command text of `build_drop_index_sql`, kept as a constant so the
+/// exact text is testable without a live server.
+const DROP_INDEX_STATEMENT: &str = "DROP INDEX not_applicable";
+
+/// Command text of `version_query`, kept as a constant so the exact text is
+/// testable without a live server.
+const VERSION_QUERY: &str = "INFO server | grep redis_version";
+
+#[cfg(test)]
+mod sql_statement_tests {
+    use super::*;
+
+    #[test]
+    fn sql_builder_constants_match_the_driver_contract() {
+        assert_eq!(TRUNCATE_STATEMENT, "FLUSHDB");
+        assert_eq!(DROP_INDEX_STATEMENT, "DROP INDEX not_applicable");
+        assert_eq!(VERSION_QUERY, "INFO server | grep redis_version");
+    }
+}
+
+impl ConnectionExt for RedisConnection {
+    fn as_relational(&self) -> Option<&dyn RelationalConnection> {
+        None
+    }
+
+    fn as_document(&self) -> Option<&dyn DocumentConnection> {
+        None
+    }
+
+    fn as_keyvalue(&self) -> Option<&dyn KeyValueConnection> {
+        Some(self)
+    }
+}
+
+impl KeyValueApi for RedisConnection {
+    fn key_count(&self, keyspace: Option<u32>) -> Result<u64, DbError> {
+        let is_cluster = {
+            let transport = self
+                .connection
+                .lock()
+                .map_err(|e| DbError::query_failed(format!("Lock error: {}", e)))?;
+            matches!(&*transport, RedisTransport::Cluster(_))
+        };
+
+        if is_cluster {
+            return self.key_count_cluster(keyspace);
+        }
+
+        self.with_connection(keyspace, |conn| {
+            redis::cmd("DBSIZE")
+                .query::<u64>(conn)
+                .map_err(|e| format_redis_query_error(&e))
+        })
+    }
+
+    fn scan_keys(&self, request: &KeyScanRequest) -> Result<KeyScanPage, DbError> {
+        self.scan_key_page(request, &CancelToken::new())
+    }
+
+    fn scan_keys_with_cancel(
+        &self,
+        request: &KeyScanRequest,
+        cancel: &CancelToken,
+    ) -> Result<KeyScanPage, DbError> {
+        self.scan_key_page(request, cancel)
+    }
+
+    fn get_key(&self, request: &KeyGetRequest) -> Result<KeyGetResult, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let key_type_name = redis::cmd("TYPE")
+                .arg(&request.key)
+                .query::<String>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+
+            let key_type = parse_key_type(&key_type_name);
+            if key_type == KeyType::Unknown && key_type_name.eq_ignore_ascii_case("none") {
+                return Err(DbError::object_not_found(format!(
+                    "Key '{}' not found",
+                    request.key
+                )));
+            }
+
+            let (value, repr, load_state) =
+                fetch_key_payload(conn, &request.key, key_type, request.max_value_bytes)?;
+
+            let ttl_seconds = if request.include_ttl {
+                let ttl = redis::cmd("TTL")
+                    .arg(&request.key)
+                    .query::<i64>(conn)
+                    .map_err(|e| format_redis_query_error(&e))?;
+
+                if ttl >= 0 { Some(ttl) } else { None }
+            } else {
+                None
+            };
+
+            let key_type = normalize_key_type_for_payload(key_type, repr);
+
+            // `size_bytes` reflects the true value size even when gated: the
+            // `TooLarge` STRLEN probe already knows it without fetching.
+            let size_bytes = match load_state {
+                KeyLoadState::TooLarge { size_bytes, .. } => Some(size_bytes),
+                _ => Some(value.len() as u64),
+            };
+
+            let entry = KeyEntry {
+                key: request.key.clone(),
+                key_type: if request.include_type {
+                    Some(key_type)
+                } else {
+                    None
+                },
+                ttl_seconds,
+                size_bytes: if request.include_size {
+                    size_bytes
+                } else {
+                    None
+                },
+            };
+
+            Ok(KeyGetResult {
+                entry,
+                value,
+                repr,
+                load_state,
+            })
+        })
+    }
+
+    fn set_key(&self, request: &KeySetRequest) -> Result<(), DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let response = match set_command(request, true).query::<Option<String>>(conn) {
+                Ok(response) => response,
+                Err(error) if wants_keep_ttl(request) && is_syntax_error(&error) => {
+                    // Servers older than 6.0 reject KEEPTTL, so the current
+                    // expiry is read first and re-applied after the write.
+                    set_reapplying_ttl(conn, request)?
+                }
+                Err(error) => return Err(format_redis_query_error(&error)),
+            };
+
+            if response.is_none() {
+                return Err(DbError::query_failed(
+                    "SET condition was not satisfied".to_string(),
+                ));
+            }
+
+            Ok(())
+        })
+    }
+
+    fn delete_key(&self, request: &KeyDeleteRequest) -> Result<bool, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let deleted = redis::cmd("DEL")
+                .arg(&request.key)
+                .query::<u64>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+            Ok(deleted > 0)
+        })
+    }
+
+    fn exists_key(&self, request: &KeyExistsRequest) -> Result<bool, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let exists = redis::cmd("EXISTS")
+                .arg(&request.key)
+                .query::<u64>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+            Ok(exists > 0)
+        })
+    }
+
+    fn key_type(&self, request: &KeyTypeRequest) -> Result<KeyType, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let type_name = redis::cmd("TYPE")
+                .arg(&request.key)
+                .query::<String>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+
+            let key_type = parse_key_type(&type_name);
+            if key_type == KeyType::Unknown && type_name.eq_ignore_ascii_case("none") {
+                return Err(DbError::object_not_found(format!(
+                    "Key '{}' not found",
+                    request.key
+                )));
+            }
+
+            Ok(key_type)
+        })
+    }
+
+    fn key_ttl(&self, request: &KeyTtlRequest) -> Result<Option<i64>, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let ttl = redis::cmd("TTL")
+                .arg(&request.key)
+                .query::<i64>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+
+            if ttl == -2 {
+                return Err(DbError::object_not_found(format!(
+                    "Key '{}' not found",
+                    request.key
+                )));
+            }
+
+            if ttl < 0 { Ok(None) } else { Ok(Some(ttl)) }
+        })
+    }
+
+    fn expire_key(&self, request: &KeyExpireRequest) -> Result<bool, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let changed = redis::cmd("EXPIRE")
+                .arg(&request.key)
+                .arg(request.ttl_seconds)
+                .query::<u64>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+            Ok(changed > 0)
+        })
+    }
+
+    fn persist_key(&self, request: &KeyPersistRequest) -> Result<bool, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let changed = redis::cmd("PERSIST")
+                .arg(&request.key)
+                .query::<u64>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+            Ok(changed > 0)
+        })
+    }
+
+    fn rename_key(&self, request: &KeyRenameRequest) -> Result<(), DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            redis::cmd("RENAME")
+                .arg(&request.from_key)
+                .arg(&request.to_key)
+                .query::<String>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+            Ok(())
+        })
+    }
+
+    fn bulk_get(&self, request: &KeyBulkGetRequest) -> Result<Vec<Option<KeyGetResult>>, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let mut values = Vec::with_capacity(request.keys.len());
+
+            for key in &request.keys {
+                let type_name = redis::cmd("TYPE")
+                    .arg(key)
+                    .query::<String>(conn)
+                    .map_err(|e| format_redis_query_error(&e))?;
+
+                let key_type = parse_key_type(&type_name);
+                if key_type == KeyType::Unknown && type_name.eq_ignore_ascii_case("none") {
+                    values.push(None);
+                    continue;
+                }
+
+                // Bulk fetches carry no per-key byte budget, so the whole
+                // payload is always transferred here.
+                let (payload, repr, load_state) =
+                    if matches!(key_type, KeyType::String | KeyType::Json | KeyType::Unknown) {
+                        let fetched = redis::cmd("GET")
+                            .arg(key)
+                            .query::<Option<Vec<u8>>>(conn)
+                            .map_err(|e| format_redis_query_error(&e))?;
+
+                        match fetched {
+                            Some(v) => {
+                                let repr = detect_value_repr(&v);
+                                (v, repr, KeyLoadState::Loaded)
+                            }
+                            None => {
+                                values.push(None);
+                                continue;
+                            }
+                        }
+                    } else {
+                        fetch_key_payload(conn, key, key_type, None)?
+                    };
+
+                let ttl_seconds = if request.include_ttl {
+                    let ttl = redis::cmd("TTL")
+                        .arg(key)
+                        .query::<i64>(conn)
+                        .map_err(|e| format_redis_query_error(&e))?;
+
+                    if ttl >= 0 { Some(ttl) } else { None }
+                } else {
+                    None
+                };
+
+                let key_type = normalize_key_type_for_payload(key_type, repr);
+
+                values.push(Some(KeyGetResult {
+                    entry: KeyEntry {
+                        key: key.clone(),
+                        key_type: if request.include_type {
+                            Some(key_type)
+                        } else {
+                            None
+                        },
+                        ttl_seconds,
+                        size_bytes: if request.include_size {
+                            Some(payload.len() as u64)
+                        } else {
+                            None
+                        },
+                    },
+                    value: payload,
+                    repr,
+                    load_state,
+                }));
+            }
+
+            Ok(values)
+        })
+    }
+
+    // -- Hash member operations --
+
+    fn hash_set(&self, request: &HashSetRequest) -> Result<(), DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let mut cmd = redis::cmd("HSET");
+            cmd.arg(&request.key);
+            for (field, value) in &request.fields {
+                cmd.arg(field).arg(value);
+            }
+            cmd.query::<()>(conn)
+                .map_err(|e| format_redis_query_error(&e))
+        })
+    }
+
+    fn hash_delete(&self, request: &HashDeleteRequest) -> Result<bool, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let mut cmd = redis::cmd("HDEL");
+            cmd.arg(&request.key);
+            for field in &request.fields {
+                cmd.arg(field);
+            }
+            let removed = cmd
+                .query::<u64>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+            Ok(removed > 0)
+        })
+    }
+
+    // -- List member operations --
+
+    fn list_set(&self, request: &ListSetRequest) -> Result<(), DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            redis::cmd("LSET")
+                .arg(&request.key)
+                .arg(request.index)
+                .arg(&request.value)
+                .query::<()>(conn)
+                .map_err(|e| format_redis_query_error(&e))
+        })
+    }
+
+    fn list_push(&self, request: &ListPushRequest) -> Result<(), DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let cmd_name = match request.end {
+                ListEnd::Head => "LPUSH",
+                ListEnd::Tail => "RPUSH",
+            };
+
+            let mut cmd = redis::cmd(cmd_name);
+            cmd.arg(&request.key);
+            for value in &request.values {
+                cmd.arg(value);
+            }
+            cmd.query::<()>(conn)
+                .map_err(|e| format_redis_query_error(&e))
+        })
+    }
+
+    fn list_remove(&self, request: &ListRemoveRequest) -> Result<bool, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let removed = redis::cmd("LREM")
+                .arg(&request.key)
+                .arg(request.count)
+                .arg(&request.value)
+                .query::<i64>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+            Ok(removed > 0)
+        })
+    }
+
+    // -- Set member operations --
+
+    fn set_add(&self, request: &SetAddRequest) -> Result<bool, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let mut cmd = redis::cmd("SADD");
+            cmd.arg(&request.key);
+            for member in &request.members {
+                cmd.arg(member);
+            }
+            let added = cmd
+                .query::<u64>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+            Ok(added > 0)
+        })
+    }
+
+    fn set_remove(&self, request: &SetRemoveRequest) -> Result<bool, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let mut cmd = redis::cmd("SREM");
+            cmd.arg(&request.key);
+            for member in &request.members {
+                cmd.arg(member);
+            }
+            let removed = cmd
+                .query::<u64>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+            Ok(removed > 0)
+        })
+    }
+
+    // -- Sorted Set member operations --
+
+    fn zset_add(&self, request: &ZSetAddRequest) -> Result<bool, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let mut cmd = redis::cmd("ZADD");
+            cmd.arg(&request.key);
+            for (member, score) in &request.members {
+                cmd.arg(*score).arg(member);
+            }
+            let added = cmd
+                .query::<u64>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+            Ok(added > 0)
+        })
+    }
+
+    fn zset_remove(&self, request: &ZSetRemoveRequest) -> Result<bool, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let mut cmd = redis::cmd("ZREM");
+            cmd.arg(&request.key);
+            for member in &request.members {
+                cmd.arg(member);
+            }
+            let removed = cmd
+                .query::<u64>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+            Ok(removed > 0)
+        })
+    }
+
+    // -- Stream operations --
+
+    fn stream_add(&self, request: &StreamAddRequest) -> Result<String, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let mut cmd = redis::cmd("XADD");
+            cmd.arg(&request.key);
+
+            if let Some(maxlen) = &request.maxlen {
+                cmd.arg("MAXLEN");
+                if maxlen.approximate {
+                    cmd.arg("~");
+                }
+                cmd.arg(maxlen.count);
+            }
+
+            match &request.id {
+                StreamEntryId::Auto => {
+                    cmd.arg("*");
+                }
+                StreamEntryId::Explicit(id) => {
+                    cmd.arg(id);
+                }
+            }
+
+            for (field, value) in &request.fields {
+                cmd.arg(field).arg(value);
+            }
+
+            let entry_id: String = cmd.query(conn).map_err(|e| format_redis_query_error(&e))?;
+
+            Ok(entry_id)
+        })
+    }
+
+    fn stream_delete(&self, request: &StreamDeleteRequest) -> Result<u64, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let mut cmd = redis::cmd("XDEL");
+            cmd.arg(&request.key);
+
+            for id in &request.ids {
+                cmd.arg(id);
+            }
+
+            let deleted: u64 = cmd.query(conn).map_err(|e| format_redis_query_error(&e))?;
+
+            Ok(deleted)
+        })
+    }
+
+    // -- Optional browsing operations --
+
+    fn features(&self) -> KeyValueFeatures {
+        KeyValueFeatures::KEY_METADATA
+            | KeyValueFeatures::SCAN_TYPE_FILTER
+            | KeyValueFeatures::KEEP_TTL_ON_WRITE
+            | KeyValueFeatures::SORTED_SET_RANGE
+            | KeyValueFeatures::STREAM_RANGE
+            | KeyValueFeatures::STREAM_GROUPS
+            | KeyValueFeatures::BULK_DELETE
+            | KeyValueFeatures::VALUE_PREFIX
+    }
+
+    fn key_metadata(&self, request: &KeyMetadataRequest) -> Result<Vec<KeyMetadata>, DbError> {
+        if request.keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let with_encoding = request.include_encoding;
+        let commands = metadata_commands(&request.keys, true, with_encoding);
+
+        match self.query_pipeline(request.keyspace, &commands) {
+            Ok(replies) => key_metadata_from_replies(&request.keys, &replies, true, with_encoding),
+            Err(error) => {
+                // MEMORY USAGE and OBJECT ENCODING can be disabled on managed
+                // servers; the expiry alone is still worth showing.
+                log::debug!("Redis key metadata without size or encoding: {error}");
+
+                let commands = metadata_commands(&request.keys, false, false);
+                let replies = self.query_pipeline(request.keyspace, &commands)?;
+                key_metadata_from_replies(&request.keys, &replies, false, false)
+            }
+        }
+    }
+
+    fn delete_keys(&self, request: &KeyBulkDeleteRequest) -> Result<u64, DbError> {
+        if request.keys.is_empty() {
+            return Ok(0);
+        }
+
+        if self.is_cluster()? {
+            // Keys of one batch live in different slots, so each UNLINK is
+            // routed on its own inside a cluster pipeline.
+            let commands: Vec<redis::Cmd> = request
+                .keys
+                .iter()
+                .map(|key| {
+                    let mut command = redis::cmd("UNLINK");
+                    command.arg(key);
+                    command
+                })
+                .collect();
+
+            let replies = self.query_pipeline(request.keyspace, &commands)?;
+
+            return Ok(replies
+                .iter()
+                .filter_map(redis_value_as_i64)
+                .map(|removed| removed.max(0) as u64)
+                .sum());
+        }
+
+        self.with_connection(request.keyspace, |conn| {
+            let mut command = redis::cmd("UNLINK");
+            command.arg(&request.keys);
+
+            command
+                .query::<u64>(conn)
+                .map_err(|e| format_redis_query_error(&e))
+        })
+    }
+
+    fn get_value_prefix(&self, request: &KeyValuePrefixRequest) -> Result<KeyGetResult, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let type_name = redis::cmd("TYPE")
+                .arg(&request.key)
+                .query::<String>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+
+            if parse_key_type(&type_name) != KeyType::String {
+                return Err(DbError::NotSupported(format!(
+                    "A value prefix can only be read from a string key, not a {type_name}"
+                )));
+            }
+
+            let total_bytes = redis::cmd("STRLEN")
+                .arg(&request.key)
+                .query::<u64>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+
+            let last_index = request.max_bytes.saturating_sub(1);
+            let value = redis::cmd("GETRANGE")
+                .arg(&request.key)
+                .arg(0)
+                .arg(last_index)
+                .query::<Vec<u8>>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+
+            let repr = detect_value_repr(&value);
+            let load_state = if (value.len() as u64) < total_bytes {
+                KeyLoadState::Truncated {
+                    returned_bytes: value.len() as u64,
+                    total_bytes: Some(total_bytes),
+                }
+            } else {
+                KeyLoadState::Loaded
+            };
+
+            Ok(KeyGetResult {
+                entry: KeyEntry {
+                    key: request.key.clone(),
+                    key_type: Some(normalize_key_type_for_payload(KeyType::String, repr)),
+                    ttl_seconds: None,
+                    size_bytes: Some(total_bytes),
+                },
+                value,
+                repr,
+                load_state,
+            })
+        })
+    }
+
+    fn zset_range(&self, request: &ZSetRangeRequest) -> Result<ZSetRangePage, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let total = redis::cmd("ZCARD")
+                .arg(&request.key)
+                .query::<u64>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+
+            if request.count == 0 || request.offset >= total {
+                return Ok(ZSetRangePage {
+                    members: Vec::new(),
+                    total,
+                });
+            }
+
+            let stop = request.offset.saturating_add(request.count) - 1;
+            let command_name = match request.order {
+                RangeOrder::Ascending => "ZRANGE",
+                RangeOrder::Descending => "ZREVRANGE",
+            };
+
+            let flat = redis::cmd(command_name)
+                .arg(&request.key)
+                .arg(request.offset)
+                .arg(stop)
+                .arg("WITHSCORES")
+                .query::<Vec<String>>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+
+            Ok(ZSetRangePage {
+                members: zset_members_from_reply(flat),
+                total,
+            })
+        })
+    }
+
+    fn stream_range(&self, request: &StreamRangeRequest) -> Result<StreamRangePage, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let total = redis::cmd("XLEN")
+                .arg(&request.key)
+                .query::<u64>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+
+            let mut command = match request.order {
+                RangeOrder::Ascending => {
+                    let mut command = redis::cmd("XRANGE");
+                    command
+                        .arg(&request.key)
+                        .arg(&request.start)
+                        .arg(&request.end);
+                    command
+                }
+                RangeOrder::Descending => {
+                    let mut command = redis::cmd("XREVRANGE");
+                    command
+                        .arg(&request.key)
+                        .arg(&request.end)
+                        .arg(&request.start);
+                    command
+                }
+            };
+            command.arg("COUNT").arg(request.count);
+
+            let raw: Vec<(String, Vec<String>)> = command
+                .query(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+
+            Ok(StreamRangePage {
+                entries: stream_entries_from_reply(raw),
+                total,
+            })
+        })
+    }
+
+    fn stream_groups(
+        &self,
+        request: &StreamGroupsRequest,
+    ) -> Result<Vec<StreamConsumerGroup>, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let info = redis::cmd("XINFO")
+                .arg("GROUPS")
+                .arg(&request.key)
+                .query::<Vec<redis::Value>>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+
+            let mut groups: Vec<StreamConsumerGroup> =
+                info.iter().filter_map(consumer_group_from_info).collect();
+
+            for group in &mut groups {
+                let consumers = redis::cmd("XINFO")
+                    .arg("CONSUMERS")
+                    .arg(&request.key)
+                    .arg(&group.name)
+                    .query::<Vec<redis::Value>>(conn)
+                    .map_err(|e| format_redis_query_error(&e))?;
+
+                group.consumers = consumers
+                    .iter()
+                    .filter_map(|consumer| {
+                        redis_value_pairs(consumer)
+                            .into_iter()
+                            .find(|(field, _)| field == "name")
+                            .and_then(|(_, value)| redis_value_as_string(&value))
+                    })
+                    .collect();
+
+                if group.pending > 0 {
+                    let oldest = redis::cmd("XPENDING")
+                        .arg(&request.key)
+                        .arg(&group.name)
+                        .arg("-")
+                        .arg("+")
+                        .arg(1)
+                        .query::<redis::Value>(conn)
+                        .map_err(|e| format_redis_query_error(&e))?;
+
+                    group.oldest_pending_idle_ms = pending_entries_from_reply(&oldest)
+                        .first()
+                        .map(|entry| entry.idle_ms);
+                }
+            }
+
+            Ok(groups)
+        })
+    }
+
+    fn stream_pending(
+        &self,
+        request: &StreamPendingRequest,
+    ) -> Result<Vec<StreamPendingEntry>, DbError> {
+        self.with_connection(request.keyspace, |conn| {
+            let reply = redis::cmd("XPENDING")
+                .arg(&request.key)
+                .arg(&request.group)
+                .arg("-")
+                .arg("+")
+                .arg(request.count)
+                .query::<redis::Value>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+
+            Ok(pending_entries_from_reply(&reply))
+        })
+    }
+
+    fn stream_claim(&self, request: &StreamClaimRequest) -> Result<Vec<String>, DbError> {
+        if request.ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        self.with_connection(request.keyspace, |conn| {
+            let mut command = redis::cmd("XCLAIM");
+            command
+                .arg(&request.key)
+                .arg(&request.group)
+                .arg(&request.consumer)
+                .arg(request.min_idle_ms)
+                .arg(&request.ids)
+                .arg("JUSTID");
+
+            command
+                .query::<Vec<String>>(conn)
+                .map_err(|e| format_redis_query_error(&e))
+        })
+    }
+}
+
+/// Builds the `SET` for a write. `keep_ttl_supported` adds `KEEPTTL` when
+/// the request asks to keep the expiry and sets none of its own.
+fn set_command(request: &KeySetRequest, keep_ttl_supported: bool) -> redis::Cmd {
+    let mut command = redis::cmd("SET");
+    command.arg(&request.key).arg(&request.value);
+
+    if let Some(ttl_seconds) = request.ttl_seconds {
+        command.arg("EX").arg(ttl_seconds);
+    } else if request.keep_ttl && keep_ttl_supported {
+        command.arg("KEEPTTL");
+    }
+
+    match request.condition {
+        SetCondition::Always => {}
+        SetCondition::IfNotExists => {
+            command.arg("NX");
+        }
+        SetCondition::IfExists => {
+            command.arg("XX");
+        }
+    }
+
+    command
+}
+
+fn wants_keep_ttl(request: &KeySetRequest) -> bool {
+    request.keep_ttl && request.ttl_seconds.is_none()
+}
+
+fn is_syntax_error(error: &redis::RedisError) -> bool {
+    error
+        .to_string()
+        .to_ascii_lowercase()
+        .contains("syntax error")
+}
+
+/// Writes the value without `KEEPTTL`, then restores the expiry the key had
+/// before the write. Used only against servers that predate `KEEPTTL`.
+fn set_reapplying_ttl(
+    conn: &mut dyn redis::ConnectionLike,
+    request: &KeySetRequest,
+) -> Result<Option<String>, DbError> {
+    let remaining_ms = redis::cmd("PTTL")
+        .arg(&request.key)
+        .query::<i64>(conn)
+        .map_err(|e| format_redis_query_error(&e))?;
+
+    let response = set_command(request, false)
+        .query::<Option<String>>(conn)
+        .map_err(|e| format_redis_query_error(&e))?;
+
+    if response.is_some() && remaining_ms > 0 {
+        redis::cmd("PEXPIRE")
+            .arg(&request.key)
+            .arg(remaining_ms)
+            .query::<i64>(conn)
+            .map_err(|e| format_redis_query_error(&e))?;
+    }
+
+    Ok(response)
+}
+
+/// Expiry in whole seconds from a `PTTL` reply: `None` for a key without an
+/// expiry, and a partial second rounds up so a live key never reads as 0.
+fn ttl_seconds_from_pttl(pttl_ms: i64) -> Option<i64> {
+    if pttl_ms < 0 {
+        None
+    } else {
+        Some((pttl_ms + 999) / 1000)
+    }
+}
+
+fn redis_value_as_i64(value: &redis::Value) -> Option<i64> {
+    match value {
+        redis::Value::Int(number) => Some(*number),
+        redis::Value::BulkString(bytes) => std::str::from_utf8(bytes).ok()?.parse().ok(),
+        redis::Value::SimpleString(text) => text.parse().ok(),
+        redis::Value::Double(number) => Some(*number as i64),
+        _ => None,
+    }
+}
+
+fn redis_value_as_string(value: &redis::Value) -> Option<String> {
+    match value {
+        redis::Value::BulkString(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+        redis::Value::SimpleString(text) => Some(text.clone()),
+        redis::Value::VerbatimString { text, .. } => Some(text.clone()),
+        redis::Value::Int(number) => Some(number.to_string()),
+        redis::Value::Okay => Some("OK".to_string()),
+        _ => None,
+    }
+}
+
+/// Pairs the `PTTL`, `MEMORY USAGE` and `OBJECT ENCODING` replies of a
+/// metadata pipeline with their keys.
+///
+/// `replies` holds `commands_per_key` replies per key, in key order: `PTTL`
+/// first, then `MEMORY USAGE` when `with_size`, then `OBJECT ENCODING` when
+/// `with_encoding`. A reply the server refused (older servers, restricted
+/// commands) leaves that field `None` instead of failing the batch.
+fn key_metadata_from_replies(
+    keys: &[String],
+    replies: &[redis::Value],
+    with_size: bool,
+    with_encoding: bool,
+) -> Result<Vec<KeyMetadata>, DbError> {
+    let commands_per_key = 1 + usize::from(with_size) + usize::from(with_encoding);
+
+    if replies.len() != keys.len() * commands_per_key {
+        return Err(DbError::query_failed(format!(
+            "Redis returned {} metadata replies for {} keys",
+            replies.len(),
+            keys.len()
+        )));
+    }
+
+    let metadata = keys
+        .iter()
+        .zip(replies.chunks(commands_per_key))
+        .map(|(key, key_replies)| {
+            let mut replies = key_replies.iter();
+            let pttl = replies.next().and_then(redis_value_as_i64).unwrap_or(-2);
+
+            let size_bytes = if with_size {
+                replies
+                    .next()
+                    .and_then(redis_value_as_i64)
+                    .and_then(|size| u64::try_from(size).ok())
+            } else {
+                None
+            };
+
+            let encoding = if with_encoding {
+                replies.next().and_then(redis_value_as_string)
+            } else {
+                None
+            };
+
+            KeyMetadata {
+                key: key.clone(),
+                exists: pttl != -2,
+                ttl_seconds: ttl_seconds_from_pttl(pttl),
+                size_bytes,
+                encoding,
+            }
+        })
+        .collect();
+
+    Ok(metadata)
+}
+
+fn metadata_commands(keys: &[String], with_size: bool, with_encoding: bool) -> Vec<redis::Cmd> {
+    let mut commands = Vec::new();
+
+    for key in keys {
+        let mut pttl = redis::cmd("PTTL");
+        pttl.arg(key);
+        commands.push(pttl);
+
+        if with_size {
+            let mut memory = redis::cmd("MEMORY");
+            memory.arg("USAGE").arg(key);
+            commands.push(memory);
+        }
+
+        if with_encoding {
+            let mut object = redis::cmd("OBJECT");
+            object.arg("ENCODING").arg(key);
+            commands.push(object);
+        }
+    }
+
+    commands
+}
+
+/// Reads the field/value pairs of one `XINFO GROUPS` entry, which RESP2
+/// sends as a flat array and RESP3 as a map.
+fn redis_value_pairs(value: &redis::Value) -> Vec<(String, redis::Value)> {
+    match value {
+        redis::Value::Map(entries) => entries
+            .iter()
+            .filter_map(|(name, value)| Some((redis_value_as_string(name)?, value.clone())))
+            .collect(),
+        redis::Value::Array(items) => items
+            .chunks(2)
+            .filter_map(|pair| match pair {
+                [name, value] => Some((redis_value_as_string(name)?, value.clone())),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A consumer group from one `XINFO GROUPS` entry, without its consumer
+/// names or pending idle time, which need further commands.
+fn consumer_group_from_info(value: &redis::Value) -> Option<StreamConsumerGroup> {
+    let pairs = redis_value_pairs(value);
+    let field = |name: &str| {
+        pairs
+            .iter()
+            .find(|(field_name, _)| field_name == name)
+            .map(|(_, value)| value)
+    };
+
+    Some(StreamConsumerGroup {
+        name: field("name").and_then(redis_value_as_string)?,
+        consumers: Vec::new(),
+        pending: field("pending")
+            .and_then(redis_value_as_i64)
+            .and_then(|pending| u64::try_from(pending).ok())
+            .unwrap_or(0),
+        last_delivered_id: field("last-delivered-id")
+            .and_then(redis_value_as_string)
+            .unwrap_or_default(),
+        oldest_pending_idle_ms: None,
+    })
+}
+
+/// Parses the extended `XPENDING key group - + count` reply.
+fn pending_entries_from_reply(value: &redis::Value) -> Vec<StreamPendingEntry> {
+    let redis::Value::Array(entries) = value else {
+        return Vec::new();
+    };
+
+    entries
+        .iter()
+        .filter_map(|entry| {
+            let redis::Value::Array(fields) = entry else {
+                return None;
+            };
+
+            match fields.as_slice() {
+                [id, consumer, idle, deliveries, ..] => Some(StreamPendingEntry {
+                    id: redis_value_as_string(id)?,
+                    consumer: redis_value_as_string(consumer)?,
+                    idle_ms: redis_value_as_i64(idle)
+                        .and_then(|idle| u64::try_from(idle).ok())
+                        .unwrap_or(0),
+                    delivery_count: redis_value_as_i64(deliveries)
+                        .and_then(|count| u64::try_from(count).ok())
+                        .unwrap_or(0),
+                }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn stream_entries_from_reply(raw: Vec<(String, Vec<String>)>) -> Vec<StreamEntry> {
+    raw.into_iter()
+        .map(|(id, flat_fields)| StreamEntry {
+            id,
+            fields: flat_fields
+                .chunks(2)
+                .filter_map(|pair| match pair {
+                    [field, value] => Some((field.clone(), value.clone())),
+                    _ => None,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+fn zset_members_from_reply(flat: Vec<String>) -> Vec<ZSetMember> {
+    flat.chunks(2)
+        .filter_map(|pair| match pair {
+            [member, score] => Some(ZSetMember {
+                member: member.clone(),
+                score: score.parse::<f64>().unwrap_or(0.0),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+struct RedisErrorFormatter;
+
+impl RedisErrorFormatter {
+    fn format_connection_message(source: &str, host: &str, port: u16) -> String {
+        let lower = source.to_ascii_lowercase();
+
+        if lower.contains("connection refused") {
+            format!("Connection refused. Is Redis running at {}:{}?", host, port)
+        } else if lower.contains("timed out") {
+            "Connection timed out".to_string()
+        } else if lower.contains("noauth") || lower.contains("wrongpass") {
+            "Authentication failed. Check credentials.".to_string()
+        } else {
+            source.to_string()
+        }
+    }
+}
+
+impl QueryErrorFormatter for RedisErrorFormatter {
+    fn format_query_error(&self, error: &(dyn std::error::Error + 'static)) -> FormattedError {
+        FormattedError::new(error.to_string())
+    }
+}
+
+impl ConnectionErrorFormatter for RedisErrorFormatter {
+    fn format_connection_error(
+        &self,
+        error: &(dyn std::error::Error + 'static),
+        host: &str,
+        port: u16,
+    ) -> FormattedError {
+        let source = error.to_string();
+        let message = Self::format_connection_message(&source, host, port);
+        FormattedError::new(message)
+    }
+
+    fn format_uri_error(
+        &self,
+        error: &(dyn std::error::Error + 'static),
+        sanitized_uri: &str,
+    ) -> FormattedError {
+        let source = error.to_string();
+        let lower = source.to_ascii_lowercase();
+
+        if lower.contains("connection refused") {
+            return FormattedError::new(format!(
+                "Connection refused. Check URI: {}",
+                sanitized_uri
+            ));
+        }
+
+        if lower.contains("noauth") || lower.contains("wrongpass") {
+            return FormattedError::new("Authentication failed. Check credentials.");
+        }
+
+        if lower.contains("timed out") {
+            return FormattedError::new("Connection timed out");
+        }
+
+        FormattedError::new(source)
+    }
+}
+
+/// Rejects request options `execute` cannot honor before any command runs.
+/// Instance metric and inspector sources build their own results, so they
+/// cannot apply a row budget.
+fn refuse_unsupported_request_options(request: &QueryRequest) -> Result<(), DbError> {
+    if request.statement_timeout.is_some() {
+        return Err(DbError::NotSupported(
+            "Redis: requested statement timeout is unsupported; rejected before execution"
+                .to_string(),
+        ));
+    }
+    if request.limit.is_some()
+        && let Some(
+            ExecutionSourceContext::InstanceMetricQuery { .. }
+            | ExecutionSourceContext::InstanceInspectorQuery { .. },
+        ) = request
+            .execution_context
+            .as_ref()
+            .and_then(|context| context.source.as_ref())
+    {
+        return Err(DbError::NotSupported(
+            "Redis: row limits on instance catalog queries are unsupported; rejected before execution"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+// -- Redis Value → QueryResult --
+
+/// Converts one command reply into a result. `row_limit` bounds only the rows
+/// of a tabular reply; text and scalar replies carry no rows and ignore it.
+fn redis_value_to_result(
+    value: redis::Value,
+    execution_time: std::time::Duration,
+    row_limit: Option<u32>,
+) -> QueryResult {
+    match value {
+        redis::Value::Nil => QueryResult::text("(nil)".to_string(), execution_time),
+
+        redis::Value::Int(i) => QueryResult::text(format!("(integer) {}", i), execution_time),
+
+        redis::Value::BulkString(bytes) => match String::from_utf8(bytes.clone()) {
+            Ok(s) => QueryResult::text(s, execution_time),
+            Err(_) => QueryResult::binary(bytes, execution_time),
+        },
+
+        redis::Value::SimpleString(s) => QueryResult::text(s, execution_time),
+
+        redis::Value::Array(items) => redis_array_to_result(items, execution_time, row_limit),
+
+        redis::Value::Map(entries) => {
+            let mut lines = Vec::with_capacity(entries.len());
+            for (k, v) in entries {
+                let key_str = redis_value_to_display(&k);
+                let val_str = redis_value_to_display(&v);
+                lines.push(format!("{}: {}", key_str, val_str));
+            }
+            QueryResult::text(lines.join("\n"), execution_time)
+        }
+
+        redis::Value::Boolean(b) => QueryResult::text(
+            if b { "(true)" } else { "(false)" }.to_string(),
+            execution_time,
+        ),
+
+        redis::Value::Double(f) => QueryResult::text(format!("(double) {}", f), execution_time),
+
+        redis::Value::BigNumber(n) => {
+            QueryResult::text(format!("(big number) {}", n), execution_time)
+        }
+
+        redis::Value::VerbatimString { format: _, text } => QueryResult::text(text, execution_time),
+
+        redis::Value::Set(items) => redis_array_to_result(items, execution_time, row_limit),
+
+        redis::Value::Okay => QueryResult::text("OK".to_string(), execution_time),
+
+        redis::Value::ServerError(e) => QueryResult::text(
+            format!("(error) {}", e.details().unwrap_or("unknown")),
+            execution_time,
+        ),
+
+        redis::Value::Push { kind: _, data } => {
+            redis_array_to_result(data, execution_time, row_limit)
+        }
+
+        redis::Value::Attribute {
+            data,
+            attributes: _,
+        } => redis_value_to_result(*data, execution_time, row_limit),
+    }
+}
+
+/// Try to present a redis array as a table (if elements are uniform key-value pairs)
+/// or fall back to numbered text lines.
+fn redis_array_to_result(
+    items: Vec<redis::Value>,
+    execution_time: std::time::Duration,
+    row_limit: Option<u32>,
+) -> QueryResult {
+    if items.is_empty() {
+        return QueryResult::text("(empty array)".to_string(), execution_time);
+    }
+
+    // Check if all items are simple scalars → table with index + value columns
+    let all_scalar = items.iter().all(|v| {
+        matches!(
+            v,
+            redis::Value::Int(_)
+                | redis::Value::BulkString(_)
+                | redis::Value::SimpleString(_)
+                | redis::Value::Nil
+                | redis::Value::Boolean(_)
+                | redis::Value::Double(_)
+                | redis::Value::Okay
+        )
+    });
+
+    if all_scalar {
+        let columns = vec![
+            ColumnMeta {
+                name: "#".to_string(),
+                type_name: "int".to_string(),
+                kind: ColumnKind::Integer,
+                nullable: false,
+                is_primary_key: false,
+            },
+            ColumnMeta {
+                name: "value".to_string(),
+                type_name: "redis".to_string(),
+                kind: ColumnKind::Text,
+                nullable: true,
+                is_primary_key: false,
+            },
+        ];
+
+        let retained = row_limit.map_or(items.len(), |limit| {
+            items
+                .len()
+                .min(usize::try_from(limit).unwrap_or(usize::MAX))
+        });
+        let truncated = retained < items.len();
+
+        let rows: Vec<Vec<Value>> = items
+            .into_iter()
+            .take(retained)
+            .enumerate()
+            .map(|(i, v)| vec![Value::Int(i as i64), redis_scalar_to_value(v)])
+            .collect();
+
+        let mut result = QueryResult::table(columns, rows, None, execution_time);
+        result.set_rows_truncated(truncated);
+        return result;
+    }
+
+    // Fallback: numbered text dump
+    let lines: Vec<String> = items
+        .iter()
+        .enumerate()
+        .map(|(i, v)| format!("{}) {}", i + 1, redis_value_to_display(v)))
+        .collect();
+
+    QueryResult::text(lines.join("\n"), execution_time)
+}
+
+fn redis_scalar_to_value(v: redis::Value) -> Value {
+    match v {
+        redis::Value::Nil => Value::Null,
+        redis::Value::Int(i) => Value::Int(i),
+        redis::Value::BulkString(bytes) => match String::from_utf8(bytes) {
+            Ok(s) => Value::Text(s),
+            Err(e) => Value::Bytes(e.into_bytes()),
+        },
+        redis::Value::SimpleString(s) => Value::Text(s),
+        redis::Value::Boolean(b) => Value::Bool(b),
+        redis::Value::Double(f) => Value::Float(f),
+        redis::Value::Okay => Value::Text("OK".to_string()),
+        _ => Value::Text(redis_value_to_display(&v)),
+    }
+}
+
+fn redis_value_to_display(v: &redis::Value) -> String {
+    match v {
+        redis::Value::Nil => "(nil)".to_string(),
+        redis::Value::Int(i) => i.to_string(),
+        redis::Value::BulkString(bytes) => {
+            String::from_utf8(bytes.clone()).unwrap_or_else(|_| format!("<{} bytes>", bytes.len()))
+        }
+        redis::Value::SimpleString(s) => s.clone(),
+        redis::Value::Array(items) | redis::Value::Set(items) => {
+            let inner: Vec<String> = items.iter().map(redis_value_to_display).collect();
+            format!("[{}]", inner.join(", "))
+        }
+        redis::Value::Map(entries) => {
+            let inner: Vec<String> = entries
+                .iter()
+                .map(|(k, v)| {
+                    format!(
+                        "{}: {}",
+                        redis_value_to_display(k),
+                        redis_value_to_display(v)
+                    )
+                })
+                .collect();
+            format!("{{{}}}", inner.join(", "))
+        }
+        redis::Value::Boolean(b) => b.to_string(),
+        redis::Value::Double(f) => f.to_string(),
+        redis::Value::BigNumber(n) => n.to_string(),
+        redis::Value::VerbatimString { text, .. } => text.clone(),
+        redis::Value::Okay => "OK".to_string(),
+        redis::Value::ServerError(e) => {
+            format!("ERR {}", e.details().unwrap_or("unknown"))
+        }
+        redis::Value::Push { data, .. } => {
+            let inner: Vec<String> = data.iter().map(redis_value_to_display).collect();
+            format!("PUSH[{}]", inner.join(", "))
+        }
+        redis::Value::Attribute { data, .. } => redis_value_to_display(data),
+    }
+}
+
+static REDIS_ERROR_FORMATTER: RedisErrorFormatter = RedisErrorFormatter;
+
+fn format_redis_error(error: &redis::RedisError, host: &str, port: u16) -> DbError {
+    let formatted = REDIS_ERROR_FORMATTER.format_connection_error(error, host, port);
+    formatted.into_connection_error()
+}
+
+fn format_redis_uri_error(error: &redis::RedisError, uri: &str) -> DbError {
+    let sanitized = sanitize_uri(uri);
+    let formatted = REDIS_ERROR_FORMATTER.format_uri_error(error, &sanitized);
+    formatted.into_connection_error()
+}
+
+/// Formats a query-time `redis::RedisError` into a `DbError`.
+///
+/// A connection-class error (see `is_connection_level_error`) is classified as
+/// `DbError::ConnectionFailed` rather than `DbError::QueryFailed`. This is what
+/// lets `RedisTransport::with_connection_like`'s Sentinel failover retry
+/// (`should_retry_sentinel_command`) recognize it without needing the raw
+/// `redis::RedisError` at that choke point — command closures already convert
+/// to `DbError` via this function before it is reached.
+pub(crate) fn format_redis_query_error(error: &redis::RedisError) -> DbError {
+    let formatted = REDIS_ERROR_FORMATTER.format_query_error(error);
+
+    if is_connection_level_error(error) {
+        formatted.into_connection_error()
+    } else {
+        formatted.into_query_error()
+    }
+}
+
+/// Best-effort write-privilege probe for `Connection::probe_write_privilege`.
+///
+/// Prefers `ACL WHOAMI` + `ACL DRYRUN`, which answers the question without
+/// touching the keyspace at all. Falls through to a short-TTL namespaced
+/// write probe (`probe_write_privilege_fallback`) when `ACL` itself is
+/// unavailable: older servers predate `ACL DRYRUN` (added in Redis 7.0), and
+/// some managed providers restrict `ACL` entirely.
+fn probe_write_privilege_over(conn: &mut dyn redis::ConnectionLike) -> WritePrivilege {
+    let probe_key = format!("datatab:privilege-probe:{}", uuid::Uuid::new_v4());
+
+    let whoami = redis::cmd("ACL").arg("WHOAMI").query::<String>(conn);
+
+    let user = match whoami {
+        Ok(user) => user,
+        Err(error) => {
+            return match classify_acl_command_error(&error.to_string()) {
+                AclCommandAvailability::Unsupported => {
+                    probe_write_privilege_fallback(conn, &probe_key)
+                }
+                AclCommandAvailability::Unexpected => WritePrivilege::Unknown,
+            };
+        }
+    };
+
+    let dryrun = redis::cmd("ACL")
+        .arg("DRYRUN")
+        .arg(&user)
+        .arg("SET")
+        .arg(&probe_key)
+        .arg("1")
+        .query::<String>(conn);
+
+    match dryrun {
+        Ok(reply) => match classify_acl_dryrun_reply(&reply) {
+            AclDryRunReply::Permitted => WritePrivilege::Writable,
+            AclDryRunReply::Denied => WritePrivilege::ReadOnly,
+        },
+        Err(error) => match classify_acl_command_error(&error.to_string()) {
+            AclCommandAvailability::Unsupported => probe_write_privilege_fallback(conn, &probe_key),
+            AclCommandAvailability::Unexpected => WritePrivilege::Unknown,
+        },
+    }
+}
+
+/// Fallback write-privilege probe used when `ACL` is unavailable: attempts a
+/// namespaced key write with a 1 second TTL, then immediately deletes it.
+///
+/// The short TTL is the safety net, not the cleanup mechanism: even if the
+/// `DEL` below fails (connection drop, etc.), the probe key expires on its
+/// own a moment later and never lingers in the keyspace.
+fn probe_write_privilege_fallback(
+    conn: &mut dyn redis::ConnectionLike,
+    probe_key: &str,
+) -> WritePrivilege {
+    let set_result = redis::cmd("SET")
+        .arg(probe_key)
+        .arg("1")
+        .arg("PX")
+        .arg(1000)
+        .arg("NX")
+        .query::<Option<String>>(conn);
+
+    match set_result {
+        Ok(_) => {
+            redis::cmd("DEL")
+                .arg(probe_key)
+                .query::<i64>(conn)
+                .log_err();
+            WritePrivilege::Writable
+        }
+        Err(error) => match classify_fallback_probe_error(&error.to_string()) {
+            FallbackProbeOutcome::PermissionDenied => WritePrivilege::ReadOnly,
+            FallbackProbeOutcome::Other => WritePrivilege::Unknown,
+        },
+    }
+}
+
+fn authenticate(
+    conn: &mut redis::Connection,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> redis::RedisResult<()> {
+    if let Some(password) = password {
+        let mut command = redis::cmd("AUTH");
+        if let Some(user) = user
+            && !user.is_empty()
+        {
+            command.arg(user);
+        }
+        command.arg(password);
+        command.query::<String>(conn)?;
+    }
+
+    Ok(())
+}
+
+fn select_db(conn: &mut dyn redis::ConnectionLike, db_index: u32) -> redis::RedisResult<()> {
+    redis::cmd("SELECT").arg(db_index).query::<String>(conn)?;
+    Ok(())
+}
+
+/// Detects the topology of the server behind `conn` via `ROLE` and, when
+/// that does not identify a Sentinel, `INFO cluster`.
+///
+/// Called once at connect time, before the connection is wrapped in a
+/// `RedisTransport`. Only a genuine transport/IO error on either probe
+/// aborts detection; a `ROLE` reply that some managed providers reject as an
+/// unsupported command is treated as "not a Sentinel" (see
+/// `classify_role_reply`) and detection falls through to `INFO cluster`.
+fn detect_topology(conn: &mut redis::Connection) -> redis::RedisResult<TopologyProbe> {
+    let role_reply = redis::cmd("ROLE").query::<redis::Role>(conn);
+
+    match (classify_role_reply(&role_reply), role_reply) {
+        (RoleClassification::Sentinel, _) => Ok(TopologyProbe::SentinelService),
+        (RoleClassification::Aborted, Err(error)) => Err(error),
+        // Unreachable in practice: `classify_role_reply` only returns `Aborted`
+        // from the `Err(_)` arm. Fall through to the INFO check defensively
+        // instead of panicking on a value that cannot occur.
+        (RoleClassification::Aborted, Ok(_)) | (RoleClassification::NotSentinel, _) => {
+            detect_topology_via_cluster_info(conn)
+        }
+    }
+}
+
+fn detect_topology_via_cluster_info(
+    conn: &mut redis::Connection,
+) -> redis::RedisResult<TopologyProbe> {
+    let info: String = redis::cmd("INFO").arg("cluster").query(conn)?;
+
+    Ok(if parse_cluster_enabled(&info) {
+        TopologyProbe::Cluster
+    } else {
+        TopologyProbe::Standalone
+    })
+}
+
+/// The user pointed a standalone or auto-detecting connection at a Redis
+/// Sentinel node. Detection alone cannot proceed (a Sentinel has no data of
+/// its own), so this tells the user exactly what to configure instead of the
+/// batch 2 placeholder ("select the Sentinel topology mode... once Sentinel
+/// support ships").
+fn unconfigured_sentinel_topology() -> DbError {
+    DbError::NotSupported(
+        "datatab detected a Redis Sentinel deployment at this address. Set this connection's \
+         topology to Sentinel and provide the Sentinel master/service name to connect through it."
+            .to_string(),
+    )
+}
+
+/// Builds a live `ClusterConnection` from a seed node URI plus any additional
+/// configured seed nodes.
+///
+/// `ClusterClient` only needs one reachable node to discover the rest of the
+/// topology via `CLUSTER SLOTS`, so `additional_nodes` is a resilience
+/// improvement (tolerating the primary node being down at connect time)
+/// rather than a correctness requirement. TLS mode is derived by the builder
+/// from `node_uri`'s scheme (and `#insecure` fragment); `additional_nodes` are
+/// always plain `redis://` — configuring per-node TLS for extra seeds is not
+/// supported by this batch (see the driver README).
+fn build_cluster_connection(
+    node_uri: &str,
+    additional_nodes: &[(String, u16)],
+    tls: &RedisTlsConfig,
+    user: Option<&str>,
+    password: Option<&str>,
+) -> redis::RedisResult<redis::cluster::ClusterConnection> {
+    let mut nodes = vec![node_uri.to_string()];
+    nodes.extend(
+        additional_nodes
+            .iter()
+            .map(|(host, port)| format!("redis://{host}:{port}/")),
+    );
+
+    let mut builder = redis::cluster::ClusterClientBuilder::new(nodes);
+
+    if let Some(user) = user.filter(|value| !value.is_empty()) {
+        builder = builder.username(user.to_string());
+    }
+
+    if let Some(password) = password {
+        builder = builder.password(password.to_string());
+    }
+
+    if let RedisTlsConfig::TlsVerify(certs) = tls {
+        builder = builder.certs(redis::TlsCertificates {
+            client_tls: certs.client_tls.clone(),
+            root_cert: certs.root_cert.clone(),
+        });
+    }
+
+    builder.build()?.get_connection()
+}
+
+/// Builds the list of Sentinel node URIs: the primary node followed by any
+/// configured additional nodes, all as plain `redis://` addresses.
+///
+/// `primary_uri` is used as typed by the caller. `refuse_sentinel_tls` refuses
+/// the list when it carries a TLS address (see the driver README).
+fn build_sentinel_node_uris(primary_uri: &str, additional_nodes: &[(String, u16)]) -> Vec<String> {
+    let mut nodes = vec![primary_uri.to_string()];
+    nodes.extend(
+        additional_nodes
+            .iter()
+            .map(|(host, port)| format!("redis://{host}:{port}/")),
+    );
+    nodes
+}
+
+/// Reads the address the `redis` crate will use, because it cleans a URI up
+/// before parsing it and text matching would miss a form such as a trailing
+/// space or an upper-case scheme. A URI that does not parse fails later in
+/// `SentinelClient::build`.
+fn is_tls_uri(uri: &str) -> bool {
+    matches!(
+        uri.into_connection_info(),
+        Ok(redis::ConnectionInfo {
+            addr: redis::ConnectionAddr::TcpTls { .. },
+            ..
+        })
+    )
+}
+
+/// `connect_sentinel_master` connects to the resolved master without TLS, and
+/// `SentinelClient` cannot take the configured root CA or client certificate.
+/// Every TLS form is refused rather than send the password in clear behind a
+/// setting that says the connection is encrypted.
+fn refuse_sentinel_tls(sentinel_node_uris: &[String]) -> Result<(), DbError> {
+    if sentinel_node_uris.iter().any(|uri| is_tls_uri(uri)) {
+        return Err(DbError::InvalidProfile(
+            "Redis TLS is not available with the Sentinel topology, because DataTab \
+             cannot reach the Sentinel master over TLS yet. To connect through \
+             Sentinel without TLS, set the TLS mode to off or use a redis:// URI"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resolves a Sentinel master, runs the standard post-connect sequence, and
+/// wraps the result in a `RedisConnection` backed by `RedisTransport::SentinelMaster`.
+///
+/// Credentials (`user`/`password`) apply only to the resolved MASTER
+/// connection, via `SentinelNodeConnectionInfo`; the Sentinel nodes themselves
+/// are contacted without authentication (see the driver README limitation).
+/// `format_error` adapts a raw `redis::RedisError` into the caller's
+/// context-appropriate `DbError` (host/port for direct connect, URI for URI
+/// mode).
+fn connect_sentinel_master(
+    sentinel_node_uris: Vec<String>,
+    master_name: Option<&str>,
+    user: Option<&str>,
+    password: Option<&str>,
+    database: Option<u32>,
+    ssh_tunnel: Option<SshTunnel>,
+    format_error: impl Fn(&redis::RedisError) -> DbError,
+) -> Result<Box<dyn Connection>, DbError> {
+    refuse_sentinel_tls(&sentinel_node_uris)?;
+
+    let master_name = master_name
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            DbError::InvalidProfile(
+                "Redis Sentinel topology requires a configured master/service name".to_string(),
+            )
+        })?;
+
+    let node_connection_info = SentinelNodeConnectionInfo {
+        tls_mode: None,
+        redis_connection_info: Some(redis::RedisConnectionInfo {
+            db: database.map(i64::from).unwrap_or(0),
+            username: user.filter(|value| !value.is_empty()).map(str::to_string),
+            password: password.map(str::to_string),
+            ..Default::default()
+        }),
+    };
+
+    let mut resolver = SentinelClient::build(
+        sentinel_node_uris,
+        master_name.to_string(),
+        Some(node_connection_info),
+        SentinelServerType::Master,
+    )
+    .map_err(|e| format_error(&e))?;
+
+    let mut connection = resolver.get_connection().map_err(|e| format_error(&e))?;
+
+    set_client_name(&mut connection);
+
+    redis::cmd("PING")
+        .query::<String>(&mut connection)
+        .map_err(|e| format_error(&e))?;
+
+    let role_reply = redis::cmd("ROLE").query::<redis::Role>(&mut connection);
+    if evaluate_master_role_sanity(&role_reply) == MasterRoleSanity::ResolvedReplica {
+        return Err(DbError::query_failed(
+            "Redis Sentinel resolved a replica; failover in progress, retry".to_string(),
+        ));
+    }
+
+    Ok(Box::new(RedisConnection {
+        connection: Arc::new(Mutex::new(RedisTransport::SentinelMaster {
+            connection: Arc::new(Mutex::new(connection)),
+            resolver: Mutex::new(resolver),
+        })),
+        active_database: Mutex::new(database),
+        _ssh_tunnel: ssh_tunnel,
+    }))
+}
+
+/// Issues `CLUSTER SLOTS` and returns the unique master `(host, port)` pairs
+/// backing the cluster. There is no public redis-rs API to enumerate
+/// masters directly, so this parses the raw reply via
+/// `parse_cluster_slots_masters`.
+fn fetch_cluster_masters(
+    conn: &mut redis::cluster::ClusterConnection,
+) -> Result<Vec<(String, u16)>, DbError> {
+    let reply = redis::cmd("CLUSTER")
+        .arg("SLOTS")
+        .query::<redis::Value>(conn)
+        .map_err(|e| format_redis_query_error(&e))?;
+
+    parse_cluster_slots_masters(&reply)
+}
+
+/// Aggregates `db0` key/TTL stats across every Redis Cluster master.
+///
+/// A plain `INFO keyspace` on a `ClusterConnection` fans out to every master
+/// (`ResponsePolicy::Special`) and returns a `Value::Map` keyed by node
+/// address rather than a single string, so it cannot reuse
+/// `fetch_keyspace_stats`'s standalone `.query::<String>()` call. Each
+/// master is queried individually via `route_command` instead, and the
+/// per-node results are summed by `aggregate_keyspace_stats`.
+fn fetch_cluster_keyspace_stats(
+    conn: &mut redis::cluster::ClusterConnection,
+    masters: &[(String, u16)],
+) -> Result<KeyspaceStats, DbError> {
+    let mut per_master = Vec::with_capacity(masters.len());
+
+    for (host, port) in masters {
+        let mut command = redis::cmd("INFO");
+        command.arg("keyspace");
+
+        let reply = conn
+            .route_command(
+                &command,
+                RoutingInfo::SingleNode(SingleNodeRoutingInfo::ByAddress {
+                    host: host.clone(),
+                    port: *port,
+                }),
+            )
+            .map_err(|e| format_redis_query_error(&e))?;
+
+        let info_text: String = redis::FromRedisValue::from_redis_value(&reply)
+            .map_err(|e| format_redis_query_error(&e))?;
+
+        per_master.push(parse_keyspace_info(&info_text));
+    }
+
+    Ok(aggregate_keyspace_stats(&per_master))
+}
+
+fn fetch_cluster_key_count(
+    conn: &mut redis::cluster::ClusterConnection,
+    masters: &[(String, u16)],
+) -> Result<u64, DbError> {
+    let mut total: u64 = 0;
+
+    for (host, port) in masters {
+        let reply = conn
+            .route_command(
+                &redis::cmd("DBSIZE"),
+                RoutingInfo::SingleNode(SingleNodeRoutingInfo::ByAddress {
+                    host: host.clone(),
+                    port: *port,
+                }),
+            )
+            .map_err(|e| format_redis_query_error(&e))?;
+
+        let node_count: u64 = redis::FromRedisValue::from_redis_value(&reply)
+            .map_err(|e| format_redis_query_error(&e))?;
+
+        total = total.saturating_add(node_count);
+    }
+
+    Ok(total)
+}
+
+/// Reports the client identity to the server via `CLIENT SETNAME` so it is
+/// visible in `CLIENT LIST`/`CLIENT INFO`. Some managed Redis providers
+/// restrict the `CLIENT` command family, so a failure here must not fail the
+/// connection.
+///
+/// On a Redis Cluster connection this broadcasts to every node (redis-rs
+/// routes `CLIENT SETNAME` as `AllNodes`/`AllSucceeded`), so the identity is
+/// visible from any node's `CLIENT LIST`.
+fn set_client_name(conn: &mut dyn redis::ConnectionLike) {
+    if let Err(error) = redis::cmd("CLIENT")
+        .arg("SETNAME")
+        .arg(datatab_core::client_identity())
+        .query::<String>(conn)
+    {
+        log::warn!("Redis CLIENT SETNAME failed (server may restrict CLIENT commands): {error}");
+    }
+}
+
+fn uri_authority_has_credentials(uri: &str) -> bool {
+    if let Some((_, rest)) = uri.split_once("://") {
+        let authority = rest.split('/').next().unwrap_or_default();
+        return authority.contains('@');
+    }
+
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct KeyspaceStats {
+    key_count: u64,
+    avg_ttl_seconds: Option<u64>,
+}
+
+fn parse_database_name(database: &str) -> Result<u32, DbError> {
+    let trimmed = database.trim();
+    let digits = trimmed.strip_prefix("db").unwrap_or(trimmed);
+
+    digits.parse::<u32>().map_err(|_| {
+        DbError::InvalidProfile(format!(
+            "Invalid database name '{}': expected dbN",
+            database
+        ))
+    })
+}
+
+fn fetch_database_count(conn: &mut dyn redis::ConnectionLike) -> Result<u32, DbError> {
+    let values: Vec<String> = redis::cmd("CONFIG")
+        .arg("GET")
+        .arg("databases")
+        .query(conn)
+        .map_err(|e| format_redis_query_error(&e))?;
+
+    if values.len() < 2 {
+        return Err(DbError::query_failed(
+            "Invalid CONFIG GET databases response",
+        ));
+    }
+
+    // Invariant: len >= 2 is guaranteed by the early-return guard above.
+    #[allow(clippy::indexing_slicing)]
+    let db_count = values[1]
+        .parse::<u32>()
+        .map_err(|_| DbError::query_failed("Invalid Redis databases count"));
+    db_count
+}
+
+fn fetch_keyspace_stats(
+    conn: &mut dyn redis::ConnectionLike,
+) -> Result<HashMap<u32, KeyspaceStats>, DbError> {
+    let info = redis::cmd("INFO")
+        .arg("keyspace")
+        .query::<String>(conn)
+        .map_err(|e| format_redis_query_error(&e))?;
+
+    Ok(parse_keyspace_info(&info))
+}
+
+/// Parses an `INFO keyspace` reply body into per-database key/TTL stats.
+///
+/// Extracted as a pure function so both the standalone path (a single
+/// `INFO keyspace` call) and the Redis Cluster path (one call per master,
+/// aggregated by `aggregate_keyspace_stats`) share the same parsing logic.
+fn parse_keyspace_info(info: &str) -> HashMap<u32, KeyspaceStats> {
+    let mut stats = HashMap::new();
+
+    for line in info.lines() {
+        let line = line.trim();
+        if !line.starts_with("db") {
+            continue;
+        }
+
+        let Some((db_part, fields_part)) = line.split_once(':') else {
+            continue;
+        };
+
+        let Ok(db_index) = db_part.trim_start_matches("db").parse::<u32>() else {
+            continue;
+        };
+
+        let mut key_count = 0_u64;
+        let mut avg_ttl_seconds = None;
+
+        for field in fields_part.split(',') {
+            let Some((name, value)) = field.split_once('=') else {
+                continue;
+            };
+
+            if name == "keys" {
+                key_count = value.parse::<u64>().unwrap_or(0);
+            }
+
+            if name == "avg_ttl" {
+                let avg_ttl_ms = value.parse::<u64>().unwrap_or(0);
+                avg_ttl_seconds = if avg_ttl_ms == 0 {
+                    None
+                } else {
+                    Some(avg_ttl_ms / 1000)
+                };
+            }
+        }
+
+        stats.insert(
+            db_index,
+            KeyspaceStats {
+                key_count,
+                avg_ttl_seconds,
+            },
+        );
+    }
+
+    stats
+}
+
+/// Sums per-master `db0` key counts into a single aggregate entry, since a
+/// Redis Cluster's `INFO keyspace` only ever reports the local master's
+/// slice of `db0` (there is no cluster-wide `INFO` aggregation for
+/// keyspace stats, unlike `DBSIZE`'s built-in cluster-wide sum).
+///
+/// `avg_ttl_seconds` is combined as a key-count-weighted average across the
+/// masters that reported one; nodes with no TTL data are skipped rather than
+/// treated as zero.
+fn aggregate_keyspace_stats(per_master: &[HashMap<u32, KeyspaceStats>]) -> KeyspaceStats {
+    let mut key_count = 0_u64;
+    let mut weighted_ttl_sum = 0_u128;
+    let mut weighted_ttl_count = 0_u64;
+
+    for stats in per_master {
+        let Some(db0) = stats.get(&0) else {
+            continue;
+        };
+
+        key_count += db0.key_count;
+
+        if let Some(avg_ttl_seconds) = db0.avg_ttl_seconds {
+            weighted_ttl_sum += u128::from(avg_ttl_seconds) * u128::from(db0.key_count);
+            weighted_ttl_count += db0.key_count;
+        }
+    }
+
+    let avg_ttl_seconds = if weighted_ttl_count == 0 {
+        None
+    } else {
+        Some((weighted_ttl_sum / u128::from(weighted_ttl_count)) as u64)
+    };
+
+    KeyspaceStats {
+        key_count,
+        avg_ttl_seconds,
+    }
+}
+
+/// Number of entries requested per `XRANGE` call. Kept as an existing safety
+/// cap on stream reads; `fetch_key_payload` now reports `KeyLoadState::Truncated`
+/// when a stream returns exactly this many entries, since the stream may hold
+/// more that were not fetched.
+const STREAM_FETCH_COUNT: usize = 50;
+
+/// Outcome of comparing a probed value size against an optional byte budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SizeGateDecision {
+    Fetch,
+    TooLarge { size_bytes: u64, limit_bytes: u64 },
+}
+
+/// Pure size-gate decision: whether a whole-payload value may be fetched
+/// given its known size and an optional byte budget.
+///
+/// `None` budget always allows the fetch (unbounded read path). A size
+/// exactly at the budget is allowed; only sizes strictly over it are gated.
+fn gate_decision(size_bytes: u64, max_value_bytes: Option<u64>) -> SizeGateDecision {
+    match max_value_bytes {
+        Some(limit_bytes) if size_bytes > limit_bytes => SizeGateDecision::TooLarge {
+            size_bytes,
+            limit_bytes,
+        },
+        _ => SizeGateDecision::Fetch,
+    }
+}
+
+fn fetch_key_payload(
+    conn: &mut dyn redis::ConnectionLike,
+    key: &str,
+    key_type: KeyType,
+    max_value_bytes: Option<u64>,
+) -> Result<(Vec<u8>, ValueRepr, KeyLoadState), DbError> {
+    match key_type {
+        KeyType::String | KeyType::Json | KeyType::Unknown => {
+            if max_value_bytes.is_some() {
+                let size_bytes = redis::cmd("STRLEN")
+                    .arg(key)
+                    .query::<u64>(conn)
+                    .map_err(|e| format_redis_query_error(&e))?;
+
+                if let SizeGateDecision::TooLarge {
+                    size_bytes,
+                    limit_bytes,
+                } = gate_decision(size_bytes, max_value_bytes)
+                {
+                    let load_state = KeyLoadState::TooLarge {
+                        size_bytes,
+                        limit_bytes,
+                    };
+                    return Ok((Vec::new(), ValueRepr::Binary, load_state));
+                }
+            }
+
+            let fetched = redis::cmd("GET")
+                .arg(key)
+                .query::<Option<Vec<u8>>>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+
+            let value = fetched
+                .ok_or_else(|| DbError::object_not_found(format!("Key '{}' not found", key)))?;
+            let repr = detect_value_repr(&value);
+            Ok((value, repr, KeyLoadState::Loaded))
+        }
+        KeyType::Hash => {
+            let entries = redis::cmd("HGETALL")
+                .arg(key)
+                .query::<Vec<String>>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+
+            let mut object = serde_json::Map::new();
+            for chunk in entries.chunks(2) {
+                if let [field, value] = chunk {
+                    object.insert(field.clone(), serde_json::Value::String(value.clone()));
+                }
+            }
+
+            let value = serde_json::to_vec(&serde_json::Value::Object(object))
+                .map_err(|e| DbError::query_failed(e.to_string()))?;
+            Ok((value, ValueRepr::Structured, KeyLoadState::Loaded))
+        }
+        KeyType::List => {
+            let entries = redis::cmd("LRANGE")
+                .arg(key)
+                .arg(0)
+                .arg(-1)
+                .query::<Vec<String>>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+
+            let value =
+                serde_json::to_vec(&entries).map_err(|e| DbError::query_failed(e.to_string()))?;
+            Ok((value, ValueRepr::Structured, KeyLoadState::Loaded))
+        }
+        KeyType::Set => {
+            let entries = redis::cmd("SMEMBERS")
+                .arg(key)
+                .query::<Vec<String>>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+
+            let value =
+                serde_json::to_vec(&entries).map_err(|e| DbError::query_failed(e.to_string()))?;
+            Ok((value, ValueRepr::Structured, KeyLoadState::Loaded))
+        }
+        KeyType::SortedSet => {
+            let entries = redis::cmd("ZRANGE")
+                .arg(key)
+                .arg(0)
+                .arg(-1)
+                .arg("WITHSCORES")
+                .query::<Vec<String>>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+
+            let items: Vec<serde_json::Value> = entries
+                .chunks(2)
+                .filter_map(|chunk| {
+                    if let [member, score] = chunk {
+                        Some(serde_json::json!({"member": member, "score": score}))
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+
+            let value =
+                serde_json::to_vec(&items).map_err(|e| DbError::query_failed(e.to_string()))?;
+            Ok((value, ValueRepr::Structured, KeyLoadState::Loaded))
+        }
+        KeyType::Stream => {
+            let raw_entries: Vec<(String, Vec<String>)> = redis::cmd("XRANGE")
+                .arg(key)
+                .arg("-")
+                .arg("+")
+                .arg("COUNT")
+                .arg(STREAM_FETCH_COUNT)
+                .query(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+
+            let hit_fetch_cap = raw_entries.len() == STREAM_FETCH_COUNT;
+
+            let entries: Vec<serde_json::Value> = raw_entries
+                .into_iter()
+                .map(|(id, fields)| {
+                    let mut map = serde_json::Map::new();
+                    for chunk in fields.chunks(2) {
+                        if let [f, v] = chunk {
+                            map.insert(f.clone(), serde_json::Value::String(v.clone()));
+                        }
+                    }
+                    serde_json::json!({ "id": id, "fields": map })
+                })
+                .collect();
+
+            let value =
+                serde_json::to_vec(&entries).map_err(|e| DbError::query_failed(e.to_string()))?;
+
+            let load_state = if hit_fetch_cap {
+                KeyLoadState::Truncated {
+                    returned_bytes: value.len() as u64,
+                    total_bytes: None,
+                }
+            } else {
+                KeyLoadState::Loaded
+            };
+
+            Ok((value, ValueRepr::Stream, load_state))
+        }
+        KeyType::Bytes => {
+            let payload = redis::cmd("DUMP")
+                .arg(key)
+                .query::<Vec<u8>>(conn)
+                .map_err(|e| format_redis_query_error(&e))?;
+            Ok((payload, ValueRepr::Binary, KeyLoadState::Loaded))
+        }
+    }
+}
+
+/// Page size used when a key scan request asks for 0 keys.
+const DEFAULT_KEY_PAGE_LIMIT: usize = 100;
+
+/// Most `SCAN` round trips one key page may spend before it is returned
+/// short, with its cursor still pending.
+const KEY_PAGE_MAX_SCAN_ROUND_TRIPS: usize = 1000;
+
+/// Longest one key page may spend scanning before it is returned short,
+/// with its cursor still pending. The connection mutex is held throughout.
+const KEY_PAGE_MAX_SCAN_DURATION: Duration = Duration::from_millis(500);
+
+fn key_page_limit(requested: u32) -> usize {
+    if requested == 0 {
+        DEFAULT_KEY_PAGE_LIMIT
+    } else {
+        requested as usize
+    }
+}
+
+/// Builds `SCAN <cursor> [MATCH <filter>] COUNT <count> [TYPE <type>]`.
+fn scan_command(
+    cursor: u64,
+    filter: Option<&str>,
+    count: usize,
+    type_name: Option<&str>,
+) -> redis::Cmd {
+    let mut command = redis::cmd("SCAN");
+    command.arg(cursor);
+
+    if let Some(filter) = filter {
+        command.arg("MATCH").arg(filter);
+    }
+
+    command.arg("COUNT").arg(count);
+
+    if let Some(type_name) = type_name {
+        command.arg("TYPE").arg(type_name);
+    }
+
+    command
+}
+
+/// Server type name `SCAN ... TYPE` expects for a key type, or `None` when
+/// the type has no server-side filter.
+fn redis_type_name(key_type: KeyType) -> Option<&'static str> {
+    match key_type {
+        KeyType::String | KeyType::Bytes => Some("string"),
+        KeyType::Hash => Some("hash"),
+        KeyType::List => Some("list"),
+        KeyType::Set => Some("set"),
+        KeyType::SortedSet => Some("zset"),
+        KeyType::Stream => Some("stream"),
+        KeyType::Json => Some("ReJSON-RL"),
+        KeyType::Unknown => None,
+    }
+}
+
+/// Keys the server examined for a page: `SCAN` reads about `COUNT` slots per
+/// round trip, matched or not.
+fn scanned_key_estimate(round_trips: usize, count: usize) -> u64 {
+    (round_trips as u64).saturating_mul(count as u64)
+}
+
+/// Entries for keys scanned with a `TYPE` filter, whose type is already known
+/// so no `TYPE` round trip is needed.
+fn key_entries_of_type(keys: Vec<String>, key_type: KeyType) -> Vec<KeyEntry> {
+    keys.into_iter()
+        .map(|key| KeyEntry {
+            key,
+            key_type: Some(key_type),
+            ttl_seconds: None,
+            size_bytes: None,
+        })
+        .collect()
+}
+
+/// Pairs page keys with the `TYPE` replies fetched for them, in order.
+fn key_entries_with_types(
+    keys: Vec<String>,
+    type_names: Vec<String>,
+) -> Result<Vec<KeyEntry>, DbError> {
+    if keys.len() != type_names.len() {
+        return Err(DbError::query_failed(format!(
+            "Redis returned {} TYPE replies for {} scanned keys",
+            type_names.len(),
+            keys.len()
+        )));
+    }
+
+    let entries = keys
+        .into_iter()
+        .zip(type_names)
+        .map(|(key, type_name)| KeyEntry {
+            key,
+            key_type: Some(parse_key_type(&type_name)),
+            ttl_seconds: None,
+            size_bytes: None,
+        })
+        .collect();
+
+    Ok(entries)
+}
+
+/// Round-trip and wall-clock allowance for filling one key page, so a sparse
+/// `MATCH` over a large keyspace cannot hold the connection indefinitely.
+struct ScanBudget {
+    max_round_trips: usize,
+    max_duration: Duration,
+    started: Instant,
+    round_trips: usize,
+}
+
+impl ScanBudget {
+    fn new(max_round_trips: usize, max_duration: Duration) -> Self {
+        Self {
+            max_round_trips,
+            max_duration,
+            started: Instant::now(),
+            round_trips: 0,
+        }
+    }
+
+    fn for_key_page() -> Self {
+        Self::new(KEY_PAGE_MAX_SCAN_ROUND_TRIPS, KEY_PAGE_MAX_SCAN_DURATION)
+    }
+
+    fn record_round_trip(&mut self) {
+        self.round_trips += 1;
+    }
+
+    fn has_started(&self) -> bool {
+        self.round_trips > 0
+    }
+
+    fn round_trips(&self) -> usize {
+        self.round_trips
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.round_trips >= self.max_round_trips || self.started.elapsed() >= self.max_duration
+    }
+}
+
+/// Keys collected for one page, in first-seen order and without the
+/// duplicates `SCAN` is allowed to return.
+#[derive(Default)]
+struct ScanPageKeys {
+    keys: Vec<String>,
+    seen: HashSet<String>,
+}
+
+impl ScanPageKeys {
+    fn extend(&mut self, batch: Vec<String>) {
+        for key in batch {
+            if self.seen.insert(key.clone()) {
+                self.keys.push(key);
+            }
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn into_keys(self) -> Vec<String> {
+        self.keys
+    }
+}
+
+/// Fills `page` from consecutive `SCAN` batches starting at `start_cursor`
+/// and returns the cursor to resume from (0 once the scan is complete).
+///
+/// Issues at least one batch unless `cancel` is already set, then stops as
+/// soon as the page holds `limit` keys, the cursor returns to 0, or `budget`
+/// is exhausted. A batch that is empty but carries a non-zero cursor does not
+/// end the page. Every key of the last batch is kept even when that
+/// overshoots `limit`, because the returned cursor has already moved past
+/// them. `cancel` is checked before every batch and ends the page with
+/// `DbError::Cancelled`.
+fn fill_scan_page(
+    start_cursor: u64,
+    limit: usize,
+    budget: &mut ScanBudget,
+    page: &mut ScanPageKeys,
+    cancel: &CancelToken,
+    mut scan_batch: impl FnMut(u64) -> Result<(u64, Vec<String>), DbError>,
+) -> Result<u64, DbError> {
+    let mut cursor = start_cursor;
+
+    loop {
+        if cancel.is_cancelled() {
+            return Err(DbError::Cancelled);
+        }
+
+        let (next_cursor, batch) = scan_batch(cursor)?;
+        budget.record_round_trip();
+
+        page.extend(batch);
+        cursor = next_cursor;
+
+        if cursor == 0 || page.len() >= limit || budget.is_exhausted() {
+            return Ok(cursor);
+        }
+    }
+}
+
+fn parse_key_type(type_name: &str) -> KeyType {
+    let normalized = type_name.trim().to_ascii_lowercase();
+
+    match normalized.as_str() {
+        "string" => KeyType::String,
+        "hash" => KeyType::Hash,
+        "list" => KeyType::List,
+        "set" => KeyType::Set,
+        "zset" => KeyType::SortedSet,
+        "stream" => KeyType::Stream,
+        "json" | "rejson-rl" => KeyType::Json,
+        _ if normalized.contains("json") => KeyType::Json,
+        _ => KeyType::Unknown,
+    }
+}
+
+fn normalize_key_type_for_payload(key_type: KeyType, repr: ValueRepr) -> KeyType {
+    if key_type == KeyType::String && repr == ValueRepr::Binary {
+        KeyType::Bytes
+    } else {
+        key_type
+    }
+}
+
+fn detect_value_repr(value: &[u8]) -> ValueRepr {
+    if let Ok(text) = std::str::from_utf8(value) {
+        if serde_json::from_str::<serde_json::Value>(text).is_ok() {
+            ValueRepr::Json
+        } else {
+            ValueRepr::Text
+        }
+    } else {
+        ValueRepr::Binary
+    }
+}
+
+fn split_command(input: &str) -> Result<Vec<String>, DbError> {
+    let mut items = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    for ch in input.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+            continue;
+        }
+
+        if ch == '"' && !in_single {
+            in_double = !in_double;
+            continue;
+        }
+
+        if ch.is_whitespace() && !in_single && !in_double {
+            if !current.is_empty() {
+                items.push(std::mem::take(&mut current));
+            }
+            continue;
+        }
+
+        current.push(ch);
+    }
+
+    if escaped {
+        return Err(DbError::query_failed(
+            "Dangling escape character in command",
+        ));
+    }
+
+    if in_single {
+        return Err(DbError::query_failed("Unterminated single-quoted string"));
+    }
+
+    if in_double {
+        return Err(DbError::query_failed("Unterminated double-quoted string"));
+    }
+
+    if !current.is_empty() {
+        items.push(current);
+    }
+
+    Ok(items)
+}
+
+/// Sends one command parsed by [`parse_command`] and returns its reply.
+///
+/// With [`ReadOnlyEnforcement::Required`] the command is first checked
+/// against the flags the server reports for it, on the same connection and
+/// with the same tokens that are then sent, and a command that is not a read
+/// is refused before it is sent. See [`crate::read_only`].
+pub(crate) fn send_parsed_command(
+    conn: &mut dyn redis::ConnectionLike,
+    parts: &[String],
+    read_only: ReadOnlyEnforcement,
+) -> Result<redis::Value, DbError> {
+    let Some((name, arguments)) = parts.split_first() else {
+        return Ok(redis::Value::Nil);
+    };
+
+    if read_only.is_required() {
+        crate::read_only::ensure_read_only_command(conn, parts)?;
+    }
+
+    let mut command = redis::cmd(name);
+    for argument in arguments {
+        command.arg(argument);
+    }
+
+    command
+        .query::<redis::Value>(conn)
+        .map_err(|e| format_redis_query_error(&e))
+}
+
+pub(crate) fn parse_command(input: &str) -> Result<Vec<String>, DbError> {
+    let cleaned = input
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with('#')
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let cleaned = cleaned.trim();
+    if cleaned.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let cleaned = cleaned.trim_end_matches(';').trim();
+    split_command(cleaned)
+}
+
+/// Arity rule for a Redis command.
+///
+/// - `min`: minimum number of arguments (excluding the command name itself)
+/// - `max`: maximum number of arguments, or `None` for variadic commands
+enum Arity {
+    Exact(usize),
+    AtLeast(usize),
+    Range(usize, usize),
+}
+
+/// Look up the arity expectation for a known Redis command. Returns `None`
+/// for unknown commands (no arity check performed).
+fn command_arity(command: &str) -> Option<Arity> {
+    match command {
+        // Key inspection / manipulation
+        "GET" => Some(Arity::Exact(1)),
+        "SET" => Some(Arity::Range(2, 7)),
+        "SETNX" => Some(Arity::Exact(2)),
+        "GETSET" => Some(Arity::Exact(2)),
+        "GETRANGE" => Some(Arity::Exact(3)),
+        "SETRANGE" => Some(Arity::Exact(3)),
+        "APPEND" => Some(Arity::Exact(2)),
+        "STRLEN" => Some(Arity::Exact(1)),
+        "MGET" => Some(Arity::AtLeast(1)),
+        "MSET" => Some(Arity::AtLeast(2)),
+        "DEL" => Some(Arity::AtLeast(1)),
+        "EXISTS" => Some(Arity::AtLeast(1)),
+        "EXPIRE" => Some(Arity::Range(2, 3)),
+        "TTL" => Some(Arity::Exact(1)),
+        "PTTL" => Some(Arity::Exact(1)),
+        "TYPE" => Some(Arity::Exact(1)),
+        "PERSIST" => Some(Arity::Exact(1)),
+        "RENAME" => Some(Arity::Exact(2)),
+        "INCR" => Some(Arity::Exact(1)),
+        "DECR" => Some(Arity::Exact(1)),
+        "INCRBY" => Some(Arity::Exact(2)),
+        "DECRBY" => Some(Arity::Exact(2)),
+        "DUMP" => Some(Arity::Exact(1)),
+        "OBJECT" => Some(Arity::AtLeast(1)),
+        "KEYS" => Some(Arity::Exact(1)),
+        "SCAN" => Some(Arity::AtLeast(1)),
+        "SELECT" => Some(Arity::Exact(1)),
+
+        // Hash
+        "HGET" => Some(Arity::Exact(2)),
+        "HSET" => Some(Arity::AtLeast(3)),
+        "HDEL" => Some(Arity::AtLeast(2)),
+        "HGETALL" => Some(Arity::Exact(1)),
+        "HLEN" => Some(Arity::Exact(1)),
+
+        // List
+        "LPUSH" => Some(Arity::AtLeast(2)),
+        "RPUSH" => Some(Arity::AtLeast(2)),
+        "LPOP" => Some(Arity::Range(1, 2)),
+        "RPOP" => Some(Arity::Range(1, 2)),
+        "LRANGE" => Some(Arity::Exact(3)),
+        "LLEN" => Some(Arity::Exact(1)),
+        "LINDEX" => Some(Arity::Exact(2)),
+        "LSET" => Some(Arity::Exact(3)),
+
+        // Set
+        "SADD" => Some(Arity::AtLeast(2)),
+        "SREM" => Some(Arity::AtLeast(2)),
+        "SMEMBERS" => Some(Arity::Exact(1)),
+        "SCARD" => Some(Arity::Exact(1)),
+        "SISMEMBER" => Some(Arity::Exact(2)),
+
+        // Sorted Set
+        "ZADD" => Some(Arity::AtLeast(3)),
+        "ZREM" => Some(Arity::AtLeast(2)),
+        "ZRANGE" => Some(Arity::Range(3, 7)),
+        "ZCARD" => Some(Arity::Exact(1)),
+        "ZSCORE" => Some(Arity::Exact(2)),
+        "ZRANK" => Some(Arity::Exact(2)),
+
+        // Server
+        "PING" => Some(Arity::Range(0, 1)),
+        "INFO" => Some(Arity::Range(0, 1)),
+
+        _ => None,
+    }
+}
+
+/// Check argument count for a parsed Redis command, returning diagnostics if
+/// the arity is wrong.
+pub(crate) fn check_redis_arity(tokens: &[String], query: &str) -> Vec<EditorDiagnostic> {
+    if tokens.is_empty() {
+        return vec![];
+    }
+
+    // Invariant: tokens is non-empty — guarded by `if tokens.is_empty()` above.
+    #[allow(clippy::indexing_slicing)]
+    let command = tokens[0].to_uppercase();
+    let arg_count = tokens.len() - 1;
+
+    let Some(arity) = command_arity(&command) else {
+        return vec![];
+    };
+
+    let problem = match arity {
+        Arity::Exact(n) if arg_count != n => Some(if n == 1 {
+            format!("{command} requires exactly {n} argument, got {arg_count}")
+        } else {
+            format!("{command} requires exactly {n} arguments, got {arg_count}")
+        }),
+
+        Arity::AtLeast(n) if arg_count < n => Some(if n == 1 {
+            format!("{command} requires at least {n} argument, got {arg_count}")
+        } else {
+            format!("{command} requires at least {n} arguments, got {arg_count}")
+        }),
+
+        Arity::Range(min, max) if arg_count < min || arg_count > max => Some(format!(
+            "{command} accepts {min}–{max} arguments, got {arg_count}"
+        )),
+
+        _ => None,
+    };
+
+    if let Some(message) = problem {
+        return vec![EditorDiagnostic {
+            severity: DiagnosticSeverity::Warning,
+            message,
+            range: redis_first_line_range(query),
+        }];
+    }
+
+    if let Some(pairing_msg) = check_pairing(&command, arg_count) {
+        return vec![EditorDiagnostic {
+            severity: DiagnosticSeverity::Warning,
+            message: pairing_msg,
+            range: redis_first_line_range(query),
+        }];
+    }
+
+    vec![]
+}
+
+/// Commands that require arguments in pairs (key/value or field/value).
+fn check_pairing(command: &str, arg_count: usize) -> Option<String> {
+    match command {
+        // MSET key value [key value ...] — total args must be even
+        "MSET" | "MSETNX" if !arg_count.is_multiple_of(2) => Some(format!(
+            "{command} requires key-value pairs (even number of arguments), got {arg_count}"
+        )),
+
+        // HSET key field value [field value ...] — args after the key must be in pairs
+        "HSET" | "HMSET" if arg_count >= 3 && !(arg_count - 1).is_multiple_of(2) => Some(format!(
+            "{command} requires a key followed by field-value pairs, got {arg_count} arguments"
+        )),
+
+        _ => None,
+    }
+}
+
+pub(crate) fn redis_first_line_range(query: &str) -> TextPositionRange {
+    let first_line_len = query
+        .lines()
+        .next()
+        .map(|line| line.chars().count())
+        .unwrap_or(1) as u32;
+    let end_col = first_line_len.max(1);
+
+    TextPositionRange::new(TextPosition::new(0, 0), TextPosition::new(0, end_col))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datatab_core::{
+        DatabaseCategory, DbDriver, KeySetRequest, MutationRequest, QueryLanguage,
+        SemanticPlanKind, SemanticRequest, TableBrowseRequest, TableRef, ValidationResult,
+    };
+
+    fn bulk(text: &str) -> redis::Value {
+        redis::Value::BulkString(text.as_bytes().to_vec())
+    }
+
+    fn scalar_array(count: usize) -> redis::Value {
+        redis::Value::Array((0..count).map(|index| bulk(&index.to_string())).collect())
+    }
+
+    #[test]
+    fn row_limit_truncates_array_replies_and_marks_the_result() {
+        let result = redis_value_to_result(scalar_array(5), std::time::Duration::ZERO, Some(3));
+
+        assert_eq!(result.rows.len(), 3);
+        assert!(result.rows_truncated());
+        assert_eq!(result.rows[2][1], Value::Text("2".to_string()));
+    }
+
+    #[test]
+    fn row_limit_equal_to_the_reply_size_does_not_mark_truncation() {
+        let result = redis_value_to_result(scalar_array(3), std::time::Duration::ZERO, Some(3));
+
+        assert_eq!(result.rows.len(), 3);
+        assert!(!result.rows_truncated());
+    }
+
+    #[test]
+    fn zero_row_limit_keeps_the_columns_and_drops_every_row() {
+        let result = redis_value_to_result(scalar_array(2), std::time::Duration::ZERO, Some(0));
+
+        assert!(result.rows.is_empty());
+        assert_eq!(result.columns.len(), 2);
+        assert!(result.rows_truncated());
+    }
+
+    #[test]
+    fn zero_row_limit_on_an_empty_array_does_not_mark_truncation() {
+        let result = redis_value_to_result(
+            redis::Value::Array(Vec::new()),
+            std::time::Duration::ZERO,
+            Some(0),
+        );
+
+        assert!(!result.rows_truncated());
+    }
+
+    #[test]
+    fn row_limit_counts_rows_of_set_and_push_replies() {
+        let set = redis_value_to_result(
+            redis::Value::Set(vec![bulk("a"), bulk("b")]),
+            std::time::Duration::ZERO,
+            Some(1),
+        );
+        let attribute = redis_value_to_result(
+            redis::Value::Attribute {
+                data: Box::new(scalar_array(4)),
+                attributes: Vec::new(),
+            },
+            std::time::Duration::ZERO,
+            Some(2),
+        );
+
+        assert_eq!(set.rows.len(), 1);
+        assert!(set.rows_truncated());
+        assert_eq!(attribute.rows.len(), 2);
+        assert!(attribute.rows_truncated());
+    }
+
+    #[test]
+    fn row_limit_is_ignored_by_scalar_and_ok_replies() {
+        for value in [redis::Value::Okay, redis::Value::Int(7), bulk("text")] {
+            let result = redis_value_to_result(value, std::time::Duration::ZERO, Some(0));
+
+            assert!(result.text_body.is_some());
+            assert!(!result.rows_truncated());
+        }
+    }
+
+    #[test]
+    fn unlimited_requests_keep_every_row() {
+        let result = redis_value_to_result(scalar_array(5), std::time::Duration::ZERO, None);
+
+        assert_eq!(result.rows.len(), 5);
+        assert!(!result.rows_truncated());
+    }
+
+    #[test]
+    fn redis_declares_request_row_limit() {
+        assert!(
+            REDIS_METADATA
+                .capabilities
+                .contains(DriverCapabilities::REQUEST_ROW_LIMIT)
+        );
+    }
+
+    #[test]
+    fn row_limit_on_instance_catalog_sources_is_refused_before_execution() {
+        for source in [
+            ExecutionSourceContext::InstanceMetricQuery {
+                metric_id: "redis.connected_clients".to_string(),
+                start_ms: 0,
+                end_ms: 1,
+            },
+            ExecutionSourceContext::InstanceInspectorQuery {
+                metric_id: "redis.client_list".to_string(),
+            },
+        ] {
+            let request = QueryRequest::new("INFO")
+                .with_limit(10)
+                .with_execution_context(Some(datatab_core::ExecutionContext {
+                    source: Some(source),
+                    ..Default::default()
+                }));
+
+            assert!(matches!(
+                refuse_unsupported_request_options(&request),
+                Err(DbError::NotSupported(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn row_limit_on_editor_commands_and_timeouts_are_classified() {
+        assert!(
+            refuse_unsupported_request_options(&QueryRequest::new("GET a").with_limit(0)).is_ok()
+        );
+
+        let mut timed = QueryRequest::new("GET a");
+        timed.statement_timeout = Some(std::time::Duration::from_secs(1));
+        assert!(matches!(
+            refuse_unsupported_request_options(&timed),
+            Err(DbError::NotSupported(_))
+        ));
+    }
+
+    fn packed_arguments(command: &redis::Cmd) -> String {
+        String::from_utf8_lossy(&command.get_packed_command()).to_string()
+    }
+
+    #[test]
+    fn set_command_keeps_the_expiry_with_keepttl_when_asked() {
+        let request = KeySetRequest::new("session:1", b"value".to_vec()).keeping_ttl();
+
+        assert!(packed_arguments(&set_command(&request, true)).contains("KEEPTTL"));
+    }
+
+    #[test]
+    fn set_command_omits_keepttl_for_plain_writes_and_explicit_ttls() {
+        let plain = KeySetRequest::new("session:1", b"value".to_vec());
+        let explicit = KeySetRequest::new("session:1", b"value".to_vec())
+            .keeping_ttl()
+            .with_ttl(60);
+
+        assert!(!packed_arguments(&set_command(&plain, true)).contains("KEEPTTL"));
+
+        let explicit_command = packed_arguments(&set_command(&explicit, true));
+        assert!(!explicit_command.contains("KEEPTTL"));
+        assert!(explicit_command.contains("EX"));
+    }
+
+    #[test]
+    fn set_command_without_keepttl_support_relies_on_reapplying_the_ttl() {
+        let request = KeySetRequest::new("session:1", b"value".to_vec()).keeping_ttl();
+
+        assert!(!packed_arguments(&set_command(&request, false)).contains("KEEPTTL"));
+        assert!(wants_keep_ttl(&request));
+    }
+
+    #[test]
+    fn scan_command_sends_the_type_filter_to_the_server() {
+        let command = packed_arguments(&scan_command(0, Some("user:*"), 100, Some("hash")));
+
+        assert!(command.contains("MATCH"));
+        assert!(command.contains("TYPE"));
+        assert!(command.contains("hash"));
+
+        let untyped = packed_arguments(&scan_command(0, None, 100, None));
+        assert!(!untyped.contains("TYPE"));
+    }
+
+    #[test]
+    fn redis_type_name_covers_every_filterable_type() {
+        assert_eq!(redis_type_name(KeyType::String), Some("string"));
+        assert_eq!(redis_type_name(KeyType::Hash), Some("hash"));
+        assert_eq!(redis_type_name(KeyType::List), Some("list"));
+        assert_eq!(redis_type_name(KeyType::Set), Some("set"));
+        assert_eq!(redis_type_name(KeyType::SortedSet), Some("zset"));
+        assert_eq!(redis_type_name(KeyType::Stream), Some("stream"));
+        assert_eq!(redis_type_name(KeyType::Json), Some("ReJSON-RL"));
+        assert_eq!(redis_type_name(KeyType::Unknown), None);
+    }
+
+    #[test]
+    fn scanned_key_estimate_counts_one_batch_per_round_trip() {
+        assert_eq!(scanned_key_estimate(0, 100), 0);
+        assert_eq!(scanned_key_estimate(7, 200), 1_400);
+    }
+
+    #[test]
+    fn ttl_seconds_from_pttl_rounds_partial_seconds_up() {
+        assert_eq!(ttl_seconds_from_pttl(-1), None);
+        assert_eq!(ttl_seconds_from_pttl(-2), None);
+        assert_eq!(ttl_seconds_from_pttl(1), Some(1));
+        assert_eq!(ttl_seconds_from_pttl(59_001), Some(60));
+        assert_eq!(ttl_seconds_from_pttl(60_000), Some(60));
+    }
+
+    #[test]
+    fn key_metadata_from_replies_pairs_each_key_with_its_replies() -> Result<(), DbError> {
+        let keys = vec!["a".to_string(), "b".to_string(), "gone".to_string()];
+        let replies = vec![
+            redis::Value::Int(90_000),
+            redis::Value::Int(512),
+            redis::Value::Int(-1),
+            redis::Value::Int(64),
+            redis::Value::Int(-2),
+            redis::Value::Nil,
+        ];
+
+        let metadata = key_metadata_from_replies(&keys, &replies, true, false)?;
+
+        assert_eq!(metadata[0].ttl_seconds, Some(90));
+        assert_eq!(metadata[0].size_bytes, Some(512));
+        assert_eq!(metadata[1].ttl_seconds, None);
+        assert!(metadata[1].exists);
+        assert!(!metadata[2].exists);
+        assert_eq!(metadata[2].size_bytes, None);
+
+        Ok(())
+    }
+
+    #[test]
+    fn key_metadata_from_replies_reads_the_encoding_when_requested() -> Result<(), DbError> {
+        let keys = vec!["hash".to_string()];
+        let replies = vec![
+            redis::Value::Int(-1),
+            redis::Value::Int(2_150),
+            redis::Value::BulkString(b"listpack".to_vec()),
+        ];
+
+        let metadata = key_metadata_from_replies(&keys, &replies, true, true)?;
+
+        assert_eq!(metadata[0].encoding.as_deref(), Some("listpack"));
+        Ok(())
+    }
+
+    #[test]
+    fn key_metadata_from_replies_rejects_a_short_reply() {
+        let keys = vec!["a".to_string(), "b".to_string()];
+        let replies = vec![redis::Value::Int(1)];
+
+        assert!(key_metadata_from_replies(&keys, &replies, false, false).is_err());
+    }
+
+    #[test]
+    fn metadata_commands_send_one_group_of_commands_per_key() {
+        let keys = vec!["a".to_string(), "b".to_string()];
+
+        assert_eq!(metadata_commands(&keys, false, false).len(), 2);
+        assert_eq!(metadata_commands(&keys, true, false).len(), 4);
+        assert_eq!(metadata_commands(&keys, true, true).len(), 6);
+    }
+
+    #[test]
+    fn consumer_group_from_info_reads_resp2_flat_arrays() {
+        let info = redis::Value::Array(vec![
+            redis::Value::BulkString(b"name".to_vec()),
+            redis::Value::BulkString(b"mailer".to_vec()),
+            redis::Value::BulkString(b"consumers".to_vec()),
+            redis::Value::Int(1),
+            redis::Value::BulkString(b"pending".to_vec()),
+            redis::Value::Int(12),
+            redis::Value::BulkString(b"last-delivered-id".to_vec()),
+            redis::Value::BulkString(b"1790194489210-0".to_vec()),
+        ]);
+
+        let group = consumer_group_from_info(&info).expect("group parses");
+
+        assert_eq!(group.name, "mailer");
+        assert_eq!(group.pending, 12);
+        assert_eq!(group.last_delivered_id, "1790194489210-0");
+    }
+
+    #[test]
+    fn pending_entries_from_reply_reads_the_extended_form() {
+        let reply = redis::Value::Array(vec![redis::Value::Array(vec![
+            redis::Value::BulkString(b"1790194489210-0".to_vec()),
+            redis::Value::BulkString(b"worker-1".to_vec()),
+            redis::Value::Int(2_460_000),
+            redis::Value::Int(3),
+        ])]);
+
+        let entries = pending_entries_from_reply(&reply);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].consumer, "worker-1");
+        assert_eq!(entries[0].idle_ms, 2_460_000);
+        assert_eq!(entries[0].delivery_count, 3);
+    }
+
+    #[test]
+    fn zset_members_and_stream_entries_pair_flat_replies() {
+        let members = zset_members_from_reply(vec![
+            "player1".to_string(),
+            "4954".to_string(),
+            "player2".to_string(),
+            "4941.5".to_string(),
+        ]);
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[1].score, 4941.5);
+
+        let entries = stream_entries_from_reply(vec![(
+            "1-0".to_string(),
+            vec!["status".to_string(), "paid".to_string()],
+        )]);
+        assert_eq!(
+            entries[0].fields,
+            vec![("status".to_string(), "paid".to_string())]
+        );
+    }
+
+    fn generous_scan_budget() -> ScanBudget {
+        ScanBudget::new(1000, Duration::from_secs(60))
+    }
+
+    /// Replays scripted `SCAN` replies in order and records the cursor each
+    /// call was issued with.
+    fn scripted_scan<'a>(
+        replies: Vec<(u64, Vec<&'static str>)>,
+        requested_cursors: &'a mut Vec<u64>,
+    ) -> impl FnMut(u64) -> Result<(u64, Vec<String>), DbError> + 'a {
+        let mut replies = replies.into_iter();
+
+        move |cursor| {
+            requested_cursors.push(cursor);
+
+            let (next_cursor, keys) = replies
+                .next()
+                .ok_or_else(|| DbError::query_failed("unexpected extra SCAN call"))?;
+
+            Ok((next_cursor, keys.into_iter().map(String::from).collect()))
+        }
+    }
+
+    #[test]
+    fn fill_scan_page_stops_before_the_next_batch_once_cancelled() {
+        let token = CancelToken::new();
+        let mut requested_cursors = Vec::new();
+        let mut budget = generous_scan_budget();
+        let mut page = ScanPageKeys::default();
+
+        let result = fill_scan_page(0, 10, &mut budget, &mut page, &token, |cursor| {
+            requested_cursors.push(cursor);
+            token.cancel();
+            Ok((7, vec!["session:1".to_string()]))
+        });
+
+        assert!(
+            matches!(result, Err(DbError::Cancelled)),
+            "a cancel between batches must end the page, got: {:?}",
+            result
+        );
+        assert_eq!(requested_cursors, vec![0]);
+    }
+
+    #[test]
+    fn fill_scan_page_issues_no_batch_when_already_cancelled() {
+        let token = CancelToken::new();
+        token.cancel();
+        let mut requested_cursors = Vec::new();
+        let mut budget = generous_scan_budget();
+        let mut page = ScanPageKeys::default();
+
+        let result = fill_scan_page(
+            0,
+            10,
+            &mut budget,
+            &mut page,
+            &token,
+            scripted_scan(vec![(0, vec!["session:1"])], &mut requested_cursors),
+        );
+
+        assert!(matches!(result, Err(DbError::Cancelled)));
+        assert!(requested_cursors.is_empty());
+        assert_eq!(page.len(), 0);
+    }
+
+    #[test]
+    fn fill_scan_page_continues_past_empty_batches_until_a_match() -> Result<(), DbError> {
+        let mut requested_cursors = Vec::new();
+        let mut budget = generous_scan_budget();
+        let mut page = ScanPageKeys::default();
+
+        let next_cursor = fill_scan_page(
+            0,
+            1,
+            &mut budget,
+            &mut page,
+            &CancelToken::new(),
+            scripted_scan(
+                vec![(7, vec![]), (12, vec![]), (19, vec!["leaderboard:weekly"])],
+                &mut requested_cursors,
+            ),
+        )?;
+
+        assert_eq!(next_cursor, 19);
+        assert_eq!(requested_cursors, vec![0, 7, 12]);
+        assert_eq!(page.into_keys(), vec!["leaderboard:weekly".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn fill_scan_page_drops_keys_repeated_across_batches() -> Result<(), DbError> {
+        let mut requested_cursors = Vec::new();
+        let mut budget = generous_scan_budget();
+        let mut page = ScanPageKeys::default();
+
+        let next_cursor = fill_scan_page(
+            0,
+            10,
+            &mut budget,
+            &mut page,
+            &CancelToken::new(),
+            scripted_scan(
+                vec![(4, vec!["a", "b"]), (0, vec!["b", "c", "a"])],
+                &mut requested_cursors,
+            ),
+        )?;
+
+        assert_eq!(next_cursor, 0);
+        assert_eq!(
+            page.into_keys(),
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fill_scan_page_stops_when_cursor_returns_to_zero() -> Result<(), DbError> {
+        let mut requested_cursors = Vec::new();
+        let mut budget = generous_scan_budget();
+        let mut page = ScanPageKeys::default();
+
+        let next_cursor = fill_scan_page(
+            5,
+            100,
+            &mut budget,
+            &mut page,
+            &CancelToken::new(),
+            scripted_scan(vec![(0, vec!["only"])], &mut requested_cursors),
+        )?;
+
+        assert_eq!(next_cursor, 0);
+        assert_eq!(requested_cursors, vec![5]);
+        assert_eq!(page.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn fill_scan_page_returns_pending_cursor_at_round_trip_cap() -> Result<(), DbError> {
+        let mut requested_cursors = Vec::new();
+        let mut budget = ScanBudget::new(3, Duration::from_secs(60));
+        let mut page = ScanPageKeys::default();
+
+        let next_cursor = fill_scan_page(
+            0,
+            10,
+            &mut budget,
+            &mut page,
+            &CancelToken::new(),
+            scripted_scan(
+                vec![(1, vec![]), (2, vec![]), (3, vec![]), (4, vec!["late"])],
+                &mut requested_cursors,
+            ),
+        )?;
+
+        assert_eq!(next_cursor, 3);
+        assert_eq!(requested_cursors, vec![0, 1, 2]);
+        assert_eq!(page.len(), 0);
+        assert!(budget.is_exhausted());
+        Ok(())
+    }
+
+    #[test]
+    fn fill_scan_page_runs_one_batch_when_time_budget_is_already_spent() -> Result<(), DbError> {
+        let mut requested_cursors = Vec::new();
+        let mut budget = ScanBudget::new(1000, Duration::ZERO);
+        let mut page = ScanPageKeys::default();
+
+        let next_cursor = fill_scan_page(
+            0,
+            10,
+            &mut budget,
+            &mut page,
+            &CancelToken::new(),
+            scripted_scan(vec![(8, vec![]), (9, vec![])], &mut requested_cursors),
+        )?;
+
+        assert_eq!(next_cursor, 8);
+        assert_eq!(requested_cursors, vec![0]);
+        Ok(())
+    }
+
+    #[test]
+    fn fill_scan_page_keeps_every_key_of_the_last_batch() -> Result<(), DbError> {
+        let mut requested_cursors = Vec::new();
+        let mut budget = generous_scan_budget();
+        let mut page = ScanPageKeys::default();
+
+        let next_cursor = fill_scan_page(
+            0,
+            2,
+            &mut budget,
+            &mut page,
+            &CancelToken::new(),
+            scripted_scan(
+                vec![(6, vec!["a"]), (11, vec!["b", "c", "d"]), (0, vec!["e"])],
+                &mut requested_cursors,
+            ),
+        )?;
+
+        assert_eq!(next_cursor, 11);
+        assert_eq!(
+            page.into_keys(),
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string()
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn fill_scan_page_propagates_batch_errors() {
+        let mut budget = generous_scan_budget();
+        let mut page = ScanPageKeys::default();
+
+        let outcome = fill_scan_page(
+            0,
+            10,
+            &mut budget,
+            &mut page,
+            &CancelToken::new(),
+            |_cursor| Err(DbError::query_failed("scan failed")),
+        );
+
+        assert!(outcome.is_err());
+    }
+
+    #[test]
+    fn key_entries_with_types_rejects_mismatched_reply_count() {
+        let outcome = key_entries_with_types(vec!["a".to_string()], Vec::new());
+
+        assert!(outcome.is_err());
+    }
+
+    #[test]
+    fn gate_decision_allows_fetch_when_size_under_budget() {
+        assert_eq!(gate_decision(50, Some(100)), SizeGateDecision::Fetch);
+    }
+
+    #[test]
+    fn gate_decision_allows_fetch_when_size_equals_budget() {
+        assert_eq!(gate_decision(100, Some(100)), SizeGateDecision::Fetch);
+    }
+
+    #[test]
+    fn gate_decision_rejects_fetch_when_size_over_budget() {
+        assert_eq!(
+            gate_decision(101, Some(100)),
+            SizeGateDecision::TooLarge {
+                size_bytes: 101,
+                limit_bytes: 100,
+            }
+        );
+    }
+
+    #[test]
+    fn gate_decision_allows_fetch_when_budget_is_unbounded() {
+        assert_eq!(gate_decision(u64::MAX, None), SizeGateDecision::Fetch);
+    }
+
+    #[test]
+    fn build_config_requires_uri_when_uri_mode_enabled() {
+        let driver = RedisDriver::new();
+        let mut values = FormValues::new();
+        values.insert("use_uri".to_string(), "true".to_string());
+
+        let result = driver.build_config(&values);
+        assert!(matches!(result, Err(DbError::InvalidProfile(_))));
+    }
+
+    #[test]
+    fn build_config_rejects_invalid_database_index() {
+        let driver = RedisDriver::new();
+        let mut values = FormValues::new();
+        values.insert("host".to_string(), "localhost".to_string());
+        values.insert("port".to_string(), "6379".to_string());
+        values.insert("database".to_string(), "nope".to_string());
+
+        let result = driver.build_config(&values);
+        assert!(matches!(result, Err(DbError::InvalidProfile(_))));
+    }
+
+    #[test]
+    fn build_config_requires_host_and_valid_port_in_manual_mode() {
+        let driver = RedisDriver::new();
+
+        let mut missing_host = FormValues::new();
+        missing_host.insert("port".to_string(), "6379".to_string());
+        let result = driver.build_config(&missing_host);
+        assert!(matches!(result, Err(DbError::InvalidProfile(_))));
+
+        let mut bad_port = FormValues::new();
+        bad_port.insert("host".to_string(), "localhost".to_string());
+        bad_port.insert("port".to_string(), "not-a-port".to_string());
+        let result = driver.build_config(&bad_port);
+        assert!(matches!(result, Err(DbError::InvalidProfile(_))));
+    }
+
+    #[test]
+    fn extract_values_includes_database_and_omits_tls() {
+        let driver = RedisDriver::new();
+        let config = DbConfig::Redis {
+            use_uri: false,
+            uri: None,
+            host: "cache.local".to_string(),
+            port: 6380,
+            user: Some("svc".to_string()),
+            database: Some(3),
+            tls: false,
+            ssl_mode: Some("on".to_string()),
+            ssl_root_cert_path: None,
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
+            ssh_tunnel: None,
+            ssh_tunnel_profile_id: None,
+            topology: None,
+            sentinel_master_name: None,
+            additional_nodes: None,
+        };
+
+        let values = driver.extract_values(&config);
+        assert_eq!(values.get("host").map(String::as_str), Some("cache.local"));
+        assert_eq!(values.get("port").map(String::as_str), Some("6380"));
+        assert_eq!(values.get("database").map(String::as_str), Some("3"));
+        // SSL mode is owned by the generic TRANSPORT control, not by the form values.
+        assert!(!values.contains_key("tls"));
+    }
+
+    #[test]
+    fn extract_values_defaults_topology_to_standalone_when_unset() {
+        let driver = RedisDriver::new();
+        let config = base_redis_config();
+
+        let values = driver.extract_values(&config);
+
+        assert_eq!(
+            values.get("topology").map(String::as_str),
+            Some("standalone")
+        );
+        assert_eq!(
+            values.get("sentinel_master_name").map(String::as_str),
+            Some("")
+        );
+        assert_eq!(values.get("additional_nodes").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn topology_is_a_single_choice_field_that_loads_saved_profiles_unchanged() {
+        let driver = RedisDriver::new();
+        let topology_field = driver
+            .form_definition()
+            .field("topology")
+            .expect("redis form must declare a topology field");
+
+        let FormFieldKind::Select { options } = &topology_field.kind else {
+            panic!("topology must be a single-choice Select field");
+        };
+        let option_values: Vec<&str> = options.iter().map(|opt| opt.value.as_str()).collect();
+        assert_eq!(option_values, ["standalone", "cluster", "sentinel"]);
+        assert_eq!(topology_field.default_value, "standalone");
+
+        for saved_topology in [None, Some("standalone"), Some("cluster"), Some("sentinel")] {
+            let mut config = base_redis_config();
+            if let DbConfig::Redis { topology, .. } = &mut config {
+                *topology = saved_topology.map(str::to_string);
+            }
+
+            let values = driver.extract_values(&config);
+            let loaded = values
+                .get("topology")
+                .expect("extract_values must always emit a topology value");
+
+            assert_eq!(loaded, saved_topology.unwrap_or("standalone"));
+            assert!(
+                option_values.contains(&loaded.as_str()),
+                "saved topology {saved_topology:?} must select one of the form options"
+            );
+        }
+    }
+
+    #[test]
+    fn extract_values_round_trips_sentinel_topology_fields() {
+        let driver = RedisDriver::new();
+        let mut config = base_redis_config();
+        if let DbConfig::Redis {
+            topology,
+            sentinel_master_name,
+            additional_nodes,
+            ..
+        } = &mut config
+        {
+            *topology = Some("sentinel".to_string());
+            *sentinel_master_name = Some("mymaster".to_string());
+            *additional_nodes = Some("10.0.0.2:26379,10.0.0.3:26379".to_string());
+        }
+
+        let values = driver.extract_values(&config);
+
+        assert_eq!(values.get("topology").map(String::as_str), Some("sentinel"));
+        assert_eq!(
+            values.get("sentinel_master_name").map(String::as_str),
+            Some("mymaster")
+        );
+        assert_eq!(
+            values.get("additional_nodes").map(String::as_str),
+            Some("10.0.0.2:26379,10.0.0.3:26379")
+        );
+    }
+
+    #[test]
+    fn build_config_round_trips_cluster_topology_fields_in_manual_mode() {
+        let driver = RedisDriver::new();
+        let mut values = FormValues::new();
+        values.insert("host".to_string(), "localhost".to_string());
+        values.insert("port".to_string(), "6379".to_string());
+        values.insert("topology".to_string(), "cluster".to_string());
+        values.insert(
+            "additional_nodes".to_string(),
+            "10.0.0.2:6379,10.0.0.3:6379".to_string(),
+        );
+
+        let config = driver.build_config(&values).expect("valid manual config");
+
+        let DbConfig::Redis {
+            topology,
+            sentinel_master_name,
+            additional_nodes,
+            ..
+        } = config
+        else {
+            panic!("expected Redis config");
+        };
+
+        assert_eq!(topology.as_deref(), Some("cluster"));
+        assert_eq!(sentinel_master_name, None);
+        assert_eq!(
+            additional_nodes.as_deref(),
+            Some("10.0.0.2:6379,10.0.0.3:6379")
+        );
+    }
+
+    #[test]
+    fn build_config_round_trips_sentinel_topology_fields_in_uri_mode() {
+        let driver = RedisDriver::new();
+        let mut values = FormValues::new();
+        values.insert("use_uri".to_string(), "true".to_string());
+        values.insert("uri".to_string(), "redis://localhost:6379/0".to_string());
+        values.insert("topology".to_string(), "sentinel".to_string());
+        values.insert("sentinel_master_name".to_string(), "mymaster".to_string());
+
+        let config = driver.build_config(&values).expect("valid uri config");
+
+        let DbConfig::Redis {
+            topology,
+            sentinel_master_name,
+            additional_nodes,
+            ..
+        } = config
+        else {
+            panic!("expected Redis config");
+        };
+
+        assert_eq!(topology.as_deref(), Some("sentinel"));
+        assert_eq!(sentinel_master_name.as_deref(), Some("mymaster"));
+        assert_eq!(additional_nodes, None);
+    }
+
+    #[test]
+    fn build_config_omits_topology_fields_when_left_blank() {
+        let driver = RedisDriver::new();
+        let mut values = FormValues::new();
+        values.insert("host".to_string(), "localhost".to_string());
+        values.insert("port".to_string(), "6379".to_string());
+
+        let config = driver.build_config(&values).expect("valid manual config");
+
+        let DbConfig::Redis {
+            topology,
+            sentinel_master_name,
+            additional_nodes,
+            ..
+        } = config
+        else {
+            panic!("expected Redis config");
+        };
+
+        assert_eq!(topology, None);
+        assert_eq!(sentinel_master_name, None);
+        assert_eq!(additional_nodes, None);
+    }
+
+    #[test]
+    fn build_uri_keeps_user_and_db_without_tls_field() {
+        let driver = RedisDriver::new();
+        let mut values = FormValues::new();
+        values.insert("host".to_string(), "cache.local".to_string());
+        values.insert("port".to_string(), "6380".to_string());
+        values.insert("user".to_string(), "service user".to_string());
+        values.insert("database".to_string(), "2".to_string());
+
+        let uri = driver
+            .build_uri(&values, "s3cr@t")
+            .expect("redis driver should support uri build");
+        assert_eq!(uri, "redis://service%20user:s3cr%40t@cache.local:6380/2");
+
+        let parsed = driver.parse_uri(&uri).expect("uri should parse");
+        assert_eq!(parsed.get("host").map(String::as_str), Some("cache.local"));
+        assert_eq!(parsed.get("port").map(String::as_str), Some("6380"));
+        assert_eq!(parsed.get("user").map(String::as_str), Some("service user"));
+        assert_eq!(parsed.get("database").map(String::as_str), Some("2"));
+    }
+
+    #[test]
+    fn ssl_mode_off_returns_plain() {
+        let cfg = redis_ssl_mode_to_config(Some("off"), None, None, None)
+            .expect("off should map to plain");
+        assert!(matches!(cfg, RedisTlsConfig::Plain));
+    }
+
+    #[test]
+    fn ssl_mode_default_when_none_is_plain() {
+        let cfg =
+            redis_ssl_mode_to_config(None, None, None, None).expect("None should map to plain");
+        assert!(matches!(cfg, RedisTlsConfig::Plain));
+    }
+
+    #[test]
+    fn ssl_mode_on_returns_tls_insecure() {
+        let cfg = redis_ssl_mode_to_config(Some("on"), None, None, None)
+            .expect("on should map to insecure TLS");
+        assert!(matches!(cfg, RedisTlsConfig::TlsInsecure));
+    }
+
+    #[test]
+    fn ssl_mode_on_label_says_the_certificate_is_not_verified() {
+        let modes = REDIS_METADATA.ssl_modes.expect("Redis declares TLS modes");
+        let on = modes
+            .iter()
+            .find(|mode| mode.id == "on")
+            .expect("Redis declares mode on");
+        assert!(on.label.contains("not verified"), "label: {}", on.label);
+    }
+
+    fn sentinel_profile(
+        host: &str,
+        uri: Option<&str>,
+        ssl_mode: Option<&str>,
+        ssh_tunnel: Option<SshTunnelConfig>,
+    ) -> ConnectionProfile {
+        ConnectionProfile::new(
+            "sentinel-tls",
+            DbConfig::Redis {
+                use_uri: uri.is_some(),
+                uri: uri.map(str::to_string),
+                host: host.to_string(),
+                port: 1,
+                user: None,
+                database: None,
+                tls: false,
+                ssl_mode: ssl_mode.map(str::to_string),
+                ssl_root_cert_path: None,
+                ssl_client_cert_path: None,
+                ssl_client_key_path: None,
+                ssh_tunnel,
+                ssh_tunnel_profile_id: None,
+                topology: Some("sentinel".to_string()),
+                sentinel_master_name: Some("primary".to_string()),
+                additional_nodes: None,
+            },
+        )
+    }
+
+    fn is_sentinel_tls_refusal(result: &Result<Box<dyn Connection>, DbError>) -> bool {
+        matches!(
+            result,
+            Err(DbError::InvalidProfile(message))
+                if message.contains("cannot reach the Sentinel master over TLS yet")
+        )
+    }
+
+    #[test]
+    fn sentinel_refuses_tls_before_the_ssh_host() {
+        // Stands in for the SSH host. It counts each dial and closes the socket,
+        // so a dial ends in a failed handshake, with no SSH server needed.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
+        let ssh_port = listener.local_addr().expect("listener address").port();
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        std::thread::spawn({
+            let dials = dials.clone();
+            move || {
+                for socket in listener.incoming() {
+                    dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    drop(socket);
+                }
+            }
+        });
+        let dial_count = || dials.load(std::sync::atomic::Ordering::SeqCst);
+        let tunnel = || {
+            Some(SshTunnelConfig {
+                host: "127.0.0.1".to_string(),
+                port: ssh_port,
+                user: "not-a-real-user".to_string(),
+                auth_method: datatab_core::SshAuthMethod::Password,
+                ssh_config_host: None,
+            })
+        };
+        let connect = |profile: &ConnectionProfile| {
+            RedisDriver::new().connect_with_secrets(profile, None, None)
+        };
+
+        let not_refused: Vec<&str> = [
+            (
+                "mode on",
+                sentinel_profile("127.0.0.1", None, Some("on"), tunnel()),
+            ),
+            (
+                "mode on with a host that does not parse in a URI",
+                sentinel_profile("::1", None, Some("on"), tunnel()),
+            ),
+            (
+                "mode verify",
+                sentinel_profile("127.0.0.1", None, Some("verify"), tunnel()),
+            ),
+            (
+                "mode verify with a host that does not parse in a URI",
+                sentinel_profile("::1", None, Some("verify"), tunnel()),
+            ),
+        ]
+        .iter()
+        .filter(|(_, profile)| !is_sentinel_tls_refusal(&connect(profile)))
+        .map(|(case, _)| *case)
+        .collect();
+        assert!(
+            not_refused.is_empty(),
+            "not refused before the SSH host: {not_refused:?}"
+        );
+        assert_eq!(
+            dial_count(),
+            0,
+            "a TLS Sentinel profile dialed the SSH host"
+        );
+
+        for (case, uri) in [
+            ("a #insecure URI", "rediss://127.0.0.1:1/#insecure"),
+            ("a rediss URI", "rediss://127.0.0.1:1/"),
+        ] {
+            let profile = sentinel_profile("127.0.0.1", Some(uri), None, tunnel());
+            assert!(
+                matches!(connect(&profile), Err(DbError::InvalidProfile(_))),
+                "{case} should be refused before the SSH host"
+            );
+        }
+        assert_eq!(
+            dial_count(),
+            0,
+            "a URI Sentinel profile dialed the SSH host"
+        );
+
+        let plain = sentinel_profile("127.0.0.1", None, Some("off"), tunnel());
+        assert!(
+            !matches!(connect(&plain), Err(DbError::InvalidProfile(_))),
+            "plain Sentinel over a tunnel should not be refused"
+        );
+        assert!(
+            dial_count() > 0,
+            "plain Sentinel over a tunnel should reach the SSH host"
+        );
+    }
+
+    #[test]
+    fn sentinel_refuses_every_tls_form() {
+        // Without the refusal the connect reaches rustls, which needs a provider
+        // here, so a missing refusal fails on the assertions below.
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .expect("no provider is installed yet");
+
+        let connect = |profile: &ConnectionProfile| {
+            RedisDriver::new().connect_with_secrets(profile, None, None)
+        };
+
+        let not_refused: Vec<&str> = [
+            (
+                "mode on",
+                sentinel_profile("127.0.0.1", None, Some("on"), None),
+            ),
+            (
+                "mode verify",
+                sentinel_profile("127.0.0.1", None, Some("verify"), None),
+            ),
+            (
+                "a #insecure URI",
+                sentinel_profile(
+                    "127.0.0.1",
+                    Some("rediss://127.0.0.1:1/#insecure"),
+                    None,
+                    None,
+                ),
+            ),
+            (
+                "a #insecure URI with a trailing space",
+                sentinel_profile(
+                    "127.0.0.1",
+                    Some("rediss://127.0.0.1:1/#insecure "),
+                    None,
+                    None,
+                ),
+            ),
+            (
+                "a rediss URI",
+                sentinel_profile("127.0.0.1", Some("rediss://127.0.0.1:1/"), None, None),
+            ),
+            (
+                "a rediss URI with a trailing space",
+                sentinel_profile("127.0.0.1", Some("rediss://127.0.0.1:1/ "), None, None),
+            ),
+            (
+                "a rediss URI with an upper-case scheme",
+                sentinel_profile("127.0.0.1", Some("REDISS://127.0.0.1:1/"), None, None),
+            ),
+            (
+                "a rediss URI with mode off",
+                sentinel_profile(
+                    "127.0.0.1",
+                    Some("rediss://127.0.0.1:1/"),
+                    Some("off"),
+                    None,
+                ),
+            ),
+        ]
+        .iter()
+        .filter(|(_, profile)| !is_sentinel_tls_refusal(&connect(profile)))
+        .map(|(case, _)| *case)
+        .collect();
+        assert!(not_refused.is_empty(), "not refused: {not_refused:?}");
+
+        // Nothing listens on this port, so these fail to connect instead.
+        let refused: Vec<&str> = [
+            (
+                "mode off",
+                sentinel_profile("127.0.0.1", None, Some("off"), None),
+            ),
+            (
+                "a redis URI",
+                sentinel_profile("127.0.0.1", Some("redis://127.0.0.1:1/"), None, None),
+            ),
+        ]
+        .iter()
+        .filter(|(_, profile)| matches!(connect(profile), Err(DbError::InvalidProfile(_))))
+        .map(|(case, _)| *case)
+        .collect();
+        assert!(refused.is_empty(), "plain Sentinel refused: {refused:?}");
+    }
+
+    #[test]
+    fn ssl_mode_verify_without_certs_is_verify_with_no_overrides() {
+        let cfg = redis_ssl_mode_to_config(Some("verify"), None, None, None)
+            .expect("verify without certs should be valid");
+        let certs = match cfg {
+            RedisTlsConfig::TlsVerify(c) => c,
+            other => panic!("expected TlsVerify, got {:?}", other),
+        };
+        assert!(certs.client_tls.is_none());
+        assert!(certs.root_cert.is_none());
+    }
+
+    #[test]
+    fn ssl_mode_verify_rejects_partial_client_cert() {
+        let err = redis_ssl_mode_to_config(Some("verify"), None, Some("/tmp/cert.pem"), None)
+            .expect_err("client cert without key should fail");
+        assert!(err.contains("client cert and a client key"));
+    }
+
+    #[test]
+    fn ssl_mode_unknown_id_returns_error() {
+        let err = redis_ssl_mode_to_config(Some("bogus"), None, None, None)
+            .expect_err("unknown mode should fail");
+        assert!(err.contains("Unknown Redis SSL mode"));
+    }
+
+    #[test]
+    fn extract_redis_config_migrates_legacy_tls_true() {
+        let config = DbConfig::Redis {
+            use_uri: false,
+            uri: None,
+            host: "localhost".to_string(),
+            port: 6379,
+            user: None,
+            database: Some(0),
+            tls: true,
+            ssl_mode: None,
+            ssl_root_cert_path: None,
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
+            ssh_tunnel: None,
+            ssh_tunnel_profile_id: None,
+            topology: None,
+            sentinel_master_name: None,
+            additional_nodes: None,
+        };
+        let extracted = extract_redis_config(&config).expect("redis config should extract");
+        assert_eq!(extracted.ssl_mode.as_deref(), Some("on"));
+    }
+
+    #[test]
+    fn extract_redis_config_migrates_legacy_tls_false() {
+        let config = DbConfig::Redis {
+            use_uri: false,
+            uri: None,
+            host: "localhost".to_string(),
+            port: 6379,
+            user: None,
+            database: Some(0),
+            tls: false,
+            ssl_mode: None,
+            ssl_root_cert_path: None,
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
+            ssh_tunnel: None,
+            ssh_tunnel_profile_id: None,
+            topology: None,
+            sentinel_master_name: None,
+            additional_nodes: None,
+        };
+        let extracted = extract_redis_config(&config).expect("redis config should extract");
+        assert_eq!(extracted.ssl_mode.as_deref(), Some("off"));
+    }
+
+    #[test]
+    fn extract_redis_config_prefers_explicit_ssl_mode_over_legacy_tls() {
+        let config = DbConfig::Redis {
+            use_uri: false,
+            uri: None,
+            host: "localhost".to_string(),
+            port: 6379,
+            user: None,
+            database: Some(0),
+            // Legacy `tls: true` but explicit `ssl_mode: "verify"` — the new field wins.
+            tls: true,
+            ssl_mode: Some("verify".to_string()),
+            ssl_root_cert_path: None,
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
+            ssh_tunnel: None,
+            ssh_tunnel_profile_id: None,
+            topology: None,
+            sentinel_master_name: None,
+            additional_nodes: None,
+        };
+        let extracted = extract_redis_config(&config).expect("redis config should extract");
+        assert_eq!(extracted.ssl_mode.as_deref(), Some("verify"));
+    }
+
+    fn base_redis_config() -> DbConfig {
+        DbConfig::Redis {
+            use_uri: false,
+            uri: None,
+            host: "localhost".to_string(),
+            port: 6379,
+            user: None,
+            database: Some(0),
+            tls: false,
+            ssl_mode: None,
+            ssl_root_cert_path: None,
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
+            ssh_tunnel: None,
+            ssh_tunnel_profile_id: None,
+            topology: None,
+            sentinel_master_name: None,
+            additional_nodes: None,
+        }
+    }
+
+    #[test]
+    fn extract_redis_config_defaults_to_standalone_topology() {
+        let extracted =
+            extract_redis_config(&base_redis_config()).expect("redis config should extract");
+        assert_eq!(extracted.topology, ConfiguredTopology::Standalone);
+        assert!(extracted.additional_nodes.is_empty());
+    }
+
+    #[test]
+    fn extract_redis_config_rejects_unknown_topology() {
+        let mut config = base_redis_config();
+        if let DbConfig::Redis { topology, .. } = &mut config {
+            *topology = Some("replica-set".to_string());
+        }
+
+        let error = extract_redis_config(&config).unwrap_err();
+        assert!(matches!(error, DbError::InvalidProfile(_)));
+    }
+
+    #[test]
+    fn extract_redis_config_sentinel_requires_master_name() {
+        let mut config = base_redis_config();
+        if let DbConfig::Redis { topology, .. } = &mut config {
+            *topology = Some("sentinel".to_string());
+        }
+
+        let error = extract_redis_config(&config).unwrap_err();
+        assert!(matches!(error, DbError::InvalidProfile(_)));
+    }
+
+    #[test]
+    fn extract_redis_config_sentinel_accepts_configured_master_name() {
+        let mut config = base_redis_config();
+        if let DbConfig::Redis {
+            topology,
+            sentinel_master_name,
+            ..
+        } = &mut config
+        {
+            *topology = Some("sentinel".to_string());
+            *sentinel_master_name = Some("mymaster".to_string());
+        }
+
+        let extracted = extract_redis_config(&config).expect("redis config should extract");
+        assert_eq!(extracted.topology, ConfiguredTopology::Sentinel);
+        assert_eq!(extracted.sentinel_master_name.as_deref(), Some("mymaster"));
+    }
+
+    #[test]
+    fn extract_redis_config_parses_additional_nodes() {
+        let mut config = base_redis_config();
+        if let DbConfig::Redis {
+            topology,
+            additional_nodes,
+            ..
+        } = &mut config
+        {
+            *topology = Some("cluster".to_string());
+            *additional_nodes = Some("10.0.0.2:6379, 10.0.0.3:6379".to_string());
+        }
+
+        let extracted = extract_redis_config(&config).expect("redis config should extract");
+        assert_eq!(extracted.topology, ConfiguredTopology::Cluster);
+        assert_eq!(
+            extracted.additional_nodes,
+            vec![
+                ("10.0.0.2".to_string(), 6379),
+                ("10.0.0.3".to_string(), 6379)
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_redis_config_rejects_malformed_additional_nodes() {
+        let mut config = base_redis_config();
+        if let DbConfig::Redis {
+            topology,
+            additional_nodes,
+            ..
+        } = &mut config
+        {
+            *topology = Some("cluster".to_string());
+            *additional_nodes = Some("not-a-node".to_string());
+        }
+
+        let error = extract_redis_config(&config).unwrap_err();
+        assert!(matches!(error, DbError::InvalidProfile(_)));
+    }
+
+    #[test]
+    fn parse_uri_rejects_unsupported_scheme() {
+        let driver = RedisDriver::new();
+        assert!(driver.parse_uri("http://localhost:6379").is_none());
+    }
+
+    #[test]
+    fn parse_uri_defaults_port_when_missing() {
+        let driver = RedisDriver::new();
+        let parsed = driver
+            .parse_uri("redis://localhost/0")
+            .expect("uri should parse");
+
+        assert_eq!(parsed.get("host").map(String::as_str), Some("localhost"));
+        assert_eq!(parsed.get("port").map(String::as_str), Some("6379"));
+        assert_eq!(parsed.get("database").map(String::as_str), Some("0"));
+    }
+
+    #[test]
+    fn parse_database_name_supports_prefix_and_plain_numbers() {
+        assert_eq!(parse_database_name("db3").unwrap(), 3);
+        assert_eq!(parse_database_name(" 7 ").unwrap(), 7);
+    }
+
+    #[test]
+    fn parse_database_name_rejects_invalid_values() {
+        let error = parse_database_name("dbx").expect_err("invalid db name should fail");
+        assert!(matches!(error, DbError::InvalidProfile(_)));
+    }
+
+    #[test]
+    fn parse_command_strips_comments_and_semicolon() {
+        let tokens = parse_command("# comment\nGET my_key;").expect("command should parse");
+        assert_eq!(tokens, vec!["GET", "my_key"]);
+    }
+
+    #[test]
+    fn parse_command_handles_quotes_and_escapes() {
+        let tokens =
+            parse_command("SET \"my key\" 'hello world'\\n").expect("quoted command should parse");
+        assert_eq!(tokens, vec!["SET", "my key", "hello worldn"]);
+    }
+
+    #[test]
+    fn parse_command_reports_unterminated_quote() {
+        let error = parse_command("SET 'abc").expect_err("unterminated quote should fail");
+        assert!(matches!(error, DbError::QueryFailed(_)));
+    }
+
+    #[test]
+    fn check_pairing_detects_mset_odd_arguments() {
+        let message = check_pairing("MSET", 3).expect("odd mset arity should warn");
+        assert!(message.contains("even number of arguments"));
+    }
+
+    #[test]
+    fn check_redis_arity_reports_exact_argument_mismatch() {
+        let diagnostics = check_redis_arity(&["GET".to_string()], "GET");
+        assert_eq!(diagnostics.len(), 1);
+        assert!(
+            diagnostics[0]
+                .message
+                .contains("requires exactly 1 argument")
+        );
+    }
+
+    #[test]
+    fn language_service_flags_sql_as_wrong_language() {
+        let service = RedisLanguageService;
+        let validation = service.validate("SELECT * FROM users");
+
+        assert!(matches!(validation, ValidationResult::WrongLanguage { .. }));
+    }
+
+    #[test]
+    fn uri_authority_has_credentials_detects_at_symbol() {
+        assert!(uri_authority_has_credentials(
+            "redis://:pass@localhost:6379/0"
+        ));
+        assert!(!uri_authority_has_credentials("redis://localhost:6379/0"));
+    }
+
+    #[test]
+    fn redis_parse_uri_decodes_username_and_password() {
+        let driver = RedisDriver::new();
+        let v = driver
+            .parse_uri("redis://user%40domain.com:p%40ss@localhost:6379/0")
+            .expect("URI should parse");
+        assert_eq!(v.get("user").map(String::as_str), Some("user@domain.com"));
+        assert_eq!(v.get("password").map(String::as_str), Some("p@ss"));
+        assert_eq!(v.get("host").map(String::as_str), Some("localhost"));
+        assert_eq!(v.get("port").map(String::as_str), Some("6379"));
+    }
+
+    #[test]
+    fn parse_uri_no_userinfo() {
+        let driver = RedisDriver::new();
+        let v = driver
+            .parse_uri("redis://host:6379/0")
+            .expect("URI should parse");
+        assert_eq!(v.get("host").map(String::as_str), Some("host"));
+        assert_eq!(v.get("port").map(String::as_str), Some("6379"));
+        assert!(!v.contains_key("user"), "no user key expected");
+        assert!(!v.contains_key("password"), "no password key expected");
+    }
+
+    #[test]
+    fn parse_uri_invalid_percent_is_lossy() {
+        let driver = RedisDriver::new();
+        // %GG is an invalid percent sequence; parse_uri must return Some (no panic, no None)
+        // and the username segment must equal the original raw text.
+        let v = driver
+            .parse_uri("redis://%GGuser:pass@host:6379/0")
+            .expect("URI should parse even with invalid percent sequence");
+        assert_eq!(
+            v.get("user").map(String::as_str),
+            Some("%GGuser"),
+            "lossy fallback must return the original raw segment"
+        );
+    }
+
+    #[test]
+    fn metadata_and_form_definition_match_redis_contract() {
+        let driver = RedisDriver::new();
+        let metadata = driver.metadata();
+
+        assert_eq!(metadata.category, DatabaseCategory::KeyValue);
+        assert_eq!(metadata.query_language, QueryLanguage::RedisCommands);
+        assert_eq!(metadata.default_port, Some(6379));
+        assert_eq!(metadata.uri_scheme, "redis");
+        assert!(!driver.form_definition().tabs.is_empty());
+    }
+
+    #[test]
+    fn settings_schema_exposes_scan_and_safety_fields() {
+        let driver = RedisDriver::new();
+        let schema = driver
+            .settings_schema()
+            .expect("redis should have a settings schema");
+
+        assert_eq!(schema.tabs.len(), 1);
+        assert_eq!(schema.tabs[0].sections.len(), 2);
+
+        let scanning = &schema.tabs[0].sections[0];
+        assert_eq!(scanning.title, "Key Scanning");
+        assert_eq!(scanning.fields.len(), 3);
+        assert_eq!(scanning.fields[0].id, "scan_batch_size");
+        assert_eq!(scanning.fields[0].default_value, "100");
+        assert_eq!(scanning.fields[1].id, "key_delimiter");
+        assert_eq!(scanning.fields[1].default_value, ":");
+        assert_eq!(scanning.fields[2].id, "stream_preview_limit");
+        assert_eq!(scanning.fields[2].default_value, "50");
+
+        let safety = &schema.tabs[0].sections[1];
+        assert_eq!(safety.title, "Safety");
+        assert_eq!(safety.fields.len(), 1);
+        assert_eq!(safety.fields[0].id, "allow_flush");
+        assert_eq!(safety.fields[0].default_value, "false");
+    }
+
+    #[test]
+    fn driver_key_is_builtin_redis() {
+        let driver = RedisDriver::new();
+        assert_eq!(driver.driver_key(), "builtin:redis");
+    }
+
+    #[test]
+    fn semantic_planner_wraps_key_value_mutation_preview() {
+        let plan = plan_redis_semantic_request(&SemanticRequest::Mutation(
+            MutationRequest::KeyValueSet(KeySetRequest::new("session:1", b"alive".to_vec())),
+        ))
+        .expect("key-value mutation should plan");
+
+        assert_eq!(plan.kind, SemanticPlanKind::MutationPreview);
+        assert_eq!(plan.queries[0].language, QueryLanguage::RedisCommands);
+        assert_eq!(plan.queries[0].text, "SET session:1 alive");
+    }
+
+    #[test]
+    fn semantic_planner_rejects_relational_browse_requests() {
+        let error = plan_redis_semantic_request(&SemanticRequest::TableBrowse(
+            TableBrowseRequest::new(TableRef::new("users")),
+        ))
+        .expect_err("redis should reject relational browse planning");
+
+        assert!(matches!(error, DbError::NotSupported(_)));
+        assert!(error.to_string().contains("browse/count"));
+    }
+
+    #[test]
+    fn semantic_planner_rejects_explain_requests_explicitly() {
+        let error = plan_redis_semantic_request(&SemanticRequest::Explain(
+            datatab_core::ExplainRequest::new(TableRef::new("sessions")).with_query("GET sessions"),
+        ))
+        .expect_err("redis should reject explain planning");
+
+        assert!(matches!(error, DbError::NotSupported(_)));
+        assert!(error.to_string().contains("explain or describe"));
+    }
+
+    #[test]
+    fn redis_metadata_advertises_chart_authoring() {
+        assert!(
+            REDIS_METADATA
+                .capabilities
+                .contains(DriverCapabilities::CHART_AUTHORING),
+            "CHART_AUTHORING must be set: Redis advertises INSTANCE_METRICS and needs \
+             CHART_AUTHORING so the sidebar surfaces Dashboards / Saved Charts folders"
+        );
+    }
+
+    #[test]
+    fn redis_metadata_advertises_instance_metrics() {
+        assert!(
+            REDIS_METADATA
+                .capabilities
+                .contains(DriverCapabilities::INSTANCE_METRICS),
+            "INSTANCE_METRICS must remain set on Redis driver"
+        );
+    }
+
+    #[test]
+    fn parse_keyspace_info_extracts_key_count_and_avg_ttl() {
+        let info = "# Keyspace\r\ndb0:keys=42,expires=1,avg_ttl=5000\r\n";
+        let stats = parse_keyspace_info(info);
+
+        assert_eq!(
+            stats.get(&0),
+            Some(&KeyspaceStats {
+                key_count: 42,
+                avg_ttl_seconds: Some(5),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_keyspace_info_treats_zero_avg_ttl_as_none() {
+        let info = "db0:keys=10,expires=0,avg_ttl=0\r\n";
+        let stats = parse_keyspace_info(info);
+
+        assert_eq!(
+            stats.get(&0),
+            Some(&KeyspaceStats {
+                key_count: 10,
+                avg_ttl_seconds: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_keyspace_info_empty_when_no_databases_reported() {
+        let info = "# Keyspace\r\n";
+        assert!(parse_keyspace_info(info).is_empty());
+    }
+
+    #[test]
+    fn aggregate_keyspace_stats_sums_key_counts_across_masters() {
+        let per_master = vec![
+            HashMap::from([(
+                0,
+                KeyspaceStats {
+                    key_count: 10,
+                    avg_ttl_seconds: None,
+                },
+            )]),
+            HashMap::from([(
+                0,
+                KeyspaceStats {
+                    key_count: 5,
+                    avg_ttl_seconds: None,
+                },
+            )]),
+        ];
+
+        let aggregated = aggregate_keyspace_stats(&per_master);
+        assert_eq!(aggregated.key_count, 15);
+        assert_eq!(aggregated.avg_ttl_seconds, None);
+    }
+
+    #[test]
+    fn aggregate_keyspace_stats_weights_avg_ttl_by_key_count() {
+        let per_master = vec![
+            HashMap::from([(
+                0,
+                KeyspaceStats {
+                    key_count: 10,
+                    avg_ttl_seconds: Some(100),
+                },
+            )]),
+            HashMap::from([(
+                0,
+                KeyspaceStats {
+                    key_count: 30,
+                    avg_ttl_seconds: Some(200),
+                },
+            )]),
+        ];
+
+        // Weighted average: (10*100 + 30*200) / 40 = 175.
+        let aggregated = aggregate_keyspace_stats(&per_master);
+        assert_eq!(aggregated.key_count, 40);
+        assert_eq!(aggregated.avg_ttl_seconds, Some(175));
+    }
+
+    #[test]
+    fn aggregate_keyspace_stats_skips_masters_without_db0() {
+        let per_master = vec![
+            HashMap::new(),
+            HashMap::from([(
+                0,
+                KeyspaceStats {
+                    key_count: 7,
+                    avg_ttl_seconds: Some(50),
+                },
+            )]),
+        ];
+
+        let aggregated = aggregate_keyspace_stats(&per_master);
+        assert_eq!(aggregated.key_count, 7);
+        assert_eq!(aggregated.avg_ttl_seconds, Some(50));
+    }
+
+    #[test]
+    fn aggregate_keyspace_stats_empty_input_reports_zero() {
+        let aggregated = aggregate_keyspace_stats(&[]);
+        assert_eq!(aggregated.key_count, 0);
+        assert_eq!(aggregated.avg_ttl_seconds, None);
+    }
+}

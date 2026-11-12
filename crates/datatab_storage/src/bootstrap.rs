@@ -1,0 +1,700 @@
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use log::info;
+
+use crate::artifacts::ArtifactStore;
+use crate::error::StorageError;
+use crate::migrations::MigrationRegistry;
+use crate::paths;
+use crate::repositories::app_meta::AppMetaRepository;
+use crate::repositories::audit::AuditRepository;
+use crate::repositories::audit_settings::AuditSettingsRepository;
+use crate::repositories::auth_profiles::AuthProfileRepository;
+use crate::repositories::connection_profiles::ConnectionProfileRepository;
+use crate::repositories::driver_overrides::DriverOverridesRepository;
+use crate::repositories::driver_setting_values::DriverSettingValuesRepository;
+use crate::repositories::driver_settings::DriverSettingsRepository;
+use crate::repositories::general_settings::GeneralSettingsRepository;
+use crate::repositories::governance_settings::GovernanceSettingsRepository;
+use crate::repositories::hook_definitions::HookDefinitionRepository;
+use crate::repositories::keybinding_overrides::KeybindingOverridesRepository;
+use crate::repositories::proxy_profiles::ProxyProfileRepository;
+use crate::repositories::saved_filters::SavedFiltersRepository;
+use crate::repositories::script_roots::ScriptRootsRepository;
+use crate::repositories::services::ServiceRepository;
+use crate::repositories::ssh_tunnel_profiles::SshTunnelProfileRepository;
+use crate::repositories::state::{
+    query_history::QueryHistoryRepository, recent_items::RecentItemsRepository,
+    saved_queries::SavedQueriesRepository, sessions::SessionRepository,
+    ui_state::UiStateRepository,
+};
+use crate::repositories::update_settings::UpdateSettingsRepository;
+use crate::repositories::viz_dashboard_panels::DashboardPanelsRepository;
+use crate::repositories::viz_dashboards::DashboardsRepository;
+use crate::repositories::viz_saved_charts::SavedChartsRepository;
+use crate::sqlite;
+
+/// An owned database connection wrapped in Arc for shared access.
+pub type OwnedConnection = Arc<rusqlite::Connection>;
+
+/// Holds the open connection for the unified DataTab database.
+///
+/// The single `datatab.db` database contains all domains (config, state, audit) using
+/// domain-prefixed table names (`cfg_*`, `st_*`, `aud_*`, `sys_*`).
+///
+/// Obtained exclusively via [`initialize`] — callers never construct this
+/// directly.
+pub struct StorageRuntime {
+    datatab_db_path: PathBuf,
+    datatab_db: OwnedConnection,
+    /// Manages filesystem artifact paths (scratch/shadow files).
+    /// Content stays on disk; metadata about paths lives in datatab.db.
+    artifacts: ArtifactStore,
+    /// The temporary directory [`StorageRuntime::in_memory`] created, removed
+    /// when the runtime drops. Without it every test runtime leaves a migrated
+    /// database behind in the temp dir, which on a RAM-backed `/tmp` fills
+    /// memory after a few full test runs.
+    ///
+    /// Declared last: fields drop in declaration order, so `datatab_db` is
+    /// closed before the directory holding `datatab.db` and its `-wal` and
+    /// `-shm` files is removed. Windows refuses to remove an open file.
+    owned_temp_dir: Option<OwnedTempDir>,
+}
+
+/// A test runtime directory and its locked owner file, removed on drop.
+struct OwnedTempDir {
+    path: PathBuf,
+    owner: Option<std::fs::File>,
+}
+
+impl Drop for OwnedTempDir {
+    fn drop(&mut self) {
+        // Windows refuses to remove a directory holding an open file.
+        drop(self.owner.take());
+
+        if let Err(error) = std::fs::remove_dir_all(&self.path) {
+            log::warn!(
+                "Could not remove test storage directory {}: {error}",
+                self.path.display()
+            );
+        }
+    }
+}
+
+/// The directory name for one test runtime.
+///
+/// Uniqueness must not come from the wall clock. `SystemTime::now()` is only as
+/// fine grained as the platform's clock, so on a coarse one two test threads can
+/// read the same value and be handed the same directory. A random identifier has
+/// no such dependency, and the process id keeps the name readable when several
+/// test binaries run at once.
+fn unique_test_runtime_dir_name() -> String {
+    format!(
+        "{TEST_RUNTIME_DIR_PREFIX}{}_{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    )
+}
+
+const TEST_RUNTIME_DIR_PREFIX: &str = "datatab_storage_test_";
+
+/// A file in each test runtime directory that the runtime holds an exclusive
+/// lock on for as long as it lives. The operating system drops the lock when
+/// the owning process exits, however it exits, so a lock the sweep can take
+/// proves the directory has no owner left.
+const TEST_RUNTIME_OWNER_FILE: &str = "owner.lock";
+
+/// Only directories at least this old are checked for an owner, so the sweep
+/// leaves alone a directory whose runtime is still being set up.
+const STALE_TEST_RUNTIME_AGE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Removes test runtime directories that finished test processes left behind.
+///
+/// A runtime held by a GPUI entity is never dropped, because the test harness
+/// does not tear its app down before the process exits, so `Drop` alone
+/// cannot clean up after it. Sweeping once per process keeps the temp dir
+/// bounded.
+fn sweep_stale_test_runtime_dirs(temp_root: &Path, max_age: std::time::Duration) {
+    let Ok(entries) = std::fs::read_dir(temp_root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let is_test_runtime = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with(TEST_RUNTIME_DIR_PREFIX));
+        let is_stale = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age > max_age);
+
+        if is_test_runtime
+            && is_stale
+            && test_runtime_owner_has_exited(&entry.path())
+            && let Err(error) = std::fs::remove_dir_all(entry.path())
+        {
+            log::debug!(
+                "Could not remove stale test storage directory {}: {error}",
+                entry.path().display()
+            );
+        }
+    }
+}
+
+/// Whether no live runtime holds the owner lock of a test runtime directory.
+/// A directory without an owner file predates the lock and has no owner.
+fn test_runtime_owner_has_exited(runtime_dir: &Path) -> bool {
+    match std::fs::File::open(runtime_dir.join(TEST_RUNTIME_OWNER_FILE)) {
+        Ok(owner) => owner.try_lock().is_ok(),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+impl StorageRuntime {
+    /// Creates a runtime pointing at the given unified database path.
+    ///
+    /// The caller is responsible for ensuring the parent directories exist.
+    /// Migrations are applied on first open using the unified schema.
+    #[allow(clippy::result_large_err)]
+    pub fn for_path(datatab_db_path: PathBuf) -> Result<Self, StorageError> {
+        // Open and validate datatab.db - apply migrations if needed
+        let datatab_conn = crate::sqlite::open_database(&datatab_db_path)?;
+
+        // Run migrations with foreign-key enforcement disabled so table-rebuild
+        // migrations (drop + recreate to change constraints) do not cascade-delete
+        // child rows when the parent table is dropped. Enforcement is restored for
+        // normal runtime use immediately afterwards.
+        crate::sqlite::set_foreign_keys(&datatab_conn, false)?;
+        let registry = MigrationRegistry::new();
+        registry.run_all(&datatab_conn)?;
+        crate::sqlite::set_foreign_keys(&datatab_conn, true)?;
+
+        // Sidecars created lazily on the first migration write; secure them now.
+        paths::secure_db_sidecars(&datatab_db_path)?;
+
+        info!("Unified database ready at {}", datatab_db_path.display());
+
+        // Initialize the artifact store using the parent directory of datatab.db as data root.
+        // This ensures test/temp runtimes use isolated directories instead of resolving
+        // the real artifact root from the user home directory.
+        let sessions_root = datatab_db_path
+            .parent()
+            .map(|p| p.join("sessions"))
+            .unwrap_or_else(|| PathBuf::from("sessions"));
+        let artifacts = ArtifactStore::for_root(sessions_root.clone())?;
+        info!(
+            "Artifact store ready at {}",
+            artifacts.root_path().display()
+        );
+
+        // Wrap connection in Arc for shared access
+        #[allow(clippy::arc_with_non_send_sync)]
+        let datatab_db = Arc::new(datatab_conn);
+
+        Ok(StorageRuntime {
+            datatab_db_path,
+            datatab_db,
+            artifacts,
+            owned_temp_dir: None,
+        })
+    }
+
+    /// Creates a runtime with the database in a temporary directory.
+    ///
+    /// Useful for tests. The directory is created under `std::env::temp_dir()`
+    /// with a name no other call can repeat, so each runtime owns its own SQLite
+    /// file, and is removed when the runtime drops.
+    #[allow(clippy::result_large_err)]
+    pub fn in_memory() -> Result<Self, StorageError> {
+        static SWEEP: std::sync::Once = std::sync::Once::new();
+        SWEEP.call_once(|| {
+            sweep_stale_test_runtime_dirs(&std::env::temp_dir(), STALE_TEST_RUNTIME_AGE);
+        });
+
+        let temp_dir = std::env::temp_dir().join(unique_test_runtime_dir_name());
+
+        // `create_dir`, not `create_dir_all`: a directory that already exists
+        // means another runtime owns this path, and silently sharing it is how
+        // two test runtimes end up migrating one SQLite file until one of them
+        // fails with `DatabaseBusy` ("database is locked"). Failing here keeps
+        // that from ever being silent.
+        std::fs::create_dir(&temp_dir).map_err(|source| StorageError::Io {
+            path: temp_dir.clone(),
+            source,
+        })?;
+
+        let owner = std::fs::File::create(temp_dir.join(TEST_RUNTIME_OWNER_FILE))
+            .and_then(|owner| owner.lock().map(|()| owner))
+            .map_err(|source| StorageError::Io {
+                path: temp_dir.clone(),
+                source,
+            });
+
+        match owner.and_then(|owner| Ok((owner, Self::for_path(temp_dir.join("datatab.db"))?))) {
+            Ok((owner, mut runtime)) => {
+                runtime.owned_temp_dir = Some(OwnedTempDir {
+                    path: temp_dir,
+                    owner: Some(owner),
+                });
+                Ok(runtime)
+            }
+            Err(error) => {
+                if let Err(cleanup_error) = std::fs::remove_dir_all(&temp_dir) {
+                    log::warn!(
+                        "Could not remove test storage directory {}: {cleanup_error}",
+                        temp_dir.display()
+                    );
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// The temporary directory an in-memory runtime owns and removes on drop,
+    /// or `None` for a runtime backed by a real path. Callers keep their own
+    /// test files under it so a test never writes to the user's data directory.
+    pub fn temp_root(&self) -> Option<&Path> {
+        self.owned_temp_dir.as_ref().map(|dir| dir.path.as_path())
+    }
+
+    /// Returns the path to the unified database.
+    pub fn datatab_db_path(&self) -> &Path {
+        &self.datatab_db_path
+    }
+
+    /// Opens a **new** connection to the unified database.
+    ///
+    /// Each call creates a fresh `rusqlite::Connection`; the PRAGMA set is
+    /// re-applied. This keeps `StorageRuntime` cheaply-cloneable (it only
+    /// stores a path) and avoids sharing a single connection across threads.
+    pub fn open_datatab_db(&self) -> Result<rusqlite::Connection, StorageError> {
+        sqlite::open_database(&self.datatab_db_path)
+    }
+
+    /// Returns an owned reference to the unified database connection.
+    ///
+    /// This is a cloneable reference stored in the Runtime.
+    pub fn datatab_db(&self) -> OwnedConnection {
+        self.datatab_db.clone()
+    }
+
+    // --- Repository convenience constructors ---
+    //
+    // All repositories now use the single unified database connection.
+    // Config-domain and state-domain tables coexist in the same database
+    // with domain-prefixed names (cfg_*, st_*).
+
+    /// Creates an app metadata repository for one-time migration flags.
+    pub fn app_meta(&self) -> AppMetaRepository {
+        AppMetaRepository::new(self.datatab_db())
+    }
+
+    /// Creates a connection profile repository.
+    pub fn connection_profiles(&self) -> ConnectionProfileRepository {
+        ConnectionProfileRepository::new(self.datatab_db())
+    }
+
+    /// Creates an auth profile repository.
+    pub fn auth_profiles(&self) -> AuthProfileRepository {
+        AuthProfileRepository::new(self.datatab_db())
+    }
+
+    /// Creates a proxy profile repository.
+    pub fn proxy_profiles(&self) -> ProxyProfileRepository {
+        ProxyProfileRepository::new(self.datatab_db())
+    }
+
+    /// Creates an SSH tunnel profile repository.
+    pub fn ssh_tunnels(&self) -> SshTunnelProfileRepository {
+        SshTunnelProfileRepository::new(self.datatab_db())
+    }
+
+    /// Creates a hook definition repository.
+    pub fn hook_definitions(&self) -> HookDefinitionRepository {
+        HookDefinitionRepository::new(self.datatab_db())
+    }
+
+    /// Creates a service repository.
+    pub fn services(&self) -> ServiceRepository {
+        ServiceRepository::new(self.datatab_db())
+    }
+
+    /// Creates a driver settings repository.
+    pub fn driver_settings(&self) -> DriverSettingsRepository {
+        DriverSettingsRepository::new(self.datatab_db())
+    }
+
+    /// Creates a general settings repository.
+    pub fn general_settings(&self) -> GeneralSettingsRepository {
+        GeneralSettingsRepository::new(self.datatab_db())
+    }
+
+    /// Creates an update settings repository.
+    pub fn update_settings(&self) -> UpdateSettingsRepository {
+        UpdateSettingsRepository::new(self.datatab_db())
+    }
+
+    /// Creates a keybinding overrides repository.
+    pub fn keybinding_overrides(&self) -> KeybindingOverridesRepository {
+        KeybindingOverridesRepository::new(self.datatab_db())
+    }
+
+    /// Creates the repository of external script folders.
+    pub fn script_roots(&self) -> ScriptRootsRepository {
+        ScriptRootsRepository::new(self.datatab_db())
+    }
+
+    /// Creates a governance settings repository.
+    pub fn governance_settings(&self) -> GovernanceSettingsRepository {
+        GovernanceSettingsRepository::new(self.datatab_db())
+    }
+
+    /// Creates a driver overrides repository.
+    pub fn driver_overrides(&self) -> DriverOverridesRepository {
+        DriverOverridesRepository::new(self.datatab_db())
+    }
+
+    /// Creates a driver setting values repository.
+    pub fn driver_setting_values(&self) -> DriverSettingValuesRepository {
+        DriverSettingValuesRepository::new(self.datatab_db())
+    }
+
+    // --- State repositories ---
+
+    /// Creates a UI state repository.
+    pub fn ui_state(&self) -> UiStateRepository {
+        UiStateRepository::new(self.datatab_db())
+    }
+
+    /// Creates a recent items repository.
+    pub fn recent_items(&self) -> RecentItemsRepository {
+        RecentItemsRepository::new(self.datatab_db())
+    }
+
+    /// Creates a query history repository.
+    pub fn query_history(&self) -> QueryHistoryRepository {
+        QueryHistoryRepository::new(self.datatab_db())
+    }
+
+    /// Creates a saved queries repository.
+    pub fn saved_queries(&self) -> SavedQueriesRepository {
+        SavedQueriesRepository::new(self.datatab_db())
+    }
+
+    /// Creates a session repository.
+    pub fn sessions(&self) -> SessionRepository {
+        SessionRepository::new(self.datatab_db())
+    }
+
+    /// Creates an audit repository.
+    ///
+    /// Returns `Err` if a new database connection cannot be opened. This can
+    /// happen when the database path is inaccessible (e.g. removed after startup).
+    pub fn audit(&self) -> Result<AuditRepository, StorageError> {
+        use std::sync::Mutex;
+        let conn = self.open_datatab_db()?;
+        Ok(AuditRepository::new(Arc::new(Mutex::new(conn))))
+    }
+
+    /// Creates an audit settings repository.
+    pub fn audit_settings(&self) -> AuditSettingsRepository {
+        AuditSettingsRepository::new(self.datatab_db())
+    }
+
+    /// Creates a saved filters repository.
+    ///
+    /// Returns `Err` if a new database connection cannot be opened.
+    pub fn saved_filters(&self) -> Result<SavedFiltersRepository, StorageError> {
+        use std::sync::Mutex;
+        let conn = self.open_datatab_db()?;
+        Ok(SavedFiltersRepository::new(Arc::new(Mutex::new(conn))))
+    }
+
+    /// Creates a shared `Arc<Mutex<Connection>>` for the viz repositories.
+    ///
+    /// All five viz repos that share this connection will serialize access
+    /// via the same mutex. Callers should create this once and clone the `Arc`
+    /// for each repository that needs it.
+    ///
+    /// Returns `Err` if a new database connection cannot be opened.
+    pub fn viz_connection(
+        &self,
+    ) -> Result<Arc<std::sync::Mutex<rusqlite::Connection>>, StorageError> {
+        let conn = self.open_datatab_db()?;
+        Ok(Arc::new(std::sync::Mutex::new(conn)))
+    }
+
+    /// Creates a `SavedChartsRepository` backed by the unified database.
+    ///
+    /// Returns `Err` if a new database connection cannot be opened.
+    pub fn saved_charts(&self) -> Result<SavedChartsRepository, StorageError> {
+        Ok(SavedChartsRepository::new(self.viz_connection()?))
+    }
+
+    /// Creates a `DashboardsRepository` backed by the unified database.
+    ///
+    /// Returns `Err` if a new database connection cannot be opened.
+    pub fn dashboards_repo(&self) -> Result<DashboardsRepository, StorageError> {
+        Ok(DashboardsRepository::new(self.viz_connection()?))
+    }
+
+    /// Creates a `DashboardPanelsRepository` backed by the unified database.
+    ///
+    /// Returns `Err` if a new database connection cannot be opened.
+    pub fn dashboard_panels_repo(&self) -> Result<DashboardPanelsRepository, StorageError> {
+        Ok(DashboardPanelsRepository::new(self.viz_connection()?))
+    }
+
+    /// Creates a `SqlitePendingExecutionStore` backed by the unified database.
+    ///
+    /// Returns `Err` if a new database connection cannot be opened. Callers
+    /// should propagate the error rather than unwrapping, since a failure here
+    /// means the approvals subsystem is unavailable at startup.
+    pub fn pending_executions(
+        &self,
+    ) -> Result<crate::pending_executions::SqlitePendingExecutionStore, StorageError> {
+        let conn = self.open_datatab_db()?;
+        let conn = Arc::new(std::sync::Mutex::new(conn));
+        crate::pending_executions::SqlitePendingExecutionStore::new(conn).map_err(|e| {
+            StorageError::Migration {
+                kind: "pending_executions".to_string(),
+                details: e.to_string(),
+            }
+        })
+    }
+
+    /// Returns the artifact store for scratch/shadow path management.
+    pub fn artifacts(&self) -> &ArtifactStore {
+        &self.artifacts
+    }
+
+    /// Returns the scratch file path for a document ID and extension.
+    pub fn scratch_path(&self, doc_id: &str, extension: &str) -> std::path::PathBuf {
+        self.artifacts.scratch_path(doc_id, extension)
+    }
+
+    /// Returns the shadow file path for a document ID.
+    pub fn shadow_path(&self, doc_id: &str) -> std::path::PathBuf {
+        self.artifacts.shadow_path(doc_id)
+    }
+}
+
+/// Bootstraps the internal storage layer.
+///
+/// This must be called once during application startup.  If it returns `Err`,
+/// the application should abort — internal storage is mandatory.
+///
+/// What it does:
+/// 1. Resolves `~/.local/share/datatab/` (creating if needed).
+/// 2. Opens (or creates) `datatab.db` in the data directory with unified migrations applied.
+/// 3. Returns a [`StorageRuntime`] that can hand out connections on demand.
+#[allow(clippy::result_large_err)]
+pub fn initialize() -> Result<StorageRuntime, StorageError> {
+    let datatab_db_path = paths::datatab_db_path()?;
+
+    info!("Unified database path: {}", datatab_db_path.display());
+
+    StorageRuntime::for_path(datatab_db_path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sqlite;
+    use std::path::Path;
+
+    fn unique_temp_dir(label: &str) -> std::path::PathBuf {
+        // Same uniqueness rule as `in_memory`: the clock is not a uniqueness
+        // source, so a fixed label plus the pid plus a fresh identifier is what
+        // makes two directories distinguishable.
+        std::env::temp_dir().join(format!(
+            "datatab_storage_{}_{}_{}",
+            label,
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ))
+    }
+
+    #[test]
+    fn initialize_succeeds_with_default_paths() {
+        // Use in-memory storage for tests to avoid polluting ~/.local/share/datatab
+        let runtime = StorageRuntime::in_memory().expect("bootstrap should succeed");
+        assert!(runtime.datatab_db_path().exists());
+    }
+
+    /// Two test runtimes must never own the same database file.
+    ///
+    /// A shared path is what turns a parallel test run into an intermittent
+    /// `DatabaseBusy` ("database is locked"): both runtimes open the same file
+    /// and both try to migrate it, and the second one loses. Every construction
+    /// is released together here because a test binary starts its threads the
+    /// same way.
+    #[test]
+    fn in_memory_runtimes_never_share_a_database_path() {
+        const RUNTIMES: usize = 32;
+
+        let barrier = std::sync::Barrier::new(RUNTIMES);
+        let results: Vec<Result<PathBuf, StorageError>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..RUNTIMES)
+                .map(|_| {
+                    let barrier = &barrier;
+                    scope.spawn(move || {
+                        barrier.wait();
+                        StorageRuntime::in_memory()
+                            .map(|runtime| runtime.datatab_db_path().to_path_buf())
+                    })
+                })
+                .collect();
+
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("runtime thread"))
+                .collect()
+        });
+
+        let paths: Vec<PathBuf> = results
+            .into_iter()
+            .map(|result| result.expect("in-memory storage"))
+            .collect();
+
+        let distinct: std::collections::HashSet<&PathBuf> = paths.iter().collect();
+        assert_eq!(
+            distinct.len(),
+            paths.len(),
+            "every test runtime must own its own database path, but {RUNTIMES} concurrent runtimes produced {} distinct paths: {}",
+            distinct.len(),
+            paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    #[test]
+    fn storage_runtime_opens_unified_db() {
+        // Use in-memory storage for tests to avoid polluting ~/.local/share/datatab
+        let runtime = StorageRuntime::in_memory().expect("bootstrap should succeed");
+        let conn = runtime.open_datatab_db().expect("should open datatab db");
+
+        // MigrationRegistry has run, so sys_migrations should have the initial migration
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sys_migrations WHERE name = '001_initial'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "001_initial migration should be recorded");
+    }
+
+    #[test]
+    fn in_memory_runtime_removes_its_directory_on_drop() {
+        let runtime = StorageRuntime::in_memory().expect("test runtime");
+        let directory = runtime
+            .datatab_db_path()
+            .parent()
+            .expect("runtime directory")
+            .to_path_buf();
+        assert!(directory.exists());
+
+        drop(runtime);
+
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn sweep_removes_only_stale_test_runtime_directories() {
+        let root =
+            std::env::temp_dir().join(format!("datatab_sweep_root_{}", uuid::Uuid::new_v4()));
+        let runtime_dir = root.join(format!("{TEST_RUNTIME_DIR_PREFIX}1_a"));
+        let other_dir = root.join("unrelated");
+        std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+        std::fs::create_dir_all(&other_dir).expect("other dir");
+
+        sweep_stale_test_runtime_dirs(&root, STALE_TEST_RUNTIME_AGE);
+        assert!(runtime_dir.exists(), "a fresh directory is kept");
+
+        let live_dir = root.join(format!("{TEST_RUNTIME_DIR_PREFIX}2_b"));
+        std::fs::create_dir_all(&live_dir).expect("live dir");
+        let live_owner =
+            std::fs::File::create(live_dir.join(TEST_RUNTIME_OWNER_FILE)).expect("owner file");
+        live_owner.lock().expect("owner lock");
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        sweep_stale_test_runtime_dirs(&root, std::time::Duration::from_millis(10));
+        assert!(!runtime_dir.exists(), "a stale directory is removed");
+        assert!(other_dir.exists(), "other directories are never touched");
+        assert!(live_dir.exists(), "a directory with a live owner is kept");
+
+        drop(live_owner);
+        sweep_stale_test_runtime_dirs(&root, std::time::Duration::from_millis(10));
+        assert!(
+            !live_dir.exists(),
+            "a directory whose owner exited is removed"
+        );
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn temp_dir_bootstrap_creates_directories_and_database() {
+        let dir = unique_temp_dir("bootstrap");
+        assert!(!dir.exists());
+
+        std::fs::create_dir_all(&dir).expect("should create temp dir");
+        let db_path = dir.join("test.sqlite");
+
+        let conn = sqlite::open_database(&db_path).expect("should open");
+        assert!(db_path.exists());
+
+        // Verify PRAGMAs applied.
+        let mode: String = conn
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nested_directory_creation_succeeds() {
+        let base = unique_temp_dir("nested");
+        let dir = base.join("a").join("b").join("c");
+
+        std::fs::create_dir_all(&dir).expect("nested dirs should be created");
+        let db_path = dir.join("nested.sqlite");
+
+        let conn = sqlite::open_database(&db_path).expect("should open in nested dir");
+        assert!(db_path.exists());
+
+        let _: i64 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn open_database_fails_on_readonly_path() {
+        let bad_path = Path::new("/proc/nonexistent_subdir/test.sqlite");
+        let result = sqlite::open_database(bad_path);
+        assert!(result.is_err(), "should fail on unwritable path");
+    }
+
+    #[test]
+    fn open_database_fails_on_directory_instead_of_file() {
+        let dir = unique_temp_dir("isdir");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let result = sqlite::open_database(&dir);
+        assert!(result.is_err(), "should fail when path is a directory");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

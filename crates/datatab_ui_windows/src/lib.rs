@@ -1,0 +1,18 @@
+//! Connection manager, settings, and shared SSH UI for DataTab.
+//!
+//! This crate holds the windows subsystem extracted from `datatab_ui`:
+//! the Connection Manager window, the Settings window, and shared SSH
+//! authentication UI helpers.
+
+#![recursion_limit = "2048"]
+
+pub mod connection_manager;
+pub mod settings;
+pub mod ssh_host_picker;
+pub mod ssh_shared;
+
+#[cfg(test)]
+mod keyboard_coverage;
+mod labels;
+mod style_guardrails;
+mod tokens;

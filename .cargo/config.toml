@@ -1,0 +1,51 @@
+# Build linker configuration for the Linux x86_64 host triple.
+#
+# Requires `mold` on PATH. The Nix dev shell (`nix develop`) provides it, and
+# CI installs it (tests.yml, style.yml, release.yml build-linux). For non-Nix
+# local setups, install it via your system package manager (e.g. `mold`).
+#
+# IMPORTANT: this applies to ALL builds for this triple, including
+# `cargo build --release`. Linux x86_64 release artifacts are therefore linked
+# with mold (functionally equivalent binary). macOS and Linux aarch64 are
+# unaffected and keep their default linker.
+
+[target.x86_64-unknown-linux-gnu]
+# Use the mold linker through the default cc driver. Drastically reduces link
+# time and peak memory when linking the 60+ workspace crates.
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+
+# Link the MSVC C runtime statically into datatab.exe.
+#
+# The msvc target links the CRT dynamically by default, so the executable
+# imports VCRUNTIME140.dll and only starts on machines that have the Visual
+# C++ Redistributable installed. A clean Windows (the winget validation
+# sandbox, a fresh VM, the portable zip on a new machine) fails with
+# STATUS_DLL_NOT_FOUND (0xC0000135) before main runs. A static CRT removes
+# that runtime dependency; every other import is shipped with Windows 10+.
+#
+# The vendored C libraries stay compatible: the `cc` and `cmake` crates pick
+# `/MT` from this target feature, and the vendored OpenSSL static libraries
+# are built with `/MT /Zl` (no CRT reference), so no mixed-runtime link.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# Keep the font stack out of the ELF's DT_NEEDED.
+#
+# `gpui-pre-wgpu` depends on `zed-font-kit` with its default features, which
+# selects the *linked* fontconfig and freetype loaders. Building that way makes
+# `fontconfig.pc` a requirement of every Linux build and turns `libfontconfig`
+# into a hard runtime dependency: without it the dynamic loader refuses to
+# start the process instead of letting the renderer fall back. The previous
+# `gpui` stack did not link it, so DataTab's released Linux binary has no font
+# libraries in DT_NEEDED at all.
+#
+# `RUST_FONTCONFIG_DLOPEN` makes the bindings load fontconfig on demand, which
+# removes both the build-time probe and the runtime requirement. It is set here
+# rather than in each CI job so that local, CI and Nix builds agree.
+#
+# freetype is left to its own build script: it uses the system library when a
+# suitable `freetype2.pc` is present and otherwise compiles its vendored
+# sources, so a missing development package costs build time rather than
+# failing the build.
+[env]
+RUST_FONTCONFIG_DLOPEN = "1"

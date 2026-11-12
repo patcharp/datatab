@@ -1,0 +1,431 @@
+# DataTab AI + MCP Integration Guide
+
+This guide explains how to integrate AI agents with DataTab via the standalone MCP server binary.
+
+It is intentionally explicit about what is available today and what is still pending, so integrations do not rely on behavior that is not implemented.
+
+## 1. Architecture Overview
+
+DataTab exposes MCP server functionality via the `datatab mcp` subcommand that speaks the Model Context Protocol over stdio. AI clients (Claude Desktop, Cursor, etc.) launch this binary as a subprocess and communicate via JSON-RPC 2.0, newline-delimited.
+
+```
+AI Client (Claude Desktop / Cursor / any MCP client)
+        |  stdio  (JSON-RPC 2.0, newline-delimited)
+        v
+  datatab mcp                    ← integrated into main datatab binary
+        |
+        +--  datatab_mcp          governance, authorization, tool catalog
+        +--  datatab_core         profiles, config, driver traits
+        +--  datatab_driver_*     real database drivers
+        +--  datatab_policy       policy engine
+        +--  datatab_audit        audit trail (SQLite)
+```
+
+The MCP server and the DataTab GUI app are independent processes. They share the same unified SQLite database at `~/.local/share/datatab/datatab.db` (profiles, governance, audit, history, sessions). Governance configured in the GUI (trusted clients, roles, policies, per-connection settings) is read by the server from that database on startup. The `--config-dir` flag is accepted for CLI compatibility but does not relocate the unified database; governance and audit always read from `~/.local/share/datatab/datatab.db`.
+
+## 2. Running the MCP Server
+
+### Build
+
+```bash
+# All drivers with MCP support (default)
+cargo build -p datatab --release
+
+# SQLite only with MCP
+cargo build -p datatab --features sqlite,mcp --release
+
+# Without MCP support (AI integration disabled)
+cargo build -p datatab --no-default-features --features sqlite,postgres,mysql,mongodb,redis,dynamodb,lua,aws --release
+```
+
+The MCP server is integrated into the main `datatab` binary.
+
+### Usage
+
+```
+datatab mcp --client-id <id> [--config-dir <path>]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--client-id <id>` | Identity of this AI client. Must match a registered trusted client in governance settings. **Required.** |
+| `--config-dir <path>` | Accepted for CLI compatibility. The governance/audit database is always resolved to the unified `~/.local/share/datatab/datatab.db`; this flag does not relocate it. For isolated test environments, override `HOME`/`XDG_DATA_HOME` instead. |
+
+### Claude Desktop config
+
+Add this to your MCP client configuration:
+
+```json
+{
+  "mcpServers": {
+    "datatab": {
+      "command": "/path/to/datatab",
+      "args": ["mcp", "--client-id", "claude-desktop"]
+    }
+  }
+}
+```
+
+The `client-id` value must match a trusted client entry you created in the DataTab GUI under **Settings → MCP → Clients**.
+
+**Note**: If you built DataTab without the `mcp` feature (`--no-default-features`), the MCP server will not be available.
+
+The server loads inline connection hooks and reusable hook bindings from the shared database. It runs PreConnect and PostConnect around connection setup, and PreDisconnect and PostDisconnect when an open connection is disconnected. Hook outcomes are recorded in the audit log. A detached PreConnect hook must emit its configured ready signal; after that signal, the server waits for the endpoint only for direct profiles. Pipeline and SSH-tunnel profiles skip that endpoint wait because their endpoint is resolved by the pipeline or tunnel. The standalone MCP server does not include the Lua hook executor; an enabled Lua hook returns an error identifying its phase and hook instead of being skipped.
+
+## 3. Governance Model (Core Concepts)
+
+Every AI request is enforced through all of these layers in order:
+
+1. **Trusted client**: requester identity must be active and registered.
+2. **Connection MCP gate**: target connection must have MCP enabled.
+3. **Policy assignment**: actor must have a scoped assignment on that connection.
+4. **Tool + class decision**: the tool ID must be listed by an assigned policy, and that policy decides the call's execution class as Allow, Ask, or Deny (see section 5).
+5. **Approval path**: an Ask decision queues the call as a pending execution. A person approves or rejects it in DataTab, and an approved call runs once when the agent repeats it with the same arguments.
+6. **Audit trail**: every decision is appended to `aud_audit_events` in the unified SQLite database and is queryable/exportable. See `docs/AUDIT.md` for the full event schema.
+
+All six layers run inside the server process on every `tools/call` request. None can be bypassed from the client side.
+
+## 4. Canonical Tool Surface (v1)
+
+| Group | Tool ID | Class | What it does |
+|-------|---------|-------|--------------|
+| Connection | `list_connections` | metadata | Enumerate all configured database connections |
+| Connection | `connect` | metadata | Open a session against a configured connection. The response reports `current_database` and the `databases` available on the server when the driver has databases; other tools take a `database` parameter to target a different one |
+| Connection | `disconnect` | metadata | Close an open session |
+| Connection | `get_connection_info` | metadata | Fetch driver capabilities and connection metadata |
+| Schema | `list_databases` | metadata | List all databases accessible on a connection |
+| Schema | `list_schemas` | metadata | List schemas within a database |
+| Schema | `list_tables` | metadata | List tables and views within a schema. Pass `names_only: true` to get the names as strings instead of one object per entry |
+| Schema | `list_collections` | metadata | List MongoDB collections. Accepts `names_only` like `list_tables` |
+| Schema | `describe_object` | metadata | Get column/field definitions and indexes for a table |
+| Read | `select_data` | read | Execute a structured SELECT against a table or collection. `joins` to other tables run on drivers that declare join support; document, key-value and other drivers that do not declare it return an explicit error. The `on` condition accepts only column comparisons joined by `AND`. With joins, a schema-qualified table on connections that drop the schema (SQLite, Turso), `$ilike` on drivers that do not declare it and an `order_by` direction other than `asc` or `desc` are refused. SQL Server runs joins too, with its row limit rendered as `OFFSET … FETCH`; the join tests run on SQLite |
+| Read | `count_records` | read | Return a row/document count for a target |
+| Read | `aggregate_data` | read | Run a read-only aggregation pipeline |
+| Read | `explain_query` | read | Show the query execution plan without executing the target mutation |
+| Read | `preview_mutation` | read | Return a read-only preview/plan for a write query. Always read-only; the mutation is never executed |
+| Write | `insert_record` | write | Insert a single record |
+| Write | `update_records` | write | Update records matching a filter |
+| Write | `upsert_record` | write | Insert or update a single record by key |
+| Write | `delete_records` | destructive | Delete records matching a filter |
+| Destructive | `truncate_table` | destructive | Remove all rows from a table |
+| DDL | `create_table` | admin | Create a table |
+| DDL | `alter_table` | admin_safe / admin / admin_destructive | Alter a table; classification is computed per change kind |
+| DDL | `create_index` | admin | Create an index |
+| DDL Destructive | `drop_index` | admin_destructive | Drop an index |
+| DDL | `create_type` | admin | Create a user-defined type |
+| DDL Destructive | `drop_table` | admin_destructive | Drop a table |
+| DDL Destructive | `drop_database` | admin_destructive | Drop a database |
+| Scripts | `list_scripts` | metadata | List saved scripts in the scripts directory (external scripts folders are not exposed) |
+| Scripts | `get_script` | read | Retrieve the source of a specific saved script |
+| Scripts | `create_script` | write | Save a new script to the scripts directory |
+| Scripts | `update_script` | write | Overwrite an existing saved script |
+| Scripts | `delete_script` | admin | Permanently remove a script |
+| Scripts | `execute_script` | computed | Execute a saved database-query script against a connection. Classification is derived from the script body. Lua, Python and Bash scripts are rejected (see below) |
+| Approval | `request_execution` | admin | Queue a call for approval by a person. Once approved, call the tool itself with the same arguments to run it once |
+| Approval | `list_pending_executions` | read | View all executions awaiting approval |
+| Approval | `get_pending_execution` | read | Retrieve details of a specific pending execution. A rejected one returns `status: "rejected"` and the reason the person gave |
+| Approval | `approve_execution` | — | Always denied over MCP. A person approves in DataTab |
+| Approval | `reject_execution` | — | Always denied over MCP. A person rejects in DataTab |
+| Audit | `query_audit_logs` | read | Search and filter the audit trail |
+| Audit | `get_audit_entry` | read | Retrieve a single audit log entry by ID |
+| Audit | `export_audit_logs` | read | Download audit log entries as CSV or JSON |
+
+When the driver fails a `select_data`, `count_records`, `aggregate_data` or `describe_object` call and the table or collection is not listed in the schema metadata of the database or schema that was queried, the error says where the name was looked up and lists the closest listed names. It reads "is not listed", because the table may not exist or the connection may not have access to it. If the call did not pass `database` and the server lists more than one database, the error adds that the table may be in another one. For tables, not collections, `count_records`, `aggregate_data`, and `select_data` where it is not checked before running (see below), do the same for a column named in `where` or `order_by`. A hint only includes names the client is allowed to list: table names need `list_tables`, column names need `describe_object`, and the database details need `list_databases`. The driver's own error text is kept at the end. The lookup runs only after the driver has failed the call, and drivers that do not expose this metadata return the original error.
+
+`select_data` checks its columns before it runs instead, on engines that read an unknown quoted identifier as a string: SQLite and Turso, where a misspelled column returns no rows rather than an error. On a relational table, and on every call with `joins`, each name in `columns`, `where` or `order_by` that is unqualified or qualified with its table is compared with the column metadata of the table, whatever its characters, folding only ASCII letters as SQLite does. A column that is not listed is refused with the same hint, followed by "The query was not run.", and nothing is executed. Table and view names resolve with ASCII case folding, and generated columns, the hidden columns of virtual tables, and `rowid`, `oid` and `_rowid_` where the engine accepts them count as listed. Without `describe_object` the refusal names no other column. The check is skipped, and the call runs as before, when the driver has no column metadata for the table, and nested paths and names qualified with another table are not checked, because the engine rejects them. It costs one column lookup per table the call names a column of. PostgreSQL, MySQL, MariaDB, SQL Server, ClickHouse and Redshift fail on an unknown column, so their calls run unchecked and a failure gets the hint described above.
+
+A pseudo-column the driver declares for the table, such as SQLite's `rowid`, MySQL's `_rowid` or PostgreSQL's `ctid` and `xmin`, counts as listed and is never suggested. A call without `joins` whose `columns` names one runs as a generated SELECT, the way a join does, so the value is returned: PostgreSQL returns `ctid` as text such as `(0,1)` and its other system columns as integers. That SELECT accepts less than an ordinary call: only the `where` operators a join accepts, plain ASCII identifiers, each column once, and `asc` or `desc` as the sort direction. On engines that are not checked before running, finding the pseudo-column costs one column lookup, made only when a `columns` entry is missing from the rows the call read.
+
+Deferred tools (explicitly rejected at request time in v1):
+
+- `estimate_query_cost`
+- `get_execution_status`
+
+## 5. Execution Classes
+
+Policies gate tools at two levels: the tool ID itself and the execution classification. A policy lists the tools it covers and gives every execution class one decision:
+
+| Decision | What happens to a call of that class |
+|----------|--------------------------------------|
+| Allow | Runs immediately |
+| Ask | Waits for a person: the call is queued as a pending execution and runs only after it is approved |
+| Deny | Is rejected |
+
+| Class | What it covers |
+|-------|---------------|
+| `metadata` | Schema inspection — listing databases, tables, and describing objects |
+| `read` | Running read-only queries, fetching data, and read-only previews |
+| `write` | Inserting, updating, or running scripts that modify data |
+| `destructive` | DELETE, DROP, TRUNCATE and other irreversible operations |
+| `admin_safe` | Safe DDL operations such as additive schema changes and index creation |
+| `admin` | Risky DDL operations, audit export, and privileged actions |
+| `admin_destructive` | Irreversible admin operations such as dropping or truncating schema objects |
+
+`metadata` and `read` only read. The other five classes change data or schema and are called mutating classes below.
+
+### How policies combine
+
+An actor can hold several policies on a connection, directly and through roles. Only the policies that list the requested tool take part, and among them the most permissive decision wins: Allow over Ask over Deny. Policies grant access; a Deny is the absence of a grant, not a veto. A policy that asks for approval of a class therefore does not slow down an actor that another assigned policy already allows to run that class. To make a class wait for approval, make sure no other policy assigned to the actor allows it.
+
+### The approval flow
+
+1. The agent calls a tool whose class the policy decides as Ask. The server queues the call as a pending execution, records an `mcp_authorize` audit event with outcome `pending`, and answers with a JSON-RPC error whose data is `{"code": "approval_required", "status": "pending", "pending_id": "..."}`.
+2. A person approves or rejects the call in DataTab (**Workspace → Pending Approvals**). The server and the app share the queue through `datatab.db`, so a call queued by `datatab mcp` appears in the app.
+3. The agent calls the same tool again with the same arguments. The server finds the approval that matches the actor, connection, tool and arguments, consumes it, and runs the call. The `mcp_authorize` event of that call has outcome `success` and names the approval in `details_json.pending_execution_id`.
+
+One approval runs one call. Repeating the call again queues a new request, and so does changing any argument. A rejected call never runs. An approval expires 24 hours after the call was queued.
+
+After a rejection, `get_pending_execution` returns `status: "rejected"` and a `reason` field with the text the person typed when rejecting, trimmed and capped at 500 characters, or `null` when they gave none. The same reason is recorded in the `mcp_reject_execution` audit event.
+
+`request_execution` queues a call explicitly, with the same result as calling the tool under Ask. `request_execution`, `list_pending_executions` and `get_pending_execution` only create or read queue entries, so under Ask they run without being queued themselves.
+
+MCP clients can never approve or reject: `approve_execution` and `reject_execution` are denied over MCP whatever the policies say, with the error code `self_approval_forbidden`, and each attempt is audited. Only a person resolves pending executions, in the DataTab UI.
+
+### Read scripts run read-only
+
+`execute_script` derives its class from the script body. A script classified `read` or `metadata` runs with read-only enforcement: the driver runs it in a session where the database itself rejects data modification (on MongoDB and Redis, DataTab rejects it, as the table shows), and the call is governed and audited as `read` or `metadata`.
+
+| Driver | How the session is made read-only |
+|--------|-----------------------------------|
+| PostgreSQL, Redshift | `BEGIN READ ONLY`, rolled back afterwards |
+| MySQL, MariaDB | `START TRANSACTION READ ONLY`, rolled back afterwards. A script with an executable comment (`/*! */`, `/*M! */`) or `INTO`, or one that runs while a transaction or a `LOCK TABLES` lock may be open, does not run read-only and is governed as `write` |
+| SQLite | `PRAGMA query_only` |
+| ClickHouse | The per-request setting `readonly = 2` |
+| MongoDB | MongoDB has no read-only session, so DataTab enforces it per operation: every operation is classified before it is sent and refused above the script's class (`read` or `metadata`), including `runCommand`, `adminCommand` and an `aggregate` with a `$out` or `$merge` stage. Change streams and operations DataTab does not recognise are refused |
+| Redis | Redis has no read-only session, so DataTab checks the single command a script sends against the flags the server reports for it in `COMMAND INFO`, before sending it. The command runs only if the server flags it `readonly` (or it is `PING`, `ECHO`, `TIME` or `INFO`) and reports no flag that marks a side effect, such as `write`, `admin`, `blocking`, `pubsub` or `may_replicate`. Commands with subcommands, such as `CONFIG` or `OBJECT`, are judged by the subcommand, which needs Redis 7 or later. Transactions, `SELECT`, subscriptions, every script command (`EVAL`, `EVALSHA`, `FCALL` and their `_RO` forms), `PFCOUNT`, module commands, commands the server does not describe, and `SRANDMEMBER`, `HRANDFIELD` or `ZRANDMEMBER` with a negative count are refused. This protects data, not availability: expensive reads such as `KEYS *` still run, and DataTab sets no Redis read timeout |
+
+SQL Server, Turso, external IPC drivers, DynamoDB, CloudWatch and InfluxDB cannot enforce read-only, and neither can Redis Cluster connections or Redis servers that cannot answer `COMMAND INFO`. On those connections, and on any connection whose session already has an open transaction, the script is governed as `write`: the policy's decision for `write` applies (Allow, Ask or Deny), and the audit records `write`.
+
+The database stops data modification in the session, except on temporary tables, which a read-only transaction in PostgreSQL and MySQL may still change, and it does not stop functions with external effects, such as PostgreSQL `dblink_exec`, `COPY ... TO PROGRAM`, `lo_export`, `pg_terminate_backend` and advisory locks, or MySQL `GET_LOCK` and user-defined functions. For a read-only MCP client, least-privilege database credentials remain the real boundary.
+
+The editor's auto-refresh uses the same enforcement. On a connection whose driver cannot enforce read-only, auto-refresh switches back to Manual.
+
+### Scripts that `execute_script` cannot run
+
+`execute_script` only runs scripts written in a database query language. A saved Lua, Python or Bash script is listed by `list_scripts` and readable with `get_script`, but `execute_script` refuses it with "Script language not supported for execution (only database queries)" and nothing runs. Run those scripts from the DataTab editor instead.
+
+### Editor safety settings do not apply
+
+The dangerous-query settings (**Confirm dangerous queries**, **Require WHERE for DELETE/UPDATE** and **Always require preview**) belong to the DataTab editor. The MCP server does not read them, at the General level, as a per-driver override or as a per-connection override. An MCP call is gated only by the policies and the approval flow described above: to make destructive statements wait for a person, set the policy's decision for `destructive` (or `admin_destructive`) to Ask or Deny.
+
+### Read-only connections
+
+When a connection's profile has **Read-only** switched on in the Connection Manager, every call above the `read` class on that connection is denied with the error code `connection_read_only`. The check runs before the policies, so no policy, role or approval can allow the call: `request_execution` is denied, and a call approved before the setting was turned on is denied when it is repeated. Each denial is recorded as an `mcp_authorize` audit event with outcome `failure`.
+
+`execute_script` governs a read script as `write` on a driver that cannot enforce read-only, as described above, so on a read-only connection with such a driver it is denied too. `select_data`, `count_records` and the other read tools still run.
+
+The MCP server reads the setting from `datatab.db` on every call, so a change made in the GUI applies to the next call without restarting the server. If the server cannot read the file, it treats the connection as read-only.
+
+## 6. Built-in Policies and Roles
+
+Three policies and three roles are shipped as immutable built-ins. They are always present regardless of what is persisted on disk, and cannot be deleted or modified.
+
+### Built-in policies
+
+Reading is allowed by default and every mutating class a built-in grants asks for approval.
+
+| ID | Allow | Ask | Scope |
+|----|-------|-----|-------|
+| `builtin/read-only` | metadata, read | — | All discovery + schema tools; read-only query and preview tools; script listing/get; audit read tools |
+| `builtin/write` | metadata, read | write | All read-only tools plus write-capable script and request/approval-submission flows |
+| `builtin/admin` | metadata, read | write, destructive, admin_safe, admin, admin_destructive | All canonical tools except `approve_execution` and `reject_execution` |
+
+Classes a built-in does not list are denied.
+
+### Policies created before Ask existed
+
+Before the Ask decision, a policy could only allow a class, so allowing a mutating class was never an explicit choice to run it without approval. The storage migration that introduced Ask (`034_cfg_tool_policy_approval_classes`) rewrites existing custom policies accordingly: an allowed mutating class becomes Ask, an allowed `metadata` or `read` class stays Allow, and a class that was not allowed stays Deny. To let an agent run mutating calls without approval again, choose **Allow all without approval** on the policy.
+
+### Built-in roles
+
+There are three built-in roles, `builtin/read-only`, `builtin/write`, and `builtin/admin`. Each one is assigned the policy of the same ID.
+
+Built-ins are injected at startup in both the GUI app (`AppState`) and the MCP server (via the `builtin_policies()` / `builtin_roles()` loops in `datatab_mcp_server::governance`). They are never written to disk. Any attempt to delete a built-in returns an error.
+
+For most integrations, assign `builtin/read-only` to start and escalate to `builtin/write` or a custom policy only when write access is explicitly needed.
+
+## 7. Operator Setup in DataTab GUI
+
+Configure governance in the DataTab GUI before starting the MCP server.
+
+1. **Settings → MCP → Clients tab**
+   - Register each AI agent as a trusted client (stable `client_id`, human-readable name, optional issuer).
+   - Mark clients active. Inactive clients are denied at the first authorization gate.
+
+2. **Settings → MCP → Roles tab**
+   - Built-in roles (`Read Only`, `Write`, `Admin`) appear at the top and cannot be deleted.
+   - Create custom roles by combining multiple policies using the multi-select dropdown.
+
+3. **Settings → MCP → Policies tab**
+   - Built-in policies appear at the top and cannot be modified.
+   - Create custom policies by selecting tools and choosing Allow, Ask, or Deny for each execution class. With the keyboard, `enter` on a class row moves it to the next decision.
+   - **Allow all without approval** sets every mutating class to Allow. The agent can then run any mutating call, including `DROP DATABASE`, without asking.
+
+4. **Connection Manager → MCP tab**
+   - Enable MCP for the target connection.
+   - Select the actor (trusted client), role, and/or policy for this connection from populated dropdowns.
+
+5. **Workspace → Pending Approvals**
+   - Review and approve or reject the calls a policy sent to approval. This is the only place pending executions are resolved.
+   - A waiting call also shows in the notifications center under the title-bar bell, which wears the accent badge while one waits. **Review** on its row opens this tab on that call; the popover itself never approves or rejects.
+   - `j` / `k` move through the pending calls, `a` approves the selected one, and `r` rejects it. An approved call runs when the agent repeats it with the same arguments. Every decision is written to the audit log.
+   - The reason field in the footer is sent back to the agent when you reject. While it has focus, `r` and `a` type text instead of deciding. It is cleared after each decision.
+
+6. **Workspace → Audit**
+   - Filter by actor/tool/decision/time range and export CSV/JSON.
+
+The MCP server reads these settings from disk on startup. If you change governance settings in the GUI while the server is running, restart the server to pick up the new config.
+
+## 8. Persisted Files and Paths
+
+DataTab persists all state in a single unified SQLite database and a few supporting directories. Paths are resolved by `dirs` using the platform data directory.
+
+Typical Linux defaults:
+
+| Path | Contents |
+|------|----------|
+| `~/.local/share/datatab/datatab.db` | Unified database: profiles, auth, SSH tunnels, governance, audit events, history, sessions, UI state |
+| `~/.local/share/datatab/sessions/` | Scratch and shadow files kept for session restore and recovery |
+| `~/.local/share/datatab/scripts/` | User-authored scripts directory |
+
+The `datatab.db` database contains all domain tables under prefixed schemas:
+
+- `cfg_*` — config (profiles, auth, governance, services, hooks, drivers)
+- `st_*` — state (sessions, query history, UI state, saved queries)
+- `aud_audit_events` — unified audit log (MCP events, query events, connections, hooks, scripts)
+- `sys_*` — system (migrations, legacy import tracking)
+
+Built-in policies and roles are synthesized at startup and never written to disk.
+
+Important for tests: do not use real user directories. Pass `--config-dir` to the binary or set `HOME`/`XDG_CONFIG_HOME`/`XDG_DATA_HOME` to temp paths for isolated runs. The `datatab_audit::temp_sqlite_path(name)` helper generates isolated paths for audit tests.
+
+## 9. Rust Integration Pattern
+
+### In-process (GUI app, `AppState`)
+
+```rust
+// Register a trusted client
+state.upsert_mcp_trusted_client(TrustedClientDto {
+    id: "agent-a".into(),
+    name: "Agent A".into(),
+    issuer: None,
+    active: true,
+})?;
+
+// Assign a built-in role to the agent on a connection
+state.save_mcp_connection_policy_assignment(ConnectionPolicyAssignmentDto {
+    connection_id: connection_id.to_string(),
+    assignments: vec![ConnectionPolicyAssignment {
+        actor_id: "agent-a".into(),
+        role_ids: vec!["builtin/read-only".into()],
+        policy_ids: vec![],
+    }],
+})?;
+```
+
+### Checking built-in IDs before deletion
+
+```rust
+if datatab_mcp::is_builtin(id) {
+    // built-ins cannot be modified or deleted
+}
+```
+
+### Authorization call (used internally by the MCP server)
+
+```rust
+use datatab_mcp::server::authorization::{AuthorizationRequest, authorize_request};
+
+let outcome = authorize_request(
+    &trusted_clients,
+    &policy_engine,
+    &audit_service,
+    &AuthorizationRequest {
+        identity: RequestIdentity { client_id: "agent-a".into(), issuer: None },
+        connection_id: connection_id.to_string(),
+        tool_id: "select_data".to_string(),
+        classification: ExecutionClassification::Read,
+        mcp_enabled_for_connection: true,
+        read_only_connection: false,
+        correlation_id: None,
+    },
+    now_epoch_ms(),
+)?;
+
+if !outcome.allowed {
+    // deny_code and deny_reason explain why
+}
+```
+
+`authorize_request` has no approval queue: an Ask decision comes back as not allowed with `deny_code == Some("approval_required")`. The MCP server calls `McpRuntime::authorize_with_approval_mut` instead, which passes the call's arguments so an Ask decision is queued, or consumes a matching approval and lets the call run.
+
+## 10. Integration Checklist
+
+Before pointing an AI client at the MCP server:
+
+- [ ] `datatab` built with MCP support (enabled by default, or with `--features mcp`)
+- [ ] Trusted client registered and active in DataTab GUI
+- [ ] `--client-id` passed to the binary matches the registered client
+- [ ] Target connection has MCP enabled
+- [ ] Actor has a policy assignment on that connection
+- [ ] Policy covers the tools the agent will use
+- [ ] Classes that need approval are set to Ask, and someone watches Pending Approvals while the agent works
+
+## 11. Test Hygiene
+
+To avoid polluting developer machines during tests:
+
+- Pass `--config-dir` to a temp directory or set `HOME`/`XDG_CONFIG_HOME`/`XDG_DATA_HOME`.
+- Use temp SQLite paths for audit tests.
+- Do not read/write `~/.config/datatab` or `~/.local/share/datatab` in test code.
+- Built-in policies and roles are available without any setup — do not insert them manually in test fixtures.
+- The `datatab_audit::temp_sqlite_path(name)` helper generates an isolated path for each test.
+
+## 12. Troubleshooting
+
+### Server exits immediately
+
+- Missing `--client-id` argument.
+- Config directory is inaccessible or cannot be created.
+
+### Request denied as untrusted
+
+- Verify the client exists and is active in trusted clients list.
+- Verify `--client-id` exactly matches the registered `id` (case-sensitive).
+
+### Request denied as connection not MCP-enabled
+
+- Enable MCP in the target connection's governance settings (Connection Manager → MCP tab).
+- Or set `mcp_enabled_by_default: true` in the config if you want all connections enabled.
+
+### Request denied as connection read-only
+
+- The connection's profile has **Read-only** switched on (Connection Manager → Main tab → Safety). Only `metadata` and `read` calls run on it, whatever the policies say.
+- Turn the setting off to allow writes again. The next call sees the change.
+
+### Policy denied
+
+- Confirm the actor has an assignment on that connection scope.
+- Confirm the tool ID is in the assigned policy's allowed tools.
+- Confirm the policy decides the execution class as Allow or Ask, not Deny.
+- If using `builtin/read-only`, write tools (`create_script`, etc.) are excluded by design.
+
+### Call answered with `approval_required`
+
+- The policy decides the call's class as Ask. Approve the pending execution named by `pending_id` in **Workspace → Pending Approvals**, then repeat the call with the same arguments.
+- Repeating the call with different arguments queues a new request instead of using the approval.
+- An agent cannot approve its own calls: `approve_execution` and `reject_execution` are always denied over MCP (`self_approval_forbidden`).
+
+### Audit export missing events
+
+- Verify filters (`actor_id`, `tool_id`, time range, decision) are not over-restrictive.
+- `export_audit_logs` is classified as the `read` execution class.
+
+### Cannot delete policy or role
+
+- Built-in IDs (`builtin/read-only`, `builtin/write`, `builtin/admin`) cannot be deleted.
+- Create a custom policy with a different ID if you need a modifiable variant.
+
+### Settings changed in GUI but server still uses old values
+
+- Restart the MCP server process. Governance is loaded from disk once at startup.

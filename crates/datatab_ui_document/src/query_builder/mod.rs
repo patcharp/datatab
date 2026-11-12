@@ -1,0 +1,18 @@
+pub(crate) mod completion;
+mod events;
+mod keyboard;
+pub(crate) mod mutation_state;
+mod panel;
+mod sections;
+mod tree_ops;
+mod view;
+
+#[cfg(test)]
+mod accessibility_tests;
+
+pub use events::BuilderEvent;
+pub use mutation_state::{AssignmentRow, BuilderMode, MutationBuilderState};
+pub use panel::{
+    FILTER_DEPTH_CAP, FkLoadState, JoinRow, ProjectionMode, ProjectionRow, QueryBuilderPanel,
+    SortRow,
+};

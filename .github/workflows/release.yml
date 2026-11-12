@@ -1,0 +1,278 @@
+# Build and package the DataTab release artifacts.
+#
+# A push of a tag vX.Y.Z builds every package and creates a draft GitHub
+# release for that tag. A manual run builds the ref you give it and only
+# uploads workflow artifacts; it never creates a release.
+#
+# The release job only creates. If a release for the tag already exists, draft
+# or published, it fails and changes nothing. To build a tag again, delete its
+# draft release by hand first, then re-run the workflow.
+#
+# This workflow only builds. It runs no tests, lints or benchmarks.
+#
+# Runner facts, checked against the current GitHub documentation:
+#   https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+#   https://github.com/actions/runner-images
+# - ubuntu-24.04: 4 cores, 16 GB RAM. Docker is installed; mold is not.
+# - windows-2025: 4 cores, 16 GB RAM. Inno Setup 6 is installed.
+# - macos-26-intel: 4 cores, 14 GB RAM, x86_64.
+# - macos-26: 3 cores (M1), 7 GB RAM, arm64.
+# - The macOS images ship Xcode 26. Its Metal toolchain is preinstalled, but
+#   it has been missing on some runs, so the macOS job checks it first.
+# A full release build peaked at about 8 GB of RAM with 2 build jobs, so JOBS
+# is 2 on the 14 and 16 GB runners and 1 on the 7 GB runner.
+#
+# No cargo cache: releases are rare, and a release binary is always built from
+# a clean state, so a restored cache can never change what ships.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit to build"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.event_name }}-${{ inputs.ref || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    name: Linux (.deb)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      JOBS: "2"
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Install the build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            mold cmake pkg-config libssl-dev libdbus-1-dev libxkbcommon-dev \
+            libxkbcommon-x11-dev libpipewire-0.3-dev libgbm-dev libegl-dev \
+            libxcb-randr0-dev libclang-dev libfontconfig1-dev libvulkan-dev \
+            binutils gettext-base
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - name: Build the binary and the .deb
+        run: sh scripts/build-linux.sh --deb
+
+      - name: Upload the package
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-linux
+          path: target/linux-package/datatab-linux-amd64.deb
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
+  windows:
+    name: Windows (installer)
+    runs-on: windows-2025
+    timeout-minutes: 240
+    env:
+      JOBS: "2"
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Make sure Inno Setup 6 is installed
+        shell: pwsh
+        run: |
+          $onPath = Get-Command ISCC.exe -ErrorAction SilentlyContinue
+          $default = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if ($onPath -or (Test-Path -LiteralPath $default)) {
+              Write-Host 'Inno Setup 6 is installed'
+              exit 0
+          }
+          choco install innosetup --version 6.7.1 --no-progress -y
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install the pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustc --version
+
+      - name: Build the executable and the installer
+        shell: pwsh
+        run: |
+          pwsh -NoProfile -NonInteractive -File scripts/build-windows.ps1 -Jobs $env:JOBS
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload the installer
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-windows
+          path: target/windows-package/output/datatab-windows-amd64-setup.exe
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
+  macos:
+    name: macOS ${{ matrix.arch }} (.app)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 340
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-26-intel
+            arch: x86_64
+            jobs: "2"
+          - runner: macos-26
+            arch: arm64
+            jobs: "1"
+    env:
+      ARCH: ${{ matrix.arch }}
+      JOBS: ${{ matrix.jobs }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Check the runner architecture
+        run: |
+          machine=$(uname -m)
+          if [ "$machine" != "$ARCH" ]; then
+            echo "expected a $ARCH runner, got $machine" >&2
+            exit 1
+          fi
+
+      - name: Make sure the Metal toolchain is installed
+        run: |
+          xcodebuild -version
+          if ! xcrun -sdk macosx metal --version; then
+            echo "The Metal toolchain is missing; downloading it"
+            xcodebuild -downloadComponent MetalToolchain
+            xcrun -sdk macosx metal --version
+          fi
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - name: Build DataTab.app
+        run: sh scripts/build-macos.sh
+
+      - name: Zip the app
+        run: |
+          mkdir -p dist
+          ditto -c -k --keepParent target/macos-package/DataTab.app "dist/datatab-macos-$ARCH.zip"
+
+      - name: Upload the app
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: package-macos-${{ matrix.arch }}
+          path: dist/datatab-macos-${{ matrix.arch }}.zip
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
+  checksums:
+    name: Collect and checksum
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Download the packages
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: package-*
+          merge-multiple: true
+          path: dist
+
+      - name: Write SHA256SUMS.txt
+        working-directory: dist
+        run: |
+          expected="datatab-linux-amd64.deb datatab-macos-arm64.zip datatab-macos-x86_64.zip datatab-windows-amd64-setup.exe"
+          for file in $expected; do
+            [ -f "$file" ] || { echo "missing package: $file" >&2; exit 1; }
+          done
+          found=$(find . -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort | tr '\n' ' ')
+          if [ "$found" != "$expected " ]; then
+            echo "unexpected files in dist: $found" >&2
+            exit 1
+          fi
+          # shellcheck disable=SC2086
+          sha256sum $expected > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload the release set
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: datatab-release
+          path: dist/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
+  release:
+    name: Draft GitHub release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: checksums
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Download the release set
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: datatab-release
+          path: dist
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          if ! printf '%s\n' "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "tag '$TAG' is not vX.Y.Z or vX.Y.Z-suffix" >&2
+            exit 1
+          fi
+          # Create only: never upload into an existing release. Any answer
+          # other than "release not found" stops the job.
+          if view_output=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>&1); then
+            echo "a release for $TAG already exists (draft: $view_output); this workflow changes nothing." >&2
+            echo "To build $TAG again, delete its draft release by hand, then re-run." >&2
+            exit 1
+          fi
+          case $view_output in
+            *"release not found"*) ;;
+            *)
+              echo "could not check for an existing release for $TAG: $view_output" >&2
+              exit 1
+              ;;
+          esac
+          gh release create "$TAG" dist/* --draft --verify-tag \
+            --title "DataTab $TAG" \
+            --notes "Unsigned packages for DataTab $TAG. Check them against SHA256SUMS.txt."

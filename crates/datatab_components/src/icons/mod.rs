@@ -1,0 +1,512 @@
+use crate::icon::IconSource;
+use datatab_core::{DatabaseCategory, Icon};
+
+/// App-specific icons embedded from resources/icons/
+///
+/// This enum centralizes all SVG icon references used throughout DataTab.
+/// Icons are loaded via GPUI's AssetSource using the `path()` method.
+///
+/// Usage:
+/// ```rust,ignore
+/// Icon::new(AppIcon::Folder).size_4().color(theme.foreground)
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum AppIcon {
+    // Chevrons / Navigation
+    ChevronDown,
+    ChevronLeft,
+    ChevronRight,
+    ChevronUp,
+
+    // Actions
+    Play,
+    SquarePlay,
+    Plus,
+    Power,
+    Save,
+    Delete,
+    Pencil,
+    Copy,
+    RefreshCcw,
+    RotateCcw,
+    Download,
+    Search,
+    Settings,
+    History,
+    Undo,
+    Redo,
+    X,
+
+    // UI elements
+    Eye,
+    EyeOff,
+    Loader,
+    Info,
+    Check,
+    CircleAlert,
+    CircleCheck,
+    CircleX,
+    TriangleAlert,
+    ExternalLink,
+    Globe,
+    Code,
+    Table,
+    Columns,
+    Rows3,
+    ArrowUp,
+    ArrowDown,
+    Star,
+    Clock,
+    Zap,
+    Hash,
+    Lock,
+    Layers,
+    Keyboard,
+    FingerprintPattern,
+    Maximize2,
+    Minimize2,
+    PanelBottomClose,
+    PanelBottomOpen,
+    PanelBottom,
+    PanelRight,
+    PanelRightClose,
+    PanelRightOpen,
+    FileSpreadsheet,
+    KeyRound,
+    Cable,
+    Link2,
+    CaseSensitive,
+    ScrollText,
+    ListFilter,
+    Tag,
+    Activity,
+    FileDown,
+    FileScan,
+    SquareFunction,
+    ArrowUpDown,
+    Bot,
+    Bell,
+    BrainCircuit,
+
+    // Connection / Network
+    Plug,
+    Unplug,
+    Server,
+    HardDrive,
+
+    // Files / Folders
+    File,
+    FileCode,
+    Image,
+    Folder,
+    Box,
+    Boxes,
+    Braces,
+    SquareTerminal,
+    Parentheses,
+    Sigma,
+
+    // Database generic
+    Database,
+    DatabaseZap,
+
+    // Zoom / View
+    ZoomIn,
+    ZoomOut,
+    Minus,
+    Grid3x3,
+    Snowflake,
+    Scale,
+    ArrowLeftRight,
+
+    // Clipboard
+    Clipboard,
+    Pin,
+
+    // Generic non-database data sources
+    Logs,
+
+    // Charts
+    ChartSpline,
+    ChartArea,
+    ChartColumnBig,
+    ChartNoAxesColumn,
+    ChartBar,
+    ChartPie,
+    ChartScatter,
+    Crosshair,
+    ChartNetwork,
+
+    // Database brands (SimpleIcons)
+    BrandPostgres,
+    BrandMysql,
+    BrandMariadb,
+    BrandSqlite,
+    BrandMongodb,
+    BrandRedis,
+    BrandClickhouse,
+    BrandTurso,
+    BrandDuckdb,
+
+    // Language brands (for script file icons)
+    BrandLua,
+    BrandPython,
+    BrandBash,
+    BrandJavaScript,
+    BrandInfluxDb,
+
+    // App branding
+    DataTab,
+}
+
+impl AppIcon {
+    /// Returns the asset path for this icon.
+    pub const fn path(self) -> &'static str {
+        match self {
+            Self::ChevronDown => "icons/ui/chevron-down.svg",
+            Self::ChevronLeft => "icons/ui/chevron-left.svg",
+            Self::ChevronRight => "icons/ui/chevron-right.svg",
+            Self::ChevronUp => "icons/ui/chevron-up.svg",
+            Self::Play => "icons/ui/play.svg",
+            Self::SquarePlay => "icons/ui/square-play.svg",
+            Self::Plus => "icons/ui/plus.svg",
+            Self::Power => "icons/ui/power.svg",
+            Self::Save => "icons/ui/save.svg",
+            Self::Delete => "icons/ui/delete.svg",
+            Self::Pencil => "icons/ui/pencil.svg",
+            Self::Copy => "icons/ui/copy.svg",
+            Self::RefreshCcw => "icons/ui/refresh-ccw.svg",
+            Self::RotateCcw => "icons/ui/rotate-ccw.svg",
+            Self::Download => "icons/ui/download.svg",
+            Self::Search => "icons/ui/search.svg",
+            Self::Settings => "icons/ui/settings.svg",
+            Self::History => "icons/ui/history.svg",
+            Self::Undo => "icons/ui/undo.svg",
+            Self::Redo => "icons/ui/redo.svg",
+            Self::X => "icons/ui/x.svg",
+            Self::Eye => "icons/ui/eye.svg",
+            Self::EyeOff => "icons/ui/eye-off.svg",
+            Self::Loader => "icons/ui/loader.svg",
+            Self::Info => "icons/ui/info.svg",
+            Self::Check => "icons/ui/check.svg",
+            Self::CircleAlert => "icons/ui/circle-alert.svg",
+            Self::CircleCheck => "icons/ui/circle-check.svg",
+            Self::CircleX => "icons/ui/circle-x.svg",
+            Self::TriangleAlert => "icons/ui/triangle-alert.svg",
+            Self::ExternalLink => "icons/ui/external-link.svg",
+            Self::Globe => "icons/ui/globe.svg",
+            Self::Code => "icons/ui/code.svg",
+            Self::Table => "icons/ui/table.svg",
+            Self::Columns => "icons/ui/columns.svg",
+            Self::Rows3 => "icons/ui/rows-3.svg",
+            Self::ArrowUp => "icons/ui/arrow-up.svg",
+            Self::ArrowDown => "icons/ui/arrow-down.svg",
+            Self::Star => "icons/ui/star.svg",
+            Self::Clock => "icons/ui/clock.svg",
+            Self::Zap => "icons/ui/zap.svg",
+            Self::Hash => "icons/ui/hash.svg",
+            Self::Lock => "icons/ui/lock.svg",
+            Self::Layers => "icons/ui/layers.svg",
+            Self::Keyboard => "icons/ui/keyboard.svg",
+            Self::FingerprintPattern => "icons/ui/fingerprint-pattern.svg",
+            Self::Maximize2 => "icons/ui/maximize-2.svg",
+            Self::Minimize2 => "icons/ui/minimize-2.svg",
+            Self::PanelBottomClose => "icons/ui/panel-bottom-close.svg",
+            Self::PanelBottomOpen => "icons/ui/panel-bottom-open.svg",
+            Self::PanelBottom => "icons/ui/panel-bottom.svg",
+            Self::PanelRight => "icons/ui/panel-right.svg",
+            Self::PanelRightClose => "icons/ui/panel-right-close.svg",
+            Self::PanelRightOpen => "icons/ui/panel-right-open.svg",
+            Self::FileSpreadsheet => "icons/ui/file-spreadsheet.svg",
+            Self::KeyRound => "icons/ui/key-round.svg",
+            Self::Cable => "icons/ui/cable.svg",
+            Self::Link2 => "icons/ui/link-2.svg",
+            Self::CaseSensitive => "icons/ui/case-sensitive.svg",
+            Self::ScrollText => "icons/ui/scroll-text.svg",
+            Self::ListFilter => "icons/ui/list-filter.svg",
+            Self::Tag => "icons/ui/tag.svg",
+            Self::Activity => "icons/ui/activity.svg",
+            Self::FileDown => "icons/ui/file-down.svg",
+            Self::FileScan => "icons/ui/file-scan.svg",
+            Self::SquareFunction => "icons/ui/square-function.svg",
+            Self::ArrowUpDown => "icons/ui/arrow-up-down.svg",
+            Self::Plug => "icons/ui/plug.svg",
+            Self::Unplug => "icons/ui/unplug.svg",
+            Self::Server => "icons/ui/server.svg",
+            Self::HardDrive => "icons/ui/hard-drive.svg",
+            Self::File => "icons/ui/file.svg",
+            Self::FileCode => "icons/ui/file-code-corner.svg",
+            Self::Image => "icons/ui/image.svg",
+            Self::Folder => "icons/ui/folder.svg",
+            Self::Box => "icons/ui/box.svg",
+            Self::Boxes => "icons/ui/boxes.svg",
+            Self::Braces => "icons/ui/braces.svg",
+            Self::SquareTerminal => "icons/ui/square-terminal.svg",
+            Self::Parentheses => "icons/ui/parentheses.svg",
+            Self::Sigma => "icons/ui/sigma.svg",
+            Self::Database => "icons/ui/database.svg",
+            Self::DatabaseZap => "icons/ui/database-zap.svg",
+            Self::ZoomIn => "icons/ui/zoom-in.svg",
+            Self::ZoomOut => "icons/ui/zoom-out.svg",
+            Self::Minus => "icons/ui/minus.svg",
+            Self::Grid3x3 => "icons/ui/grid-3x3.svg",
+            Self::Snowflake => "icons/ui/snowflake.svg",
+            Self::Scale => "icons/ui/scale.svg",
+            Self::ArrowLeftRight => "icons/ui/arrow-left-right.svg",
+            Self::Clipboard => "icons/ui/clipboard.svg",
+            Self::Pin => "icons/ui/pin.svg",
+            Self::Logs => "icons/ui/logs.svg",
+            Self::ChartSpline => "icons/ui/chart-spline.svg",
+            Self::ChartArea => "icons/ui/chart-area.svg",
+            Self::ChartColumnBig => "icons/ui/chart-column-big.svg",
+            Self::ChartNoAxesColumn => "icons/ui/chart-no-axes-column.svg",
+            Self::ChartBar => "icons/ui/chart-bar.svg",
+            Self::ChartPie => "icons/ui/chart-pie.svg",
+            Self::ChartScatter => "icons/ui/chart-scatter.svg",
+            Self::Crosshair => "icons/ui/crosshair.svg",
+            Self::ChartNetwork => "icons/ui/chart-network.svg",
+            Self::BrandPostgres => "icons/brand/postgresql.svg",
+            Self::BrandMysql => "icons/brand/mysql.svg",
+            Self::BrandMariadb => "icons/brand/mariadb.svg",
+            Self::BrandSqlite => "icons/brand/sqlite.svg",
+            Self::BrandMongodb => "icons/brand/mongodb.svg",
+            Self::BrandRedis => "icons/brand/redis.svg",
+            Self::BrandClickhouse => "icons/brand/clickhouse.svg",
+            Self::BrandTurso => "icons/brand/turso.svg",
+            Self::BrandDuckdb => "icons/brand/duckdb.svg",
+            Self::BrandLua => "icons/brand/lua.svg",
+            Self::BrandPython => "icons/brand/python.svg",
+            Self::BrandBash => "icons/brand/gnubash.svg",
+            Self::BrandJavaScript => "icons/brand/javascript.svg",
+            Self::BrandInfluxDb => "icons/brand/influxdb.svg",
+            Self::DataTab => "icons/datatab.svg",
+            Self::BrainCircuit => "icons/ui/brain-circuit.svg",
+            Self::Bot => "icons/ui/bot.svg",
+            Self::Bell => "icons/ui/bell.svg",
+        }
+    }
+
+    /// Returns the best icon for a given query language.
+    ///
+    /// Languages with a dedicated brand SVG get their own icon. Languages that
+    /// are DB-specific (SQL, MongoDB query, Redis, Cypher, CQL, InfluxQL) reuse
+    /// the corresponding DB brand icon when one exists, or fall back to a
+    /// generic file icon.
+    pub fn for_language(lang: &datatab_core::QueryLanguage) -> Self {
+        use datatab_core::QueryLanguage;
+        match lang {
+            QueryLanguage::Lua => Self::BrandLua,
+            QueryLanguage::Python => Self::BrandPython,
+            QueryLanguage::Bash => Self::BrandBash,
+            QueryLanguage::MongoQuery => Self::BrandMongodb,
+            QueryLanguage::RedisCommands => Self::BrandRedis,
+            QueryLanguage::InfluxQuery | QueryLanguage::Flux => Self::BrandInfluxDb,
+            QueryLanguage::Sql
+            | QueryLanguage::CloudWatchLogsInsightsQl
+            | QueryLanguage::OpenSearchPpl
+            | QueryLanguage::OpenSearchSql
+            | QueryLanguage::Cql => Self::Database,
+            QueryLanguage::Cypher => Self::Database,
+            QueryLanguage::Custom(_) => Self::FileCode,
+        }
+    }
+
+    /// Returns the icon that best represents a given chart kind.
+    ///
+    /// Used for chart tabs and any chart-kind-specific affordance so the UI
+    /// stays agnostic to the concrete `ChartKind` variants.
+    pub const fn for_chart_kind(kind: crate::chart::ChartKind) -> Self {
+        use crate::chart::ChartKind;
+        match kind {
+            ChartKind::Line => Self::ChartSpline,
+            ChartKind::Bar => Self::ChartColumnBig,
+            ChartKind::Scatter => Self::ChartNetwork,
+            ChartKind::Area => Self::ChartArea,
+            ChartKind::StackedBar => Self::ChartColumnBig,
+            ChartKind::Pie => Self::ChartPie,
+            ChartKind::Number => Self::Sigma,
+        }
+    }
+
+    /// Resolves a driver icon, using its database category for generic fallbacks.
+    pub const fn for_driver(icon: Icon, category: DatabaseCategory) -> Self {
+        match icon {
+            Icon::Postgres => Self::BrandPostgres,
+            Icon::Mysql => Self::BrandMysql,
+            Icon::Mariadb => Self::BrandMariadb,
+            Icon::Sqlite => Self::BrandSqlite,
+            Icon::Mongodb => Self::BrandMongodb,
+            Icon::Redis => Self::BrandRedis,
+            Icon::Dynamodb => Self::Braces,
+            Icon::Redshift => Self::ChartNoAxesColumn,
+            Icon::S3 => Self::Boxes,
+            Icon::Clickhouse => Self::BrandClickhouse,
+            Icon::Turso => Self::BrandTurso,
+            Icon::Duckdb => Self::BrandDuckdb,
+            Icon::Influxdb => Self::BrandInfluxDb,
+            Icon::Logs => Self::Logs,
+            Icon::Database => crate::category::category_presentation(category).fallback_icon,
+        }
+    }
+}
+
+/// Palette role of a driver logo, from the driver-declared [`Icon`] and its
+/// database category, never from a driver id (P1Sidebar, P1DriverPicker):
+/// relational engines read in the info blue, document stores in green,
+/// key-value stores in the danger red, time series in the NULL violet, and
+/// object storage and log streams in amber.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriverIconTone {
+    Info,
+    Success,
+    Danger,
+    Violet,
+    Warning,
+}
+
+impl DriverIconTone {
+    pub const fn for_driver(icon: Icon, category: DatabaseCategory) -> Self {
+        match icon {
+            Icon::Postgres
+            | Icon::Mysql
+            | Icon::Mariadb
+            | Icon::Sqlite
+            | Icon::Redshift
+            | Icon::Clickhouse
+            | Icon::Turso
+            | Icon::Duckdb => Self::Info,
+            Icon::Mongodb | Icon::Dynamodb => Self::Success,
+            Icon::Redis => Self::Danger,
+            Icon::Influxdb => Self::Violet,
+            Icon::S3 | Icon::Logs => Self::Warning,
+            Icon::Database => crate::category::category_presentation(category).fallback_tone,
+        }
+    }
+
+    /// The same tone as a row or badge tone, which resolves its own color
+    /// against the theme when it draws. Use it where a color is stored and
+    /// drawn later, so a light and dark switch does not leave a stale hue.
+    pub const fn badge_tone(self) -> crate::primitives::BadgeTone {
+        use crate::primitives::BadgeTone;
+
+        match self {
+            Self::Info => BadgeTone::Info,
+            Self::Success => BadgeTone::Success,
+            Self::Danger => BadgeTone::Danger,
+            Self::Violet => BadgeTone::Violet,
+            Self::Warning => BadgeTone::Warning,
+        }
+    }
+
+    /// The color of this tone in the active theme.
+    pub fn resolve(self, cx: &gpui::App) -> gpui::Hsla {
+        use gpui_component::ActiveTheme;
+
+        let theme = cx.theme();
+
+        match self {
+            Self::Info => theme.info,
+            Self::Success => theme.success,
+            Self::Danger => theme.danger,
+            Self::Violet => crate::tokens::SyntaxColors::for_current(cx).number,
+            Self::Warning => theme.warning,
+        }
+    }
+}
+
+impl From<AppIcon> for IconSource {
+    fn from(icon: AppIcon) -> Self {
+        IconSource::Svg(icon.path().into())
+    }
+}
+
+impl From<AppIcon> for gpui_component::Icon {
+    fn from(icon: AppIcon) -> Self {
+        gpui_component::Icon::default().path(icon.path())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppIcon, DriverIconTone};
+
+    #[test]
+    fn driver_tones_follow_the_declared_icon_then_the_category() {
+        assert_eq!(
+            DriverIconTone::for_driver(Icon::Postgres, DatabaseCategory::Relational),
+            DriverIconTone::Info
+        );
+        assert_eq!(
+            DriverIconTone::for_driver(Icon::Redis, DatabaseCategory::KeyValue),
+            DriverIconTone::Danger
+        );
+        assert_eq!(
+            DriverIconTone::for_driver(Icon::S3, DatabaseCategory::ObjectStorage),
+            DriverIconTone::Warning
+        );
+        assert_eq!(
+            DriverIconTone::for_driver(Icon::Database, DatabaseCategory::Document),
+            DriverIconTone::Success
+        );
+        assert_eq!(
+            DriverIconTone::for_driver(Icon::Database, DatabaseCategory::TimeSeries),
+            DriverIconTone::Violet
+        );
+    }
+    use datatab_core::{DatabaseCategory, Icon};
+
+    #[test]
+    fn explicit_driver_icons_preserve_brands_and_semantic_fallbacks() {
+        assert_eq!(
+            AppIcon::for_driver(Icon::Influxdb, DatabaseCategory::TimeSeries).path(),
+            "icons/brand/influxdb.svg"
+        );
+        assert_eq!(
+            AppIcon::for_driver(Icon::Redshift, DatabaseCategory::Relational),
+            AppIcon::ChartNoAxesColumn
+        );
+        assert_eq!(
+            AppIcon::for_driver(Icon::Dynamodb, DatabaseCategory::Document),
+            AppIcon::Braces
+        );
+        assert_eq!(
+            AppIcon::for_driver(Icon::S3, DatabaseCategory::ObjectStorage),
+            AppIcon::Boxes
+        );
+        assert_eq!(
+            AppIcon::for_driver(Icon::Clickhouse, DatabaseCategory::Relational),
+            AppIcon::BrandClickhouse
+        );
+        assert_eq!(
+            AppIcon::for_driver(Icon::Turso, DatabaseCategory::Relational),
+            AppIcon::BrandTurso
+        );
+    }
+
+    #[test]
+    fn generic_database_icon_uses_category_fallbacks() {
+        let cases = [
+            (DatabaseCategory::Relational, AppIcon::Database),
+            (DatabaseCategory::Document, AppIcon::Braces),
+            (DatabaseCategory::KeyValue, AppIcon::KeyRound),
+            (DatabaseCategory::ObjectStorage, AppIcon::Boxes),
+            (DatabaseCategory::TimeSeries, AppIcon::Database),
+            (DatabaseCategory::LogStream, AppIcon::Database),
+            (DatabaseCategory::SecretStore, AppIcon::Lock),
+        ];
+
+        for (category, expected) in cases {
+            assert_eq!(AppIcon::for_driver(Icon::Database, category), expected);
+        }
+    }
+
+    #[test]
+    fn semantic_driver_icons_use_expected_asset_paths() {
+        assert_eq!(
+            AppIcon::ChartNoAxesColumn.path(),
+            "icons/ui/chart-no-axes-column.svg"
+        );
+        assert_eq!(AppIcon::Boxes.path(), "icons/ui/boxes.svg");
+    }
+}

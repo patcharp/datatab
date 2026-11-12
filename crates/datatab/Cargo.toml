@@ -1,0 +1,104 @@
+[package]
+name = "datatab"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "datatab"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+gpui-component.workspace = true
+gpui-pre-platform.workspace = true
+datatab_app.workspace = true
+datatab_ui = { workspace = true }
+datatab_core = { workspace = true, features = ["tracing-bridge"] }
+datatab_i18n.workspace = true
+datatab_ui_base.workspace = true
+datatab_ipc.workspace = true
+datatab_driver_ipc.workspace = true
+datatab_audit.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+log.workspace = true
+interprocess.workspace = true
+# rustls 0.23 refuses to auto-select a crypto provider when more than one
+# backend is linked. This workspace links several (the AWS SDK pulls `ring`,
+# reqwest and the TLS drivers pull `aws-lc-rs`), so the binary installs a
+# process-wide default in `main`. Declared here to reach `rustls::crypto`.
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# The build script embeds the icon and VERSIONINFO into datatab.exe. gpui already
+# builds with embed-resource on Windows, so this widens an existing dependency
+# rather than adding one.
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0"
+
+# The binary registers drivers and runtime features through `datatab_app`, not
+# directly. Optional dep declarations on driver crates would be dead weight
+# (no `use ...` in this crate), so they live on `datatab_app` instead. The few
+# optional deps below exist only for feature passthroughs that this manifest
+# itself exposes (e.g. `vendored-openssl` on `datatab_ssh`).
+
+[dependencies.datatab_ssh]
+workspace = true
+optional = true
+
+[features]
+default = ["sqlite", "postgres", "mysql", "mongodb", "redis", "dynamodb", "cloudwatch", "influxdb", "mssql", "redshift", "clickhouse", "turso", "duckdb", "s3", "aws_secrets", "lua", "aws", "mcp"]
+# datatab_ui is driver-agnostic, so driver features only drive datatab_app (which
+# registers the drivers and relays to the MCP server). The binary does not need
+# to declare driver/runtime crates as direct optional deps — `datatab_app/<feat>`
+# pulls them in through datatab_app's own optional deps.
+sqlite = ["datatab_app/sqlite"]
+postgres = ["datatab_app/postgres"]
+mysql = ["datatab_app/mysql"]
+mongodb = ["datatab_app/mongodb"]
+redis = ["datatab_app/redis"]
+dynamodb = ["datatab_app/dynamodb"]
+cloudwatch = ["datatab_app/cloudwatch"]
+influxdb = ["datatab_app/influxdb"]
+mssql = ["datatab_app/mssql"]
+redshift = ["datatab_app/redshift"]
+clickhouse = ["datatab_app/clickhouse"]
+turso = ["datatab_app/turso"]
+duckdb = ["datatab_app/duckdb"]
+s3 = ["datatab_app/s3"]
+aws_secrets = ["datatab_app/aws_secrets"]
+lua = ["datatab_app/lua", "datatab_ui/lua"]
+aws = ["datatab_app/aws", "datatab_ui/aws"]
+mcp = ["datatab_app/mcp", "datatab_ui/mcp"]
+# Development-only UI automation bridge (gpui-mcp). Never part of `default`.
+ui-automation = ["datatab_ui/ui-automation"]
+vendored-openssl = ["datatab_ssh/vendored-openssl"]
+
+[dev-dependencies]
+datatab_test_support.workspace = true
+# Process-level MCP end-to-end tests spawn the binary against an isolated
+# settings database, which they seed through the storage layer.
+datatab_storage.workspace = true
+tempfile = "3.10"
+serde_json.workspace = true
+
+[package.metadata.cargo-machete]
+# tokio is declared to pin the rt-multi-thread+time features for the MCP runtime;
+# no direct tokio:: calls appear in this crate's source because the runtime is
+# driven through datatab_app/datatab_mcp_server.
+# datatab_ssh is an optional dep forwarded only to enable the vendored-openssl
+# feature on the ssh crate; no source-level use of datatab_ssh is needed.
+# gpui-pre-platform publishes the package `gpui-pre-platform` but names its
+# library `gpui_platform`, so main.rs opens the platform through
+# `gpui_platform::application()` and no source path can ever contain the
+# package name.
+ignored = ["tokio", "datatab_ssh", "gpui-pre-platform"]
+
+[lints]
+workspace = true

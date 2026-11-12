@@ -1,0 +1,224 @@
+use gpui::{Context, ElementId, IntoElement, SharedString, div};
+use gpui_component::ActiveTheme;
+
+use crate::query_builder::keyboard::row_id;
+use crate::query_builder::panel::{AggregateRow, GroupByRow, QueryBuilderPanel};
+
+/// Renders the "Group By / Aggregates" section body.
+///
+/// Two sub-sections:
+/// 1. Group-by rows: column text input + remove button, "+" button at bottom.
+/// 2. Aggregate rows: function dropdown + column input + alias input + remove button.
+pub(crate) fn render_group_by(
+    panel: &mut QueryBuilderPanel,
+    cx: &mut Context<QueryBuilderPanel>,
+) -> impl IntoElement {
+    use crate::labels::agg_fn_display;
+    use crate::query_builder::panel::AGG_FN_ORDER;
+    use datatab_components::composites::control_shell;
+    use datatab_components::controls::{Button, Input};
+    use datatab_components::tokens::Heights;
+    use datatab_core::AggFn;
+    use gpui::prelude::*;
+    use gpui_component::input::EditorState;
+
+    let group_by_rows: Vec<GroupByRow> = panel.group_by_rows.clone();
+    let aggregate_rows: Vec<AggregateRow> = panel.aggregate_rows.clone();
+    let gb_col_inputs = panel.group_by_col_inputs.clone();
+    let agg_fn_dropdowns = panel.agg_fn_dropdowns.clone();
+    let agg_col_inputs = panel.agg_col_inputs.clone();
+    let agg_alias_inputs = panel.agg_alias_inputs.clone();
+    let mark = panel.rail_mark.clone();
+
+    let mut container = div().flex().flex_col().gap_1();
+
+    container = container.child(
+        div()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(SharedString::from(datatab_i18n::t!(
+                "document.query_builder.group_by.heading"
+            ))),
+    );
+
+    for (i, _row) in group_by_rows.iter().enumerate() {
+        let mut row_div = mark
+            .row(&row_id::group_by(i), div())
+            .flex()
+            .flex_row()
+            .gap_1()
+            .items_center();
+
+        if let Some(col_input) = gb_col_inputs.get(i).cloned() {
+            row_div = row_div.child(
+                crate::completion_support::single_line_completion_editor(&col_input, cx)
+                    .flex_1()
+                    .min_w(gpui::px(0.0))
+                    .w_full(),
+            );
+        }
+
+        row_div = row_div.child(
+            Button::new(element_id("qb-gb-rm", i), "✕")
+                .ghost()
+                .inline()
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.remove_group_by_row(i, cx);
+                })),
+        );
+
+        container = container.child(row_div);
+    }
+
+    let source_alias = panel.current_spec.source.alias.clone();
+    container = container.child(
+        mark.row(
+            &row_id::group_by_add(),
+            div().flex().child(
+                Button::new(
+                    "qb-gb-add",
+                    datatab_i18n::t!("document.query_builder.group_by.add_column"),
+                )
+                .ghost()
+                .inline()
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.add_group_by_column(source_alias.clone(), String::new(), cx);
+                })),
+            ),
+        ),
+    );
+
+    container = container.child(
+        div()
+            .text_sm()
+            .text_color(cx.theme().muted_foreground)
+            .child(SharedString::from(datatab_i18n::t!(
+                "document.query_builder.group_by.aggregates_heading"
+            ))),
+    );
+
+    for (i, row) in aggregate_rows.iter().enumerate() {
+        let is_count_star = row.function == AggFn::CountStar;
+
+        let aggregate_row = row_id::aggregate(i);
+        let mut row_div = mark
+            .row(&aggregate_row, div())
+            .flex()
+            .flex_row()
+            .gap_1()
+            .items_center();
+
+        if let Some(fn_dd) = agg_fn_dropdowns.get(i).cloned() {
+            row_div = row_div.child(
+                mark.ring(&aggregate_row, "function", div())
+                    .w(gpui::px(110.0))
+                    .h(Heights::BUTTON)
+                    .flex_shrink_0()
+                    .child(control_shell(fn_dd, cx).h(Heights::BUTTON)),
+            );
+        }
+
+        if let Some(col_input) = agg_col_inputs.get(i).cloned() {
+            if is_count_star {
+                row_div = row_div.child(
+                    div()
+                        .flex_1()
+                        .min_w(gpui::px(0.0))
+                        .text_sm()
+                        .opacity(0.4)
+                        .child(SharedString::from("*")),
+                );
+                let _col_input = col_input;
+            } else {
+                row_div = row_div.child(
+                    mark.ring(
+                        &aggregate_row,
+                        "column",
+                        div().flex_1().min_w(gpui::px(0.0)),
+                    )
+                    .child(
+                        crate::completion_support::single_line_completion_editor(&col_input, cx)
+                            .w_full(),
+                    ),
+                );
+            }
+        }
+
+        if let Some(alias_input) = agg_alias_inputs.get(i).cloned() {
+            row_div = row_div.child(
+                mark.ring(&aggregate_row, "alias", div())
+                    .w(gpui::px(100.0))
+                    .flex_shrink_0()
+                    .child(Input::new(&alias_input).small().w_full().placeholder(
+                        datatab_i18n::t!("document.query_builder.group_by.alias_placeholder"),
+                    )),
+            );
+        }
+
+        row_div = row_div.child(
+            Button::new(element_id("qb-agg-rm", i), "✕")
+                .ghost()
+                .inline()
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.remove_aggregate_row(i, cx);
+                })),
+        );
+
+        container = container.child(row_div);
+    }
+
+    let agg_add_items: Vec<(String, AggFn)> = AGG_FN_ORDER
+        .iter()
+        .map(|f| (agg_fn_display(*f), *f))
+        .collect();
+
+    let add_row_id = row_id::aggregate_add();
+    let mut add_row = mark
+        .row(&add_row_id, div())
+        .flex()
+        .flex_row()
+        .gap_1()
+        .flex_wrap();
+    for (label, function) in agg_add_items {
+        let button_label = datatab_i18n::t!(
+            "document.query_builder.group_by.add_aggregate",
+            function = label.clone()
+        );
+        add_row = add_row.child(
+            mark.ring_element(
+                &add_row_id,
+                &format!("add-{label}"),
+                Button::new(
+                    ElementId::Name(SharedString::from(format!("qb-agg-add-{}", label))),
+                    button_label,
+                )
+                .ghost()
+                .inline()
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    this.add_aggregate(function, cx);
+                })),
+            ),
+        );
+    }
+    container = container.child(add_row);
+
+    container
+}
+
+/// Renders the HAVING section body.
+///
+/// Delegates to the same filter-node renderer used by the WHERE section,
+/// but bound to `FilterTarget::Having` so mutations land on `spec.having`.
+pub(crate) fn render_having(
+    panel: &mut QueryBuilderPanel,
+    cx: &mut Context<QueryBuilderPanel>,
+) -> impl IntoElement {
+    use super::filters::render_filters_for_target;
+    use crate::query_builder::panel::FilterTarget;
+
+    render_filters_for_target(panel, FilterTarget::Having, cx)
+}
+
+fn element_id(prefix: &str, index: usize) -> ElementId {
+    ElementId::Name(SharedString::from(format!("{}-{}", prefix, index)))
+}

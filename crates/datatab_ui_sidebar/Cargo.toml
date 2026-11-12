@@ -1,0 +1,47 @@
+[package]
+name = "datatab_ui_sidebar"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+description = "Connection and scripts sidebar tree for DataTab"
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+
+[dependencies]
+gpui.workspace = true
+gpui-component.workspace = true
+datatab_ui_base.workspace = true
+datatab_components.workspace = true
+datatab_core.workspace = true
+datatab_i18n.workspace = true
+datatab_app.workspace = true
+datatab_storage.workspace = true
+datatab_ssh.workspace = true
+uuid.workspace = true
+log.workspace = true
+rfd.workspace = true
+dirs.workspace = true
+
+[dev-dependencies]
+secrecy.workspace = true
+rusqlite.workspace = true
+gpui = { workspace = true, features = ["test-support"] }
+datatab_components = { workspace = true, features = ["test-support"] }
+datatab_ui_base = { workspace = true, features = ["test-support"] }
+
+[features]
+default = []
+# Passthroughs: sidebar code has no direct mcp/lua/aws gates, but these must
+# forward to every dependency that also exposes them (datatab_app, datatab_ui_base)
+# so the feature set stays unified regardless of build entry point and datatab_app
+# is never compiled twice with mismatched features.
+# Note: datatab_ui_windows features are forwarded by datatab_ui directly.
+mcp = ["datatab_app/mcp", "datatab_ui_base/mcp"]
+lua = ["datatab_app/lua", "datatab_ui_base/lua"]
+aws = ["datatab_app/aws", "datatab_ui_base/aws"]
+
+[lints]
+workspace = true

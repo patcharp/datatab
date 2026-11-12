@@ -1,0 +1,4107 @@
+use super::data_grid_panel::{DataGridEvent, DataGridPanel};
+use super::handle::DocumentEvent;
+use super::task_runner::DocumentTaskRunner;
+use super::types::{DocumentId, DocumentState};
+use crate::history_panel::{
+    HistoryPanel, HistoryPanelCallbacks, HistoryPanelClosed, HistoryQuerySelected,
+};
+use datatab_app::keymap::{Command, ContextId};
+use datatab_components::common::time_range::state::TimeRange;
+use datatab_components::common::time_range::view::{TimeRangeChanged, TimeRangePanel};
+use datatab_components::components::multi_select::{MultiSelect, MultiSelectChanged};
+use datatab_components::controls::{
+    Button, CodeActionProvider, CompletionProvider, GpuiInput as Input, InputEvent, InputPosition,
+    InputState, Rope, RopeExt,
+};
+use datatab_components::controls::{
+    ButtonVariant, Dropdown, DropdownItem, DropdownSelectionChanged,
+};
+use datatab_components::icons::AppIcon;
+use datatab_components::modals::ModalFocus;
+use datatab_components::modals::schema_drift::{
+    ModalSchemaDrift, SchemaDriftContinue, SchemaDriftDismissed, SchemaDriftRefresh,
+};
+use datatab_components::result_panel::ResultPanel;
+use datatab_components::tokens::{FontSizes, Heights, Radii, Spacing};
+use datatab_core::observability::actions as audit_actions;
+use datatab_core::observability::{
+    AuditAction, AuditContext, EventActorType, EventCategory, EventOrigin, EventOutcome,
+    EventRecord, EventSeverity, EventSourceId,
+};
+use datatab_core::{
+    Connection, DangerousAction, DangerousQueryKind, DbError,
+    DiagnosticSeverity as CoreDiagnosticSeverity, DriftOutcome, DriverCapabilities,
+    EditorDiagnostic as CoreEditorDiagnostic, EditorLanguageProfile, ExecutionContext,
+    ExecutionSourceContext, HistoryEntry, OutputReceiver, QueryLanguage, QueryRequest, QueryResult,
+    ReadOnlyEnforcement, RefreshPolicy, SchemaDriftDetected, SchemaLoadingStrategy, TaskTarget,
+    ValidationResult, check_schema_drift,
+};
+use datatab_ui_base::toast::{Toast, copy_action, now_hms};
+use datatab_ui_base::{AppStateChanged, AppStateEntity};
+use gpui::prelude::FluentBuilder;
+use gpui::*;
+use gpui_component::ActiveTheme;
+use gpui_component::Sizable;
+use gpui_component::highlighter::{
+    Diagnostic as InputDiagnostic, DiagnosticSeverity as InputDiagnosticSeverity,
+};
+use gpui_component::input::EditorState as GpuiEditorState;
+use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
+use lsp_types::{
+    CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit,
+    InsertTextFormat, Position as LspPosition, Range as LspRange, TextEdit,
+};
+use std::cell::Cell;
+use std::cmp::min;
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Instant;
+use uuid::Uuid;
+
+mod code_actions;
+mod comment;
+mod completion;
+#[cfg(test)]
+mod completion_tests;
+mod context_bar;
+mod diagnostics;
+mod execution;
+mod execution_session;
+mod file_ops;
+mod file_persistence;
+mod focus;
+mod live_output;
+pub(crate) mod pane;
+mod render;
+mod statements;
+mod vim;
+
+use code_actions::SqlCodeActionProvider;
+pub(crate) use completion::QueryCompletionProvider;
+pub(crate) use execution_session::ExecutionSessionBinding;
+use live_output::LiveOutputState;
+pub(crate) use vim::VimMode;
+
+pub(crate) use execution::evaluate_dangerous_with_effective_settings;
+
+/// A single result tab within the CodeDocument.
+///
+/// Each tab wraps the `DataGridPanel` in a `ResultPanel` shell so the mode
+/// bar and chrome row are rendered consistently with `DataDocument` tabs.
+/// The `grid` field is kept for direct access by focus/dispatch/execution
+/// callers that need to call grid-specific methods.
+pub(super) struct ResultTab {
+    id: Uuid,
+    title: String,
+    grid: Entity<DataGridPanel>,
+    result_panel: Entity<ResultPanel>,
+    /// Where the tab's result came from, so its footer actions run the
+    /// query there even after the document moved on.
+    origin: Option<ResultOrigin>,
+    _subscription: Subscription,
+}
+
+/// Internal layout of the document.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SqlQueryLayout {
+    #[default]
+    Split,
+    EditorOnly,
+    ResultsOnly,
+}
+
+/// Where the results sit in the split: below the editor, or beside it on
+/// the right for wide screens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum ResultsPosition {
+    #[default]
+    Bottom,
+    Right,
+}
+
+/// UI state key holding the position the last toggle chose, which new query
+/// tabs open with.
+const RESULTS_POSITION_KEY: &str = "query_results_position";
+
+impl ResultsPosition {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Bottom => Self::Right,
+            Self::Right => Self::Bottom,
+        }
+    }
+
+    fn hide_icon(self) -> AppIcon {
+        match self {
+            Self::Bottom => AppIcon::PanelBottomClose,
+            Self::Right => AppIcon::PanelRightClose,
+        }
+    }
+
+    fn show_icon(self) -> AppIcon {
+        match self {
+            Self::Bottom => AppIcon::PanelBottomOpen,
+            Self::Right => AppIcon::PanelRightOpen,
+        }
+    }
+
+    /// The label and icon of the toggle, naming the position it moves to.
+    fn toggle_label_and_icon(self) -> (String, AppIcon) {
+        match self {
+            Self::Bottom => (
+                datatab_i18n::t!("document.code.toolbar.results_right"),
+                AppIcon::PanelRight,
+            ),
+            Self::Right => (
+                datatab_i18n::t!("document.code.toolbar.results_bottom"),
+                AppIcon::PanelBottom,
+            ),
+        }
+    }
+
+    fn storage_value(self) -> &'static str {
+        match self {
+            Self::Bottom => "\"bottom\"",
+            Self::Right => "\"right\"",
+        }
+    }
+
+    fn load(app_state: &AppStateEntity) -> Self {
+        match app_state
+            .storage_runtime()
+            .ui_state()
+            .get(RESULTS_POSITION_KEY)
+        {
+            Ok(Some(value)) if value == Self::Right.storage_value() => Self::Right,
+            Ok(_) => Self::Bottom,
+            Err(error) => {
+                log::warn!("Could not read the saved results position: {error}");
+                Self::Bottom
+            }
+        }
+    }
+
+    fn save(self, app_state: &AppStateEntity) {
+        if let Err(error) = app_state
+            .storage_runtime()
+            .ui_state()
+            .set(RESULTS_POSITION_KEY, self.storage_value())
+        {
+            log::error!("Could not save the results position: {error}");
+        }
+    }
+}
+
+/// Where focus is within the document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(crate) enum SqlQueryFocus {
+    #[default]
+    Editor,
+    Results,
+    ContextBar,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum ContextBarSlot {
+    #[default]
+    Connection,
+    Database,
+    Schema,
+    SourceQueryMode,
+    SourceTargets,
+    SourceStart,
+    SourceEnd,
+    /// The pane-actions button of a script editor, whose bar has no
+    /// connection controls: the bar's only stop, so Ctrl+K still lands there.
+    PaneActions,
+}
+
+/// Counts lines added and removed between two text strings using a set-based
+/// line delta. Lines in `current` not in `original` are "added"; lines in
+/// `original` not in `current` are "removed". Reorderings are counted as both
+/// an add and a remove — good enough for a change-summary label.
+pub(crate) fn diff_stats_from_pair(original: &str, current: &str) -> (usize, usize) {
+    if original == current {
+        return (0, 0);
+    }
+
+    let original_lines: std::collections::HashSet<&str> = original.lines().collect();
+    let current_lines: std::collections::HashSet<&str> = current.lines().collect();
+
+    let added = current_lines.difference(&original_lines).count();
+    let removed = original_lines.difference(&current_lines).count();
+
+    (added, removed)
+}
+
+fn build_source_window_context(
+    query_mode: Option<String>,
+    targets: &[String],
+    start_ms: Option<i64>,
+    end_ms: Option<i64>,
+) -> Result<ExecutionSourceContext, &'static str> {
+    let query_mode = query_mode.filter(|value| !value.trim().is_empty());
+    let requires_targets = query_mode.as_deref() != Some("sql");
+
+    if requires_targets && targets.is_empty() {
+        // This is a stable token, not display text: `labels::source_window_error_message`
+        // maps it to the translated catalog entry at the toast display site.
+        return Err("Select at least one source");
+    }
+
+    let Some(start_ms) = start_ms else {
+        return Err("Start time is required");
+    };
+
+    let Some(end_ms) = end_ms else {
+        return Err("End time is required");
+    };
+
+    if start_ms > end_ms {
+        return Err("Start time must be earlier than end time");
+    }
+
+    Ok(ExecutionSourceContext::CollectionWindow {
+        targets: targets.to_vec(),
+        start_ms,
+        end_ms,
+        query_mode,
+    })
+}
+
+fn format_source_datetime_input(timestamp_ms: i64) -> String {
+    datatab_core::chrono::DateTime::from_timestamp_millis(timestamp_ms)
+        .map(|dt| dt.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+        .unwrap_or_default()
+}
+
+fn source_input_values_from_context(source: &ExecutionSourceContext) -> Option<(String, String)> {
+    match source {
+        ExecutionSourceContext::CollectionWindow {
+            start_ms, end_ms, ..
+        } => Some((
+            format_source_datetime_input(*start_ms),
+            format_source_datetime_input(*end_ms),
+        )),
+        // MetricQuery sources carry their time bounds in the variant itself rather
+        // than being driven by the log-group source bar; return None so the source
+        // controls are not populated for metric sources.
+        _ => None,
+    }
+}
+
+/// Caps an editor query at `editor_row_limit` rows unless the request already
+/// carries its own limit, which wins even when it is zero. A limit beyond
+/// `u32::MAX` saturates because `QueryRequest::limit` is a `u32`.
+///
+/// `None` leaves the request as it is: the connection cannot enforce a row
+/// budget, and a driver that cannot enforce one refuses the whole request
+/// instead of running it unbounded (see [`enforces_request_row_limit`]).
+fn apply_editor_row_limit(
+    mut request: QueryRequest,
+    editor_row_limit: Option<usize>,
+) -> QueryRequest {
+    if let (Some(editor_row_limit), None) = (editor_row_limit, request.limit) {
+        request.limit = Some(u32::try_from(editor_row_limit).unwrap_or(u32::MAX));
+    }
+
+    request
+}
+
+/// Whether `connection` enforces [`QueryRequest::limit`] itself: it stops
+/// reading rows at the cap and marks the result truncated, instead of refusing
+/// a request that carries one.
+///
+/// A request goes out with the editor row limit only when this holds. The limit
+/// is a budget the driver has to enforce, so sending it to a driver that cannot
+/// enforce it turns the query away without running anything; the native console
+/// gates its commands on the same flag.
+pub(crate) fn enforces_request_row_limit(connection: &dyn Connection) -> bool {
+    connection
+        .metadata()
+        .supports(DriverCapabilities::REQUEST_ROW_LIMIT)
+}
+
+fn query_request_for_execution(
+    query: String,
+    active_database: Option<String>,
+    exec_ctx: &ExecutionContext,
+    query_language: QueryLanguage,
+    editor_row_limit: Option<usize>,
+) -> QueryRequest {
+    let window = match &exec_ctx.source {
+        Some(ExecutionSourceContext::CollectionWindow {
+            start_ms, end_ms, ..
+        }) => Some((*start_ms, *end_ms)),
+        _ => None,
+    };
+
+    let sql = datatab_core::substitute_time_macros(&query, window, query_language);
+
+    let request = QueryRequest::new(sql)
+        .with_database(active_database)
+        .with_execution_context(Some(exec_ctx.clone()));
+
+    apply_editor_row_limit(request, editor_row_limit)
+}
+
+/// Per-document execution-source UI controls and the `ExecutionContext` they populate.
+///
+/// Groups the connection/database/schema dropdowns, source-range inputs, the optional
+/// `TimeRangePanel`, and the subscription vec that keeps them in sync.
+pub(super) struct SourceContext {
+    pub(super) exec_ctx: ExecutionContext,
+    pub(super) connection_dropdown: Entity<Dropdown>,
+    pub(super) database_dropdown: Entity<Dropdown>,
+    pub(super) schema_dropdown: Entity<Dropdown>,
+    pub(super) source_query_mode_dropdown: Entity<Dropdown>,
+    pub(super) source_targets: Entity<MultiSelect>,
+    pub(super) source_start_input: Entity<InputState>,
+    pub(super) source_end_input: Entity<InputState>,
+    /// Number of upcoming `InputEvent::Change` emissions from the source
+    /// start/end inputs that originate from a programmatic seed rather than a
+    /// user edit, and must therefore be ignored. `InputState::set_value` always
+    /// emits `Change`, so seeding both inputs while draining
+    /// `pending.source_input_values` queues two handler calls that would
+    /// otherwise re-derive the exec context from the values just written.
+    pub(super) source_seed_suppress: usize,
+    pub(super) source_time_range_panel: Option<Entity<TimeRangePanel>>,
+    pub(super) _source_time_range_sub: Option<Subscription>,
+    pub(super) _context_subscriptions: Vec<Subscription>,
+}
+
+/// How a document's editor language is bound over its lifetime.
+///
+/// A scratch query tab follows its connection: retargeting the connection
+/// dropdown from a relational profile to a document one has to re-derive
+/// highlighting, time-macro substitution, and dangerous-query classification,
+/// because `connection_id` alone already decides which driver executes the text.
+/// A document whose language came from somewhere the connection cannot speak
+/// for — a file extension, an in-process script language, a read-only routine
+/// body — keeps it instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LanguageBinding {
+    /// Re-derive the language from whichever connection the tab is bound to.
+    FollowsConnection,
+    /// Keep the document's own language regardless of the bound connection.
+    Pinned,
+}
+
+/// Text editor entity, file-backing metadata, language mode, and diagnostic debounce.
+///
+/// Groups the `InputState` entity and its subscription together with the fields
+/// that track editor-lifecycle concerns: content dirtiness, file path, language,
+/// and the incremental diagnostic refresh debounce.
+pub(super) struct EditorState {
+    pub(super) input_state: Entity<GpuiEditorState>,
+    pub(super) _input_subscriptions: Vec<Subscription>,
+    pub(super) original_content: String,
+    pub(super) saved_query_id: Option<Uuid>,
+    pub(super) current_editor_mode: String,
+    /// Cached `EditorLanguageProfile::supports_connection_context`, refreshed
+    /// whenever the effective profile changes (construction, connection change,
+    /// syntax/query-mode switch). Cached so per-render call sites do not re-resolve
+    /// and re-clone the profile every frame.
+    pub(super) cached_supports_connection_context: bool,
+    /// Cached `EditorLanguageProfile::comment_prefix`, refreshed alongside
+    /// `cached_supports_connection_context`.
+    pub(super) cached_comment_prefix: String,
+    pub(super) diagnostic_request_id: u64,
+    pub(super) _diagnostic_debounce: Option<Task<()>>,
+    pub(super) path: Option<PathBuf>,
+    pub(super) is_dirty: bool,
+    /// Buffer length at the previous `Change` event, to detect deletions.
+    pub(super) last_change_length: usize,
+    /// Set while `toggle_comment` rewrites the buffer, so the Change handler
+    /// skips the completion-menu plumbing meant for a user's deletion.
+    pub(super) toggling_comment: bool,
+    /// Shared with the completion provider, which bumps it on every query.
+    /// A deletion that did NOT bump it was ignored by the menu plumbing
+    /// (cursor deleted back past the menu's trigger start) and would leave a
+    /// stale menu open; the Change handler force-closes it then.
+    pub(super) completion_query_generation: Rc<Cell<u64>>,
+    /// Value of `completion_query_generation` at the previous `Change` event.
+    pub(super) last_completion_generation: u64,
+    /// The language this document declares for itself: derived from the active
+    /// connection at construction, from a file extension, or passed explicitly.
+    /// Read it through `CodeDocument::effective_language()` rather than
+    /// directly — an unpinned document resolves to its bound connection's
+    /// language instead.
+    pub(super) query_language: QueryLanguage,
+    pub(super) language_binding: LanguageBinding,
+    /// Cached `resolve_effective_language` result, refreshed alongside
+    /// `cached_supports_connection_context` whenever the effective language can
+    /// change (construction, connection change, query-mode switch).
+    pub(super) cached_effective_language: QueryLanguage,
+    /// Byte ranges of the buffer's statements from the language's statement
+    /// splitter, refreshed on every edit. `None` when the language has no
+    /// splitter, which also hides the statement gutter.
+    pub(super) statement_ranges: Option<Vec<std::ops::Range<usize>>>,
+    /// The gutter style installed on the editor, compared against the theme
+    /// on every render so a palette switch repaints the gutter.
+    pub(super) gutter_style: Option<gpui_base::input::GutterStatementStyle>,
+    /// Whether the installed gutter carries statements (false while hidden).
+    pub(super) gutter_shown: bool,
+}
+
+/// Auto-save-to-disk machinery and saved-label UI feedback.
+pub(super) struct SessionPersistence {
+    pub(super) scratch_path: Option<PathBuf>,
+    pub(super) shadow_path: Option<PathBuf>,
+    pub(super) _auto_save_debounce: Option<Task<()>>,
+    pub(super) show_saved_label: bool,
+    pub(super) _saved_label_timer: Option<Task<()>>,
+    /// The content the shutdown flush last wrote into this document's session
+    /// artifact. The shutdown loop polls every 50 ms, so this is what keeps one
+    /// quit from rewriting identical bytes dozens of times.
+    pub(super) shutdown_flush_written: Option<String>,
+}
+
+/// History panel entity and its event subscriptions.
+pub(super) struct HistoryState {
+    pub(super) history_panel: Entity<HistoryPanel>,
+    pub(super) _history_subscriptions: Vec<Subscription>,
+}
+
+/// Auto-refresh policy, timer, and dropdown control.
+pub(super) struct RefreshState {
+    pub(super) refresh_policy: RefreshPolicy,
+    pub(super) refresh_dropdown: Entity<Dropdown>,
+    pub(super) _refresh_timer: Option<Task<()>>,
+    pub(super) _refresh_subscriptions: Vec<Subscription>,
+}
+
+/// Schema-drift modal entity, its subscriptions, and the in-flight preflight flag.
+pub(super) struct DriftState {
+    pub(super) schema_drift_modal: Entity<ModalSchemaDrift>,
+    pub(super) _schema_drift_subscriptions: Vec<Subscription>,
+    pub(super) preflight_running: bool,
+}
+
+/// In-flight and historical query execution state.
+pub(super) struct Execution {
+    pub(super) execution_history: Vec<ExecutionRecord>,
+    pub(super) active_execution_index: Option<usize>,
+    pub(super) live_output: Option<LiveOutputState>,
+    pub(super) _live_output_drain: Option<Task<()>>,
+    pub(super) active_query_task: Option<ActiveQueryTask>,
+    /// Byte offset in the buffer where the text of the latest run starts,
+    /// used to name the statement lines behind each result.
+    pub(super) query_origin: Option<usize>,
+    /// A result tab's Load all rows request. The next execution takes it, and
+    /// drops the row limit and replaces that tab only when it runs the same
+    /// query.
+    pub(super) load_all_rows: Option<LoadAllRows>,
+}
+
+pub(super) struct LoadAllRows {
+    pub(super) query: String,
+    pub(super) grid: gpui::EntityId,
+    pub(super) origin: ResultOrigin,
+}
+
+/// The connection, database and execution context a query result came from.
+#[derive(Clone)]
+pub(super) struct ResultOrigin {
+    connection_id: Uuid,
+    context: ExecutionSessionContext,
+    exec_ctx: ExecutionContext,
+}
+
+/// The result-tab collection and its selection cursor.
+pub(super) struct ResultTabs {
+    pub(super) result_tabs: Vec<ResultTab>,
+    pub(super) active_result_index: Option<usize>,
+    pub(super) result_tab_counter: usize,
+    pub(super) run_in_new_tab: bool,
+}
+
+/// All deferred action slots drained at the top of each render cycle.
+///
+/// Each field is an individually-addressable typed slot. The drain order
+/// in `render` matches the declaration order here and must not be changed.
+/// `pending.drift_query` supports re-entrancy: the drift state machine may
+/// `.take()` the value and then re-store it within the same render pass when
+/// the modal has not yet been answered.
+#[derive(Default)]
+pub(super) struct PendingActions {
+    result: Option<PendingQueryResult>,
+    set_query: Option<HistoryQuerySelected>,
+    auto_refresh: bool,
+    /// A result tab asked to load every row of its query.
+    load_all_rows: Option<gpui::EntityId>,
+    history_focus_restore: bool,
+    drift_query: Option<PendingDriftQuery>,
+    source_input_values: Option<(String, String)>,
+    chart_reexecute: bool,
+    /// Window bounds emitted by the source `TimeRangePanel`. Taken by
+    /// `run_query_text` on the next execution path; bypasses the text inputs.
+    window_override: Option<(i64, i64)>,
+    dangerous_query: Option<PendingDangerousQuery>,
+    script_confirm: Option<PendingScriptConfirm>,
+    routine_definition: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+struct ExecutionSessionContext {
+    root: Arc<dyn datatab_core::Connection>,
+    database: Option<String>,
+}
+
+impl ExecutionSessionContext {
+    fn same_as(&self, other: &Self) -> bool {
+        self.database == other.database && Arc::ptr_eq(&self.root, &other.root)
+    }
+}
+
+pub struct CodeDocument {
+    // Identity
+    id: DocumentId,
+    title: String,
+    state: DocumentState,
+    connection_id: Option<Uuid>,
+    /// When true, the editor content must not be modified and query execution is blocked.
+    read_only: bool,
+    /// Deduplication key for routine definition documents. `None` for regular code documents.
+    routine_dedup: Option<(Uuid, String, String)>,
+    /// True when this is a routine document restored from a session without an active connection.
+    /// The definition will be fetched automatically once the profile connects.
+    routine_definition_pending: bool,
+
+    // Dependencies
+    app_state: Entity<AppStateEntity>,
+
+    // Editor: text input, file-backing, language mode, and diagnostics.
+    editor: EditorState,
+
+    // Execution context and associated source-control widgets.
+    source: SourceContext,
+
+    // Query execution state and result tabs.
+    execution: Execution,
+    execution_session: Arc<ExecutionSessionBinding>,
+    execution_session_context: Option<ExecutionSessionContext>,
+    result_tabs: ResultTabs,
+
+    // History modal, refresh timer, and schema drift modal.
+    history: HistoryState,
+    refresh: RefreshState,
+    drift: DriftState,
+
+    // Layout/focus
+    layout: SqlQueryLayout,
+    results_position: ResultsPosition,
+    focus_handle: FocusHandle,
+    focus_mode: SqlQueryFocus,
+    /// Keyboard focus for the multi-statement script confirmation.
+    script_confirm_focus: ModalFocus,
+    /// Keyboard focus for the dangerous query confirmation.
+    dangerous_query_focus: ModalFocus,
+    context_bar_slot: ContextBarSlot,
+    results_maximized: bool,
+
+    // Task runner (query execution)
+    runner: DocumentTaskRunner,
+
+    is_active_tab: bool,
+
+    // Pending file I/O
+    _pending_save: Option<Task<()>>,
+
+    // Serializes writes to the real file (autosave, explicit save, Save As)
+    // and tracks the on-disk baseline for external-change detection.
+    physical_writes: file_persistence::PhysicalWriteQueue,
+
+    // Session persistence (auto-save to disk).
+    session: SessionPersistence,
+
+    /// Deferred action slots drained at the top of each render cycle.
+    pending: PendingActions,
+
+    /// Set when a save was started by the interrupted-close flow, so a write
+    /// that lands also asks the workspace to close the tab.
+    close_after_save: bool,
+
+    /// Opt-in modal editing state for the editor.
+    vim: datatab_components::vim::VimBinding,
+}
+
+struct PendingQueryResult {
+    task_id: datatab_core::TaskId,
+    exec_id: Uuid,
+    query: String,
+    result: Result<QueryResult, DbError>,
+    /// Whether this execution is a script (vs a database query).
+    /// Determines the audit event category and whether connection context is required.
+    is_script: bool,
+    /// The read-only enforcement the execution requested.
+    read_only: ReadOnlyEnforcement,
+    /// The result tab a Load all rows run replaces, whichever tab is active.
+    result_grid: Option<gpui::EntityId>,
+    /// Where the query ran; `None` for a script.
+    origin: Option<ResultOrigin>,
+}
+
+pub(super) struct ActiveQueryTask {
+    task_id: datatab_core::TaskId,
+    target: TaskTarget,
+    uses_isolated_session: bool,
+}
+
+/// Pending dangerous query confirmation.
+struct PendingDangerousQuery {
+    query: String,
+    kind: DangerousQueryKind,
+    in_new_tab: bool,
+    /// The "Don't ask again" checkbox of the confirmation.
+    suppress: bool,
+}
+
+/// Pending confirmation for running a whole multi-statement script.
+///
+/// Raised when the user runs without a selection, the buffer holds more than
+/// one statement, and the driver advertises `MULTI_STATEMENT`, or when the
+/// statement under the cursor only opens or ends a transaction.
+struct PendingScriptConfirm {
+    query: String,
+    in_new_tab: bool,
+    statement_count: usize,
+    /// The transaction boundary under the cursor that a cursor run would have
+    /// executed alone; the confirmation offers to run just that statement.
+    cursor_statement: Option<CursorStatement>,
+}
+
+/// A statement of the buffer a run without a selection would execute.
+struct CursorStatement {
+    text: String,
+    origin: usize,
+    line: usize,
+    /// Whether the confirmation may offer the whole script: false on a
+    /// driver that cannot run a batch, where only this statement can run.
+    offers_script: bool,
+}
+
+/// Action resolved by the schema-drift modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriftAction {
+    /// Waiting for user response — do not execute yet.
+    Pending,
+    /// No drift (or driver doesn't support parsing) — execute immediately and
+    /// apply transparent cache refreshes first.
+    ExecuteNow,
+    /// User chose "Continue with stale schema" — proceed without touching the cache.
+    ContinueStale,
+}
+
+/// A query paused by the schema-drift preflight or drift modal awaiting execution.
+struct PendingDriftQuery {
+    query: String,
+    in_new_tab: bool,
+    action: DriftAction,
+    /// Cache updates to apply before execution when action is `ExecuteNow` or
+    /// after "Refresh & re-run". Each entry is `(TableKey, TableInfo)`, where
+    /// `TableKey` is `(database, schema, table)`.
+    cache_updates: Vec<(datatab_core::TableKey, datatab_core::TableInfo)>,
+    read_only: ReadOnlyEnforcement,
+}
+
+/// Record of a query execution.
+#[derive(Clone)]
+pub(crate) struct ExecutionRecord {
+    pub id: Uuid,
+    pub started_at: Instant,
+    pub finished_at: Option<Instant>,
+    pub result: Option<Arc<QueryResult>>,
+    pub error: Option<String>,
+    pub rows_affected: Option<u64>,
+    /// Whether this execution is a script (vs a database query).
+    /// Used to determine audit event category on cancellation.
+    pub is_script: bool,
+}
+
+impl CodeDocument {
+    pub fn new(
+        app_state: Entity<AppStateEntity>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let connection_id = app_state.read(cx).active_connection_id();
+
+        // Get query language from the active connection, default to SQL
+        let query_language = connection_id
+            .and_then(|id| app_state.read(cx).connections().get(&id))
+            .map(|conn| conn.connection.metadata().query_language.clone())
+            .unwrap_or(QueryLanguage::Sql);
+
+        Self::new_with_language(app_state, connection_id, query_language, window, cx)
+    }
+
+    /// Resolve the editor presentation profile for a document.
+    ///
+    /// Prefers the connected driver's `DriverMetadata::editor_profile()` so a
+    /// driver can override editor mode, completion engagement, placeholder, and
+    /// comment prefix (e.g. DynamoDB's PartiQL surface) without the UI branching
+    /// on a driver id. Falls back to deriving from `query_language` when the
+    /// connection is absent or its language no longer matches the document's
+    /// effective language (a source-context query-mode override).
+    pub(super) fn resolve_editor_profile(
+        app_state: &Entity<AppStateEntity>,
+        connection_id: Option<Uuid>,
+        query_language: &QueryLanguage,
+        cx: &App,
+    ) -> EditorLanguageProfile {
+        if let Some(connection_id) = connection_id
+            && let Some(connected) = app_state.read(cx).connections().get(&connection_id)
+        {
+            let metadata = connected.connection.metadata();
+            if &metadata.query_language == query_language {
+                return metadata.editor_profile();
+            }
+        }
+
+        EditorLanguageProfile::from_language(query_language)
+    }
+
+    /// Whether this document's editor is backed by a database connection
+    /// (versus an in-process script such as Lua/Bash/Python).
+    ///
+    /// Returns the cached profile value (refreshed on construction and whenever
+    /// the effective language is re-bound via `sync_editor_language`) so the
+    /// render and execution paths do not re-resolve and re-clone the editor
+    /// profile every frame. Drivers with a bespoke query surface (e.g. DynamoDB)
+    /// are recognized as connection-backed even when their `QueryLanguage` is
+    /// `Custom`, without the UI branching on a driver id.
+    pub(super) fn supports_connection_context(&self) -> bool {
+        self.editor.cached_supports_connection_context
+    }
+
+    /// The cached line-comment prefix for the editor's effective profile,
+    /// refreshed alongside `cached_supports_connection_context`.
+    pub(super) fn comment_prefix(&self) -> &str {
+        &self.editor.cached_comment_prefix
+    }
+
+    /// Create a document with an explicit language (used when opening files).
+    pub fn new_with_language(
+        app_state: Entity<AppStateEntity>,
+        connection_id: Option<Uuid>,
+        query_language: QueryLanguage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let editor_profile =
+            Self::resolve_editor_profile(&app_state, connection_id, &query_language, cx);
+        let editor_mode = editor_profile.editor_mode.clone();
+        let placeholder = editor_profile.placeholder.clone();
+
+        // An in-process script language (Lua/Python/Bash) is pinned on sight: no
+        // connection can turn a script buffer into a query buffer. Every other
+        // language starts out following the bound connection; `with_path` and
+        // `with_read_only` pin it afterwards for the documents whose language
+        // came from a file extension or a routine body.
+        let language_binding = if query_language.supports_connection_context() {
+            LanguageBinding::FollowsConnection
+        } else {
+            LanguageBinding::Pinned
+        };
+
+        let input_state = cx.new(|cx| {
+            let mut state = GpuiEditorState::new(window, cx)
+                .language(editor_mode)
+                .line_number(true)
+                .soft_wrap(false)
+                .placeholder(placeholder);
+            // The menu sizes itself to its longest item; allow database identifiers
+            // more room than the component's 320 px default, while keeping a cap.
+            state.lsp_mut().completion_menu.max_width = px(640.);
+            state
+        });
+
+        let completion_query_generation = Rc::new(std::cell::Cell::new(0u64));
+        let supports_connection_context = editor_profile.supports_connection_context;
+
+        let input_change_sub = cx.subscribe_in(
+            &input_state,
+            window,
+            |this, input, event: &InputEvent, _window, cx| match event {
+                InputEvent::Change => {
+                    this.finish_replace_once(_window, cx);
+                    this.refresh_statements(cx);
+                    let current_length = input.read(cx).text().len();
+                    let previous_length =
+                        std::mem::replace(&mut this.editor.last_change_length, current_length);
+                    // Consumed here, not cleared by the toggle itself: GPUI
+                    // delivers `emit` after the outermost update finishes, so a
+                    // toggle's Change arrives long after it returned.
+                    let toggled = std::mem::take(&mut this.editor.toggling_comment);
+
+                    let generation = this.editor.completion_query_generation.get();
+                    let provider_queried = generation != this.editor.last_completion_generation;
+                    this.editor.last_completion_generation = generation;
+
+                    if this.read_only {
+                        // Genuine user edit on a read-only document: revert once.
+                        // set_content is silent in 0.6.1 (set_value no longer
+                        // emits Change), so the revert cannot re-enter here.
+                        let original = this.editor.original_content.clone();
+                        this.set_content(&original, _window, cx);
+                    } else {
+                        if current_length < previous_length
+                            && !provider_queried
+                            && this.editor.current_editor_mode == "sql"
+                            && !toggled
+                        {
+                            // The menu plumbing ignores deletions once the menu
+                            // lost its trigger anchor, leaving a stale menu (or
+                            // none). No public API for either side: the cursor
+                            // move closes whatever is open, the zero-length edit
+                            // reopens a fresh menu at the new position. The
+                            // no-op edit joins the deletion's undo group, so
+                            // undo is unaffected.
+                            input.update(cx, |state, cx| {
+                                let position = state.cursor_position();
+                                state.set_cursor_position(position, _window, cx);
+                                state.replace_text_in_range(None, "", _window, cx);
+                            });
+                        }
+
+                        this.mark_dirty(cx);
+                        this.schedule_auto_save(cx);
+                        this.schedule_diagnostic_refresh(cx);
+                    }
+                }
+                InputEvent::Focus => {
+                    this.enter_editor_mode(cx);
+                }
+                InputEvent::Blur => {
+                    this.close_change_group_on_blur(cx);
+                }
+                InputEvent::PressEnter { .. } => {}
+            },
+        );
+
+        // Create the history panel — each closure captures a clone of app_state
+        // and reproduces the exact AppStateEntity mutation the panel calls.
+        let history_panel = cx.new(|cx| {
+            let app = app_state.clone();
+            HistoryPanel::new(
+                HistoryPanelCallbacks {
+                    history_provider: {
+                        let a = app.clone();
+                        Box::new(move |cx: &App| a.read(cx).history_entries().to_vec())
+                    },
+                    saved_provider: {
+                        let a = app.clone();
+                        Box::new(move |cx: &App| a.read(cx).saved_queries().to_vec())
+                    },
+                    on_save: {
+                        let a = app.clone();
+                        Box::new(move |q, cx| {
+                            a.update(cx, |s, _| {
+                                s.add_saved_query(q);
+                            });
+                        })
+                    },
+                    on_rename: {
+                        let a = app.clone();
+                        Box::new(move |id, name, sql, cx| {
+                            a.update(cx, |s, _| {
+                                s.update_saved_query(id, name, sql);
+                            });
+                        })
+                    },
+                    on_delete: {
+                        let a = app.clone();
+                        Box::new(move |id, cx| {
+                            a.update(cx, |s, _| {
+                                s.remove_saved_query(id);
+                            });
+                        })
+                    },
+                    on_toggle_favorite: {
+                        let a = app.clone();
+                        Box::new(move |id, cx| {
+                            a.update(cx, |s, _| {
+                                s.toggle_saved_query_favorite(id);
+                            });
+                        })
+                    },
+                    on_mark_used: {
+                        let a = app.clone();
+                        Box::new(move |id, cx| {
+                            a.update(cx, |s, _| {
+                                s.update_saved_query_last_used(id);
+                            });
+                        })
+                    },
+                },
+                window,
+                cx,
+            )
+        });
+
+        // Subscribe to history modal events
+        let query_selected_sub = cx.subscribe(
+            &history_panel,
+            |this, _, event: &HistoryQuerySelected, cx| {
+                this.pending.set_query = Some(event.clone());
+                cx.notify();
+            },
+        );
+
+        let history_closed_sub =
+            cx.subscribe(&history_panel, |this, _, _: &HistoryPanelClosed, cx| {
+                this.pending.history_focus_restore = true;
+                cx.notify();
+            });
+
+        // Create schema drift modal and wire up action subscriptions.
+        let schema_drift_modal = cx.new(ModalSchemaDrift::new);
+
+        let drift_refresh_sub = cx.subscribe(
+            &schema_drift_modal,
+            |this, _, _event: &SchemaDriftRefresh, cx| {
+                this.on_schema_drift_refresh(cx);
+            },
+        );
+
+        let drift_continue_sub = cx.subscribe(
+            &schema_drift_modal,
+            |this, _, _event: &SchemaDriftContinue, cx| {
+                this.on_schema_drift_continue(cx);
+            },
+        );
+
+        let drift_dismissed_sub = cx.subscribe(
+            &schema_drift_modal,
+            |this, _, _event: &SchemaDriftDismissed, cx| {
+                this.pending.drift_query = None;
+                cx.notify();
+            },
+        );
+
+        let runner = {
+            let mut r = DocumentTaskRunner::new(app_state.clone());
+            if let Some(pid) = connection_id {
+                r.set_profile_id(pid);
+            }
+            r
+        };
+
+        let default_refresh = app_state
+            .read(cx)
+            .effective_settings_for_connection(connection_id)
+            .resolve_refresh_policy();
+
+        let refresh_dropdown = cx.new(|_cx| {
+            let items = RefreshPolicy::ALL
+                .iter()
+                .map(|policy| DropdownItem::new(crate::labels::refresh_policy_label(*policy)))
+                .collect();
+
+            Dropdown::new("sql-auto-refresh")
+                .items(items)
+                .selected_index(Some(default_refresh.index()))
+                .aria_label(datatab_i18n::t!(
+                    "document.code.toolbar.auto_refresh_interval"
+                ))
+                .chevron_trigger(ButtonVariant::Secondary)
+        });
+
+        let refresh_policy_sub = cx.subscribe_in(
+            &refresh_dropdown,
+            window,
+            |this, _, event: &DropdownSelectionChanged, _window, cx| {
+                let policy = RefreshPolicy::from_index(event.index);
+
+                if policy.is_auto() && !this.can_auto_refresh(cx) {
+                    this.refresh.refresh_dropdown.update(cx, |dd, cx| {
+                        dd.set_selected_index(Some(RefreshPolicy::Manual.index()), cx);
+                    });
+                    Toast::warning(datatab_i18n::t!(
+                        "document.code.execution.toast.auto_refresh_blocked"
+                    ))
+                    .meta_right(now_hms())
+                    .push(cx);
+                    return;
+                }
+
+                this.set_refresh_policy(policy, cx);
+            },
+        );
+
+        let doc_id = DocumentId::new();
+
+        let scratch_path = Some(
+            app_state
+                .read(cx)
+                .scratch_path(&doc_id.0.to_string(), query_language.default_extension()),
+        );
+
+        let initial_database = connection_id.and_then(|id| {
+            let connections = app_state.read(cx).connections();
+            let connected = connections.get(&id)?;
+
+            connected.active_database.clone().or_else(|| {
+                connected
+                    .schema
+                    .as_ref()
+                    .and_then(|s| s.current_database().map(String::from))
+            })
+        });
+
+        let mut exec_ctx = ExecutionContext {
+            connection_id,
+            database: initial_database,
+            ..Default::default()
+        };
+
+        // Pre-select "public" schema when available (PostgreSQL default).
+        let schema_items = Self::schema_items_for_connection(&app_state, &exec_ctx, cx);
+        if schema_items
+            .iter()
+            .any(|item| item.value.as_ref() == "public")
+        {
+            exec_ctx.schema = Some("public".to_string());
+        }
+
+        let completion_provider: Rc<dyn CompletionProvider> =
+            Rc::new(QueryCompletionProvider::new(
+                query_language.clone(),
+                app_state.clone(),
+                connection_id,
+                exec_ctx.database.clone(),
+                exec_ctx.schema.clone(),
+                completion_query_generation.clone(),
+            ));
+
+        let code_action_provider: Rc<dyn CodeActionProvider> = Rc::new(SqlCodeActionProvider::new(
+            app_state.clone(),
+            connection_id,
+            exec_ctx.database.clone(),
+        ));
+
+        input_state.update(cx, |state, _cx| {
+            state.lsp_mut().completion_provider =
+                supports_connection_context.then_some(completion_provider.clone());
+            state.lsp_mut().code_action_providers = vec![code_action_provider.clone()];
+        });
+
+        let (connection_dropdown, conn_sub) =
+            Self::create_connection_dropdown(&app_state, &exec_ctx, window, cx);
+        let (database_dropdown, db_sub) =
+            Self::create_database_dropdown(&app_state, &exec_ctx, window, cx);
+        let (schema_dropdown, schema_sub) =
+            Self::create_schema_dropdown(&app_state, &exec_ctx, window, cx);
+        let source_query_mode_dropdown = cx.new(|_cx| {
+            Dropdown::new("ctx-source-query-mode")
+                .placeholder(datatab_i18n::t!(
+                    "document.code.context_bar.fallback.syntax"
+                ))
+                .toolbar_style(true)
+        });
+        // bare() suppresses the trigger's own border/background because the
+        // context bar wraps this in control_shell which provides the chrome.
+        let source_targets = cx.new(|_cx| {
+            MultiSelect::new("ctx-source-targets")
+                .bare()
+                .placeholder(datatab_i18n::t!(
+                    "document.code.context_bar.fallback.sources"
+                ))
+        });
+        let source_start_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("2026-04-24T00:00:00Z"));
+        let source_end_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("2026-04-24T01:00:00Z"));
+        let source_query_mode_sub = cx.subscribe_in(
+            &source_query_mode_dropdown,
+            window,
+            |this, _, event: &DropdownSelectionChanged, _window, cx| {
+                this.on_source_query_mode_changed(&event.item, cx);
+            },
+        );
+        let source_targets_sub = cx.subscribe(
+            &source_targets,
+            |this, entity, _event: &MultiSelectChanged, cx| {
+                let selected_targets = entity
+                    .read(cx)
+                    .selected_values()
+                    .iter()
+                    .map(|value| value.to_string())
+                    .collect::<Vec<_>>();
+
+                this.on_source_targets_changed(selected_targets, cx);
+            },
+        );
+        let source_start_sub = cx.subscribe_in(
+            &source_start_input,
+            window,
+            |this, _input, event: &InputEvent, _window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.on_source_time_range_changed(cx);
+                }
+            },
+        );
+        let source_end_sub = cx.subscribe_in(
+            &source_end_input,
+            window,
+            |this, _input, event: &InputEvent, _window, cx| {
+                if matches!(event, InputEvent::Change) {
+                    this.on_source_time_range_changed(cx);
+                }
+            },
+        );
+        let app_state_sub = cx.subscribe(&app_state, |this, _, _: &AppStateChanged, cx| {
+            this.invalidate_execution_session_if_context_changed(cx);
+            this.sync_external_query_cancellation(cx);
+            this.sync_context_dropdowns(cx);
+            this.try_fetch_pending_routine_definition(cx);
+            this.sync_vim_setting(cx);
+        });
+
+        let refresh_policy = default_refresh;
+
+        let vim = datatab_components::vim::VimBinding::new(input_state.clone(), window, cx);
+        let results_position = ResultsPosition::load(app_state.read(cx));
+
+        let mut document = Self {
+            id: doc_id,
+            title: "Query 1".to_string(),
+            state: DocumentState::Clean,
+            connection_id,
+            read_only: false,
+            routine_dedup: None,
+            routine_definition_pending: false,
+            app_state,
+            editor: EditorState {
+                input_state,
+                _input_subscriptions: vec![input_change_sub],
+                original_content: String::new(),
+                saved_query_id: None,
+                current_editor_mode: editor_profile.editor_mode.clone(),
+                cached_supports_connection_context: editor_profile.supports_connection_context,
+                cached_comment_prefix: editor_profile.comment_prefix.clone(),
+                diagnostic_request_id: 0,
+                _diagnostic_debounce: None,
+                path: None,
+                is_dirty: false,
+                last_change_length: 0,
+                toggling_comment: false,
+                completion_query_generation,
+                last_completion_generation: 0,
+                cached_effective_language: query_language.clone(),
+                language_binding,
+                query_language,
+                statement_ranges: None,
+                gutter_style: None,
+                gutter_shown: false,
+            },
+            source: SourceContext {
+                exec_ctx,
+                connection_dropdown,
+                database_dropdown,
+                schema_dropdown,
+                source_query_mode_dropdown,
+                source_targets,
+                source_start_input,
+                source_end_input,
+                source_seed_suppress: 0,
+                source_time_range_panel: None,
+                _source_time_range_sub: None,
+                _context_subscriptions: vec![
+                    conn_sub,
+                    db_sub,
+                    schema_sub,
+                    source_query_mode_sub,
+                    source_targets_sub,
+                    source_start_sub,
+                    source_end_sub,
+                    app_state_sub,
+                ],
+            },
+            execution: Execution {
+                execution_history: Vec::new(),
+                active_execution_index: None,
+                live_output: None,
+                _live_output_drain: None,
+                active_query_task: None,
+                query_origin: None,
+                load_all_rows: None,
+            },
+            execution_session: ExecutionSessionBinding::new(),
+            execution_session_context: None,
+            result_tabs: ResultTabs {
+                result_tabs: Vec::new(),
+                active_result_index: None,
+                result_tab_counter: 0,
+                run_in_new_tab: false,
+            },
+            history: HistoryState {
+                history_panel,
+                _history_subscriptions: vec![query_selected_sub, history_closed_sub],
+            },
+            layout: SqlQueryLayout::EditorOnly,
+            results_position,
+            focus_handle: cx.focus_handle(),
+            focus_mode: SqlQueryFocus::Editor,
+            script_confirm_focus: ModalFocus::new(cx),
+            dangerous_query_focus: ModalFocus::new(cx),
+            context_bar_slot: ContextBarSlot::Connection,
+            results_maximized: false,
+            runner,
+            refresh: RefreshState {
+                refresh_policy,
+                refresh_dropdown,
+                _refresh_timer: None,
+                _refresh_subscriptions: vec![refresh_policy_sub],
+            },
+            is_active_tab: true,
+            drift: DriftState {
+                schema_drift_modal,
+                _schema_drift_subscriptions: vec![
+                    drift_refresh_sub,
+                    drift_continue_sub,
+                    drift_dismissed_sub,
+                ],
+                preflight_running: false,
+            },
+            _pending_save: None,
+            physical_writes: file_persistence::PhysicalWriteQueue::new(),
+            session: SessionPersistence {
+                scratch_path,
+                shadow_path: None,
+                _auto_save_debounce: None,
+                show_saved_label: false,
+                _saved_label_timer: None,
+                shutdown_flush_written: None,
+            },
+            pending: PendingActions::default(),
+            close_after_save: false,
+            vim,
+        };
+
+        document.sync_context_dropdowns(cx);
+        document.sync_vim_setting(cx);
+        document
+    }
+
+    /// Whether the query an auto-refresh would run may run unattended: it is a
+    /// single read, checked on exactly the text that runs (the selection when
+    /// there is one), and the connection's driver enforces read-only
+    /// execution for it.
+    pub fn can_auto_refresh(&self, cx: &App) -> bool {
+        let (query, _from_selection) = self.auto_refresh_query(cx);
+
+        self.connection_enforces_read_only(cx) && datatab_core::is_safe_read_query(&query)
+    }
+
+    fn connection_enforces_read_only(&self, cx: &App) -> bool {
+        self.connection_id
+            .and_then(|id| self.app_state.read(cx).connections().get(&id))
+            .is_some_and(|connected| connected.connection.metadata().enforces_read_only())
+    }
+
+    /// Returns the full editor content trimmed, or `None` when blank.
+    ///
+    /// Used by the "New chart from current query" command to seed a new `ChartDocument`.
+    pub fn current_query_text(&self, cx: &App) -> Option<String> {
+        let text = self.editor.input_state.read(cx).value().trim().to_string();
+        if text.is_empty() { None } else { Some(text) }
+    }
+
+    /// Emit a `ChartThisQuery` event with the current editor text.
+    ///
+    /// Wired to the editor toolbar "Chart" button. When the editor is blank,
+    /// surfaces a toast instead of emitting so the user gets feedback.
+    pub fn emit_chart_this_query(&mut self, cx: &mut Context<Self>) {
+        let Some(query) = self.current_query_text(cx) else {
+            Toast::warning(datatab_i18n::t!(
+                "document.code.execution.toast.write_query_first"
+            ))
+            .meta_right(now_hms())
+            .push(cx);
+            return;
+        };
+
+        cx.emit(DocumentEvent::ChartThisQuery {
+            query,
+            connection_id: self.connection_id,
+        });
+    }
+
+    /// Records whether this tab is the active one and, on activation, lets the
+    /// visible result grid re-mount whatever it owns in the shared inspector
+    /// rail. The workspace hides the rail before every activation, so only
+    /// activation is forwarded. A result grid's own active flag gates nothing
+    /// but its refresh timer, which result grids have always run as active.
+    pub fn set_active_tab(&mut self, active: bool, cx: &mut Context<Self>) {
+        self.is_active_tab = active;
+
+        if active && let Some(grid) = self.active_result_grid() {
+            grid.update(cx, |grid, cx| grid.set_active_tab(true, cx));
+        }
+    }
+
+    /// Drops every result grid's inspector state after the user dismissed the
+    /// workspace rail, so no grid re-opens it on the next activation.
+    pub fn mark_inspector_closed(&mut self, cx: &mut Context<Self>) {
+        for tab in &self.result_tabs.result_tabs {
+            tab.grid
+                .update(cx, |grid, cx| grid.clear_inspector_state(cx));
+        }
+    }
+
+    pub fn set_refresh_policy(&mut self, policy: RefreshPolicy, cx: &mut Context<Self>) {
+        if self.refresh.refresh_policy == policy {
+            return;
+        }
+
+        self.refresh.refresh_policy = policy;
+        self.update_refresh_timer(cx);
+        cx.notify();
+    }
+
+    fn update_refresh_timer(&mut self, cx: &mut Context<Self>) {
+        self.refresh._refresh_timer = None;
+
+        let Some(duration) = self.refresh.refresh_policy.duration() else {
+            return;
+        };
+
+        self.refresh._refresh_timer = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(duration).await;
+
+                cx.update(|cx| {
+                    let Some(entity) = this.upgrade() else {
+                        return;
+                    };
+
+                    entity.update(cx, |doc, cx| {
+                        if !doc.refresh.refresh_policy.is_auto() || doc.runner.is_primary_active() {
+                            return;
+                        }
+
+                        let settings = doc.app_state.read(cx).general_settings();
+
+                        if settings.auto_refresh_pause_on_error && doc.state == DocumentState::Error
+                        {
+                            return;
+                        }
+
+                        if settings.auto_refresh_only_if_visible && !doc.is_active_tab {
+                            return;
+                        }
+
+                        doc.pending.auto_refresh = true;
+                        cx.notify();
+                    });
+                });
+            }
+        }));
+    }
+
+    /// Sets the document content (without marking dirty).
+    ///
+    /// `set_value` no longer emits `Change` in 0.6.1, so a programmatic load
+    /// cannot reach the dirty-marking handler at all.
+    pub fn set_content(&mut self, sql: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let sql_owned = sql.to_string();
+        self.editor
+            .input_state
+            .update(cx, |state, cx| state.set_value(&sql_owned, window, cx));
+        self.editor.original_content = sql_owned;
+        self.editor.is_dirty = false;
+        self.refresh_editor_diagnostics(window, cx);
+        self.refresh_statements(cx);
+    }
+
+    /// Creates document with specific title.
+    pub fn with_title(mut self, title: String) -> Self {
+        self.title = title;
+        self
+    }
+
+    /// Attach a file path (used after opening or "Save As").
+    ///
+    /// This pins the language: the file's extension chose it, so retargeting the
+    /// document at another connection must not override it.
+    pub fn with_path(mut self, path: PathBuf) -> Self {
+        self.editor.path = Some(path);
+        self.editor.language_binding = LanguageBinding::Pinned;
+        self.editor.cached_effective_language = self.editor.query_language.clone();
+        self
+    }
+
+    /// Records the raw bytes currently on disk at `path` as this document's
+    /// physical baseline.
+    ///
+    /// Autosave conflict-checks the file against exactly these bytes before
+    /// writing, so the baseline must be what the file holds, paired with the path
+    /// it came from: bytes loaded from one file never authorize a write to
+    /// another. Callers seed it only after a successful create, load, or landed
+    /// write. A document with no baseline refuses to autosave rather than create
+    /// or overwrite a file it never read.
+    pub fn seed_file_baseline(&mut self, path: PathBuf, bytes: String) {
+        self.physical_writes
+            .adopt_baseline(Some(file_persistence::FileBaseline::new(path, bytes)));
+    }
+
+    /// Mark the document as read-only: blocks query execution, dirty marking,
+    /// and all text editing. Completion is also disabled so no autocomplete
+    /// popup appears on focus or key events.
+    pub fn with_read_only(mut self, cx: &mut Context<Self>) -> Self {
+        self.read_only = true;
+
+        // A read-only document shows a fixed body (a routine definition), not a
+        // buffer the user retargets at another connection.
+        self.editor.language_binding = LanguageBinding::Pinned;
+        self.editor.cached_effective_language = self.editor.query_language.clone();
+
+        // Disable the LSP completion provider so no autocomplete popup fires
+        // when the user focuses or types (which would otherwise happen because
+        // the Input component receives key events before the disabled guard
+        // blocks the actual text insertion).
+        self.editor.input_state.update(cx, |state, _cx| {
+            state.lsp_mut().completion_provider = None;
+            state.lsp_mut().code_action_providers = Vec::new();
+        });
+
+        self
+    }
+
+    /// Set a routine deduplication key so this document can be detected as
+    /// already-open by `DocumentKey::Routine` lookups.
+    pub fn with_routine_dedup(
+        mut self,
+        profile_id: Uuid,
+        schema: String,
+        specific_name: String,
+    ) -> Self {
+        self.routine_dedup = Some((profile_id, schema, specific_name));
+        self
+    }
+
+    /// Mark this routine document as awaiting its definition from the database.
+    ///
+    /// When set, a placeholder is shown until the connection becomes available
+    /// and the definition is fetched via `routine_definition`.
+    pub fn with_routine_definition_pending(mut self) -> Self {
+        self.routine_definition_pending = true;
+        self
+    }
+
+    /// Returns true when this document is showing the "connect to view" placeholder.
+    pub fn is_routine_definition_pending(&self) -> bool {
+        self.routine_definition_pending
+    }
+
+    /// If this document is awaiting a routine definition and the profile connection
+    /// is now active, spawn a background fetch and populate the editor on success.
+    ///
+    /// Called from the `AppStateChanged` subscription so that session-restored
+    /// routine docs automatically load their definition on connect.
+    pub fn try_fetch_pending_routine_definition(&mut self, cx: &mut Context<Self>) {
+        let Some((profile_id, schema, specific_name)) = self.routine_dedup.clone() else {
+            return;
+        };
+
+        if !self.routine_definition_pending {
+            return;
+        }
+
+        let connections = self.app_state.read(cx).connections();
+        let Some(connected) = connections.get(&profile_id) else {
+            return;
+        };
+
+        let database = connected
+            .active_database
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        let connection = connected.connection.clone();
+
+        let specific_name_for_log = specific_name.clone();
+
+        cx.spawn(async move |this, cx| {
+            let result =
+                cx.background_executor()
+                    .spawn(async move {
+                        connection.routine_definition(&database, &schema, &specific_name)
+                    })
+                    .await;
+
+            cx.update(|cx| {
+                this.update(cx, |doc, cx| {
+                    match result {
+                        Ok(body) => {
+                            doc.routine_definition_pending = false;
+                            // set_content requires Window, use pending path to defer to render cycle.
+                            doc.pending.routine_definition = Some(body);
+                            cx.notify();
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to fetch pending routine definition for {}: {}",
+                                specific_name_for_log,
+                                e
+                            );
+                            doc.routine_definition_pending = false;
+                            doc.pending.routine_definition =
+                                Some(format!("-- Failed to load routine definition:\n-- {}", e));
+                            cx.notify();
+                        }
+                    }
+                })
+                .ok();
+            });
+        })
+        .detach();
+    }
+
+    /// Set the execution context (e.g. parsed from file header).
+    pub fn with_exec_ctx(mut self, ctx: ExecutionContext, cx: &mut Context<Self>) -> Self {
+        self.invalidate_execution_session(cx);
+        self.pending.source_input_values = ctx
+            .source
+            .as_ref()
+            .and_then(source_input_values_from_context);
+        self.connection_id = ctx.connection_id;
+        self.source.exec_ctx = ctx;
+        self.sync_context_dropdowns(cx);
+        self
+    }
+
+    fn invalidate_execution_session_if_context_changed(&mut self, cx: &mut Context<Self>) {
+        let Some(bound) = self.execution_session_context.as_ref() else {
+            return;
+        };
+
+        let unchanged = self
+            .current_execution_context(cx)
+            .is_some_and(|current| current.same_as(bound));
+
+        if !unchanged {
+            self.invalidate_execution_session(cx);
+        }
+    }
+
+    /// The connection and database the next query would run on.
+    fn current_execution_context(&self, cx: &App) -> Option<ExecutionSessionContext> {
+        let app_state = self.app_state.read(cx);
+        let connected = app_state.connections().get(&self.connection_id?)?;
+        let database = self
+            .source
+            .exec_ctx
+            .database
+            .clone()
+            .or_else(|| connected.active_database.clone());
+        connected
+            .resolve_connection_for_execution(database.as_deref())
+            .ok()
+            .map(|root| ExecutionSessionContext { root, database })
+    }
+
+    /// Invalidates before detached background cleanup; no document entity is retained.
+    pub(super) fn invalidate_execution_session(&mut self, cx: &mut Context<Self>) {
+        self.execution_session_context = None;
+        let generation = self.execution_session.invalidate();
+        let binding = self.execution_session.clone();
+        let cleanup = cx
+            .background_executor()
+            .spawn(async move { binding.close_invalidated(generation) });
+        cx.spawn(async move |_this, cx| {
+            if let Err(error) = cleanup.await {
+                datatab_ui_base::user_error::report_error_async(
+                    datatab_ui_base::user_error::UserFacingError::new(
+                        datatab_ui_base::user_error::ErrorKind::Driver,
+                        "Could not confirm cleanup of the editor execution session",
+                    )
+                    .with_cause(error.to_string()),
+                    cx,
+                );
+            }
+        })
+        .detach();
+    }
+
+    // === File backing ===
+
+    pub fn path(&self) -> Option<&PathBuf> {
+        self.editor.path.as_ref()
+    }
+
+    pub fn is_file_backed(&self) -> bool {
+        self.editor.path.is_some()
+    }
+
+    #[allow(dead_code)]
+    pub fn query_language(&self) -> QueryLanguage {
+        self.effective_language().clone()
+    }
+
+    /// The language this editor currently presents and classifies with.
+    ///
+    /// This is the cached `resolve_effective_language` result, so for an
+    /// unpinned document it tracks the bound connection. Every consumer that
+    /// drives user-visible or governance behaviour — highlighting, time-macro
+    /// substitution, statement counting, dangerous-query classification — must
+    /// read this rather than `editor.query_language`.
+    pub(super) fn effective_language(&self) -> &QueryLanguage {
+        &self.editor.cached_effective_language
+    }
+
+    /// Returns true if the editor content is empty or whitespace-only.
+    pub fn is_content_empty(&self, cx: &App) -> bool {
+        self.editor.input_state.read(cx).value().trim().is_empty()
+    }
+
+    fn mark_dirty(&mut self, cx: &mut Context<Self>) {
+        if !self.editor.is_dirty {
+            self.editor.is_dirty = true;
+
+            if self.is_file_backed() && self.session.shadow_path.is_none() {
+                self.session.shadow_path =
+                    Some(self.app_state.read(cx).shadow_path(&self.id.0.to_string()));
+            }
+
+            cx.emit(DocumentEvent::MetaChanged);
+            cx.notify();
+        }
+    }
+
+    fn mark_clean(&mut self, cx: &mut Context<Self>) {
+        if self.editor.is_dirty {
+            self.editor.is_dirty = false;
+            self.editor.original_content = self.editor.input_state.read(cx).value().to_string();
+            self.session._auto_save_debounce = None;
+
+            if let Some(shadow) = self.session.shadow_path.take()
+                && let Err(e) = std::fs::remove_file(&shadow)
+            {
+                log::warn!(
+                    "Failed to remove the session shadow {}: {e}; a stale copy may be restored on the next launch",
+                    shadow.display()
+                );
+            }
+
+            cx.emit(DocumentEvent::MetaChanged);
+            cx.notify();
+        }
+    }
+
+    /// Marks the buffer clean against the text a finished write captured.
+    ///
+    /// The user can keep typing while a write is in flight, so the buffer may no
+    /// longer match what landed. It then stays dirty against that text — now the
+    /// on-disk baseline — and reports `false`, so a close waiting on the save
+    /// keeps the tab open instead of discarding the newer edits. The debounce
+    /// armed for those newer edits is deliberately left running: cancelling it
+    /// here would strand the latest text until the user typed again.
+    fn mark_clean_against(&mut self, saved_input: &str, cx: &mut Context<Self>) -> bool {
+        if self.editor.input_state.read(cx).value() != saved_input {
+            self.editor.original_content = saved_input.to_string();
+            self.editor.is_dirty = true;
+            cx.emit(DocumentEvent::MetaChanged);
+            cx.notify();
+            return false;
+        }
+
+        self.mark_clean(cx);
+        true
+    }
+
+    // === Accessors for DocumentHandle ===
+
+    pub fn id(&self) -> DocumentId {
+        self.id
+    }
+
+    pub fn title(&self) -> String {
+        if let Some(path) = &self.editor.path {
+            let untitled = datatab_i18n::t!("document.code.title.untitled");
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(untitled.as_str());
+
+            if self.editor.is_dirty {
+                format!("{}*", name)
+            } else {
+                name.to_string()
+            }
+        } else {
+            self.title.clone()
+        }
+    }
+
+    pub fn state(&self) -> DocumentState {
+        self.state
+    }
+
+    pub fn refresh_policy(&self) -> RefreshPolicy {
+        self.refresh.refresh_policy
+    }
+
+    pub fn connection_id(&self) -> Option<Uuid> {
+        self.connection_id
+    }
+
+    #[allow(dead_code)]
+    pub fn exec_ctx(&self) -> &ExecutionContext {
+        &self.source.exec_ctx
+    }
+
+    pub fn scratch_path(&self) -> Option<&PathBuf> {
+        self.session.scratch_path.as_ref()
+    }
+
+    pub fn shadow_path(&self) -> Option<&PathBuf> {
+        self.session.shadow_path.as_ref()
+    }
+
+    /// Override session paths (used during session restore).
+    pub fn set_session_paths(&mut self, scratch: Option<PathBuf>, shadow: Option<PathBuf>) {
+        self.session.scratch_path = scratch;
+        self.session.shadow_path = shadow;
+    }
+
+    /// Mark the document as dirty without assigning a new shadow path.
+    /// Used during session restore when we already have the shadow from the manifest.
+    pub fn restore_dirty(&mut self, cx: &mut Context<Self>) {
+        if !self.editor.is_dirty {
+            self.editor.is_dirty = true;
+            cx.emit(DocumentEvent::MetaChanged);
+            cx.notify();
+        }
+    }
+
+    pub fn can_close(&self, cx: &App) -> bool {
+        !self.has_unsaved_changes(cx)
+    }
+
+    pub fn has_unsaved_changes(&self, cx: &App) -> bool {
+        if self.is_file_backed() {
+            return self.editor.is_dirty;
+        }
+
+        let current = self.editor.input_state.read(cx).value();
+        current != self.editor.original_content
+    }
+
+    /// Counts lines added and removed relative to `original_content`.
+    pub fn diff_stats(&self, cx: &App) -> (usize, usize) {
+        let current = self.editor.input_state.read(cx).value().to_string();
+        diff_stats_from_pair(&self.editor.original_content, &current)
+    }
+
+    /// Short summary of pending edits for the dirty-dot tooltip.
+    ///
+    /// Returns `None` when the document has no unsaved changes.
+    pub fn change_summary(&self, cx: &App) -> Option<String> {
+        let (added, removed) = self.diff_stats(cx);
+
+        if added == 0 && removed == 0 {
+            None
+        } else {
+            Some(format!("+{}/−{} lines", added, removed))
+        }
+    }
+
+    // === Command Dispatch ===
+
+    /// Route commands to the history panel while it owns the keyboard.
+    fn dispatch_to_history_panel(
+        &mut self,
+        cmd: Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        match cmd {
+            Command::Cancel => {
+                self.history
+                    .history_panel
+                    .update(cx, |panel, cx| panel.cancel(window, cx));
+                true
+            }
+            Command::SelectNext => {
+                self.history
+                    .history_panel
+                    .update(cx, |panel, cx| panel.select_next(cx));
+                true
+            }
+            Command::SelectPrev => {
+                self.history
+                    .history_panel
+                    .update(cx, |panel, cx| panel.select_prev(cx));
+                true
+            }
+            Command::Execute => {
+                self.history
+                    .history_panel
+                    .update(cx, |panel, cx| panel.execute_selected(window, cx));
+                true
+            }
+            Command::Delete => {
+                self.history
+                    .history_panel
+                    .update(cx, |panel, cx| panel.delete_selected(cx));
+                true
+            }
+            Command::ToggleFavorite => {
+                self.history
+                    .history_panel
+                    .update(cx, |panel, cx| panel.toggle_favorite_selected(cx));
+                true
+            }
+            Command::Rename => {
+                self.history
+                    .history_panel
+                    .update(cx, |panel, cx| panel.start_rename_selected(window, cx));
+                true
+            }
+            Command::FocusSearch => {
+                self.history
+                    .history_panel
+                    .update(cx, |panel, cx| panel.focus_search(window, cx));
+                true
+            }
+            Command::SaveQuery => {
+                self.history
+                    .history_panel
+                    .update(cx, |panel, cx| panel.save_selected_history(window, cx));
+                true
+            }
+            Command::NextPanelTab | Command::PrevPanelTab => {
+                self.history
+                    .history_panel
+                    .update(cx, |panel, cx| panel.step_tab(cx));
+                true
+            }
+            // Other commands are not handled by the modal
+            _ => false,
+        }
+    }
+
+    pub fn dispatch_command(
+        &mut self,
+        cmd: Command,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        // When dangerous query confirmation is showing, handle only modal commands
+        if self.pending.dangerous_query.is_some() {
+            match cmd {
+                Command::Cancel => {
+                    self.cancel_dangerous_query(window, cx);
+                    return true;
+                }
+                Command::Execute => {
+                    self.confirm_dangerous_query(false, window, cx);
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+
+        // Same for the multi-statement script confirmation.
+        if self.pending.script_confirm.is_some() {
+            match cmd {
+                Command::Cancel => {
+                    self.cancel_script_query(window, cx);
+                    return true;
+                }
+                Command::Execute => {
+                    self.confirm_script_query(window, cx);
+                    return true;
+                }
+                _ => return false,
+            }
+        }
+
+        // While the history panel owns the keyboard, route commands to it first
+        if self.history.history_panel.read(cx).owns_keyboard()
+            && self.dispatch_to_history_panel(cmd, window, cx)
+        {
+            return true;
+        }
+
+        // Always land in the text: FocusUp from it would move into the context bar.
+        if cmd == Command::FocusEditor {
+            self.reveal_editor(cx);
+            self.exit_context_bar(window, cx);
+            return true;
+        }
+
+        // When focused on results, delegate to active DataGridPanel
+        if self.focus_mode == SqlQueryFocus::Results
+            && let Some(grid) = self.active_result_grid()
+        {
+            // Special handling for FocusUp to exit results
+            if cmd == Command::FocusUp {
+                self.reveal_editor(cx);
+                self.focus_mode = SqlQueryFocus::Editor;
+                self.editor
+                    .input_state
+                    .update(cx, |state, cx| state.focus(window, cx));
+                cx.notify();
+                return true;
+            }
+
+            // Delegate to grid
+            let handled = grid.update(cx, |g, cx| g.dispatch_command(cmd, window, cx));
+            if handled {
+                return true;
+            }
+        }
+
+        if self.focus_mode == SqlQueryFocus::ContextBar
+            && self.dispatch_context_bar_command(cmd, window, cx)
+        {
+            return true;
+        }
+
+        match cmd {
+            Command::RunQuery => {
+                self.run_query(window, cx);
+                true
+            }
+            Command::RunQueryInNewTab => {
+                self.run_query_in_new_tab(window, cx);
+                true
+            }
+            Command::ExplainQuery => {
+                self.run_explain(window, cx);
+                true
+            }
+            Command::ToggleComment => self.toggle_comment(window, cx),
+            Command::Cancel | Command::CancelQuery if self.runner.is_primary_active() => {
+                self.cancel_query(cx);
+                true
+            }
+            Command::Cancel | Command::CancelQuery => false,
+
+            Command::FocusUp if self.focus_mode == SqlQueryFocus::Editor => {
+                self.enter_context_bar(window, cx);
+                true
+            }
+
+            Command::FocusDown
+                if self.focus_mode == SqlQueryFocus::Editor
+                    && !self.result_tabs.result_tabs.is_empty() =>
+            {
+                self.focus_mode = SqlQueryFocus::Results;
+                if let Some(grid) = self.active_result_grid() {
+                    grid.update(cx, |g, cx| g.focus_active_view(window, cx));
+                }
+                cx.notify();
+                true
+            }
+            Command::FocusDown => false,
+
+            // Layout toggles: the header's hide and maximize buttons.
+            Command::ToggleEditor => {
+                if self.layout == SqlQueryLayout::EditorOnly {
+                    self.layout = SqlQueryLayout::Split;
+                    cx.notify();
+                } else {
+                    self.hide_results_from_keyboard(window, cx);
+                }
+                true
+            }
+            Command::ToggleResults | Command::TogglePanel => {
+                self.toggle_maximize_results(cx);
+                true
+            }
+            Command::ToggleResultsPosition => {
+                self.toggle_results_position(cx);
+                true
+            }
+
+            Command::NextResultTab => self.step_result_tab(true, window, cx),
+            Command::PrevResultTab => self.step_result_tab(false, window, cx),
+            Command::CloseResultTab => self.close_active_result_tab(window, cx),
+
+            // History panel commands
+            Command::ToggleHistoryDropdown => {
+                let is_open = self.history.history_panel.read(cx).is_visible();
+                if is_open {
+                    self.history
+                        .history_panel
+                        .update(cx, |panel, cx| panel.close(cx));
+                } else {
+                    self.history
+                        .history_panel
+                        .update(cx, |panel, cx| panel.open(window, cx));
+                }
+                true
+            }
+            Command::OpenSavedQueries => {
+                self.history
+                    .history_panel
+                    .update(cx, |panel, cx| panel.open_saved_tab(window, cx));
+                true
+            }
+            Command::SaveQuery => {
+                if self.is_file_backed() {
+                    self.save_file(window, cx);
+                } else {
+                    self.save_file_as(window, cx);
+                }
+                true
+            }
+
+            Command::SaveFileAs => {
+                self.save_file_as(window, cx);
+                true
+            }
+
+            _ => false,
+        }
+    }
+
+    /// Emits an audit event for a query or script execution.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_audit_event(
+        &self,
+        cx: &mut Context<Self>,
+        category: EventCategory,
+        action: AuditAction,
+        outcome: EventOutcome,
+        summary: String,
+        query: Option<&str>,
+        duration_ms: Option<i64>,
+        error: Option<&str>,
+        metadata_extra: Option<&std::collections::HashMap<String, serde_json::Value>>,
+    ) {
+        // Scripts don't require a connection context
+        let (conn_id, database_name, driver_id) = if category == EventCategory::Script {
+            (None, None, None)
+        } else {
+            let Some(conn_id) = self.connection_id else {
+                // For non-script queries, require connection context
+                return;
+            };
+            let (database_name, driver_id) = self
+                .app_state
+                .read(cx)
+                .connections()
+                .get(&conn_id)
+                .map(|c| {
+                    let db = self
+                        .source
+                        .exec_ctx
+                        .database
+                        .clone()
+                        .or(c.active_database.clone());
+                    (Some(db.unwrap_or_default()), Some(c.profile.driver_id()))
+                })
+                .unwrap_or((None, None));
+            (Some(conn_id), database_name, driver_id)
+        };
+
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        let severity = match outcome {
+            EventOutcome::Success => EventSeverity::Info,
+            EventOutcome::Failure => EventSeverity::Error,
+            EventOutcome::Cancelled => EventSeverity::Warn,
+            EventOutcome::Pending => EventSeverity::Debug,
+        };
+
+        let mut event = EventRecord::new(ts_ms, severity, category, outcome)
+            .with_typed_action(action)
+            .with_summary(&summary);
+
+        if let Some(conn_id) = conn_id
+            && let (Some(db), Some(driver)) = (database_name, driver_id)
+        {
+            event = event.with_connection_context(conn_id.to_string(), db, driver);
+        }
+
+        if category == EventCategory::Script {
+            event = event.with_origin(EventOrigin::script());
+        } else {
+            event = event.with_origin(EventOrigin::local());
+        }
+
+        // Build details_json from the query text and any driver-provided extra fields.
+        // The extra fields let drivers surface structured context (e.g., language, version,
+        // injected window) without requiring driver-id branching here.
+        event.details_json = audit_details_json(query, metadata_extra);
+
+        if let Some(duration) = duration_ms {
+            event.duration_ms = Some(duration);
+        }
+
+        if let Some(error) = error {
+            event.error_message = Some(error.to_string());
+        }
+
+        if let Err(e) = self.app_state.read(cx).audit_service().record(event) {
+            log::warn!("Failed to emit audit event: {}", e);
+        }
+    }
+
+    /// Emits an audit event for a dangerous query confirmation.
+    fn emit_dangerous_query_audit_event(&self, cx: &mut Context<Self>, kind: DangerousQueryKind) {
+        let Some(conn_id) = self.connection_id else {
+            return;
+        };
+
+        let (database_name, driver_id) = self
+            .app_state
+            .read(cx)
+            .connections()
+            .get(&conn_id)
+            .map(|c| {
+                let db = self
+                    .source
+                    .exec_ctx
+                    .database
+                    .clone()
+                    .or(c.active_database.clone());
+                (db.unwrap_or_default(), c.profile.driver_id())
+            })
+            .unwrap_or_default();
+
+        let summary = format!("Dangerous query confirmed: {}", kind.message());
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
+        let event = EventRecord::new(
+            ts_ms,
+            EventSeverity::Warn,
+            EventCategory::Query,
+            EventOutcome::Success,
+        )
+        .with_typed_action(audit_actions::DANGEROUS_QUERY_CONFIRMED)
+        .with_summary(&summary)
+        .with_connection_context(conn_id.to_string(), database_name, driver_id);
+
+        let mut e = event;
+        e = e.with_origin(EventOrigin::local());
+        e.details_json = Some(serde_json::json!({ "dangerous_kind": kind.message() }).to_string());
+
+        if let Err(err) = self.app_state.read(cx).audit_service().record(e) {
+            log::warn!("Failed to emit dangerous query audit event: {}", err);
+        }
+    }
+}
+
+impl EventEmitter<DocumentEvent> for CodeDocument {}
+
+#[cfg(test)]
+mod language_binding_tests {
+    use super::{CodeDocument, LanguageBinding};
+    use datatab_components::theme;
+    use datatab_core::QueryLanguage;
+    use datatab_storage::bootstrap::StorageRuntime;
+    use datatab_ui_base::AppStateEntity;
+    use datatab_ui_base::toast::{ToastGlobal, ToastHost};
+    use gpui::{AppContext, TestAppContext};
+    use gpui_component::Root;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    fn isolated_test_app_state(cx: &mut TestAppContext) -> gpui::Entity<AppStateEntity> {
+        cx.update(|cx| {
+            cx.new(|_| {
+                let storage_runtime =
+                    StorageRuntime::in_memory().expect("isolated storage runtime");
+                AppStateEntity::new_with_storage_runtime(storage_runtime)
+                    .expect("test storage setup")
+            })
+        })
+    }
+
+    fn init_test_runtime(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(theme::init);
+        cx.update(|cx| {
+            let host = cx.new(|_| ToastHost::new());
+            cx.set_global(ToastGlobal { host });
+        });
+    }
+
+    /// Build a document and report the language binding it ended up with.
+    ///
+    /// `customize` runs the builder steps under test (`with_path`,
+    /// `with_read_only`, or nothing at all).
+    fn binding_for(
+        cx: &mut TestAppContext,
+        language: QueryLanguage,
+        customize: impl Fn(CodeDocument, &mut gpui::Context<CodeDocument>) -> CodeDocument + 'static,
+    ) -> LanguageBinding {
+        init_test_runtime(cx);
+
+        let app_state = isolated_test_app_state(cx);
+        let doc_holder: Rc<RefCell<Option<gpui::Entity<CodeDocument>>>> =
+            Rc::new(RefCell::new(None));
+        let doc_ref = doc_holder.clone();
+
+        let (_, window) = cx.add_window_view(|window, cx| {
+            let doc = cx.new(|cx| {
+                let document = CodeDocument::new_with_language(
+                    app_state.clone(),
+                    None,
+                    language.clone(),
+                    window,
+                    cx,
+                );
+                customize(document, cx)
+            });
+            doc_ref.replace(Some(doc.clone()));
+            Root::new(doc, window, cx)
+        });
+
+        let doc = doc_holder.borrow().clone().expect("doc should be created");
+
+        window.update(|_, app| doc.read(app).editor.language_binding)
+    }
+
+    /// A plain scratch query tab must follow its connection, so retargeting the
+    /// connection dropdown re-derives the language.
+    #[gpui::test]
+    fn a_scratch_query_tab_follows_its_connection(cx: &mut TestAppContext) {
+        assert_eq!(
+            binding_for(cx, QueryLanguage::Sql, |doc, _cx| doc),
+            LanguageBinding::FollowsConnection
+        );
+    }
+
+    /// An in-process script language is pinned at construction: no connection
+    /// can turn a Lua buffer into a query buffer.
+    #[gpui::test]
+    fn a_script_language_is_pinned_on_sight(cx: &mut TestAppContext) {
+        assert_eq!(
+            binding_for(cx, QueryLanguage::Lua, |doc, _cx| doc),
+            LanguageBinding::Pinned
+        );
+    }
+
+    /// A file's extension chose its language, so attaching a path pins it.
+    #[gpui::test]
+    fn attaching_a_file_path_pins_the_language(cx: &mut TestAppContext) {
+        assert_eq!(
+            binding_for(cx, QueryLanguage::Sql, |doc, _cx| doc
+                .with_path(std::path::PathBuf::from("/tmp/report.sql"))),
+            LanguageBinding::Pinned
+        );
+    }
+
+    /// A read-only document shows a fixed routine body, not a buffer the user
+    /// retargets at another connection.
+    #[gpui::test]
+    fn a_read_only_document_pins_its_language(cx: &mut TestAppContext) {
+        assert_eq!(
+            binding_for(cx, QueryLanguage::Sql, |doc, cx| doc.with_read_only(cx)),
+            LanguageBinding::Pinned
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CodeDocument, LanguageBinding, SqlQueryFocus, diff_stats_from_pair,
+        source_input_values_from_context,
+    };
+    use crate::handle::DocumentEvent;
+    use datatab_app::keymap::Command;
+    use datatab_components::theme;
+    use datatab_core::{ExecutionSourceContext, QueryLanguage};
+    use datatab_storage::bootstrap::StorageRuntime;
+    use datatab_ui_base::toast::{ToastGlobal, ToastHost};
+    use datatab_ui_base::{AppStateEntity, SaveTargetOutcome, SaveTargetProvider};
+    use gpui::{AppContext, Focusable, TestAppContext};
+    use gpui_component::Root;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::Arc;
+
+    fn isolated_test_app_state(cx: &mut TestAppContext) -> gpui::Entity<AppStateEntity> {
+        cx.update(|cx| {
+            cx.new(|_| {
+                let storage_runtime =
+                    StorageRuntime::in_memory().expect("isolated storage runtime");
+                AppStateEntity::new_with_storage_runtime(storage_runtime)
+                    .expect("test storage setup")
+            })
+        })
+    }
+
+    fn isolated_test_app_state_with_picker(
+        cx: &mut TestAppContext,
+        picker: SaveTargetProvider,
+    ) -> gpui::Entity<AppStateEntity> {
+        cx.update(|cx| {
+            cx.new(|_| {
+                let storage_runtime =
+                    StorageRuntime::in_memory().expect("isolated storage runtime");
+                AppStateEntity::new_with_storage_runtime(storage_runtime)
+                    .expect("test storage setup")
+                    .with_save_target_override(picker)
+            })
+        })
+    }
+
+    fn init_test_runtime(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(theme::init);
+        cx.update(|cx| {
+            let host = cx.new(|_cx| ToastHost::new());
+            cx.set_global(ToastGlobal { host });
+        });
+    }
+
+    /// Constructing a read-only CodeDocument must not hang, and run_query must
+    /// be a no-op (active_query_task stays None, is_dirty stays false).
+    #[gpui::test]
+    fn read_only_document_blocks_execution(cx: &mut TestAppContext) {
+        init_test_runtime(cx);
+
+        let app_state = isolated_test_app_state(cx);
+        let doc_holder: Rc<RefCell<Option<gpui::Entity<CodeDocument>>>> =
+            Rc::new(RefCell::new(None));
+        let doc_ref = doc_holder.clone();
+
+        const DEF: &str = "SELECT * FROM users;";
+
+        let (_, window) = cx.add_window_view(|window, cx| {
+            let doc = cx.new(|cx| {
+                let mut d = CodeDocument::new_with_language(
+                    app_state.clone(),
+                    None,
+                    QueryLanguage::Sql,
+                    window,
+                    cx,
+                )
+                .with_read_only(cx);
+                d.set_content(DEF, window, cx);
+                d
+            });
+            doc_ref.replace(Some(doc.clone()));
+            Root::new(doc, window, cx)
+        });
+
+        let doc = doc_holder.borrow().clone().expect("doc should be created");
+
+        // Trigger run_query on the read-only document; it must return immediately.
+        window.update(|window, cx| {
+            doc.update(cx, |d, cx| {
+                d.run_query(window, cx);
+            });
+        });
+
+        // Verify the document is still in its expected read-only, clean state.
+        let (is_ro, has_task, is_dirty) = window.update(|_, app| {
+            let d = doc.read(app);
+            (
+                d.read_only,
+                d.execution.active_query_task.is_none(),
+                d.editor.is_dirty,
+            )
+        });
+
+        assert!(is_ro, "document must remain read-only");
+        assert!(
+            has_task,
+            "run_query on a read-only doc must not spawn a task"
+        );
+        assert!(!is_dirty, "read-only document must not be marked dirty");
+    }
+
+    /// `ToggleComment` rewrites the selected lines with the language's comment
+    /// prefix, marks the buffer dirty, and leaves a selection that a second
+    /// press can toggle back.
+    #[gpui::test]
+    fn toggle_comment_uses_the_language_prefix(cx: &mut TestAppContext) {
+        init_test_runtime(cx);
+
+        let app_state = isolated_test_app_state(cx);
+        let doc_holder: Rc<RefCell<Option<gpui::Entity<CodeDocument>>>> =
+            Rc::new(RefCell::new(None));
+        let doc_ref = doc_holder.clone();
+
+        let (_, window) = cx.add_window_view(|window, cx| {
+            let doc = cx.new(|cx| {
+                let mut d = CodeDocument::new_with_language(
+                    app_state.clone(),
+                    None,
+                    QueryLanguage::Lua,
+                    window,
+                    cx,
+                );
+                d.set_content("print(1)\nprint(2)", window, cx);
+                d
+            });
+            doc_ref.replace(Some(doc.clone()));
+            Root::new(doc, window, cx)
+        });
+
+        let doc = doc_holder.borrow().clone().expect("doc should be created");
+
+        window.update(|window, cx| {
+            doc.update(cx, |d, cx| {
+                d.editor
+                    .input_state
+                    .update(cx, |state, cx| state.set_selected_range(0..8, cx));
+                assert!(
+                    d.dispatch_command(Command::ToggleComment, window, cx),
+                    "an editable script document must handle ToggleComment"
+                );
+            });
+        });
+
+        window.update(|_, cx| {
+            let d = doc.read(cx);
+            assert_eq!(
+                d.editor.input_state.read(cx).value().to_string(),
+                "-- print(1)\nprint(2)",
+                "a Lua buffer must be commented with `--`"
+            );
+            assert!(d.editor.is_dirty, "a toggled buffer must be marked dirty");
+        });
+
+        window.update(|window, cx| {
+            doc.update(cx, |d, cx| {
+                d.dispatch_command(Command::ToggleComment, window, cx);
+            });
+        });
+
+        window.update(|_, cx| {
+            let value = doc.read(cx).editor.input_state.read(cx).value().to_string();
+            assert_eq!(value, "print(1)\nprint(2)", "the second press must restore");
+        });
+    }
+
+    /// Caret and selection offsets are UTF-8 byte ranges, so a toggle that
+    /// splices a prefix next to multi-byte text must keep them on character
+    /// boundaries — a byte-indexed rewrite that ignored that would panic on
+    /// `String` slicing or silently shift the caret by the wrong amount.
+    ///
+    /// SQL is the mode worth exercising: removing a comment there also takes
+    /// the deletion path in the `InputEvent::Change` handler.
+    #[gpui::test]
+    fn toggle_comment_keeps_multibyte_offsets(cx: &mut TestAppContext) {
+        init_test_runtime(cx);
+
+        let app_state = isolated_test_app_state(cx);
+        let doc_holder: Rc<RefCell<Option<gpui::Entity<CodeDocument>>>> =
+            Rc::new(RefCell::new(None));
+        let doc_ref = doc_holder.clone();
+
+        let (_, window) = cx.add_window_view(|window, cx| {
+            let doc = cx.new(|cx| {
+                let mut d = CodeDocument::new_with_language(
+                    app_state.clone(),
+                    None,
+                    QueryLanguage::Sql,
+                    window,
+                    cx,
+                );
+                d.set_content("SELECT 'привет';", window, cx);
+                d
+            });
+            doc_ref.replace(Some(doc.clone()));
+            Root::new(doc, window, cx)
+        });
+
+        let doc = doc_holder.borrow().clone().expect("doc should be created");
+
+        window.update(|window, cx| {
+            doc.update(cx, |d, cx| {
+                d.editor
+                    .input_state
+                    .update(cx, |state, cx| state.set_selected_range(7..7, cx));
+                assert!(
+                    d.dispatch_command(Command::ToggleComment, window, cx),
+                    "an editable SQL document must handle ToggleComment"
+                );
+            });
+        });
+
+        window.update(|_, cx| {
+            let state = doc.read(cx).editor.input_state.read(cx);
+            assert_eq!(
+                state.value().to_string(),
+                "-- SELECT 'привет';",
+                "a SQL buffer must be commented with `--`"
+            );
+            assert_eq!(
+                state.selected_range(),
+                10..10,
+                "the caret must move by the byte length of the inserted prefix"
+            );
+        });
+
+        window.update(|window, cx| {
+            doc.update(cx, |d, cx| {
+                d.dispatch_command(Command::ToggleComment, window, cx);
+            });
+        });
+
+        window.update(|_, cx| {
+            let state = doc.read(cx).editor.input_state.read(cx);
+            assert_eq!(
+                state.value().to_string(),
+                "SELECT 'привет';",
+                "the second press must restore the text byte for byte"
+            );
+            assert_eq!(
+                state.selected_range(),
+                7..7,
+                "the caret must come back to its pre-toggle offset"
+            );
+        });
+    }
+
+    /// Commenting and uncommenting must both leave the toggled lines selected.
+    /// The completion plumbing in the Change handler moves the cursor on a
+    /// deletion, which used to drop the selection on the way out. The first
+    /// toggle seeds `last_change_length` — a `set_content` does not emit a
+    /// `Change` — so the uncomment below really is seen as a deletion.
+    #[gpui::test]
+    fn toggle_comment_keeps_the_selection_when_uncommenting(cx: &mut TestAppContext) {
+        use gpui::{IntoElement, point, px, size};
+
+        init_test_runtime(cx);
+
+        let app_state = isolated_test_app_state(cx);
+        let doc_holder: Rc<RefCell<Option<gpui::Entity<CodeDocument>>>> =
+            Rc::new(RefCell::new(None));
+        let doc_ref = doc_holder.clone();
+
+        let (_, window) = cx.add_window_view(|window, cx| {
+            let doc = cx.new(|cx| {
+                let mut d = CodeDocument::new_with_language(
+                    app_state.clone(),
+                    None,
+                    QueryLanguage::Sql,
+                    window,
+                    cx,
+                );
+                d.set_content("SELECT 1;\nSELECT 2;\n-- SELECT 3;", window, cx);
+                d
+            });
+            doc_ref.replace(Some(doc.clone()));
+            Root::new(doc, window, cx)
+        });
+
+        let doc = doc_holder.borrow().clone().expect("doc should be created");
+
+        // Comment the first line to seed the Change handler with the buffer
+        // length, the way any real edit before the toggle would.
+        window.update(|window, cx| {
+            doc.update(cx, |d, cx| {
+                d.editor
+                    .input_state
+                    .update(cx, |state, cx| state.set_selected_range(0..0, cx));
+                assert!(
+                    d.dispatch_command(Command::ToggleComment, window, cx),
+                    "an editable SQL document must handle ToggleComment"
+                );
+            });
+        });
+
+        let text = "-- SELECT 1;\nSELECT 2;\n-- SELECT 3;";
+        let line_start = "-- SELECT 1;\nSELECT 2;\n".len();
+        let line_end = line_start + "-- SELECT 3;".len();
+
+        window.update(|window, cx| {
+            doc.update(cx, |d, cx| {
+                d.editor.input_state.update(cx, |state, cx| {
+                    state.set_selected_range(line_start..line_end, cx)
+                });
+                assert!(
+                    d.dispatch_command(Command::ToggleComment, window, cx),
+                    "an editable SQL document must handle ToggleComment"
+                );
+            });
+        });
+
+        window.draw(point(px(0.), px(0.)), size(px(800.), px(600.)), {
+            let doc = doc.clone();
+            move |_, _| doc.clone().into_any_element()
+        });
+
+        window.update(|_, cx| {
+            let state = doc.read(cx).editor.input_state.read(cx);
+            assert_eq!(
+                state.value().to_string(),
+                "-- SELECT 1;\nSELECT 2;\nSELECT 3;",
+                "the second toggle must remove the prefix"
+            );
+            assert_eq!(
+                state.selected_range(),
+                line_start..line_end - 3,
+                "the uncommented lines must stay selected"
+            );
+            assert_eq!(
+                text.len() - 3,
+                state.value().len(),
+                "the uncomment must shorten the buffer"
+            );
+        });
+    }
+
+    /// A toggle only rewrites the block of touched lines, so the editor keeps
+    /// the syntax highlighter it already had. This guards that: a whole-buffer
+    /// replacement drops the cached highlighter, and the pass that recreates it
+    /// is exactly where the colors go missing.
+    #[gpui::test]
+    fn toggle_comment_keeps_the_syntax_highlighter(cx: &mut TestAppContext) {
+        use gpui::{
+            Context, HighlightStyle, IntoElement, SharedString, VisualTestContext, Window, point,
+            px, size,
+        };
+        use gpui_component::input::{
+            FoldRange, HighlightStyleResolver, InputEdit, InputHighlighter,
+            InputHighlighterFactory, Rope,
+        };
+        use std::cell::Cell;
+        use std::ops::Range;
+
+        struct CountingHighlighter;
+
+        impl InputHighlighter for CountingHighlighter {
+            fn language(&self) -> SharedString {
+                "test".into()
+            }
+
+            fn update(
+                &mut self,
+                _edit: Option<InputEdit>,
+                _text: &Rope,
+                _folding: bool,
+                _window: &mut Window,
+                _cx: &mut Context<super::GpuiEditorState>,
+            ) {
+            }
+
+            fn styles(
+                &self,
+                range: &Range<usize>,
+                _resolver: &dyn HighlightStyleResolver,
+            ) -> Vec<(Range<usize>, HighlightStyle)> {
+                vec![(range.clone(), HighlightStyle::default())]
+            }
+
+            fn fold_ranges(&self, _text: &Rope) -> Vec<FoldRange> {
+                Vec::new()
+            }
+        }
+
+        init_test_runtime(cx);
+
+        let app_state = isolated_test_app_state(cx);
+        let doc_holder: Rc<RefCell<Option<gpui::Entity<CodeDocument>>>> =
+            Rc::new(RefCell::new(None));
+        let doc_ref = doc_holder.clone();
+
+        let (_, window) = cx.add_window_view(|window, cx| {
+            let doc = cx.new(|cx| {
+                let mut d = CodeDocument::new_with_language(
+                    app_state.clone(),
+                    None,
+                    QueryLanguage::Lua,
+                    window,
+                    cx,
+                );
+                d.set_content("print(1)", window, cx);
+                d
+            });
+            doc_ref.replace(Some(doc.clone()));
+            Root::new(doc, window, cx)
+        });
+
+        let doc = doc_holder.borrow().clone().expect("doc should be created");
+
+        // The editor installs gpui-component's tree-sitter factory only when no
+        // factory is set, so counting rebuilds through our own is enough to see
+        // whether the highlighter survives a toggle.
+        let rebuilds = Rc::new(Cell::new(0usize));
+        window.update(|_, cx| {
+            doc.update(cx, |d, cx| {
+                let counter = rebuilds.clone();
+                d.editor.input_state.update(cx, |state, cx| {
+                    let factory: InputHighlighterFactory = Rc::new(move |_language: &str| {
+                        counter.set(counter.get() + 1);
+                        Some(Box::new(CountingHighlighter))
+                    });
+                    state.set_highlighter_factory(factory, cx);
+                });
+            });
+        });
+
+        let draw = |window: &mut VisualTestContext| {
+            let doc = doc.clone();
+            window.draw(
+                point(px(0.), px(0.)),
+                size(px(800.), px(600.)),
+                move |_, _| doc.clone().into_any_element(),
+            );
+        };
+
+        draw(window);
+        let rebuilds_before_toggle = rebuilds.get();
+
+        window.update(|window, cx| {
+            doc.update(cx, |d, cx| {
+                assert!(
+                    d.dispatch_command(Command::ToggleComment, window, cx),
+                    "an editable script document must handle ToggleComment"
+                );
+            });
+        });
+
+        draw(window);
+
+        window.update(|_, cx| {
+            assert_eq!(
+                doc.read(cx).editor.input_state.read(cx).value().to_string(),
+                "-- print(1)"
+            );
+        });
+        assert_eq!(
+            rebuilds.get(),
+            rebuilds_before_toggle,
+            "toggling a comment must not rebuild the syntax highlighter"
+        );
+    }
+
+    /// A read-only document (a routine body) declines `ToggleComment` and keeps
+    /// its text untouched.
+    #[gpui::test]
+    fn toggle_comment_is_a_no_op_on_read_only_documents(cx: &mut TestAppContext) {
+        init_test_runtime(cx);
+
+        let app_state = isolated_test_app_state(cx);
+        let doc_holder: Rc<RefCell<Option<gpui::Entity<CodeDocument>>>> =
+            Rc::new(RefCell::new(None));
+        let doc_ref = doc_holder.clone();
+
+        let (_, window) = cx.add_window_view(|window, cx| {
+            let doc = cx.new(|cx| {
+                let mut d = CodeDocument::new_with_language(
+                    app_state.clone(),
+                    None,
+                    QueryLanguage::Sql,
+                    window,
+                    cx,
+                )
+                .with_read_only(cx);
+                d.set_content("SELECT 1;", window, cx);
+                d
+            });
+            doc_ref.replace(Some(doc.clone()));
+            Root::new(doc, window, cx)
+        });
+
+        let doc = doc_holder.borrow().clone().expect("doc should be created");
+
+        window.update(|window, cx| {
+            doc.update(cx, |d, cx| {
+                d.editor
+                    .input_state
+                    .update(cx, |state, cx| state.set_selected_range(0..0, cx));
+                assert!(
+                    !d.dispatch_command(Command::ToggleComment, window, cx),
+                    "a read-only document must decline ToggleComment"
+                );
+            });
+        });
+
+        window.update(|_, cx| {
+            let d = doc.read(cx);
+            assert_eq!(
+                d.editor.input_state.read(cx).value().to_string(),
+                "SELECT 1;"
+            );
+            assert!(!d.editor.is_dirty);
+        });
+    }
+
+    /// A programmatic write into the underlying InputState of a read-only
+    /// CodeDocument must be reverted to the original definition.
+    ///
+    /// Real user keystrokes are now blocked at the InputState level (the Input
+    /// component sets `disabled = true` during render). This test exercises the
+    /// `set_value` path which bypasses the disabled guard and still emits
+    /// `InputEvent::Change`, verifying that the subscription's defensive revert
+    /// fires and keeps the document clean.
+    #[gpui::test]
+    fn read_only_document_reverts_edits(cx: &mut TestAppContext) {
+        init_test_runtime(cx);
+
+        let app_state = isolated_test_app_state(cx);
+        let doc_holder: Rc<RefCell<Option<gpui::Entity<CodeDocument>>>> =
+            Rc::new(RefCell::new(None));
+        let doc_ref = doc_holder.clone();
+
+        const DEF: &str = "SELECT * FROM users;";
+
+        let (_, window) = cx.add_window_view(|window, cx| {
+            let doc = cx.new(|cx| {
+                let mut d = CodeDocument::new_with_language(
+                    app_state.clone(),
+                    None,
+                    QueryLanguage::Sql,
+                    window,
+                    cx,
+                )
+                .with_read_only(cx);
+                d.set_content(DEF, window, cx);
+                d
+            });
+            doc_ref.replace(Some(doc.clone()));
+            Root::new(doc, window, cx)
+        });
+
+        let doc = doc_holder.borrow().clone().expect("doc should be created");
+
+        // Simulate a programmatic write into the underlying InputState.
+        // `set_value` temporarily bypasses the disabled flag (it is the same
+        // path used by `set_content` internally) so `InputEvent::Change` fires.
+        // The subscription must detect `read_only` and revert the change.
+        window.update(|window, cx| {
+            doc.update(cx, |d, cx| {
+                d.editor.input_state.update(cx, |state, cx| {
+                    state.replace_all("DROP TABLE x;", window, cx);
+                });
+            });
+        });
+
+        // After the revert the content must be the original definition and the
+        // document must not be dirty.
+        let (content, is_dirty) = window.update(|_, app| {
+            let d = doc.read(app);
+            (
+                d.editor.input_state.read(app).value().to_string(),
+                d.editor.is_dirty,
+            )
+        });
+
+        assert_eq!(
+            content, DEF,
+            "read-only document must revert programmatic edits to the original definition"
+        );
+        assert!(
+            !is_dirty,
+            "read-only document must not be marked dirty after revert"
+        );
+    }
+
+    #[test]
+    fn diff_stats_identical_text_returns_zero() {
+        let (added, removed) = diff_stats_from_pair("SELECT 1", "SELECT 1");
+        assert_eq!(added, 0);
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn diff_stats_pure_addition() {
+        let original = "SELECT 1";
+        let current = "SELECT 1\nSELECT 2\nSELECT 3";
+        let (added, removed) = diff_stats_from_pair(original, current);
+        assert_eq!(added, 2);
+        assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn diff_stats_pure_removal() {
+        let original = "SELECT 1\nSELECT 2\nSELECT 3";
+        let current = "SELECT 1";
+        let (added, removed) = diff_stats_from_pair(original, current);
+        assert_eq!(added, 0);
+        assert_eq!(removed, 2);
+    }
+
+    #[test]
+    fn diff_stats_mixed_edits() {
+        let original = "SELECT a\nSELECT b\nSELECT c";
+        let current = "SELECT a\nSELECT x\nSELECT y";
+        let (added, removed) = diff_stats_from_pair(original, current);
+        assert_eq!(added, 2);
+        assert_eq!(removed, 2);
+    }
+
+    #[test]
+    fn source_input_values_restore_start_and_end_strings() {
+        let values = source_input_values_from_context(&ExecutionSourceContext::CollectionWindow {
+            targets: vec!["/aws/lambda/app".to_string()],
+            start_ms: 1_704_067_200_000,
+            end_ms: 1_704_070_800_000,
+            query_mode: Some("cwli".to_string()),
+        })
+        .expect("source input values");
+
+        assert_eq!(values.0, "2024-01-01T00:00:00Z");
+        assert_eq!(values.1, "2024-01-01T01:00:00Z");
+    }
+
+    #[test]
+    fn code_title_untitled_key_resolves_in_english() {
+        let key = "document.code.title.untitled";
+        let value = datatab_i18n::t!(key, locale = "en");
+
+        assert!(!value.is_empty(), "{key} resolved empty in en");
+        assert_ne!(value, key, "{key} resolved to its own key in en");
+        assert_ne!(value, format!("en.{key}"), "{key} missing from en catalog");
+    }
+
+    /// The document events the workspace acts on, in delivery order.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    enum RecordedEvent {
+        SaveFinished(bool),
+        RequestClose,
+    }
+
+    /// Builds a document with real pending edits and records its events while
+    /// `drive` runs, then reports the recorded events and whether the buffer is
+    /// still dirty.
+    ///
+    /// The fixture edits the buffer rather than forcing the dirty flag, so it
+    /// is dirty by the same `change_summary` predicate the close flow uses to
+    /// decide whether to raise the unsaved-changes dialog at all.
+    fn with_dirty_document(
+        cx: &mut TestAppContext,
+        path: std::path::PathBuf,
+        drive: impl FnOnce(&gpui::Entity<CodeDocument>, &mut gpui::VisualTestContext),
+    ) -> (Vec<RecordedEvent>, bool) {
+        init_test_runtime(cx);
+        let app_state = isolated_test_app_state(cx);
+        with_dirty_document_and_app_state(cx, app_state, Some(path), drive)
+    }
+
+    fn with_dirty_untitled_document_with_picker(
+        cx: &mut TestAppContext,
+        picker: SaveTargetProvider,
+        drive: impl FnOnce(&gpui::Entity<CodeDocument>, &mut gpui::VisualTestContext),
+    ) -> (Vec<RecordedEvent>, bool) {
+        init_test_runtime(cx);
+        let app_state = isolated_test_app_state_with_picker(cx, picker);
+        with_dirty_document_and_app_state(cx, app_state, None, drive)
+    }
+
+    fn with_dirty_document_and_app_state(
+        cx: &mut TestAppContext,
+        app_state: gpui::Entity<AppStateEntity>,
+        path: Option<std::path::PathBuf>,
+        drive: impl FnOnce(&gpui::Entity<CodeDocument>, &mut gpui::VisualTestContext),
+    ) -> (Vec<RecordedEvent>, bool) {
+        let doc_holder: Rc<RefCell<Option<gpui::Entity<CodeDocument>>>> =
+            Rc::new(RefCell::new(None));
+        let doc_ref = doc_holder.clone();
+
+        // A caller that pre-creates the file gives the document a real loaded
+        // baseline; a path that does not exist yet leaves it without one, which is
+        // exactly the no-baseline case autosave must refuse.
+        let baseline_bytes = path
+            .as_ref()
+            .and_then(|path| std::fs::read_to_string(path).ok());
+        let path_for_doc = path.clone();
+
+        let (_, window) = cx.add_window_view(|window, cx| {
+            let doc = cx.new(|cx| {
+                let mut document = CodeDocument::new_with_language(
+                    app_state.clone(),
+                    None,
+                    QueryLanguage::Sql,
+                    window,
+                    cx,
+                );
+                if let Some(path) = path {
+                    document = document.with_path(path);
+                }
+                document.set_content("SELECT 1;", window, cx);
+
+                if let (Some(bytes), Some(path)) = (baseline_bytes, path_for_doc) {
+                    document.seed_file_baseline(path, bytes);
+                }
+
+                document.editor.input_state.update(cx, |state, cx| {
+                    state.replace_all("SELECT 2;", window, cx);
+                });
+                document
+            });
+            doc_ref.replace(Some(doc.clone()));
+            Root::new(doc, window, cx)
+        });
+
+        let doc = doc_holder.borrow().clone().expect("doc should be created");
+
+        let summary = window.update(|_, app| doc.read(app).change_summary(app));
+        assert!(
+            summary.is_some(),
+            "the fixture must be dirty by the close flow's own predicate"
+        );
+
+        let events: Rc<RefCell<Vec<RecordedEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = events.clone();
+        window.update(|_, app| {
+            app.subscribe(&doc, move |_, event: &DocumentEvent, _| match event {
+                DocumentEvent::SaveFinished { succeeded } => {
+                    sink.borrow_mut()
+                        .push(RecordedEvent::SaveFinished(*succeeded));
+                }
+                DocumentEvent::RequestClose => {
+                    sink.borrow_mut().push(RecordedEvent::RequestClose);
+                }
+                _ => {}
+            })
+            .detach();
+        });
+
+        drive(&doc, window);
+        window.run_until_parked();
+
+        let dirty = window.update(|_, app| doc.read(app).editor.is_dirty);
+        let recorded = events.borrow().clone();
+
+        (recorded, dirty)
+    }
+
+    /// A session shadow that cannot be removed must not disturb the transition
+    /// to clean, and must not be swallowed either.
+    ///
+    /// A directory is what makes the removal fail: `remove_file` refuses it,
+    /// which is the same shape a read-only or otherwise hostile session
+    /// directory produces. The document has to end clean with its shadow path
+    /// cleared; the failure itself is reported on the log, so it is the
+    /// removal having really happened that this test pins.
+    #[gpui::test]
+    fn a_shadow_that_cannot_be_removed_still_leaves_the_document_clean(cx: &mut TestAppContext) {
+        init_test_runtime(cx);
+
+        let shadow = std::env::temp_dir().join(format!("datatab-shadow-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&shadow).expect("shadow stand-in directory");
+
+        let app_state = isolated_test_app_state(cx);
+        let (_, dirty) = with_dirty_document_and_app_state(cx, app_state, None, |doc, window| {
+            window.update(|_, cx| {
+                doc.update(cx, |document, cx| {
+                    document.set_session_paths(None, Some(shadow.clone()));
+                    document.mark_clean(cx);
+                });
+            });
+        });
+
+        assert!(
+            !dirty,
+            "a shadow removal that fails must still clear the dirty state"
+        );
+        assert!(
+            shadow.exists(),
+            "the removal must really have been attempted, so the fixture stayed a directory"
+        );
+
+        std::fs::remove_dir_all(&shadow).expect("cleanup");
+    }
+
+    fn temp_save_path() -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("datatab-save-outcome-{}.sql", uuid::Uuid::new_v4()))
+    }
+
+    /// A landed ordinary save reports success but must not close the tab: only
+    /// the interrupted-close flow may ask for that.
+    #[gpui::test]
+    fn a_landed_save_reports_success_and_clears_the_dirty_flag(cx: &mut TestAppContext) {
+        let path = temp_save_path();
+
+        let (events, dirty) = with_dirty_document(cx, path.clone(), |doc, window| {
+            window.update(|window, cx| {
+                doc.update(cx, |document, cx| document.save_file(window, cx));
+            });
+        });
+
+        assert_eq!(
+            events,
+            vec![RecordedEvent::SaveFinished(true)],
+            "a landed write reports success and does not ask to close"
+        );
+        assert!(!dirty, "a landed write must clear the dirty flag");
+
+        std::fs::remove_file(&path).expect("the temp save file must be removable");
+    }
+
+    /// Regression for the blocking review: the tab closes only once the write
+    /// the interrupted close started actually landed.
+    #[gpui::test]
+    fn a_landed_save_for_close_asks_to_close_the_tab(cx: &mut TestAppContext) {
+        let path = temp_save_path();
+
+        let (events, dirty) = with_dirty_document(cx, path.clone(), |doc, window| {
+            window.update(|window, cx| {
+                doc.update(cx, |document, cx| {
+                    document.save_for_close(window, cx);
+                });
+            });
+        });
+
+        assert_eq!(
+            events,
+            vec![
+                RecordedEvent::SaveFinished(true),
+                RecordedEvent::RequestClose
+            ],
+            "the close the dialog interrupted must finish after the write lands"
+        );
+        assert!(!dirty, "a landed write must clear the dirty flag");
+
+        std::fs::remove_file(&path).expect("the temp save file must be removable");
+    }
+
+    /// Cancelling Save As must leave the tab open with its pending edits. The
+    /// close intent is dropped, so a later ordinary save cannot close it either.
+    #[gpui::test]
+    fn cancelling_save_as_keeps_the_tab_open(cx: &mut TestAppContext) {
+        let retry_path = temp_save_path();
+        let picker: SaveTargetProvider =
+            Arc::new(|_request| gpui::Task::ready(SaveTargetOutcome::Cancelled));
+
+        let retry_path_for_drive = retry_path.clone();
+        let (events, dirty) =
+            with_dirty_untitled_document_with_picker(cx, picker, move |doc, window| {
+                window.update(|window, cx| {
+                    doc.update(cx, |document, cx| {
+                        document.save_for_close(window, cx);
+                    });
+                });
+                window.run_until_parked();
+
+                let (still_dirty, has_close_intent, file_created) = window.update(|_, app| {
+                    let document = doc.read(app);
+                    (
+                        document.editor.is_dirty,
+                        document.close_after_save,
+                        retry_path_for_drive.exists(),
+                    )
+                });
+                assert!(still_dirty, "cancelling Save As must keep the buffer dirty");
+                assert!(
+                    !has_close_intent,
+                    "cancelling Save As must drop the close intent"
+                );
+                assert!(!file_created, "cancelling Save As must not create a file");
+
+                window.update(|window, cx| {
+                    doc.update(cx, |document, cx| {
+                        document.editor.path = Some(retry_path_for_drive.clone());
+                        document.save_file(window, cx);
+                    });
+                });
+            });
+
+        assert_eq!(
+            events,
+            vec![
+                RecordedEvent::SaveFinished(false),
+                RecordedEvent::SaveFinished(true)
+            ],
+            "the cancelled close-driven save reports failure; the retry does not ask to close"
+        );
+        assert!(!dirty, "the retried write must land");
+        assert_eq!(
+            std::fs::read_to_string(&retry_path).expect("the retry must write"),
+            "SELECT 2;"
+        );
+
+        std::fs::remove_file(&retry_path).expect("the retry file must be removable");
+    }
+
+    /// Choosing a path in Save As writes the captured buffer, retargets the
+    /// document at that path, and lets the interrupted close finish.
+    #[gpui::test]
+    fn choosing_a_path_in_save_as_writes_and_closes(cx: &mut TestAppContext) {
+        let path = temp_save_path();
+        let retarget_expected = path.clone();
+        let picker: SaveTargetProvider = {
+            let path = path.clone();
+            Arc::new(move |_request| {
+                gpui::Task::ready(SaveTargetOutcome::Selected {
+                    path: path.clone(),
+                    used_fallback: false,
+                })
+            })
+        };
+
+        let (events, dirty) =
+            with_dirty_untitled_document_with_picker(cx, picker, move |doc, window| {
+                window.update(|window, cx| {
+                    doc.update(cx, |document, cx| {
+                        document.save_for_close(window, cx);
+                    });
+                });
+                window.run_until_parked();
+
+                let retargeted = window.update(|_, app| doc.read(app).path().cloned());
+                assert_eq!(
+                    retargeted,
+                    Some(retarget_expected),
+                    "Save As must retarget the document at the chosen path"
+                );
+            });
+
+        assert_eq!(
+            events,
+            vec![
+                RecordedEvent::SaveFinished(true),
+                RecordedEvent::RequestClose
+            ],
+            "a Save As write that lands must finish the close it started"
+        );
+        assert!(!dirty, "the chosen path must receive the pending buffer");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the chosen file must exist"),
+            "SELECT 2;"
+        );
+
+        std::fs::remove_file(&path).expect("the chosen file must be removable");
+    }
+
+    /// Save As from the toolbar is not a close: it retargets the document and
+    /// reports its outcome without asking the workspace to close the tab.
+    #[gpui::test]
+    fn save_as_from_the_toolbar_retargets_without_asking_to_close(cx: &mut TestAppContext) {
+        let path = temp_save_path();
+        let retarget_expected = path.clone();
+        let picker: SaveTargetProvider = {
+            let path = path.clone();
+            Arc::new(move |_request| {
+                gpui::Task::ready(SaveTargetOutcome::Selected {
+                    path: path.clone(),
+                    used_fallback: false,
+                })
+            })
+        };
+
+        let (events, dirty) =
+            with_dirty_untitled_document_with_picker(cx, picker, move |doc, window| {
+                window.update(|window, cx| {
+                    doc.update(cx, |document, cx| {
+                        document.save_file_as(window, cx);
+                    });
+                });
+                window.run_until_parked();
+
+                let retargeted = window.update(|_, app| doc.read(app).path().cloned());
+                assert_eq!(
+                    retargeted,
+                    Some(retarget_expected),
+                    "Save As must retarget the document at the chosen path"
+                );
+            });
+
+        assert_eq!(
+            events,
+            vec![RecordedEvent::SaveFinished(true)],
+            "Save As reports its outcome and never asks to close on its own"
+        );
+        assert!(
+            !dirty,
+            "the captured content landed, so the buffer is clean"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the chosen file must exist"),
+            "SELECT 2;"
+        );
+
+        std::fs::remove_file(&path).expect("the chosen file must be removable");
+    }
+
+    /// Regression for the blocking review: a save that cannot land reports
+    /// failure, so the tab stays open with its changes.
+    #[gpui::test]
+    fn a_failed_save_reports_failure_and_keeps_the_buffer_dirty(cx: &mut TestAppContext) {
+        // Writing over a directory fails on every platform, which is the same
+        // branch a full disk or a revoked permission takes.
+        let (events, dirty) = with_dirty_document(cx, std::env::temp_dir(), |doc, window| {
+            window.update(|window, cx| {
+                doc.update(cx, |document, cx| {
+                    document.save_for_close(window, cx);
+                });
+            });
+        });
+
+        assert_eq!(
+            events,
+            vec![RecordedEvent::SaveFinished(false)],
+            "a failed write reports failure and never asks to close"
+        );
+        assert!(dirty, "a failed write must keep the buffer dirty");
+    }
+
+    /// Regression for the poisoned-expectation case the review found: a
+    /// cancelled or failed close-driven save must drop its close intent, so the
+    /// user's own later save cannot close the tab behind their back.
+    #[gpui::test]
+    fn a_failed_save_for_close_forgets_the_close_intent(cx: &mut TestAppContext) {
+        let writable = temp_save_path();
+
+        let (events, dirty) = with_dirty_document(cx, std::env::temp_dir(), |doc, window| {
+            window.update(|window, cx| {
+                doc.update(cx, |document, cx| {
+                    document.save_for_close(window, cx);
+                });
+            });
+            window.run_until_parked();
+
+            // The user retries later, at a path that works: that is an
+            // ordinary save, so it must not close the tab.
+            window.update(|window, cx| {
+                doc.update(cx, |document, cx| {
+                    document.editor.path = Some(writable.clone());
+                    document.save_file(window, cx);
+                });
+            });
+        });
+
+        assert_eq!(
+            events,
+            vec![
+                RecordedEvent::SaveFinished(false),
+                RecordedEvent::SaveFinished(true)
+            ],
+            "the failed close-driven save must not arm a later save to close the tab"
+        );
+        assert!(!dirty, "the retried write must land");
+
+        std::fs::remove_file(&writable).expect("the temp save file must be removable");
+    }
+
+    /// Regression: edits made while the close-driven write is in flight are
+    /// neither written nor discarded. The tab stays open and dirty, and the
+    /// file holds exactly the text the write captured.
+    #[gpui::test]
+    fn typing_during_a_save_for_close_keeps_the_tab_open(cx: &mut TestAppContext) {
+        let path = temp_save_path();
+        let path_for_write = path.clone();
+
+        let (events, dirty) = with_dirty_document(cx, path.clone(), |doc, window| {
+            window.update(|window, cx| {
+                doc.update(cx, |document, cx| {
+                    document.save_for_close(window, cx);
+                });
+            });
+
+            // The write is still in flight: the buffer moves on without it.
+            window.update(|window, cx| {
+                doc.update(cx, |document, cx| {
+                    document.editor.input_state.update(cx, |state, cx| {
+                        state.replace_all("SELECT 3;", window, cx);
+                    });
+                });
+            });
+        });
+
+        assert_eq!(
+            events,
+            vec![RecordedEvent::SaveFinished(false)],
+            "a save the buffer outgrew must not close the tab"
+        );
+        assert!(dirty, "the newer edits must stay pending");
+
+        let written = std::fs::read_to_string(&path_for_write).expect("the save must land");
+        assert_eq!(
+            written, "SELECT 2;",
+            "the file holds the text the write captured, not the newer edits"
+        );
+
+        std::fs::remove_file(&path_for_write).expect("the temp save file must be removable");
+    }
+
+    /// The workspace only learns about a finished close through this relay: the
+    /// document event becomes a `TabManagerEvent` carrying the tab's own id.
+    #[gpui::test]
+    fn a_close_request_relays_through_the_tab_manager(cx: &mut TestAppContext) {
+        use crate::tab_manager::{Tab, TabManager, TabManagerEvent};
+
+        let path = temp_save_path();
+        init_test_runtime(cx);
+        let app_state = isolated_test_app_state(cx);
+        let doc_holder: Rc<RefCell<Option<gpui::Entity<CodeDocument>>>> =
+            Rc::new(RefCell::new(None));
+        let doc_ref = doc_holder.clone();
+        let path_for_doc = path.clone();
+
+        let (_, window) = cx.add_window_view(|window, cx| {
+            let doc = cx.new(|cx| {
+                let mut document = CodeDocument::new_with_language(
+                    app_state.clone(),
+                    None,
+                    QueryLanguage::Sql,
+                    window,
+                    cx,
+                )
+                .with_path(path_for_doc);
+                document.set_content("SELECT 1;", window, cx);
+                document.editor.input_state.update(cx, |state, cx| {
+                    state.replace_all("SELECT 2;", window, cx);
+                });
+                document
+            });
+            doc_ref.replace(Some(doc.clone()));
+            Root::new(doc, window, cx)
+        });
+
+        let doc = doc_holder.borrow().clone().expect("doc should be created");
+        let document_id = window.update(|_, app| doc.read(app).id());
+
+        let manager = window.new(|_| TabManager::new());
+        let events: Rc<RefCell<Vec<TabManagerEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = events.clone();
+        window.update(|_, app| {
+            app.subscribe(&manager, move |_, event: &TabManagerEvent, _| {
+                sink.borrow_mut().push(event.clone());
+            })
+            .detach();
+
+            let pane = CodeDocument::into_pane(doc.clone(), app);
+            manager.update(app, |manager, cx| {
+                manager.open(Tab::Pane(Box::new(pane)), cx)
+            });
+        });
+
+        window.update(|window, cx| {
+            doc.update(cx, |document, cx| {
+                document.save_for_close(window, cx);
+            });
+        });
+        window.run_until_parked();
+
+        let recorded = events.borrow().clone();
+        assert!(
+            recorded.iter().any(|event| matches!(
+                event,
+                TabManagerEvent::RequestClose { id } if *id == document_id
+            )),
+            "the tab manager must relay the close request for the tab that asked, got {recorded:?}"
+        );
+
+        std::fs::remove_file(&path).expect("the temp save file must be removable");
+    }
+
+    // === Auto-save on the physical file (T1) ===
+
+    /// A file-backed edit must autosave to the real file, not only the shadow:
+    /// reopening the script reads the persisted text. A landed autosave clears
+    /// the dirty flag and, unlike an explicit save, emits no save/close events.
+    #[gpui::test]
+    fn autosave_writes_the_physical_file_and_clears_the_dirty_flag(cx: &mut TestAppContext) {
+        let path = temp_save_path();
+        std::fs::write(&path, "SELECT 1;").expect("seed the preexisting file");
+
+        let (events, dirty) = with_dirty_document(cx, path.clone(), |doc, window| {
+            // The edit armed the 2 s autosave debounce; advance the fake clock
+            // so it fires and its write lands.
+            window
+                .executor()
+                .advance_clock(std::time::Duration::from_secs(3));
+            window.run_until_parked();
+            let _ = doc;
+        });
+
+        let written =
+            std::fs::read_to_string(&path).expect("the autosave must write the real file");
+        assert_eq!(
+            written, "SELECT 2;",
+            "the autosave must land on the physical path, not only the shadow"
+        );
+        assert!(
+            events.is_empty(),
+            "an autosave is not an explicit save: it must not emit save/close events, got {events:?}"
+        );
+        assert!(!dirty, "a landed autosave must clear the dirty flag");
+
+        std::fs::remove_file(&path).expect("the temp save file must be removable");
+    }
+
+    /// A file-backed document that never loaded a trustworthy baseline (for
+    /// example a restore whose physical read failed) must refuse to autosave
+    /// rather than create or blind-overwrite the file. The newer edits stay
+    /// pending, so nothing the user typed is lost.
+    #[gpui::test]
+    fn autosave_refuses_without_a_loaded_baseline(cx: &mut TestAppContext) {
+        let path = temp_save_path();
+
+        let (events, dirty) = with_dirty_document(cx, path.clone(), |doc, window| {
+            window
+                .executor()
+                .advance_clock(std::time::Duration::from_secs(3));
+            window.run_until_parked();
+            let _ = doc;
+        });
+
+        assert!(
+            !path.exists(),
+            "an autosave with no loaded baseline must not create the file"
+        );
+        assert!(
+            events.is_empty(),
+            "a refused autosave reports no save event, got {events:?}"
+        );
+        assert!(dirty, "the unsaved edits must stay pending");
+    }
+
+    /// Edits typed while an explicit save is in flight must still autosave: the
+    /// save only clears the dirty state for the text it captured, so the debounce
+    /// armed for the newer text must survive the save's completion and land it
+    /// without another keystroke.
+    #[gpui::test]
+    fn newer_edits_typed_during_an_explicit_save_still_autosave(cx: &mut TestAppContext) {
+        let path = temp_save_path();
+        std::fs::write(&path, "SELECT 1;").expect("seed the preexisting file");
+
+        let (events, dirty) = with_dirty_document(cx, path.clone(), |doc, window| {
+            // The explicit save captures the buffer as it stands ("SELECT 2;").
+            window.update(|window, cx| {
+                doc.update(cx, |document, cx| document.save_file(window, cx));
+            });
+
+            // The user keeps typing before that write lands, so the buffer is now
+            // newer than the text the save will write.
+            window.update(|window, cx| {
+                doc.update(cx, |document, cx| {
+                    document.editor.input_state.update(cx, |state, cx| {
+                        state.replace_all("SELECT 3;", window, cx);
+                    });
+                });
+            });
+
+            window.run_until_parked();
+            assert_eq!(
+                std::fs::read_to_string(&path).expect("the explicit save must land"),
+                "SELECT 2;",
+                "the explicit save writes the text it captured"
+            );
+
+            // No further keystroke: the debounce armed for the newer text must
+            // still be alive after the save's completion.
+            window
+                .executor()
+                .advance_clock(std::time::Duration::from_secs(3));
+            window.run_until_parked();
+        });
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the autosave must land"),
+            "SELECT 3;",
+            "the newer edit must autosave without another keystroke"
+        );
+        assert_eq!(
+            events,
+            vec![RecordedEvent::SaveFinished(false)],
+            "only the explicit save reports an outcome; the autosave stays silent"
+        );
+        assert!(
+            !dirty,
+            "the newer edit autosaved and cleared the dirty flag"
+        );
+
+        std::fs::remove_file(&path).expect("the temp save file must be removable");
+    }
+
+    /// An autosave must never silently overwrite an external change: once the
+    /// document has written the file, foreign bytes on disk make the next
+    /// autosave refuse to write and keep the buffer dirty, with no save event.
+    #[gpui::test]
+    fn autosave_refuses_to_clobber_an_externally_changed_file(cx: &mut TestAppContext) {
+        let path = temp_save_path();
+        let path_for_external = path.clone();
+        std::fs::write(&path, "SELECT 1;").expect("seed the preexisting file");
+
+        let (events, dirty) = with_dirty_document(cx, path.clone(), |doc, window| {
+            // The first autosave lands and seeds the on-disk baseline.
+            window
+                .executor()
+                .advance_clock(std::time::Duration::from_secs(3));
+            window.run_until_parked();
+            assert_eq!(
+                std::fs::read_to_string(&path_for_external).expect("the first autosave lands"),
+                "SELECT 2;",
+                "the first autosave writes the content the document captured"
+            );
+
+            // An external process rewrites the file behind our back.
+            std::fs::write(&path_for_external, "EXTERNAL EDIT;")
+                .expect("the external write must succeed");
+
+            // The user keeps typing; the armed autosave must refuse to clobber.
+            window.update(|window, cx| {
+                doc.update(cx, |document, cx| {
+                    document.editor.input_state.update(cx, |state, cx| {
+                        state.replace_all("SELECT 3;", window, cx);
+                    });
+                });
+            });
+            window
+                .executor()
+                .advance_clock(std::time::Duration::from_secs(3));
+            window.run_until_parked();
+        });
+
+        let written = std::fs::read_to_string(&path).expect("the file must still exist");
+        assert_eq!(
+            written, "EXTERNAL EDIT;",
+            "the autosave must not overwrite bytes another process wrote"
+        );
+        assert!(
+            events.is_empty(),
+            "a refused autosave reports no save event"
+        );
+        assert!(dirty, "the unsaved edits must keep the buffer dirty");
+
+        std::fs::remove_file(&path).expect("the temp save file must be removable");
+    }
+
+    /// A file that disappears after the document wrote it must not be silently
+    /// recreated by an autosave: the deletion is an external action the user
+    /// may rely on, so the write is refused and the buffer stays dirty.
+    #[gpui::test]
+    fn autosave_does_not_recreate_an_externally_deleted_file(cx: &mut TestAppContext) {
+        let path = temp_save_path();
+        let path_for_delete = path.clone();
+        std::fs::write(&path, "SELECT 1;").expect("seed the preexisting file");
+
+        let (events, dirty) = with_dirty_document(cx, path.clone(), |doc, window| {
+            // The first autosave lands and seeds the on-disk baseline.
+            window
+                .executor()
+                .advance_clock(std::time::Duration::from_secs(3));
+            window.run_until_parked();
+            assert!(
+                path_for_delete.exists(),
+                "the first autosave must have written the file"
+            );
+
+            // An external process deletes the file.
+            std::fs::remove_file(&path_for_delete).expect("the external delete must succeed");
+
+            // The user keeps typing; the armed autosave must not recreate it.
+            window.update(|window, cx| {
+                doc.update(cx, |document, cx| {
+                    document.editor.input_state.update(cx, |state, cx| {
+                        state.replace_all("SELECT 3;", window, cx);
+                    });
+                });
+            });
+            window
+                .executor()
+                .advance_clock(std::time::Duration::from_secs(3));
+            window.run_until_parked();
+        });
+
+        assert!(
+            !path.exists(),
+            "the autosave must not recreate a file another process deleted"
+        );
+        assert!(
+            events.is_empty(),
+            "a refused autosave reports no save event"
+        );
+        assert!(dirty, "the unsaved edits must keep the buffer dirty");
+    }
+
+    /// Sequential autosaves must land in order: each landed write becomes the
+    /// new on-disk baseline, and the final file holds the newest content.
+    #[gpui::test]
+    fn sequential_autosaves_land_in_order_and_keep_the_newest_bytes(cx: &mut TestAppContext) {
+        let path = temp_save_path();
+        let path_for_assert = path.clone();
+        std::fs::write(&path, "SELECT 1;").expect("seed the preexisting file");
+
+        let (events, dirty) = with_dirty_document(cx, path.clone(), |doc, window| {
+            window
+                .executor()
+                .advance_clock(std::time::Duration::from_secs(3));
+            window.run_until_parked();
+            assert_eq!(
+                std::fs::read_to_string(&path_for_assert).expect("the first autosave lands"),
+                "SELECT 2;",
+            );
+
+            window.update(|window, cx| {
+                doc.update(cx, |document, cx| {
+                    document.editor.input_state.update(cx, |state, cx| {
+                        state.replace_all("SELECT 3;", window, cx);
+                    });
+                });
+            });
+            window
+                .executor()
+                .advance_clock(std::time::Duration::from_secs(3));
+            window.run_until_parked();
+            assert_eq!(
+                std::fs::read_to_string(&path_for_assert).expect("the second autosave lands"),
+                "SELECT 3;",
+                "each autosave must replace the bytes of the previous one"
+            );
+
+            window.update(|window, cx| {
+                doc.update(cx, |document, cx| {
+                    document.editor.input_state.update(cx, |state, cx| {
+                        state.replace_all("SELECT 4;", window, cx);
+                    });
+                });
+            });
+            window
+                .executor()
+                .advance_clock(std::time::Duration::from_secs(3));
+            window.run_until_parked();
+        });
+
+        let written =
+            std::fs::read_to_string(&path).expect("the final autosave must have written the file");
+        assert_eq!(
+            written, "SELECT 4;",
+            "the newest edit must be the one on disk"
+        );
+        assert!(events.is_empty(), "autosaves emit no save/close events");
+        assert!(!dirty, "the final autosave lands the current buffer");
+
+        std::fs::remove_file(&path).expect("the temp save file must be removable");
+    }
+
+    /// A file whose baseline was seeded from its own bytes before any autosave ran
+    /// must still refuse to clobber bytes an external process wrote before the
+    /// first debounce fired. The document keeps its edits pending and reports no
+    /// save event.
+    #[gpui::test]
+    fn autosave_refuses_foreign_change_after_baseline_seeded_before_first_write(
+        cx: &mut TestAppContext,
+    ) {
+        let path = temp_save_path();
+        let path_for_external = path.clone();
+        std::fs::write(&path, "ORIGINAL;").expect("seed the original file");
+
+        let (events, dirty) = with_dirty_document(cx, path.clone(), |doc, window| {
+            // The fixture seeded the baseline from ORIGINAL before any write ran.
+            std::fs::write(&path_for_external, "EXTERNAL EDIT;")
+                .expect("the external write must succeed");
+
+            window.update(|window, cx| {
+                doc.update(cx, |document, cx| {
+                    document.editor.input_state.update(cx, |state, cx| {
+                        state.replace_all("SELECT 3;", window, cx);
+                    });
+                });
+            });
+            window
+                .executor()
+                .advance_clock(std::time::Duration::from_secs(3));
+            window.run_until_parked();
+        });
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("the file must still exist"),
+            "EXTERNAL EDIT;",
+            "the autosave must not overwrite bytes another process wrote"
+        );
+        assert!(
+            events.is_empty(),
+            "a refused autosave reports no save event"
+        );
+        assert!(dirty, "the unsaved edits must keep the buffer dirty");
+
+        std::fs::remove_file(&path).expect("the temp save file must be removable");
+    }
+
+    /// A file deleted after its baseline was seeded but before the first autosave
+    /// must not be recreated: the deletion is an external action the user may rely
+    /// on, so the write is refused and the buffer stays dirty.
+    #[gpui::test]
+    fn autosave_does_not_recreate_a_file_deleted_after_baseline_seeded_before_first_write(
+        cx: &mut TestAppContext,
+    ) {
+        let path = temp_save_path();
+        let path_for_delete = path.clone();
+        std::fs::write(&path, "ORIGINAL;").expect("seed the original file");
+
+        let (events, dirty) = with_dirty_document(cx, path.clone(), |doc, window| {
+            // The fixture seeded the baseline from ORIGINAL before any write ran.
+            std::fs::remove_file(&path_for_delete).expect("the external delete must succeed");
+
+            window.update(|window, cx| {
+                doc.update(cx, |document, cx| {
+                    document.editor.input_state.update(cx, |state, cx| {
+                        state.replace_all("SELECT 3;", window, cx);
+                    });
+                });
+            });
+            window
+                .executor()
+                .advance_clock(std::time::Duration::from_secs(3));
+            window.run_until_parked();
+        });
+
+        assert!(
+            !path.exists(),
+            "the autosave must not recreate a file another process deleted"
+        );
+        assert!(
+            events.is_empty(),
+            "a refused autosave reports no save event"
+        );
+        assert!(dirty, "the unsaved edits must keep the buffer dirty");
+    }
+
+    /// A tab restored with a profile that is not connected reads "No
+    /// connection": it must not keep that profile's environment badge or
+    /// production banner, and its selector shows the neutral database icon.
+    #[gpui::test]
+    fn a_disconnected_profile_leaves_the_context_bar_neutral(cx: &mut TestAppContext) {
+        init_test_runtime(cx);
+
+        let app_state = isolated_test_app_state(cx);
+        let mut profile = datatab_core::ConnectionProfile::new(
+            "shop-prod",
+            datatab_core::DbConfig::default_postgres(),
+        );
+        profile.environment = Some(datatab_core::ConnectionEnvironment::Production);
+        let profile_id = profile.id;
+
+        cx.update(|cx| {
+            app_state.update(cx, |state, _| state.inner.profiles_mut().push(profile));
+        });
+
+        let doc_holder: Rc<RefCell<Option<gpui::Entity<CodeDocument>>>> =
+            Rc::new(RefCell::new(None));
+        let doc_ref = doc_holder.clone();
+
+        let (_, window) = cx.add_window_view(|window, cx| {
+            let doc = cx.new(|cx| {
+                CodeDocument::new_with_language(
+                    app_state.clone(),
+                    Some(profile_id),
+                    QueryLanguage::Sql,
+                    window,
+                    cx,
+                )
+            });
+            doc_ref.replace(Some(doc.clone()));
+            Root::new(doc, window, cx)
+        });
+
+        let doc = doc_holder.borrow().clone().expect("doc should be created");
+
+        let (environment, banner, icon) = window.update(|_, cx| {
+            let doc = doc.read(cx);
+            (
+                doc.connection_environment(cx),
+                doc.render_production_banner(cx).is_some(),
+                doc.connection_driver_icon(cx),
+            )
+        });
+
+        assert_eq!(environment, None);
+        assert!(!banner);
+        assert_eq!(icon.0, datatab_components::icons::AppIcon::Database);
+    }
+
+    /// Focus editor lands in the query text, from the context bar or from the text itself.
+    #[gpui::test]
+    fn focus_editor_lands_in_the_text_not_the_context_bar(cx: &mut TestAppContext) {
+        init_test_runtime(cx);
+
+        let app_state = isolated_test_app_state(cx);
+        let doc_holder: Rc<RefCell<Option<gpui::Entity<CodeDocument>>>> =
+            Rc::new(RefCell::new(None));
+        let doc_ref = doc_holder.clone();
+
+        let (_, window) = cx.add_window_view(|window, cx| {
+            let doc = cx.new(|cx| {
+                CodeDocument::new_with_language(
+                    app_state.clone(),
+                    None,
+                    QueryLanguage::Sql,
+                    window,
+                    cx,
+                )
+            });
+            doc_ref.replace(Some(doc.clone()));
+            Root::new(doc, window, cx)
+        });
+
+        let doc = doc_holder.borrow().clone().expect("doc should be created");
+
+        // Stepping up from the text moves into the context bar.
+        window.update(|window, cx| {
+            doc.update(cx, |doc, cx| {
+                doc.dispatch_command(Command::FocusUp, window, cx);
+            })
+        });
+        assert_eq!(
+            window.update(|_, cx| doc.read(cx).focus_mode),
+            SqlQueryFocus::ContextBar
+        );
+
+        // Focus editor brings the keyboard back to the text from there...
+        window.update(|window, cx| {
+            doc.update(cx, |doc, cx| {
+                assert!(doc.dispatch_command(Command::FocusEditor, window, cx));
+            })
+        });
+        assert_eq!(
+            window.update(|_, cx| doc.read(cx).focus_mode),
+            SqlQueryFocus::Editor
+        );
+
+        // ...and keeps it there when it is already in the text.
+        window.update(|window, cx| {
+            doc.update(cx, |doc, cx| {
+                assert!(doc.dispatch_command(Command::FocusEditor, window, cx));
+            })
+        });
+        let (mode, text_focused) = window.update(|window, cx| {
+            let doc = doc.read(cx);
+            (
+                doc.focus_mode,
+                doc.editor
+                    .input_state
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window),
+            )
+        });
+        assert_eq!(mode, SqlQueryFocus::Editor);
+        assert!(text_focused, "the query text has the keyboard");
+    }
+
+    /// An editor's history opens as a side panel for the workspace instead
+    /// of a modal over the document, and leaves the keyboard to the editor
+    /// until focus moves into it.
+    #[gpui::test]
+    fn history_opens_as_a_side_panel_without_taking_the_keyboard(cx: &mut TestAppContext) {
+        init_test_runtime(cx);
+
+        let app_state = isolated_test_app_state(cx);
+        let doc_holder: Rc<RefCell<Option<gpui::Entity<CodeDocument>>>> =
+            Rc::new(RefCell::new(None));
+        let doc_ref = doc_holder.clone();
+
+        let (_, window) = cx.add_window_view(|window, cx| {
+            let doc = cx.new(|cx| {
+                CodeDocument::new_with_language(
+                    app_state.clone(),
+                    None,
+                    QueryLanguage::Sql,
+                    window,
+                    cx,
+                )
+            });
+            doc_ref.replace(Some(doc.clone()));
+            Root::new(doc, window, cx)
+        });
+
+        let doc = doc_holder.borrow().clone().expect("doc should be created");
+
+        let panel_ids = |window: &mut gpui::VisualTestContext| {
+            window.update(|_, cx| {
+                doc.update(cx, |doc, cx| {
+                    doc.side_panels(cx)
+                        .into_iter()
+                        .map(|panel| panel.id.to_string())
+                        .collect::<Vec<_>>()
+                })
+            })
+        };
+
+        assert!(panel_ids(window).is_empty());
+
+        window.update(|window, cx| {
+            doc.update(cx, |doc, cx| {
+                assert!(doc.dispatch_command(Command::ToggleHistoryDropdown, window, cx));
+            });
+        });
+        window.run_until_parked();
+
+        assert_eq!(panel_ids(window), vec!["query-history".to_string()]);
+        assert_eq!(
+            window.update(|_, cx| doc.read(cx).active_context(cx)),
+            datatab_app::keymap::ContextId::Editor
+        );
+
+        window.update(|window, cx| {
+            doc.update(cx, |doc, cx| {
+                assert!(doc.dispatch_command(Command::ToggleHistoryDropdown, window, cx));
+            });
+        });
+
+        assert!(panel_ids(window).is_empty());
+    }
+}
+
+/// `details_json` of an editor audit event: the query text and the
+/// driver-provided extra fields, without the server notices, which are user
+/// output rather than audit context and can carry row values.
+fn audit_details_json(
+    query: Option<&str>,
+    metadata_extra: Option<&std::collections::HashMap<String, serde_json::Value>>,
+) -> Option<String> {
+    let mut details = serde_json::Map::new();
+    if let Some(query) = query {
+        details.insert(
+            "query".to_string(),
+            serde_json::Value::String(query.to_string()),
+        );
+    }
+    if let Some(extra) = metadata_extra {
+        for (key, value) in extra {
+            if key == datatab_core::SERVER_NOTICES_METADATA_KEY {
+                continue;
+            }
+            details.insert(key.clone(), value.clone());
+        }
+    }
+
+    (!details.is_empty()).then(|| serde_json::Value::Object(details).to_string())
+}
+
+#[cfg(test)]
+mod audit_details_tests {
+    use super::audit_details_json;
+    use datatab_core::{QueryResult, ServerNotice};
+    use std::time::Duration;
+
+    #[test]
+    fn server_notices_stay_out_of_the_audit_details() {
+        let mut result = QueryResult::table(Vec::new(), Vec::new(), Some(0), Duration::ZERO);
+        result.set_server_notices([ServerNotice {
+            severity: "NOTICE".to_string(),
+            message: "row 42 belongs to alice".to_string(),
+        }]);
+        result.set_rows_truncated(true);
+
+        let details = audit_details_json(Some("COMMIT"), result.metadata_extra.as_ref())
+            .expect("details with the query");
+        let details: serde_json::Value = serde_json::from_str(&details).expect("details are JSON");
+
+        assert_eq!(details["query"], "COMMIT");
+        assert!(
+            details
+                .get(datatab_core::SERVER_NOTICES_METADATA_KEY)
+                .is_none()
+        );
+        assert!(!details.to_string().contains("alice"));
+        assert_eq!(
+            details.as_object().map(|object| object.len()),
+            Some(2),
+            "the other driver fields are kept"
+        );
+    }
+
+    #[test]
+    fn no_query_and_no_extra_fields_leave_no_details() {
+        assert_eq!(audit_details_json(None, None), None);
+    }
+}

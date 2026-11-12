@@ -1,0 +1,1207 @@
+#![allow(clippy::type_complexity)]
+
+use super::data_grid_panel::ReferencedRowTarget;
+use super::dedup::DocumentKey;
+use super::handle::DocumentEvent;
+use super::pane::{EmptyScriptCleanup, PaneHandle};
+use super::types::{DocumentId, DocumentKind, DocumentMetaSnapshot};
+use datatab_app::keymap::{Command, ContextId};
+use datatab_components::modals::CloseAction;
+use datatab_core::RefreshPolicy;
+use gpui::{AnyElement, App, Context, EventEmitter, Subscription, Window};
+use std::collections::HashMap;
+
+/// Wrapper around a `PaneHandle` representing one open workspace tab.
+///
+/// `PaneHandle` is large (many `Box<dyn Fn>` closure fields), so it is
+/// heap-allocated via `Box` to keep the `Tab` size small.
+///
+/// The enum form is kept for forward-compatibility: additional variants such
+/// as a detachable pane could be added here without touching all call sites.
+#[non_exhaustive]
+pub enum Tab {
+    /// A document managed via the closure-erased `PaneHandle` shell.
+    Pane(Box<PaneHandle>),
+}
+
+impl Tab {
+    // --- Identity (no cx required) ---
+
+    pub fn id(&self) -> DocumentId {
+        match self {
+            Tab::Pane(p) => p.id(),
+        }
+    }
+
+    pub fn kind(&self) -> DocumentKind {
+        match self {
+            Tab::Pane(p) => p.kind(),
+        }
+    }
+
+    // --- Rendering and behaviour ---
+
+    pub fn render(&self, window: &mut Window, cx: &mut App) -> AnyElement {
+        match self {
+            Tab::Pane(p) => p.render(window, cx),
+        }
+    }
+
+    pub fn side_panels(
+        &self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<crate::pane::DocumentSidePanel> {
+        match self {
+            Tab::Pane(p) => p.side_panels(window, cx),
+        }
+    }
+
+    pub fn focus(&self, window: &mut Window, cx: &mut App) {
+        match self {
+            Tab::Pane(p) => p.focus(window, cx),
+        }
+    }
+
+    pub fn dispatch_command(&self, cmd: Command, window: &mut Window, cx: &mut App) -> bool {
+        match self {
+            Tab::Pane(p) => p.dispatch_command(cmd, window, cx),
+        }
+    }
+
+    // --- Pure reads ---
+
+    pub fn meta_snapshot(&self, cx: &App) -> DocumentMetaSnapshot {
+        match self {
+            Tab::Pane(p) => p.meta_snapshot(cx),
+        }
+    }
+
+    pub fn tab_title(&self, cx: &App) -> String {
+        match self {
+            Tab::Pane(p) => p.tab_title(cx),
+        }
+    }
+
+    pub fn can_close(&self, cx: &App) -> bool {
+        match self {
+            Tab::Pane(p) => p.can_close(cx),
+        }
+    }
+
+    pub fn connection_id(&self, cx: &App) -> Option<uuid::Uuid> {
+        match self {
+            Tab::Pane(p) => p.connection_id(cx),
+        }
+    }
+
+    pub fn active_context(&self, cx: &App) -> ContextId {
+        match self {
+            Tab::Pane(p) => p.active_context(cx),
+        }
+    }
+
+    pub fn key_context_entries(&self, cx: &App) -> Vec<(gpui::SharedString, gpui::SharedString)> {
+        match self {
+            Tab::Pane(p) => p.key_context_entries(cx),
+        }
+    }
+
+    pub fn change_summary(&self, cx: &App) -> Option<String> {
+        match self {
+            Tab::Pane(p) => p.change_summary(cx),
+        }
+    }
+
+    pub fn tab_tooltip(&self, cx: &App) -> Option<gpui::SharedString> {
+        match self {
+            Tab::Pane(p) => p.tab_tooltip(cx),
+        }
+    }
+
+    pub fn refresh_policy(&self, cx: &App) -> RefreshPolicy {
+        match self {
+            Tab::Pane(p) => p.refresh_policy(cx),
+        }
+    }
+
+    pub fn flush_auto_save(&self, cx: &App) {
+        match self {
+            Tab::Pane(p) => p.flush_auto_save(cx),
+        }
+    }
+
+    /// Starts a save for an interrupted close; `false` means the document has
+    /// no save path and its tab must stay open.
+    pub fn save_for_close(&self, window: &mut Window, cx: &mut App) -> bool {
+        match self {
+            Tab::Pane(p) => p.save_for_close(window, cx),
+        }
+    }
+
+    // --- Mutations ---
+
+    pub fn set_active_tab(&self, active: bool, cx: &mut App) {
+        match self {
+            Tab::Pane(p) => p.set_active_tab(active, cx),
+        }
+    }
+
+    pub fn set_refresh_policy(&self, policy: RefreshPolicy, cx: &mut App) {
+        match self {
+            Tab::Pane(p) => p.set_refresh_policy(policy, cx),
+        }
+    }
+
+    // --- Dedup ---
+
+    pub fn matches_dedup_key(&self, key: &DocumentKey, cx: &App) -> bool {
+        match self {
+            Tab::Pane(p) => p.matches_dedup_key(key, cx),
+        }
+    }
+
+    // --- Subscription ---
+
+    pub fn subscribe<F>(&self, cx: &mut App, callback: F) -> Subscription
+    where
+        F: Fn(&DocumentEvent, &mut App) + 'static,
+    {
+        match self {
+            Tab::Pane(p) => p.subscribe(cx, callback),
+        }
+    }
+
+    // --- PaneHandle accessors ---
+
+    /// Returns the inner `PaneHandle`.
+    pub fn as_pane(&self) -> &PaneHandle {
+        match self {
+            Tab::Pane(p) => p.as_ref(),
+        }
+    }
+
+    /// Reports the cleanup this tab leaves behind when it closes, if any: an empty
+    /// buffer over a file-backed script, with the bytes that file is expected to
+    /// hold.
+    ///
+    /// Returns `None` for non-script tabs, non-file-backed scripts, non-empty
+    /// buffers, and files without a trustworthy baseline — the caller keeps those.
+    ///
+    /// The bytes are not read from disk here: the report carries the document's own
+    /// baseline, and the caller verifies the file against it away from the UI
+    /// thread, where removing it also happens.
+    pub fn pending_empty_script_cleanup(&self, cx: &App) -> Option<EmptyScriptCleanup> {
+        match self {
+            Tab::Pane(p) => p.empty_script_cleanup.as_ref().and_then(|f| f(cx)),
+        }
+    }
+
+    /// Tells the document that the workspace inspector rail was dismissed,
+    /// so it can drop any cached inspector state. No-op for documents that do
+    /// not own an inspector.
+    pub fn mark_inspector_closed(&self, cx: &mut App) {
+        match self {
+            Tab::Pane(p) => {
+                if let Some(f) = p.mark_inspector_closed.as_ref() {
+                    f(cx);
+                }
+            }
+        }
+    }
+
+    pub fn row_inspector_is_tracking(&self, cx: &App) -> bool {
+        match self {
+            Tab::Pane(p) => p
+                .row_inspector_is_tracking
+                .as_ref()
+                .is_some_and(|tracking| tracking(cx)),
+        }
+    }
+
+    pub fn set_row_inspector_tracking(&self, tracking: bool, cx: &mut App) {
+        match self {
+            Tab::Pane(p) => {
+                if let Some(set_tracking) = p.set_row_inspector_tracking.as_ref() {
+                    set_tracking(tracking, cx);
+                }
+            }
+        }
+    }
+
+    pub fn value_panel_is_open(&self, cx: &App) -> bool {
+        match self {
+            Tab::Pane(p) => p.value_panel_is_open.as_ref().is_some_and(|open| open(cx)),
+        }
+    }
+
+    pub fn set_value_panel_open(&self, open: bool, cx: &mut App) {
+        match self {
+            Tab::Pane(p) => {
+                if let Some(set_open) = p.set_value_panel_open.as_ref() {
+                    set_open(open, cx);
+                }
+            }
+        }
+    }
+
+    /// Returns a session snapshot for this tab if it is a code document with
+    /// a persistent backing (file-backed or scratch). Returns `None` for all
+    /// other document types and for ephemeral tabs with no backing path.
+    pub fn session_tab_snapshot(&self, cx: &App) -> Option<super::pane::CodeSessionTabSnapshot> {
+        match self {
+            Tab::Pane(p) => p.session_tab_snapshot.as_ref().and_then(|f| f(cx)),
+        }
+    }
+
+    /// Returns this tab's contributed status-bar segments. Empty for
+    /// documents that do not populate `PaneHandle::status_segments`.
+    pub fn status_segments(&self, cx: &App) -> Vec<super::pane::StatusSegment> {
+        match self {
+            Tab::Pane(p) => p.status_segments(cx),
+        }
+    }
+
+    /// Drains a browse-this-bucket intent, if this tab is a
+    /// `BucketsTableDocument` with one pending. `None` for every other
+    /// document type and when there is nothing pending.
+    pub fn take_pending_open_bucket(&self, cx: &mut App) -> Option<String> {
+        match self {
+            Tab::Pane(p) => p.take_pending_open_bucket.as_ref().and_then(|f| f(cx)),
+        }
+    }
+
+    /// Opens `path` in this tab when it is a secret store document. A no-op
+    /// for every other document type.
+    pub fn navigate_secret_path(&self, path: Option<String>, cx: &mut App) {
+        match self {
+            Tab::Pane(p) => {
+                if let Some(navigate) = p.navigate_secret_path.as_ref() {
+                    navigate(path, cx);
+                }
+            }
+        }
+    }
+
+    /// Drains an open-this-object-in-an-editor-tab intent, if this tab has one
+    /// pending. `None` for every other document type.
+    pub fn take_pending_open_object_editor(
+        &self,
+        cx: &mut App,
+    ) -> Option<super::pane::ObjectEditorRequest> {
+        match self {
+            Tab::Pane(p) => p
+                .take_pending_open_object_editor
+                .as_ref()
+                .and_then(|f| f(cx)),
+        }
+    }
+}
+
+/// Manages open documents (tabs) in the workspace.
+///
+/// Responsibilities:
+/// - Track open documents in visual order (left to right in tab bar)
+/// - Track active document
+/// - Maintain MRU (Most Recently Used) order for Ctrl+Tab navigation
+/// - Handle document subscriptions for cleanup on close
+pub struct TabManager {
+    /// Documents in visual order (left to right in tab bar).
+    documents: Vec<Tab>,
+
+    /// Index of the active document (in `documents`).
+    active_index: Option<usize>,
+
+    /// MRU order for Ctrl+Tab navigation (front = most recent).
+    mru_order: Vec<DocumentId>,
+
+    /// Subscriptions per document (for cleanup on close).
+    subscriptions: HashMap<DocumentId, Subscription>,
+}
+
+/// The shared inspector rail's per-tab state, carried from the outgoing
+/// document to the incoming one so an open rail follows the user.
+#[derive(Clone, Copy, Default)]
+struct RailState {
+    row_inspector_tracking: bool,
+    value_panel_open: bool,
+}
+
+impl TabManager {
+    pub fn new() -> Self {
+        Self {
+            documents: Vec::new(),
+            active_index: None,
+            mru_order: Vec::new(),
+            subscriptions: HashMap::new(),
+        }
+    }
+
+    /// Opens a new document and activates it.
+    pub fn open(&mut self, doc: Tab, cx: &mut Context<Self>) {
+        let id = doc.id();
+
+        // Subscribe to document events.
+        // The TabManager entity is captured so events can be re-emitted from
+        // within the subscription callback.
+        let tab_manager = cx.entity().clone();
+        let subscription = doc.subscribe(cx, move |event, cx| {
+            tab_manager.update(cx, |_, cx| match event {
+                DocumentEvent::RequestFocus => {
+                    cx.emit(TabManagerEvent::DocumentRequestedFocus);
+                }
+                DocumentEvent::SaveFinished { succeeded } => {
+                    cx.emit(TabManagerEvent::SaveFinished {
+                        id,
+                        succeeded: *succeeded,
+                    });
+                }
+                DocumentEvent::RequestClose => {
+                    cx.emit(TabManagerEvent::RequestClose { id });
+                }
+                DocumentEvent::RequestSqlPreview {
+                    context,
+                    generation_type,
+                } => {
+                    cx.emit(TabManagerEvent::RequestSqlPreview {
+                        context: context.clone(),
+                        generation_type: *generation_type,
+                    });
+                }
+                DocumentEvent::OpenInspector {
+                    title,
+                    content,
+                    content_has_header,
+                } => {
+                    cx.emit(TabManagerEvent::OpenInspector {
+                        title: title.clone(),
+                        content: content.clone(),
+                        content_has_header: *content_has_header,
+                    });
+                }
+                DocumentEvent::CloseInspector => {
+                    cx.emit(TabManagerEvent::CloseInspector);
+                }
+                DocumentEvent::ChartThisQuery {
+                    query,
+                    connection_id,
+                } => {
+                    cx.emit(TabManagerEvent::ChartThisQuery {
+                        query: query.clone(),
+                        connection_id: *connection_id,
+                    });
+                }
+                DocumentEvent::RequestAddPanel { dashboard_id } => {
+                    cx.emit(TabManagerEvent::RequestAddPanel {
+                        dashboard_id: *dashboard_id,
+                    });
+                }
+                DocumentEvent::RequestSaveAsEditable {
+                    source_title,
+                    profile_id,
+                } => {
+                    cx.emit(TabManagerEvent::RequestSaveAsEditable {
+                        source_title: source_title.clone(),
+                        profile_id: *profile_id,
+                    });
+                }
+                DocumentEvent::RequestOpenApprovals => {
+                    cx.emit(TabManagerEvent::RequestOpenApprovals);
+                }
+                DocumentEvent::OpenEditorWithContent { profile_id, sql } => {
+                    cx.emit(TabManagerEvent::OpenEditorWithContent {
+                        profile_id: *profile_id,
+                        sql: sql.clone(),
+                    });
+                }
+                DocumentEvent::OpenReferencedRow { target } => {
+                    cx.emit(TabManagerEvent::OpenReferencedRow {
+                        target: target.clone(),
+                    });
+                }
+                _ => {}
+            });
+        });
+
+        let rail = self.capture_rail_state(cx);
+
+        self.subscriptions.insert(id, subscription);
+        self.documents.push(doc);
+        let new_index = self.documents.len() - 1;
+        self.active_index = Some(new_index);
+        self.hand_over_rail_state(new_index, rail, cx);
+
+        // Add to front of MRU
+        self.mru_order.insert(0, id);
+
+        cx.emit(TabManagerEvent::Opened(id));
+        // Opening a tab activates it. Without this the workspace never runs
+        // its per-document `set_active_tab` pass, so the shared inspector rail
+        // keeps rendering the tab the user just navigated away from.
+        cx.emit(TabManagerEvent::Activated(id));
+        cx.notify();
+    }
+
+    /// Removes a document, without asking what closing it means.
+    ///
+    /// The caller owns that question: the workspace funnel asks the document's
+    /// own close policy first and reaches this only once the answer was
+    /// `CloseNow`. A caller that removes a tab here directly still drops pending
+    /// edits exactly as before, which is why every close route above this crate
+    /// goes through the funnel and never calls this itself.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "idx comes from index_of() over self.documents, so it is a valid index"
+    )]
+    pub fn close(&mut self, id: DocumentId, cx: &mut Context<Self>) -> bool {
+        let Some(idx) = self.index_of(id) else {
+            return false;
+        };
+
+        self.documents[idx].flush_auto_save(cx);
+        self.documents[idx].as_pane().on_close(cx);
+        self.remove_document(idx, id, cx);
+        true
+    }
+
+    /// Removes the tab at `idx` and, when the active tab changes as a result,
+    /// runs the same handover `activate` does, so the tab that takes over is
+    /// authoritative over the shared inspector rail.
+    fn remove_document(&mut self, idx: usize, id: DocumentId, cx: &mut Context<Self>) {
+        let previous_active_id = self.active_id();
+        let rail = self.capture_rail_state(cx);
+
+        self.documents.remove(idx);
+        self.subscriptions.remove(&id);
+        self.mru_order.retain(|&i| i != id);
+        self.active_index = self.compute_new_active_after_close(idx);
+
+        let new_active_id = self
+            .active_id()
+            .filter(|&new_id| Some(new_id) != previous_active_id);
+        if let (Some(_), Some(new_index)) = (new_active_id, self.active_index) {
+            self.hand_over_rail_state(new_index, rail, cx);
+        }
+
+        cx.emit(TabManagerEvent::Closed(id));
+        if let Some(new_id) = new_active_id {
+            cx.emit(TabManagerEvent::Activated(new_id));
+        }
+        cx.notify();
+    }
+
+    /// Computes the new active index after closing a tab.
+    fn compute_new_active_after_close(&self, closed_idx: usize) -> Option<usize> {
+        if self.documents.is_empty() {
+            return None;
+        }
+
+        // Try to activate the next in MRU order
+        for mru_id in &self.mru_order {
+            if let Some(idx) = self.index_of(*mru_id) {
+                return Some(idx);
+            }
+        }
+
+        // Fallback: the closest tab visually
+        Some(closed_idx.min(self.documents.len() - 1))
+    }
+
+    /// Activates a document by ID.
+    pub fn activate(&mut self, id: DocumentId, cx: &mut Context<Self>) {
+        let Some(idx) = self.index_of(id) else {
+            return;
+        };
+
+        if self.active_index == Some(idx) {
+            return; // Already active
+        }
+
+        let rail = self.capture_rail_state(cx);
+
+        self.active_index = Some(idx);
+        self.hand_over_rail_state(idx, rail, cx);
+
+        // Move to front of MRU
+        self.mru_order.retain(|&i| i != id);
+        self.mru_order.insert(0, id);
+
+        cx.emit(TabManagerEvent::Activated(id));
+        cx.notify();
+    }
+
+    /// Read the rail state of the currently active document, before the
+    /// active index moves.
+    fn capture_rail_state(&self, cx: &App) -> RailState {
+        let outgoing = self
+            .active_index
+            .and_then(|active| self.documents.get(active));
+
+        RailState {
+            row_inspector_tracking: outgoing.is_some_and(|tab| tab.row_inspector_is_tracking(cx)),
+            value_panel_open: outgoing.is_some_and(|tab| tab.value_panel_is_open(cx)),
+        }
+    }
+
+    /// The inspector rail is shared by the workspace, so hand its state to the
+    /// newly active document. A closed rail likewise clears stale per-tab
+    /// state before that tab is mounted.
+    fn hand_over_rail_state(&mut self, idx: usize, rail: RailState, cx: &mut App) {
+        let Some(document) = self.documents.get(idx) else {
+            return;
+        };
+
+        document.set_row_inspector_tracking(rail.row_inspector_tracking, cx);
+        document.set_value_panel_open(rail.value_panel_open, cx);
+    }
+
+    /// Navigates to the next tab in VISUAL order (Ctrl+PgDn).
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "documents.len() > 1 after the early return and next is a modular step over it"
+    )]
+    pub fn next_visual_tab(&mut self, cx: &mut Context<Self>) {
+        if self.documents.len() <= 1 {
+            return;
+        }
+
+        if let Some(active) = self.active_index {
+            let next = (active + 1) % self.documents.len();
+            let id = self.documents[next].id();
+            self.activate(id, cx);
+        }
+    }
+
+    /// Navigates to the previous tab in VISUAL order (Ctrl+PgUp).
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "documents.len() > 1 after the early return and prev is documents.len() - 1 or active - 1, with active_index kept below documents.len() by the manager (not re-checked here)"
+    )]
+    pub fn prev_visual_tab(&mut self, cx: &mut Context<Self>) {
+        if self.documents.len() <= 1 {
+            return;
+        }
+
+        if let Some(active) = self.active_index {
+            let prev = if active == 0 {
+                self.documents.len() - 1
+            } else {
+                active - 1
+            };
+            let id = self.documents[prev].id();
+            self.activate(id, cx);
+        }
+    }
+
+    /// Navigates to the next tab in MRU order (Ctrl+Tab).
+    pub fn next_mru_tab(&mut self, cx: &mut Context<Self>) {
+        if self.mru_order.len() <= 1 {
+            return;
+        }
+
+        // The second in MRU is the "next" most recent
+        if let Some(&next_id) = self.mru_order.get(1) {
+            self.activate(next_id, cx);
+        }
+    }
+
+    /// Navigates to the previous tab in MRU order (Ctrl+Shift+Tab).
+    pub fn prev_mru_tab(&mut self, cx: &mut Context<Self>) {
+        if self.mru_order.len() <= 1 {
+            return;
+        }
+
+        // The last in MRU is the "least recent"
+        if let Some(&prev_id) = self.mru_order.last() {
+            self.activate(prev_id, cx);
+        }
+    }
+
+    /// The ids of every open document, in tab order.
+    ///
+    /// A batch close selects from this list and hands the result to the workspace
+    /// funnel, whose per-tab step asks the document what closing means before
+    /// removing anything. This crate cannot ask that question itself, so it never
+    /// closes in batches on its own: doing so would drop pending edits, which is
+    /// the regression the funnel exists to prevent.
+    pub fn document_ids(&self) -> Vec<DocumentId> {
+        self.documents.iter().map(|d| d.id()).collect()
+    }
+
+    /// The ids a "close others" batch removes: everything but the tab the gesture
+    /// names.
+    pub fn ids_to_close_others(all_ids: &[DocumentId], keep_id: DocumentId) -> Vec<DocumentId> {
+        all_ids
+            .iter()
+            .copied()
+            .filter(|&id| id != keep_id)
+            .collect()
+    }
+
+    /// The ids a "close to the left" batch removes: every tab before the target.
+    ///
+    /// An unknown target selects nothing, which closes nothing — the same answer
+    /// the positional fallback a caller might write by hand would produce.
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "idx comes from position() over all_ids, so [..idx] and [(idx + 1)..] are valid ranges"
+    )]
+    pub fn ids_to_close_left(all_ids: &[DocumentId], target_id: DocumentId) -> Vec<DocumentId> {
+        let Some(idx) = all_ids.iter().position(|&id| id == target_id) else {
+            return Vec::new();
+        };
+        all_ids[..idx].to_vec()
+    }
+
+    /// The ids a "close to the right" batch removes: every tab after the target.
+    ///
+    /// An unknown target selects nothing, exactly like [`Self::ids_to_close_left`].
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "idx comes from position() over all_ids, so idx <= all_ids.len() and [(idx + 1)..] is a valid range"
+    )]
+    pub fn ids_to_close_right(all_ids: &[DocumentId], target_id: DocumentId) -> Vec<DocumentId> {
+        let Some(idx) = all_ids.iter().position(|&id| id == target_id) else {
+            return Vec::new();
+        };
+        all_ids[(idx + 1)..].to_vec()
+    }
+
+    /// Switches to tab by 1-based number (Ctrl+1 through Ctrl+9).
+    pub fn switch_to_tab(&mut self, n: usize, cx: &mut Context<Self>) {
+        if n == 0 || n > self.documents.len() {
+            return;
+        }
+        #[expect(
+            clippy::indexing_slicing,
+            reason = "the guard above requires 1 <= n <= documents.len(), so n - 1 is a valid index"
+        )]
+        let id = self.documents[n - 1].id();
+        self.activate(id, cx);
+    }
+
+    /// Finds a document by ID.
+    fn index_of(&self, id: DocumentId) -> Option<usize> {
+        self.documents.iter().position(|d| d.id() == id)
+    }
+
+    /// Returns the active tab.
+    pub fn active_tab(&self) -> Option<&Tab> {
+        self.active_index.and_then(|i| self.documents.get(i))
+    }
+
+    /// Renders the active tab.
+    ///
+    /// Returns `None` when no tab is active.
+    pub fn render_active(&self, window: &mut Window, cx: &mut App) -> Option<AnyElement> {
+        Some(self.active_tab()?.render(window, cx))
+    }
+
+    /// The side panels of the active tab, drawn by the workspace as islands
+    /// beside the document island. Empty when no tab is active.
+    pub fn active_side_panels(
+        &self,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<crate::pane::DocumentSidePanel> {
+        self.active_tab()
+            .map(|tab| tab.side_panels(window, cx))
+            .unwrap_or_default()
+    }
+
+    /// Dispatches a command to the active tab.
+    ///
+    /// Returns `true` when the command was handled, `false` when there is no
+    /// active tab or the tab declined the command.
+    pub fn dispatch_active(&self, cmd: Command, window: &mut Window, cx: &mut App) -> bool {
+        match self.active_tab() {
+            Some(tab) => tab.dispatch_command(cmd, window, cx),
+            None => false,
+        }
+    }
+
+    /// Focuses the active tab. No-ops when no tab is active.
+    pub fn focus_active(&self, window: &mut Window, cx: &mut App) {
+        if let Some(tab) = self.active_tab() {
+            tab.focus(window, cx);
+        }
+    }
+
+    /// Returns the active document ID.
+    pub fn active_id(&self) -> Option<DocumentId> {
+        self.active_tab().map(|d| d.id())
+    }
+
+    /// Returns the active document index.
+    pub fn active_index(&self) -> Option<usize> {
+        self.active_index
+    }
+
+    /// Returns all tabs (for TabBar and action iteration).
+    pub fn documents(&self) -> &[Tab] {
+        &self.documents
+    }
+
+    /// Finds a tab by ID.
+    pub fn document(&self, id: DocumentId) -> Option<&Tab> {
+        self.documents.iter().find(|d| d.id() == id)
+    }
+
+    /// Opens a pane-style document and activates it.
+    pub fn open_pane(&mut self, pane: PaneHandle, cx: &mut Context<Self>) {
+        self.open(Tab::Pane(Box::new(pane)), cx);
+    }
+
+    /// Returns the first tab whose identity matches `key`.
+    ///
+    /// Used by `actions.rs` paths for deduplication instead of `is_*` methods.
+    pub fn find_by_key(&self, key: &DocumentKey, cx: &App) -> Option<DocumentId> {
+        self.documents
+            .iter()
+            .find(|tab| tab.matches_dedup_key(key, cx))
+            .map(|tab| tab.id())
+    }
+
+    /// Returns `(DocumentId, summary)` for every document that reports pending changes.
+    ///
+    /// Used for dirty-dot tooltips and the unsaved-changes modal.
+    pub fn dirty_summaries(&self, cx: &App) -> Vec<(DocumentId, String, CloseAction)> {
+        self.documents
+            .iter()
+            .filter_map(|doc| {
+                doc.change_summary(cx)
+                    .map(|summary| (doc.id(), summary, doc.as_pane().close_action()))
+            })
+            .collect()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.documents.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.documents.len()
+    }
+
+    /// Moves a tab from one position to another (for drag & drop).
+    #[allow(unused_variables)]
+    /// Moves the active tab one place left (`forward == false`) or right,
+    /// keeping it active. Returns `false` at either end or without tabs.
+    pub fn move_active_tab(&mut self, forward: bool, cx: &mut Context<Self>) -> bool {
+        let Some(active) = self.active_index else {
+            return false;
+        };
+
+        let target = if forward {
+            active + 1
+        } else {
+            match active.checked_sub(1) {
+                Some(target) => target,
+                None => return false,
+            }
+        };
+
+        if target >= self.documents.len() {
+            return false;
+        }
+
+        self.move_tab(active, target, cx);
+        true
+    }
+
+    pub fn move_tab(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        if from == to || from >= self.documents.len() || to >= self.documents.len() {
+            return;
+        }
+
+        let doc = self.documents.remove(from);
+        self.documents.insert(to, doc);
+
+        // Adjust active_index if needed
+        if let Some(active) = self.active_index {
+            self.active_index = Some(if active == from {
+                to
+            } else if from < active && active <= to {
+                active - 1
+            } else if to <= active && active < from {
+                active + 1
+            } else {
+                active
+            });
+        }
+
+        cx.emit(TabManagerEvent::Reordered);
+        cx.notify();
+    }
+}
+
+impl Default for TabManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EventEmitter<TabManagerEvent> for TabManager {}
+
+#[derive(Clone, Debug)]
+pub enum TabManagerEvent {
+    Opened(DocumentId),
+    Closed(DocumentId),
+    Activated(DocumentId),
+    /// A document finished a save attempt, successful or not.
+    SaveFinished {
+        id: DocumentId,
+        succeeded: bool,
+    },
+    /// A document asked to be closed — it is safe to close now.
+    RequestClose {
+        id: DocumentId,
+    },
+    Reordered,
+    /// A document requested focus (user clicked on it).
+    DocumentRequestedFocus,
+    /// A document requested SQL preview modal.
+    RequestSqlPreview {
+        context: Box<datatab_components::SqlPreviewContext>,
+        generation_type: datatab_components::SqlGenerationType,
+    },
+    /// Request to mount content into the workspace-level inspector rail.
+    OpenInspector {
+        title: gpui::SharedString,
+        content: gpui::AnyView,
+        /// The content draws its own title bar; the rail must not add one.
+        content_has_header: bool,
+    },
+    /// Request to hide the workspace inspector rail without forgetting the
+    /// document's cached inspector state.
+    CloseInspector,
+    /// User requested "Chart this query" from a data document's context menu.
+    ChartThisQuery {
+        query: String,
+        connection_id: Option<uuid::Uuid>,
+    },
+    /// Dashboard document requested the workspace to open the "Add Panel" picker.
+    RequestAddPanel {
+        dashboard_id: uuid::Uuid,
+    },
+    /// Read-only dashboard requested the workspace to create an editable copy.
+    RequestSaveAsEditable {
+        source_title: String,
+        profile_id: uuid::Uuid,
+    },
+    /// A document asked to open the MCP approvals view.
+    RequestOpenApprovals,
+    /// The query builder's "Open in Editor" action was triggered.
+    ///
+    /// Carries the target connection profile and the fully materialized SQL
+    /// (parameter literals inlined, no placeholders).
+    OpenEditorWithContent {
+        profile_id: uuid::Uuid,
+        sql: String,
+    },
+    /// Open the row a foreign-key value points at (see
+    /// [`ReferencedRowTarget`]).
+    OpenReferencedRow {
+        target: ReferencedRowTarget,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DocumentId, TabManager};
+    use uuid::Uuid;
+
+    fn make_ids(n: usize) -> Vec<DocumentId> {
+        (0..n).map(|_| DocumentId(Uuid::new_v4())).collect()
+    }
+
+    #[test]
+    fn close_others_excludes_keep_id() {
+        let ids = make_ids(5);
+        let keep = ids[2];
+        let result = TabManager::ids_to_close_others(&ids, keep);
+
+        assert_eq!(result.len(), 4);
+        assert!(!result.contains(&keep));
+        assert!(result.contains(&ids[0]));
+        assert!(result.contains(&ids[1]));
+        assert!(result.contains(&ids[3]));
+        assert!(result.contains(&ids[4]));
+    }
+
+    #[test]
+    fn close_others_with_single_tab_returns_empty() {
+        let ids = make_ids(1);
+        let result = TabManager::ids_to_close_others(&ids, ids[0]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn close_left_returns_ids_before_target() {
+        let ids = make_ids(5);
+        let result = TabManager::ids_to_close_left(&ids, ids[3]);
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result, &ids[..3]);
+    }
+
+    #[test]
+    fn close_left_at_first_position_returns_empty() {
+        let ids = make_ids(5);
+        let result = TabManager::ids_to_close_left(&ids, ids[0]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn close_left_with_unknown_id_returns_empty() {
+        let ids = make_ids(3);
+        let unknown = DocumentId(Uuid::new_v4());
+        let result = TabManager::ids_to_close_left(&ids, unknown);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn close_right_returns_ids_after_target() {
+        let ids = make_ids(5);
+        let result = TabManager::ids_to_close_right(&ids, ids[1]);
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result, &ids[2..]);
+    }
+
+    #[test]
+    fn close_right_at_last_position_returns_empty() {
+        let ids = make_ids(5);
+        let result = TabManager::ids_to_close_right(&ids, ids[4]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn close_right_with_unknown_id_returns_empty() {
+        let ids = make_ids(3);
+        let unknown = DocumentId(Uuid::new_v4());
+        let result = TabManager::ids_to_close_right(&ids, unknown);
+        assert!(result.is_empty());
+    }
+
+    /// Regression guard for `ids_to_close_right` from the first position.
+    #[test]
+    fn close_right_from_first_returns_two_tabs() {
+        let ids = make_ids(3);
+        let result = TabManager::ids_to_close_right(&ids, ids[0]);
+        assert_eq!(
+            result.len(),
+            2,
+            "structural: close-right from first keeps 2 tabs"
+        );
+    }
+}
+
+#[cfg(test)]
+mod close_activation_tests {
+    use super::{DocumentId, Tab, TabManager, TabManagerEvent};
+    use crate::code::CodeDocument;
+    use datatab_components::theme;
+    use datatab_core::QueryLanguage;
+    use datatab_storage::bootstrap::StorageRuntime;
+    use datatab_ui_base::AppStateEntity;
+    use datatab_ui_base::toast::{ToastGlobal, ToastHost};
+    use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    struct Harness<'a> {
+        window: &'a mut VisualTestContext,
+        app_state: Entity<AppStateEntity>,
+        manager: Entity<TabManager>,
+        events: Rc<RefCell<Vec<TabManagerEvent>>>,
+    }
+
+    fn harness(cx: &mut TestAppContext) -> Harness<'_> {
+        cx.update(gpui_component::init);
+        cx.update(theme::init);
+        cx.update(|cx| {
+            let host = cx.new(|_| ToastHost::new());
+            cx.set_global(ToastGlobal { host });
+        });
+
+        let app_state = cx.update(|cx| {
+            cx.new(|_| {
+                let storage_runtime =
+                    StorageRuntime::in_memory().expect("isolated storage runtime");
+                AppStateEntity::new_with_storage_runtime(storage_runtime)
+                    .expect("test storage setup")
+            })
+        });
+
+        let window = cx.add_empty_window();
+        let manager = window.update(|_, cx| cx.new(|_| TabManager::new()));
+
+        let events: Rc<RefCell<Vec<TabManagerEvent>>> = Rc::new(RefCell::new(Vec::new()));
+        let sink = events.clone();
+        window.update(|_, cx| {
+            cx.subscribe(&manager, move |_, event: &TabManagerEvent, _| {
+                sink.borrow_mut().push(event.clone());
+            })
+            .detach();
+        });
+
+        Harness {
+            window,
+            app_state,
+            manager,
+            events,
+        }
+    }
+
+    fn open_code_tab(harness: &mut Harness<'_>) -> DocumentId {
+        let app_state = harness.app_state.clone();
+        let manager = harness.manager.clone();
+
+        harness.window.update(|window, cx| {
+            let document = cx.new(|cx| {
+                CodeDocument::new_with_language(app_state, None, QueryLanguage::Sql, window, cx)
+            });
+            let document_id = document.read(cx).id();
+
+            let pane = CodeDocument::into_pane(document, cx);
+            manager.update(cx, |manager, cx| {
+                manager.open(Tab::Pane(Box::new(pane)), cx);
+            });
+
+            document_id
+        })
+    }
+
+    fn close_and_record(harness: &mut Harness<'_>, id: DocumentId) -> Vec<TabManagerEvent> {
+        let manager = harness.manager.clone();
+
+        harness.window.run_until_parked();
+        harness.events.borrow_mut().clear();
+
+        harness.window.update(|_, cx| {
+            manager.update(cx, |manager, cx| {
+                assert!(manager.close(id, cx), "the tab must be open");
+            });
+        });
+        harness.window.run_until_parked();
+
+        harness.events.borrow().clone()
+    }
+
+    /// Closing the active tab hands activation to the tab that takes over,
+    /// after the close, so the workspace runs its activation pass for it.
+    #[gpui::test]
+    fn closing_the_active_tab_activates_the_next_one_after_the_close(cx: &mut TestAppContext) {
+        let mut harness = harness(cx);
+        let remaining = open_code_tab(&mut harness);
+        let closed = open_code_tab(&mut harness);
+
+        let recorded = close_and_record(&mut harness, closed);
+
+        assert!(
+            matches!(
+                recorded.as_slice(),
+                [TabManagerEvent::Closed(first), TabManagerEvent::Activated(second)]
+                    if *first == closed && *second == remaining
+            ),
+            "closing the active tab must emit Closed, then Activated for the new active tab, got {recorded:?}"
+        );
+        let active_id = harness
+            .window
+            .update(|_, cx| harness.manager.read(cx).active_id());
+        assert_eq!(active_id, Some(remaining));
+    }
+
+    /// Closing a background tab leaves the active tab in place, so there is no
+    /// activation to announce.
+    #[gpui::test]
+    fn closing_a_background_tab_does_not_reactivate(cx: &mut TestAppContext) {
+        let mut harness = harness(cx);
+        let background = open_code_tab(&mut harness);
+        let active = open_code_tab(&mut harness);
+
+        let recorded = close_and_record(&mut harness, background);
+
+        assert!(
+            matches!(recorded.as_slice(), [TabManagerEvent::Closed(first)] if *first == background),
+            "closing a background tab must only emit Closed, got {recorded:?}"
+        );
+        let active_id = harness
+            .window
+            .update(|_, cx| harness.manager.read(cx).active_id());
+        assert_eq!(active_id, Some(active));
+    }
+
+    /// Closing the last tab leaves nothing active and announces no activation.
+    #[gpui::test]
+    fn closing_the_last_tab_activates_nothing(cx: &mut TestAppContext) {
+        let mut harness = harness(cx);
+        let only = open_code_tab(&mut harness);
+
+        let recorded = close_and_record(&mut harness, only);
+
+        assert!(
+            matches!(recorded.as_slice(), [TabManagerEvent::Closed(first)] if *first == only),
+            "closing the last tab must only emit Closed, got {recorded:?}"
+        );
+        let active_id = harness
+            .window
+            .update(|_, cx| harness.manager.read(cx).active_id());
+        assert_eq!(active_id, None);
+    }
+
+    fn active_side_panel_ids(harness: &mut Harness<'_>) -> Vec<(String, gpui::Pixels)> {
+        let manager = harness.manager.clone();
+
+        harness.window.update(|window, cx| {
+            manager.update(cx, |manager, cx| {
+                manager
+                    .active_side_panels(window, cx)
+                    .into_iter()
+                    .map(|panel| (panel.id.to_string(), panel.width))
+                    .collect()
+            })
+        })
+    }
+
+    /// The history of an editor is a side panel of its tab: the workspace
+    /// draws it while that tab is active and drops it when another tab is.
+    #[gpui::test]
+    fn the_active_tab_hands_its_side_panels_to_the_workspace(cx: &mut TestAppContext) {
+        let mut harness = harness(cx);
+        let with_history = open_code_tab(&mut harness);
+        let plain = open_code_tab(&mut harness);
+        let manager = harness.manager.clone();
+
+        assert!(active_side_panel_ids(&mut harness).is_empty());
+
+        harness.window.update(|window, cx| {
+            manager.update(cx, |manager, cx| {
+                manager.activate(with_history, cx);
+                assert!(manager.dispatch_active(
+                    datatab_app::keymap::Command::ToggleHistoryDropdown,
+                    window,
+                    cx
+                ));
+            });
+        });
+
+        assert_eq!(
+            active_side_panel_ids(&mut harness),
+            vec![(
+                "query-history".to_string(),
+                datatab_components::tokens::HistoryPanelMetrics::WIDTH
+            )]
+        );
+
+        harness.window.update(|_, cx| {
+            manager.update(cx, |manager, cx| manager.activate(plain, cx));
+        });
+        assert!(active_side_panel_ids(&mut harness).is_empty());
+
+        harness.window.update(|_, cx| {
+            manager.update(cx, |manager, cx| manager.activate(with_history, cx));
+        });
+        assert_eq!(active_side_panel_ids(&mut harness).len(), 1);
+    }
+}

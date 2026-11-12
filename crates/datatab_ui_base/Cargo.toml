@@ -1,0 +1,54 @@
+[package]
+name = "datatab_ui_base"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+description = "App-state-aware UI base layer for DataTab (AppStateEntity + GPUI event types)"
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+
+[dependencies]
+gpui.workspace = true
+gpui-component.workspace = true
+bolt.workspace = true
+datatab_app.workspace = true
+datatab_storage.workspace = true
+datatab_components.workspace = true
+datatab_core.workspace = true
+datatab_i18n.workspace = true
+datatab_mcp = { workspace = true, optional = true }
+datatab_aws = { workspace = true, optional = true }
+gpui-mcp = { workspace = true, optional = true }
+tracing.workspace = true
+uuid.workspace = true
+log.workspace = true
+anyhow = { workspace = true }
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+# The keyboard-coverage registry's frame capture lives behind Bolt's
+# `test-support` feature, which a plain dependency build does not enable.
+bolt = { workspace = true, features = ["test-support"] }
+datatab_components = { workspace = true, features = ["test-support"] }
+tempfile = "3"
+rusqlite.workspace = true
+serde_json.workspace = true
+
+[features]
+default = []
+test-support = ["gpui/test-support", "bolt/test-support"]
+mcp = ["datatab_mcp", "datatab_app/mcp"]
+lua = ["datatab_app/lua"]
+aws = ["datatab_aws", "datatab_app/aws"]
+# Installs the gpui-mcp automation bridge in every window. Development only: the
+# bridge exposes rendered UI text to local processes of the same user.
+ui-automation = ["dep:gpui-mcp"]
+
+[lints]
+workspace = true

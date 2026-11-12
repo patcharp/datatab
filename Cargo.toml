@@ -1,0 +1,291 @@
+[workspace]
+members = [
+    "crates/datatab",
+    "crates/datatab_app",
+    "crates/datatab_ui",
+    "crates/datatab_ui_base",
+    "crates/datatab_ui_document",
+    "crates/datatab_ui_windows",
+    "crates/datatab_ui_sidebar",
+    "crates/datatab_components",
+    "crates/bolt",
+    "crates/bolt_keys",
+    "crates/datatab_core",
+    "crates/datatab_lua",
+    "crates/datatab_js",
+    "crates/datatab_ipc",
+    "crates/datatab_driver_ipc",
+    "crates/datatab_test_support",
+    "crates/datatab_driver_sqlite",
+    "crates/datatab_driver_postgres",
+    "crates/datatab_driver_mysql",
+    "crates/datatab_driver_mongodb",
+    "crates/datatab_driver_redis",
+    "crates/datatab_driver_dynamodb",
+    "crates/datatab_driver_cloudwatch",
+    "crates/datatab_driver_mssql",
+    "crates/datatab_driver_redshift",
+    "crates/datatab_driver_clickhouse",
+    "crates/datatab_driver_turso",
+    "crates/datatab_driver_duckdb",
+    "crates/datatab_ssh",
+    "crates/datatab_proxy",
+    "crates/datatab_tunnel_core",
+    "crates/datatab_export",
+    "crates/datatab_transfer",
+    "crates/datatab_byte_source",
+    "crates/datatab_delimited",
+    "crates/datatab_parquet",
+    "crates/datatab_spreadsheet",
+    "crates/datatab_driver_host",
+    "crates/datatab_aws",
+    "crates/datatab_ssm",
+    "crates/datatab_mcp",
+    "crates/datatab_mcp_server",
+    "crates/datatab_policy",
+    "crates/datatab_approval",
+    "crates/datatab_audit",
+    "crates/datatab_storage",
+    "crates/datatab_schema_viz",
+    "crates/datatab_driver_influxdb",
+    "crates/datatab_portability",
+    "crates/datatab_driver_s3",
+    "crates/datatab_driver_aws_secrets",
+    "crates/datatab_i18n",
+    # Upstream themixednuts/gpui-mcp crates for UI automation; see vendor/gpui-mcp/VENDOR.md.
+    "vendor/gpui-mcp/crates/gpui-mcp",
+    "vendor/gpui-mcp/crates/gpui-mcp-protocol",
+    "vendor/gpui-mcp/crates/gpui-mcp-server",
+    "vendor/gpui-mcp/crates/gpui-mcp-capture",
+]
+default-members = ["crates/datatab"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.88"
+version = "0.1.1"
+authors = ["PCPLab <me@pcplab.me>"]
+description = "A fast, keyboard-first database client"
+repository = "https://github.com/patcharp/datatab"
+homepage = "https://datatab.pcplab.me"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+datatab = { path = "crates/datatab" }
+datatab_core = { path = "crates/datatab_core" }
+datatab_lua = { path = "crates/datatab_lua" }
+datatab_js = { path = "crates/datatab_js" }
+datatab_test_support = { path = "crates/datatab_test_support" }
+datatab_driver_sqlite = { path = "crates/datatab_driver_sqlite" }
+datatab_driver_postgres = { path = "crates/datatab_driver_postgres" }
+datatab_driver_mysql = { path = "crates/datatab_driver_mysql" }
+datatab_driver_mongodb = { path = "crates/datatab_driver_mongodb" }
+datatab_driver_redis = { path = "crates/datatab_driver_redis" }
+datatab_driver_dynamodb = { path = "crates/datatab_driver_dynamodb" }
+datatab_driver_cloudwatch = { path = "crates/datatab_driver_cloudwatch" }
+datatab_driver_mssql = { path = "crates/datatab_driver_mssql" }
+datatab_driver_redshift = { path = "crates/datatab_driver_redshift" }
+datatab_driver_clickhouse = { path = "crates/datatab_driver_clickhouse" }
+datatab_driver_turso = { path = "crates/datatab_driver_turso" }
+datatab_driver_duckdb = { path = "crates/datatab_driver_duckdb" }
+datatab_ssh = { path = "crates/datatab_ssh" }
+datatab_proxy = { path = "crates/datatab_proxy" }
+datatab_export = { path = "crates/datatab_export" }
+datatab_byte_source = { path = "crates/datatab_byte_source" }
+datatab_delimited = { path = "crates/datatab_delimited" }
+datatab_parquet = { path = "crates/datatab_parquet" }
+datatab_spreadsheet = { path = "crates/datatab_spreadsheet" }
+datatab_ipc = { path = "crates/datatab_ipc" }
+datatab_driver_ipc = { path = "crates/datatab_driver_ipc" }
+datatab_aws = { path = "crates/datatab_aws" }
+datatab_ssm = { path = "crates/datatab_ssm" }
+datatab_mcp = { path = "crates/datatab_mcp" }
+datatab_mcp_server = { path = "crates/datatab_mcp_server" }
+datatab_policy = { path = "crates/datatab_policy" }
+datatab_approval = { path = "crates/datatab_approval" }
+datatab_audit = { path = "crates/datatab_audit" }
+datatab_storage = { path = "crates/datatab_storage" }
+datatab_schema_viz = { path = "crates/datatab_schema_viz" }
+datatab_driver_influxdb = { path = "crates/datatab_driver_influxdb" }
+datatab_portability = { path = "crates/datatab_portability" }
+datatab_driver_s3 = { path = "crates/datatab_driver_s3" }
+datatab_driver_aws_secrets = { path = "crates/datatab_driver_aws_secrets" }
+datatab_app = { path = "crates/datatab_app" }
+datatab_components = { path = "crates/datatab_components" }
+bolt = { path = "crates/bolt" }
+bolt_keys = { path = "crates/bolt_keys" }
+datatab_ui_base = { path = "crates/datatab_ui_base" }
+datatab_ui_document = { path = "crates/datatab_ui_document" }
+datatab_ui_windows = { path = "crates/datatab_ui_windows" }
+datatab_ui_sidebar = { path = "crates/datatab_ui_sidebar" }
+datatab_ui = { path = "crates/datatab_ui" }
+datatab_transfer = { path = "crates/datatab_transfer" }
+datatab_i18n = { path = "crates/datatab_i18n" }
+mysql = "28"
+
+petgraph = "0.7"
+
+gpui = { package = "gpui-pre", version = "=0.3.9" }
+# The same crate under the name gpui-mcp's `gpui-pre` backend expects; keep both in step.
+gpui_pre = { package = "gpui-pre", version = "=0.3.9" }
+gpui-component = { version = "=0.7.3", features = ["tree-sitter"] }
+gpui-pre-platform = { version = "=0.3.9", default-features = false, features = ["font-kit", "wayland", "x11"] }
+gpui-mcp = { path = "vendor/gpui-mcp/crates/gpui-mcp" }
+# Grammars for the code-editor highlighter (gpui-component's highlighter::LanguageRegistry).
+# gpui-component's own `tree-sitter-languages` feature pulls in ~30 grammars; DataTab only
+# ever asks the editor for the modes `QueryLanguage::editor_mode()` can return (sql,
+# javascript, cypher, lua, python, bash, plaintext) plus json, so those are registered
+# individually at startup instead (see datatab_components::highlighting).
+tree-sitter = "0.26"
+tree-sitter-sequel = "0.3.8"
+tree-sitter-javascript = "0.23.1"
+tree-sitter-cypher = "0.2.6"
+tree-sitter-lua = "0.4.1"
+tree-sitter-python = "0.23.6"
+tree-sitter-bash = "0.23.3"
+tree-sitter-json = "0.24.8"
+# Bundled by bolt behind its opt-in `syntax-xml` and `syntax-html` features.
+tree-sitter-xml = "0.7.0"
+tree-sitter-html = "0.23.2"
+core-text = ">=21.0.0, <21.1.0"
+smallvec = "1.13.2"
+rfd = "0.17"
+# Raster decoding for object previews. Already in the tree via gpui (which
+# decodes `img()` sources with the same crate); the direct dependency only
+# exists so previews can validate bytes and read pixel dimensions before
+# handing them to the renderer.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "webp",
+    "gif",
+    "bmp",
+] }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+quick-xml = "0.39"
+async-trait = "0.1"
+anyhow = "1"
+postcard = { version = "1", features = ["use-std"] }
+lsp-types = "0.97"
+toml = "1"
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
+thiserror = "2"
+secrecy = "0.10"
+age = { version = "0.11", features = ["armor"] }
+dirs = "6"
+rusqlite = { version = "0.40", features = ["bundled"] }
+# Pinned to match the aes/cbc versions already vendored transitively via
+# gpui -> oo7, avoiding a second copy of the RustCrypto block-cipher stack.
+aes = "0.8"
+cbc = "0.1"
+tokio-postgres = "0.7"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+turso_serverless = "=0.1.3"
+duckdb = { version = "1.10506", features = ["bundled", "parquet", "json"] }
+log = "0.4"
+env_logger = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tracing-log = "0.2"
+tracing-appender = "0.2"
+fuzzy-matcher = "0.3"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls", "gzip", "json"] }
+csv = "1"
+encoding_rs = "0.8"
+chardetng = "1"
+semver = "1"
+chrono = { version = "0.4", features = ["serde"] }
+urlencoding = "2"
+base64 = "0.22"
+hex = "0.4"
+sha2 = "0.11"
+interprocess = "2.4"
+mlua = "0.11"
+rquickjs = "0.13"
+flate2 = "1"
+zstd = "0.13"
+# Held at 59.3: it builds with the workspace's zstd 0.13, and 60 needs zstd 0.14.
+# The arrow crates must stay on the same version as parquet.
+# Brotli and encryption are left out on purpose: such files are refused with a typed error.
+parquet = { version = "59.3", default-features = false, features = [
+    "arrow",
+    "snap",
+    "zstd",
+    "lz4",
+    "flate2-zlib-rs",
+    "simdutf8",
+] }
+arrow-array = "59.3"
+arrow-schema = "59.3"
+# Spreadsheet reading. `zip` matches calamine's and `rust_xlsxwriter`'s own zip
+# dependency, so format detection and xlsx writing add no second copy;
+# `rust_xlsxwriter` writes xls values into a new xlsx and builds test fixtures.
+calamine = "0.37"
+zip = { version = "9.0", default-features = false, features = ["deflate"] }
+rust_xlsxwriter = "0.102"
+bytes = "1"
+snap = "1"
+lz4_flex = "0.14"
+rmp-serde = "1.3"
+indexmap = "2"
+sqlformat = "0.5.0"
+sys-locale = "0.3"
+serde_yaml = "0.9"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+unused_must_use = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
+panic = "warn"
+unwrap_in_result = "warn"
+dbg_macro = "warn"
+todo = "warn"
+unimplemented = "warn"
+indexing_slicing = "warn"
+
+# The schema visualizer pans and zooms by handing one transform to a subtree
+# (`crates/datatab_ui_document/src/schema_viz/mod.rs`), which needs the
+# `ElementTransform` API that upstream gpui does not carry yet, and UI automation
+# needs the frame-observer hooks. The vendored crate is the published gpui-pre 0.3.9
+# source with `vendor/gpui-pre/element-transform.patch` and
+# `vendor/gpui-pre/frame-observer.patch` applied; see `vendor/gpui-pre/VENDOR.md`
+# for the provenance and `vendor/gpui-pre/refresh.sh` for the update procedure.
+# `gpui-base` and `gpui-component` are the published 0.7.3 crates with local
+# editor patches, and `gpui-pre-linux` is the published 0.3.9 crate with a
+# Wayland keymap fix; see their `VENDOR.md` files.
+[patch.crates-io]
+gpui-pre = { path = "vendor/gpui-pre" }
+gpui-base = { path = "vendor/gpui-base" }
+gpui-component = { path = "vendor/gpui-component" }
+gpui-pre-linux = { path = "vendor/gpui-pre-linux" }
+
+# Development build profile tuned for memory and link speed.
+# Full debug info (debug = 2) is the main driver of peak RAM and disk usage
+# when linking this many crates; line tables keep backtraces usable at a
+# fraction of the cost.
+[profile.dev]
+debug = "line-tables-only"
+
+# Dependencies rarely need debugging; dropping their debug info entirely is a
+# large reduction in target/ size and link-time memory.
+[profile.dev.package."*"]
+debug = false
+
+# Release build profile tuned for binary size and runtime speed.
+# `panic` is intentionally left at the default `unwind`: switching to `abort` is a
+# separate decision that loses `catch_unwind` and may break GPUI internals that
+# rely on unwinding, so it is not changed here.
+# `codegen-units` stays at cargo's release default (16): a single unit makes
+# the final binary crate a serial 4-8 minute step on every CI platform, and
+# thin LTO already recovers most of the cross-unit optimization.
+[profile.release]
+lto = "thin"
+strip = "symbols"

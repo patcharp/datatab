@@ -1,0 +1,66 @@
+[package]
+name = "datatab_ui"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+description = "GPUI UI layer for DataTab"
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+
+[dependencies]
+gpui.workspace = true
+gpui-component.workspace = true
+datatab_components.workspace = true
+datatab_i18n.workspace = true
+datatab_ui_base.workspace = true
+datatab_ui_document.workspace = true
+datatab_ui_windows.workspace = true
+datatab_ui_sidebar.workspace = true
+datatab_core.workspace = true
+datatab_storage.workspace = true
+datatab_app.workspace = true
+datatab_ipc.workspace = true
+datatab_ssh.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+log.workspace = true
+serde_json.workspace = true
+rfd.workspace = true
+fuzzy-matcher.workspace = true
+interprocess.workspace = true
+open = "5"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[features]
+# datatab_ui is driver-agnostic: it has no per-driver features and no driver
+# dependencies. The cross-cutting features only forward to the workspace/app and
+# the sibling UI crates so a single feature set is unified across the build.
+default = ["lua", "aws", "mcp"]
+lua = ["datatab_app/lua", "datatab_ui_base/lua", "datatab_ui_document/lua", "datatab_ui_windows/lua", "datatab_ui_sidebar/lua"]
+aws = ["datatab_app/aws", "datatab_ui_base/aws", "datatab_ui_document/aws", "datatab_ui_windows/aws", "datatab_ui_sidebar/aws"]
+mcp = ["datatab_app/mcp", "datatab_ui_base/mcp", "datatab_ui_document/mcp", "datatab_ui_windows/mcp", "datatab_ui_sidebar/mcp"]
+# Off by default. Only datatab_ui_base holds the gated bridge code; every other
+# crate calls its always-present install function.
+ui-automation = ["datatab_ui_base/ui-automation"]
+vendored-openssl = ["datatab_ssh/vendored-openssl"]
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+datatab_ui_base = { workspace = true, features = ["test-support"] }
+datatab_ui_document = { workspace = true, features = ["test-support"] }
+parquet.workspace = true
+arrow-array.workspace = true
+arrow-schema.workspace = true
+
+[package.metadata.cargo-machete]
+# datatab_ssh is used only via the vendored-openssl feature passthrough
+# (no direct source usage needed — the dep only forwards the feature).
+ignored = ["datatab_ssh"]
+
+[lints]
+workspace = true

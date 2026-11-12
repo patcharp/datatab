@@ -1,0 +1,16 @@
+target/
+.direnv
+thoughts/
+scripts/src
+scripts/pkg
+scripts/datatab*
+__pycache__/
+.logs
+result
+.atl/
+# Local Pi runtime state
+.agent/
+.codegraph/
+
+# Local Claude Code settings
+.claude/settings.local.json

@@ -1,0 +1,177 @@
+use gpui::{Context, IntoElement, SharedString, div};
+use gpui_component::ActiveTheme;
+
+use datatab_components::controls::{Button, ButtonVariant, Input};
+use datatab_components::tokens::{FontSizes, Spacing};
+
+use crate::data_grid_panel::mutation_executor::ExecutionMode;
+use crate::labels::{execution_count_state_label, execution_mode_label};
+use crate::query_builder::keyboard::row_id;
+use crate::query_builder::panel::QueryBuilderPanel;
+
+/// Renders the execution mode section.
+///
+/// Shows:
+/// - A 3-button segmented control for SingleTransaction / ChunkedTransaction / DirectAutocommit
+/// - A chunk-size input (greyed out unless ChunkedTransaction is selected)
+/// - A lock-timeout input (greyed out for DirectAutocommit)
+/// - The row-count state label
+pub(crate) fn render_execution(
+    panel: &mut QueryBuilderPanel,
+    cx: &mut Context<QueryBuilderPanel>,
+) -> impl IntoElement {
+    use gpui::prelude::*;
+
+    let theme = cx.theme().clone();
+
+    let (current_mode, count_state) = match panel.mutation_state.as_ref() {
+        Some(s) => (s.exec_options.mode, s.count_state.clone()),
+        None => return div().into_any_element(),
+    };
+
+    let count_text = execution_count_state_label(&count_state);
+
+    let modes = [
+        ExecutionMode::SingleTransaction,
+        ExecutionMode::ChunkedTransaction,
+        ExecutionMode::DirectAutocommit,
+    ];
+
+    let mark = panel.rail_mark.clone();
+    let mode_row_id = row_id::execution_mode();
+
+    let mut mode_row = mark
+        .row(&mode_row_id, div())
+        .flex()
+        .flex_row()
+        .gap_1()
+        .items_center()
+        .child(
+            div()
+                .text_size(FontSizes::SM)
+                .text_color(theme.muted_foreground)
+                .child(datatab_i18n::t!(
+                    "document.query_builder.execution.mode_label"
+                )),
+        );
+
+    for mode in modes {
+        let is_active = mode == current_mode;
+        let variant = if is_active {
+            ButtonVariant::Primary
+        } else {
+            ButtonVariant::Secondary
+        };
+        mode_row = mode_row.child(
+            mark.ring_element(
+                &mode_row_id,
+                &format!("mode-{}", mode as usize),
+                Button::new(("qb-exec-mode", mode as usize), execution_mode_label(mode))
+                    .variant(variant)
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
+                        this.set_execution_mode(mode, cx);
+                    })),
+            ),
+        );
+    }
+
+    // Chunk size row (enabled only in ChunkedTransaction mode)
+    let chunk_enabled = current_mode == ExecutionMode::ChunkedTransaction;
+    let chunk_label_color = if chunk_enabled {
+        theme.foreground
+    } else {
+        theme.muted_foreground
+    };
+
+    let chunk_row = mark
+        .row(&row_id::chunk_size(), div())
+        .flex()
+        .flex_row()
+        .gap_1()
+        .items_center()
+        .child(
+            div()
+                .text_size(FontSizes::SM)
+                .text_color(chunk_label_color)
+                .child(datatab_i18n::t!(
+                    "document.query_builder.execution.chunk_size_label"
+                )),
+        )
+        .child(div().w(gpui::px(100.0)).child(
+            // guardrail-allow: explicit pixel width for input field
+            if let Some(cs_state) = panel.exec_chunk_size_input.as_ref().cloned() {
+                div().child(
+                    Input::new(&cs_state)
+                        .placeholder("1000")
+                        .disabled(!chunk_enabled),
+                )
+            } else {
+                div().child(
+                    div()
+                        .text_size(FontSizes::SM)
+                        .text_color(theme.muted_foreground)
+                        .child("1000"),
+                )
+            },
+        ));
+
+    // Lock timeout row (disabled for DirectAutocommit)
+    let lock_enabled = current_mode != ExecutionMode::DirectAutocommit;
+    let lock_label_color = if lock_enabled {
+        theme.foreground
+    } else {
+        theme.muted_foreground
+    };
+
+    let lock_row = mark
+        .row(&row_id::lock_timeout(), div())
+        .flex()
+        .flex_row()
+        .gap_1()
+        .items_center()
+        .child(
+            div()
+                .text_size(FontSizes::SM)
+                .text_color(lock_label_color)
+                .child(datatab_i18n::t!(
+                    "document.query_builder.execution.lock_timeout_label"
+                )),
+        )
+        .child(div().w(gpui::px(100.0)).child(
+            // guardrail-allow: explicit pixel width for input field
+            if let Some(lt_state) = panel.exec_lock_timeout_input.as_ref().cloned() {
+                div().child(
+                    Input::new(&lt_state)
+                        .placeholder(datatab_i18n::t!(
+                            "document.query_builder.execution.lock_timeout_none"
+                        ))
+                        .disabled(!lock_enabled),
+                )
+            } else {
+                div().child(
+                    div()
+                        .text_size(FontSizes::SM)
+                        .text_color(theme.muted_foreground)
+                        .child(datatab_i18n::t!(
+                            "document.query_builder.execution.lock_timeout_none"
+                        )),
+                )
+            },
+        ));
+
+    // Row count label
+    let count_row = div()
+        .text_size(FontSizes::SM)
+        .text_color(theme.muted_foreground)
+        .child(SharedString::from(count_text));
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(Spacing::XS)
+        .child(mode_row)
+        .child(chunk_row)
+        .child(lock_row)
+        .child(count_row)
+        .into_any_element()
+}

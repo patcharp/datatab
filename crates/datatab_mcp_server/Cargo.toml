@@ -1,0 +1,93 @@
+[package]
+name = "datatab_mcp_server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Standalone headless MCP server for DataTab"
+repository.workspace = true
+homepage.workspace = true
+license.workspace = true
+
+[lib]
+name = "datatab_mcp_server"
+path = "src/lib.rs"
+
+[features]
+sqlite = ["datatab_driver_sqlite"]
+postgres = ["datatab_driver_postgres"]
+mysql = ["datatab_driver_mysql"]
+mongodb = ["datatab_driver_mongodb"]
+redis = ["datatab_driver_redis"]
+dynamodb = ["datatab_driver_dynamodb"]
+redshift = ["datatab_driver_redshift"]
+clickhouse = ["datatab_driver_clickhouse"]
+turso = ["datatab_driver_turso"]
+duckdb = ["datatab_driver_duckdb"]
+aws = ["datatab_aws", "datatab_ssm"]
+
+[dependencies]
+# DataTab core crates
+datatab_core = { workspace = true, features = ["tracing-bridge"] }
+datatab_mcp = { workspace = true }
+datatab_policy = { workspace = true }
+datatab_approval = { workspace = true }
+datatab_audit = { workspace = true }
+datatab_storage = { workspace = true }
+datatab_ipc = { workspace = true }
+
+# Optional driver crates
+datatab_driver_sqlite = { workspace = true, optional = true }
+datatab_driver_postgres = { workspace = true, optional = true }
+datatab_driver_mysql = { workspace = true, optional = true }
+datatab_driver_mongodb = { workspace = true, optional = true }
+datatab_driver_redis = { workspace = true, optional = true }
+datatab_driver_dynamodb = { workspace = true, optional = true }
+datatab_driver_redshift = { workspace = true, optional = true }
+datatab_driver_clickhouse = { workspace = true, optional = true }
+datatab_driver_turso = { workspace = true, optional = true }
+datatab_driver_duckdb = { workspace = true, optional = true }
+datatab_aws = { workspace = true, optional = true }
+datatab_ssm = { workspace = true, optional = true }
+
+# MCP SDK
+rmcp = { version = "2.0.0", features = ["server", "macros", "transport-io"] }
+schemars = "1.0"
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+
+# Async runtime
+tokio = { workspace = true, features = ["rt-multi-thread", "io-util", "sync", "macros", "time"] }
+
+# Utilities
+uuid = { workspace = true }
+anyhow = { workspace = true }
+chrono = { workspace = true }
+async-trait = { workspace = true }
+rusqlite.workspace = true
+
+log.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Test support
+datatab_test_support = { workspace = true }
+
+# The MCP client half is test-only: the transport-level end-to-end tests connect
+# to the server as an external agent does, and nothing in the shipped server
+# binary needs the client role or the in-memory transport.
+rmcp = { version = "2.0.0", features = ["client", "transport-async-rw"] }
+
+# Real driver for the end-to-end data path. The crate already carries it as an
+# optional dependency behind the `sqlite` feature; declaring it here keeps the
+# end-to-end tests runnable under a plain `cargo test -p datatab_mcp_server`.
+datatab_driver_sqlite = { workspace = true }
+
+tempfile = "3.10"
+
+# Async test runtime
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[lints]
+workspace = true

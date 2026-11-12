@@ -1,0 +1,1890 @@
+use super::*;
+use crate::connection_failure::{ConnectionFailure, parse_failure_row_id};
+use datatab_components::controls::Button;
+use datatab_components::icons::AppIcon;
+use datatab_components::primitives::{Icon, Status, StatusIndicator, Text};
+use datatab_components::tokens::{ChromeColors, ShellMetrics, TreeMetrics};
+use gpui::FontWeight;
+use std::time::Duration;
+
+/// Whether `item_id` is an error placeholder row, whose label is the full
+/// failure message and is usually wider than the sidebar.
+fn is_error_retry_row(item_id: &str) -> bool {
+    item_id.starts_with("object-retry|")
+        || item_id.starts_with("metrics-retry|")
+        || item_id.starts_with(crate::root_sections::DECLARATIONS_RETRY_PREFIX)
+        || item_id.starts_with(crate::root_sections::LISTING_RETRY_PREFIX)
+}
+
+/// Whether a row draws its chevron pointing down.
+///
+/// A profile keeps its expanded flag across a disconnect so it reopens on
+/// reconnect, but while it has no children there is nothing open under it.
+fn reads_expanded(node_kind: SchemaNodeKind, is_expanded: bool, has_children: bool) -> bool {
+    is_expanded && (has_children || node_kind != SchemaNodeKind::Profile)
+}
+
+fn sidebar_tree_label(
+    label: SharedString,
+    node_kind: SchemaNodeKind,
+    is_active: bool,
+    is_active_database: bool,
+    color: Hsla,
+) -> Text {
+    let weight = if (node_kind == SchemaNodeKind::Profile && is_active) || is_active_database {
+        FontWeight::SEMIBOLD
+    } else {
+        FontWeight::NORMAL
+    };
+
+    Text::body(label).font_weight(weight).color(color)
+}
+
+/// Splits a folder label of the form `"Tables (36)"` into its name and item
+/// count, so the count can sit right-aligned in the row (P1Sidebar). Labels
+/// without a trailing parenthesized number come back whole.
+pub(crate) fn split_folder_count(label: &str) -> (&str, Option<&str>) {
+    let Some(without_close) = label.strip_suffix(')') else {
+        return (label, None);
+    };
+
+    let Some((name, count)) = without_close.rsplit_once(" (") else {
+        return (label, None);
+    };
+
+    if count.is_empty() || !count.chars().all(|character| character.is_ascii_digit()) {
+        return (label, None);
+    }
+
+    (name, Some(count))
+}
+
+/// Folder rows whose labels carry an item count.
+fn is_counted_folder(node_kind: SchemaNodeKind) -> bool {
+    matches!(
+        node_kind,
+        SchemaNodeKind::TablesFolder
+            | SchemaNodeKind::ViewsFolder
+            | SchemaNodeKind::TypesFolder
+            | SchemaNodeKind::ColumnsFolder
+            | SchemaNodeKind::IndexesFolder
+            | SchemaNodeKind::ForeignKeysFolder
+            | SchemaNodeKind::ConstraintsFolder
+            | SchemaNodeKind::SchemaIndexesFolder
+            | SchemaNodeKind::SchemaForeignKeysFolder
+            | SchemaNodeKind::RoutinesFolder
+            | SchemaNodeKind::CollectionsFolder
+            | SchemaNodeKind::DatabaseIndexesFolder
+            | SchemaNodeKind::CollectionFieldsFolder
+            | SchemaNodeKind::CollectionIndexesFolder
+            | SchemaNodeKind::DependentsFolder
+    )
+}
+
+pub(super) struct TreeRenderParams {
+    pub connections: Vec<Uuid>,
+    /// Tooltip text for profiles whose latest connect attempt failed.
+    pub connect_failures: HashMap<Uuid, SharedString>,
+    /// The error of each failed profile, split for the failure block.
+    pub failure_details: HashMap<Uuid, ConnectionFailure>,
+    /// Profiles with a connect attempt in progress.
+    pub connecting: HashSet<Uuid>,
+    /// Code-generation capabilities of each connected profile's driver.
+    pub code_gen_capabilities: HashMap<Uuid, CodeGenCapabilities>,
+    pub active_id: Option<Uuid>,
+    pub profile_icons: HashMap<Uuid, AppIcon>,
+    /// Color of each profile's driver logo (`DriverIconTone`).
+    pub profile_icon_colors: HashMap<Uuid, Hsla>,
+    /// Round-trip latency of each connected profile, shown after its status
+    /// diamond. A profile whose probe has not answered shows the diamond
+    /// alone.
+    pub connection_latencies: HashMap<Uuid, Duration>,
+    pub active_databases: HashMap<Uuid, String>,
+    pub sidebar_entity: Entity<Sidebar>,
+    pub multi_selection: HashSet<String>,
+    pub pending_delete: Option<String>,
+    pub drop_target: Option<DropTarget>,
+    pub scripts_drop_target: Option<DropTarget>,
+    pub editing_id: Option<Uuid>,
+    pub editing_script_path: Option<std::path::PathBuf>,
+    pub rename_input: Entity<InputState>,
+    pub gutter_metadata: HashMap<String, GutterInfo>,
+    /// Key count of each key-value database row, by tree item id.
+    pub key_counts: HashMap<String, u64>,
+    pub line_color: Hsla,
+    pub color_teal: Hsla,
+    pub color_yellow: Hsla,
+    pub color_blue: Hsla,
+    pub color_purple: Hsla,
+    pub color_gray: Hsla,
+    pub color_orange: Hsla,
+    pub color_schema: Hsla,
+    pub color_green: Hsla,
+    /// Item ID of the currently hovered tree row. Used to show the ⋯ button
+    /// only while a row is hovered.
+    pub hovered_item_id: Option<SharedString>,
+}
+
+pub(super) fn render_tree_item(
+    params: &TreeRenderParams,
+    ix: usize,
+    entry: &gpui_component::tree::TreeEntry,
+    selected: bool,
+    cx: &App,
+) -> ListItem {
+    let item = entry.item();
+    let item_id = item.id.clone();
+    let depth = entry.depth();
+
+    // Loading placeholder rows. Two encodings exist:
+    //   - new pattern: id ends with `_loading`
+    //   - legacy SchemaNodeId variants whose pipe-encoded form starts with the
+    //     `LD|`, `YL|`, `XL|`, or `KL|` prefix (database/types/schema-indexes/
+    //     schema-fks loading folders)
+    // Render either case with `AppIcon::Loader` for visual consistency.
+    let is_loading_row = item_id.ends_with("_loading")
+        || item_id.starts_with("LD|")
+        || item_id.starts_with("YL|")
+        || item_id.starts_with("XL|")
+        || item_id.starts_with("KL|");
+    if is_loading_row {
+        let theme = cx.theme();
+        let label_start = datatab_components::fonts::ui_px(cx, TreeMetrics::INDENT) * depth as f32
+            + datatab_components::fonts::ui_px(cx, TreeMetrics::CHEVRON)
+            + TreeMetrics::GAP;
+        return ListItem::new(ix).h(TreeMetrics::ROW_HEIGHT).child(
+            div()
+                .w_full()
+                .flex()
+                .items_center()
+                .gap(TreeMetrics::GAP)
+                .pl(label_start)
+                .child(
+                    Icon::new(AppIcon::Loader)
+                        .size(TreeMetrics::ICON)
+                        .color(theme.muted_foreground),
+                )
+                .child(
+                    Text::caption(datatab_i18n::t!("sidebar.tree.status.loading"))
+                        .color(theme.muted_foreground),
+                ),
+        );
+    }
+
+    if let Some((profile_id, slice)) = parse_failure_row_id(&item_id) {
+        return render_failure_slice(params, ix, profile_id, slice, entry.depth(), cx);
+    }
+
+    let node_kind = parse_node_kind(&item_id);
+    let parsed_id = parse_node_id(&item_id);
+
+    let is_connected = matches!(
+        &parsed_id,
+        Some(SchemaNodeId::Profile { profile_id })
+            if params.connections.contains(profile_id)
+    );
+
+    let is_active = matches!(
+        &parsed_id,
+        Some(SchemaNodeId::Profile { profile_id })
+            if params.active_id == Some(*profile_id)
+    );
+
+    // Check if this database is the active one for its connection
+    let is_active_database = matches!(
+        &parsed_id,
+        Some(SchemaNodeId::Database { profile_id, name })
+            if params.active_databases
+                .get(profile_id)
+                .is_some_and(|active_db| active_db == name)
+    );
+
+    let theme = cx.theme();
+    let indent_per_level = f32::from(datatab_components::fonts::ui_px(cx, TreeMetrics::INDENT));
+    let is_folder = entry.is_folder();
+    let is_expanded = reads_expanded(node_kind, entry.is_expanded(), is_folder);
+
+    let needs_chevron = matches!(
+        node_kind,
+        SchemaNodeKind::Profile | SchemaNodeKind::Database
+    ) || (is_folder
+        && matches!(
+            node_kind,
+            SchemaNodeKind::DatabasesFolder
+                | SchemaNodeKind::EmptyDatabasesFolder
+                | SchemaNodeKind::ConnectionFolder
+                | SchemaNodeKind::Table
+                | SchemaNodeKind::View
+                | SchemaNodeKind::Schema
+                | SchemaNodeKind::TablesFolder
+                | SchemaNodeKind::ViewsFolder
+                | SchemaNodeKind::TypesFolder
+                | SchemaNodeKind::ColumnsFolder
+                | SchemaNodeKind::IndexesFolder
+                | SchemaNodeKind::ForeignKeysFolder
+                | SchemaNodeKind::ConstraintsFolder
+                | SchemaNodeKind::SchemaIndexesFolder
+                | SchemaNodeKind::SchemaForeignKeysFolder
+                | SchemaNodeKind::RoutinesFolder
+                | SchemaNodeKind::CustomType
+                | SchemaNodeKind::ScriptsFolder
+                | SchemaNodeKind::ScriptsRoot
+                | SchemaNodeKind::Collection
+                | SchemaNodeKind::CollectionChild
+                | SchemaNodeKind::CollectionsFolder
+                | SchemaNodeKind::DatabaseIndexesFolder
+                | SchemaNodeKind::CollectionFieldsFolder
+                | SchemaNodeKind::CollectionIndexesFolder
+                | SchemaNodeKind::DependentsFolder
+                | SchemaNodeKind::MetricsFolder
+                | SchemaNodeKind::MetricNamespaceFolder
+                | SchemaNodeKind::DashboardsFolder
+                | SchemaNodeKind::RemoteDashboardsFolder
+                | SchemaNodeKind::SavedChartsFolder
+                | SchemaNodeKind::InstanceMetricsFolder
+                | SchemaNodeKind::InstanceInspectorsFolder
+                | SchemaNodeKind::InstanceFolder
+        ));
+
+    let chevron_icon: Option<AppIcon> = if needs_chevron {
+        Some(if is_expanded {
+            AppIcon::ChevronDown
+        } else {
+            AppIcon::ChevronRight
+        })
+    } else {
+        None
+    };
+
+    let connect_failure: Option<(Uuid, SharedString)> = match &parsed_id {
+        Some(SchemaNodeId::Profile { profile_id }) if !is_connected => params
+            .connect_failures
+            .get(profile_id)
+            .map(|tooltip| (*profile_id, tooltip.clone())),
+        _ => None,
+    };
+
+    let (node_icon, unicode_icon, _category_color) = resolve_node_icon(
+        node_kind,
+        &parsed_id,
+        &params.profile_icons,
+        is_connected,
+        theme,
+        params,
+        &item.label,
+    );
+    let profile_id = match &parsed_id {
+        Some(SchemaNodeId::Profile { profile_id }) => Some(*profile_id),
+        _ => None,
+    };
+
+    // Icons read muted, the driver logo keeps its tone, and the selected row
+    // takes the tint (DSApp "Tree").
+    let icon_color = if connect_failure.is_some() {
+        theme.danger
+    } else if selected {
+        ChromeColors::tint(theme)
+    } else if let Some(color) = profile_id.and_then(|id| params.profile_icon_colors.get(&id)) {
+        *color
+    } else {
+        theme.muted_foreground
+    };
+
+    let label_color = if connect_failure.is_some() {
+        theme.danger
+    } else if selected
+        || matches!(
+            node_kind,
+            SchemaNodeKind::Profile | SchemaNodeKind::ConnectionFolder
+        )
+    {
+        ChromeColors::strong(theme)
+    } else {
+        theme.foreground
+    };
+
+    let (label_text, folder_count): (SharedString, Option<SharedString>) =
+        if is_counted_folder(node_kind) {
+            let (name, count) = split_folder_count(&item.label);
+            (
+                SharedString::from(name.to_string()),
+                count.map(|count| SharedString::from(count.to_string())),
+            )
+        } else if node_kind == SchemaNodeKind::Database {
+            let count = params
+                .key_counts
+                .get(item_id.as_ref())
+                .map(|count| SharedString::from(crate::labels::compact_key_count(*count)));
+            (item.label.clone(), count)
+        } else {
+            (item.label.clone(), None)
+        };
+
+    let is_connecting = profile_id.is_some_and(|id| params.connecting.contains(&id));
+    let connecting_tooltip: Option<SharedString> = is_connecting
+        .then(|| SharedString::from(crate::labels::profile_connecting_label(&item.label)));
+
+    let connection_status: Option<(Status, Option<Duration>)> =
+        profile_id.filter(|_| is_connected).map(|id| {
+            (
+                Status::Connected,
+                params.connection_latencies.get(&id).copied(),
+            )
+        });
+
+    let is_being_renamed = match &parsed_id {
+        Some(SchemaNodeId::ConnectionFolder { node_id }) => {
+            params.editing_id.as_ref() == Some(node_id)
+        }
+        Some(SchemaNodeId::Profile { profile_id }) => {
+            params.editing_id.as_ref() == Some(profile_id)
+        }
+        Some(SchemaNodeId::ScriptFile { path }) => params
+            .editing_script_path
+            .as_ref()
+            .is_some_and(|p| p == std::path::Path::new(path)),
+        Some(SchemaNodeId::ScriptsFolder { path: Some(p) }) => params
+            .editing_script_path
+            .as_ref()
+            .is_some_and(|ep| ep == std::path::Path::new(p)),
+        _ => false,
+    };
+
+    let code_gen = parsed_id
+        .as_ref()
+        .and_then(SchemaNodeId::profile_id)
+        .and_then(|profile_id| params.code_gen_capabilities.get(&profile_id).copied())
+        .unwrap_or_else(CodeGenCapabilities::empty);
+    let has_context_menu = crate::context_menu::node_has_context_menu(node_kind, code_gen);
+
+    let is_table_or_view = matches!(
+        node_kind,
+        SchemaNodeKind::Table | SchemaNodeKind::View | SchemaNodeKind::Collection
+    );
+
+    let sidebar_entity = &params.sidebar_entity;
+    let sidebar_for_mousedown = sidebar_entity.clone();
+    let item_id_for_mousedown = item_id.clone();
+    let sidebar_for_click = sidebar_entity.clone();
+    let item_id_for_click = item_id.clone();
+    let sidebar_for_chevron = sidebar_entity.clone();
+    let item_id_for_chevron = item_id.clone();
+
+    let gutter: AnyElement = if let Some(info) = params.gutter_metadata.get(item_id.as_ref()) {
+        tree_nav::render_gutter(
+            info.depth,
+            indent_per_level,
+            TreeMetrics::ROW_HEIGHT,
+            params.line_color,
+            false,
+        )
+    } else {
+        div()
+            .w(px(depth as f32 * indent_per_level))
+            .flex_shrink_0()
+            .into_any_element()
+    };
+
+    let is_multi_selected = params.multi_selection.contains(item_id.as_ref());
+    let multi_select_bg = theme.list_active;
+
+    let is_pending_delete = params
+        .pending_delete
+        .as_ref()
+        .is_some_and(|id| id == item_id.as_ref());
+    let pending_delete_bg: Hsla = theme.danger.opacity(0.15);
+
+    let current_drop_target = params.drop_target.as_ref();
+    let drop_indicator_color = ChromeColors::tint(theme);
+
+    let selection_tint = ChromeColors::tint(theme);
+    let selection_wash = theme.list_active;
+
+    // The selected row gets the tint wash and a 2 px tint bar on its left
+    // edge; the bar takes its width out of the left padding so the row's
+    // content, and with it the indent guides, stay in place.
+    let mut list_item = ListItem::new(ix)
+        .h(TreeMetrics::ROW_HEIGHT)
+        .when(selected && !is_pending_delete, |el| {
+            el.bg(selection_wash)
+                .border_l_2()
+                .border_color(selection_tint)
+                .pl(TreeMetrics::PADDING_X - TreeMetrics::SELECTION_BAR)
+        })
+        .when(is_pending_delete, |el| el.bg(pending_delete_bg))
+        .when(is_multi_selected && !selected && !is_pending_delete, |el| {
+            el.bg(multi_select_bg)
+        })
+        .child(
+            div()
+                .id(SharedString::from(format!("row-{}", item_id)))
+                .debug_selector({
+                    let item_id = item_id.clone();
+                    move || format!("row-{item_id}")
+                })
+                // Named by the item rather than by what the row draws: while the
+                // inline editor stands in for the label, the drawn text is the
+                // editor, and the name would be the menu glyph on its own.
+                .aria_label(label_text.clone())
+                .w_full()
+                .flex()
+                .items_center()
+                .gap_0()
+                .child(gutter)
+                .when(is_table_or_view, |el| {
+                    let sidebar_md = sidebar_for_mousedown.clone();
+                    let id_md = item_id_for_mousedown.clone();
+                    let sidebar_cl = sidebar_for_click.clone();
+                    let id_cl = item_id_for_click.clone();
+                    let is_collection = node_kind == SchemaNodeKind::Collection;
+                    el.on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        cx.stop_propagation();
+                        sidebar_md.update(cx, |this, cx| {
+                            if let Some(idx) = this.find_item_index(&id_md, cx) {
+                                this.tree_state.update(cx, |state, cx| {
+                                    state.set_selected_index(Some(idx), cx);
+                                });
+                            }
+                            cx.emit(SidebarEvent::RequestFocus);
+                            cx.notify();
+                        });
+                    })
+                    .on_click(move |event, _window, cx| {
+                        if event.click_count() == 2 {
+                            sidebar_cl.update(cx, |this, cx| {
+                                if is_collection {
+                                    this.browse_collection(&id_cl, cx);
+                                } else {
+                                    this.browse_table(&id_cl, cx);
+                                }
+                            });
+                        }
+                    })
+                })
+                // Handle clicks directly on non-table nodes (single select, double action)
+                .when(!is_table_or_view && node_kind.needs_click_handler(), |el| {
+                    let sidebar_click = sidebar_entity.clone();
+                    let item_id_click = item_id.clone();
+
+                    el.on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                    })
+                    .on_click(move |event, _window, cx| {
+                        cx.stop_propagation();
+                        let click_count = event.click_count();
+                        let with_ctrl = event.modifiers().platform || event.modifiers().control;
+                        let with_shift = event.modifiers().shift;
+
+                        sidebar_click.update(cx, |this, cx| {
+                            this.handle_item_click(
+                                &item_id_click,
+                                click_count,
+                                with_ctrl,
+                                with_shift,
+                                cx,
+                            );
+                        });
+                    })
+                })
+                .child(
+                    div()
+                        .id(SharedString::from(format!("chevron-{}", item_id)))
+                        .flex_shrink_0()
+                        .w(datatab_components::tokens::Heights::MIN_HIT_TARGET)
+                        .h(TreeMetrics::ROW_HEIGHT)
+                        .ml(-datatab_components::tokens::ui(6.0))
+                        .mr(TreeMetrics::GAP
+                            - datatab_components::fonts::ui_px(
+                                cx,
+                                datatab_components::tokens::ui(6.0),
+                            ))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .when_some(chevron_icon, |el, icon| {
+                            // The arrow draws only an icon, so the row's own
+                            // text names it, and its expanded state says which
+                            // way it folds.
+                            let chevron_name = label_text.clone();
+                            el.role(Role::Button)
+                                .aria_label(chevron_name)
+                                .aria_expanded(is_expanded)
+                                .cursor_pointer()
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                    cx.stop_propagation();
+                                })
+                                .on_click(move |_, _, cx| {
+                                    cx.stop_propagation();
+                                    sidebar_for_chevron.update(cx, |this, cx| {
+                                        this.handle_chevron_click(&item_id_for_chevron, cx);
+                                    });
+                                })
+                                .child(Icon::new(icon).size(TreeMetrics::CHEVRON).muted())
+                        }),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(TreeMetrics::ICON)
+                        .mr(TreeMetrics::GAP)
+                        .flex()
+                        .justify_center()
+                        .when_some(node_icon, |el, icon| {
+                            el.child(Icon::new(icon).size(TreeMetrics::ICON).color(icon_color))
+                        })
+                        .when(node_icon.is_none() && !unicode_icon.is_empty(), |el| {
+                            el.child(
+                                Text::body(unicode_icon)
+                                    .font_size(FontSizes::SM)
+                                    .color(icon_color),
+                            )
+                        })
+                        .when(
+                            node_icon.is_none()
+                                && unicode_icon.is_empty()
+                                && node_kind == SchemaNodeKind::Profile,
+                            |el| {
+                                let status = if is_connected {
+                                    Status::Connected
+                                } else if connect_failure.is_some() {
+                                    Status::Error
+                                } else {
+                                    Status::Idle
+                                };
+                                el.child(StatusIndicator::new(status))
+                            },
+                        ),
+                )
+                .when(is_being_renamed, |el| {
+                    let rename_input = params.rename_input.clone();
+                    el.child(
+                        div()
+                            .flex_1()
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .child(
+                                Input::new(&rename_input)
+                                    .xsmall()
+                                    .appearance(false)
+                                    .cleanable(false),
+                            ),
+                    )
+                })
+                .when(!is_being_renamed, |el| {
+                    let error_tooltip =
+                        is_error_retry_row(item_id.as_ref()).then(|| label_text.clone());
+
+                    el.child(
+                        div()
+                            .id(SharedString::from(format!("row-label-{item_id}")))
+                            .flex_1()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .when_some(error_tooltip, |el, tooltip| {
+                                el.tooltip(move |window, cx| {
+                                    gpui_component::tooltip::Tooltip::new(tooltip.clone())
+                                        .build(window, cx)
+                                })
+                            })
+                            .child(sidebar_tree_label(
+                                label_text.clone(),
+                                node_kind,
+                                is_active,
+                                is_active_database,
+                                label_color,
+                            )),
+                    )
+                })
+                .when_some(folder_count, |el, count| {
+                    el.child(
+                        div()
+                            .flex_shrink_0()
+                            .ml(TreeMetrics::GAP)
+                            .font_family(datatab_components::fonts::editor_family(cx))
+                            .text_size(TreeMetrics::META_FONT)
+                            .text_color(theme.muted_foreground)
+                            .child(count),
+                    )
+                })
+                .when_some(connection_status, |el, (status, latency)| {
+                    let indicator = StatusIndicator::new(status);
+                    let indicator = match latency {
+                        Some(latency) => indicator.latency(latency),
+                        None => indicator,
+                    };
+
+                    el.child(
+                        div()
+                            .flex_shrink_0()
+                            .ml(TreeMetrics::GAP)
+                            .text_size(TreeMetrics::META_FONT)
+                            .child(indicator),
+                    )
+                })
+                .when_some(connecting_tooltip, |el, tooltip| {
+                    let tint = ChromeColors::tint(theme);
+
+                    el.child(
+                        div()
+                            .id(SharedString::from(format!("connecting-{item_id}")))
+                            .flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap(ShellMetrics::ROW_STATUS_GAP)
+                            .ml(TreeMetrics::GAP)
+                            .text_size(ShellMetrics::ROW_STATUS_FONT)
+                            .text_color(tint)
+                            .child(
+                                Icon::new(AppIcon::Loader)
+                                    .size(TreeMetrics::CHEVRON)
+                                    .color(tint),
+                            )
+                            .child(datatab_i18n::t!("sidebar.tree.status.connecting_inline"))
+                            .tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(tooltip.clone())
+                                    .build(window, cx)
+                            }),
+                    )
+                })
+                .when_some(connect_failure, |el, (profile_id, tooltip)| {
+                    let sidebar = params.sidebar_entity.clone();
+
+                    el.child(
+                        div()
+                            .id(SharedString::from(format!("connect-error-{profile_id}")))
+                            .debug_selector(move || format!("connect-error-{profile_id}"))
+                            .flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .gap(ShellMetrics::ROW_STATUS_GAP)
+                            .ml(TreeMetrics::GAP)
+                            .text_size(ShellMetrics::ROW_STATUS_FONT)
+                            .text_color(theme.danger)
+                            .cursor_pointer()
+                            .child(
+                                Icon::new(AppIcon::TriangleAlert)
+                                    .size(TreeMetrics::CHEVRON)
+                                    .color(theme.danger),
+                            )
+                            .child(datatab_i18n::t!("sidebar.tree.status.retry_inline"))
+                            .tooltip(move |window, cx| {
+                                gpui_component::tooltip::Tooltip::new(tooltip.clone())
+                                    .build(window, cx)
+                            })
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                sidebar.update(cx, |sidebar, cx| {
+                                    sidebar.connect_to_profile(profile_id, cx);
+                                });
+                            }),
+                    )
+                })
+                .when(
+                    matches!(
+                        node_kind,
+                        SchemaNodeKind::Profile | SchemaNodeKind::ConnectionFolder
+                    ),
+                    |el| {
+                        let drag_node_id = match &parsed_id {
+                            Some(SchemaNodeId::Profile { profile_id }) => Some(*profile_id),
+                            Some(SchemaNodeId::ConnectionFolder { node_id }) => Some(*node_id),
+                            _ => None,
+                        };
+
+                        if let Some(node_id) = drag_node_id {
+                            let drag_label = item.label.to_string();
+                            let is_folder = node_kind == SchemaNodeKind::ConnectionFolder;
+
+                            // Drag from selected item => drag whole selected set.
+                            // Drag from non-selected item => drag only this item.
+                            let current_item_id = item_id.to_string();
+                            let include_selected_set =
+                                params.multi_selection.contains(&current_item_id);
+
+                            let additional_nodes: Vec<Uuid> = if include_selected_set {
+                                params
+                                    .multi_selection
+                                    .iter()
+                                    .filter(|id| *id != &current_item_id)
+                                    .filter_map(|id| match parse_node_id(id) {
+                                        Some(SchemaNodeId::Profile { profile_id }) => {
+                                            Some(profile_id)
+                                        }
+                                        Some(SchemaNodeId::ConnectionFolder { node_id }) => {
+                                            Some(node_id)
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+
+                            let total_count = 1 + additional_nodes.len();
+                            let preview_label = if total_count > 1 {
+                                format!("{} (+{} more)", drag_label, total_count - 1)
+                            } else {
+                                drag_label
+                            };
+
+                            el.on_drag(
+                                SidebarDragState {
+                                    node_id,
+                                    additional_nodes,
+                                    is_folder,
+                                    label: preview_label,
+                                },
+                                |state, _, _, cx| {
+                                    cx.new(|_| DragPreview {
+                                        label: state.label.clone(),
+                                    })
+                                },
+                            )
+                        } else {
+                            el
+                        }
+                    },
+                )
+                // Drop indicator
+                .when(
+                    matches!(
+                        node_kind,
+                        SchemaNodeKind::Profile | SchemaNodeKind::ConnectionFolder
+                    ),
+                    |el| {
+                        let is_drop_into = current_drop_target
+                            .as_ref()
+                            .map(|t| {
+                                t.item_id == item_id.as_ref() && t.position == DropPosition::Into
+                            })
+                            .unwrap_or(false);
+
+                        let is_drop_before = current_drop_target
+                            .as_ref()
+                            .map(|t| {
+                                t.item_id == item_id.as_ref() && t.position == DropPosition::Before
+                            })
+                            .unwrap_or(false);
+
+                        let is_drop_after = current_drop_target
+                            .as_ref()
+                            .map(|t| {
+                                t.item_id == item_id.as_ref() && t.position == DropPosition::After
+                            })
+                            .unwrap_or(false);
+
+                        if is_drop_into {
+                            el.bg(theme.drop_target)
+                        } else if is_drop_before {
+                            el.border_t_2().border_color(drop_indicator_color)
+                        } else if is_drop_after {
+                            el.border_b_2().border_color(drop_indicator_color)
+                        } else {
+                            el
+                        }
+                    },
+                )
+                // Profile drop handling (insert after)
+                .when(node_kind == SchemaNodeKind::Profile, |el| {
+                    let item_id_for_drop = item_id.to_string();
+                    let item_id_for_move = item_id.to_string();
+                    let sidebar_for_drop = sidebar_entity.clone();
+                    let sidebar_for_move = sidebar_entity.clone();
+                    let item_ix = ix;
+
+                    el.drag_over::<SidebarDragState>(move |style, state, _, cx| {
+                        let profile_id = match parse_node_id(&item_id_for_move) {
+                            Some(SchemaNodeId::Profile { profile_id }) => Some(profile_id),
+                            _ => None,
+                        };
+                        if profile_id.is_some_and(|pid| state.node_id != pid) {
+                            sidebar_for_move.update(cx, |this, cx| {
+                                this.clear_drag_hover_folder(cx);
+                                this.set_drop_target(
+                                    item_id_for_move.clone(),
+                                    DropPosition::After,
+                                    cx,
+                                );
+                                this.check_auto_scroll(item_ix, cx);
+                            });
+                        }
+                        style
+                    })
+                    .on_drop(move |state: &SidebarDragState, _, cx| {
+                        sidebar_for_drop.update(cx, |this, cx| {
+                            this.stop_auto_scroll(cx);
+                            this.clear_drag_hover_folder(cx);
+                            this.set_drop_target(item_id_for_drop.clone(), DropPosition::After, cx);
+                            this.handle_drop_with_position(state, cx);
+                        });
+                    })
+                })
+                // Folder drop handling (before/into/after zones)
+                .when(node_kind == SchemaNodeKind::ConnectionFolder, |el| {
+                    let item_id_for_drop = item_id.to_string();
+                    let item_id_for_move = item_id.to_string();
+                    let sidebar_for_drop = sidebar_entity.clone();
+                    let sidebar_for_move = sidebar_entity.clone();
+                    let item_ix = ix;
+
+                    if let Some(folder_id) = parse_node_id(&item_id).and_then(|n| match n {
+                        SchemaNodeId::ConnectionFolder { node_id } => Some(node_id),
+                        _ => None,
+                    }) {
+                        el.drag_over::<SidebarDragState>(move |style, _, _, _| style)
+                            .on_drag_move::<SidebarDragState>(move |event, _, cx| {
+                                let drag_state = event.drag(cx);
+                                if drag_state.all_node_ids().contains(&folder_id) {
+                                    sidebar_for_move.update(cx, |this, cx| {
+                                        this.clear_drop_target(cx);
+                                        this.clear_drag_hover_folder(cx);
+                                    });
+                                    return;
+                                }
+
+                                let top = event.bounds.origin.y;
+                                let height = event.bounds.size.height;
+                                let zone_top = top + (height / 3.0);
+                                let zone_bottom = top + (height * (2.0 / 3.0));
+
+                                let drop_position = if event.event.position.y < zone_top {
+                                    DropPosition::Before
+                                } else if event.event.position.y > zone_bottom {
+                                    DropPosition::After
+                                } else {
+                                    DropPosition::Into
+                                };
+
+                                sidebar_for_move.update(cx, |this, cx| {
+                                    this.set_drop_target(
+                                        item_id_for_move.clone(),
+                                        drop_position,
+                                        cx,
+                                    );
+
+                                    if drop_position == DropPosition::Into {
+                                        this.start_drag_hover_folder(folder_id, cx);
+                                    } else {
+                                        this.clear_drag_hover_folder(cx);
+                                    }
+
+                                    this.check_auto_scroll(item_ix, cx);
+                                });
+                            })
+                            .on_drop(move |state: &SidebarDragState, _, cx| {
+                                sidebar_for_drop.update(cx, |this, cx| {
+                                    this.stop_auto_scroll(cx);
+                                    this.clear_drag_hover_folder(cx);
+
+                                    let dropping_onto_self = parse_node_id(&item_id_for_drop)
+                                        .and_then(|n| match n {
+                                            SchemaNodeId::ConnectionFolder { node_id } => {
+                                                Some(node_id)
+                                            }
+                                            _ => None,
+                                        })
+                                        .is_some_and(|id| state.all_node_ids().contains(&id));
+
+                                    if dropping_onto_self {
+                                        this.clear_drop_target(cx);
+                                        return;
+                                    }
+
+                                    let target_matches_row = this
+                                        .drop_target
+                                        .as_ref()
+                                        .is_some_and(|t| t.item_id == item_id_for_drop);
+
+                                    if !target_matches_row {
+                                        this.set_drop_target(
+                                            item_id_for_drop.clone(),
+                                            DropPosition::Into,
+                                            cx,
+                                        );
+                                    }
+
+                                    this.handle_drop_with_position(state, cx);
+                                });
+                            })
+                    } else {
+                        el
+                    }
+                })
+                // Scripts drag source (files and subfolders, not root)
+                .when(
+                    matches!(
+                        node_kind,
+                        SchemaNodeKind::ScriptFile | SchemaNodeKind::ScriptsFolder
+                    ) && !matches!(&parsed_id, Some(SchemaNodeId::ScriptsFolder { path: None })),
+                    |el| {
+                        let drag_path = match &parsed_id {
+                            Some(SchemaNodeId::ScriptFile { path }) => {
+                                Some(std::path::PathBuf::from(path))
+                            }
+                            Some(SchemaNodeId::ScriptsFolder { path: Some(p) }) => {
+                                Some(std::path::PathBuf::from(p))
+                            }
+                            _ => None,
+                        };
+
+                        if let Some(path) = drag_path {
+                            let label = item.label.to_string();
+                            let current_item_id = item_id.to_string();
+                            let include_selected_set =
+                                params.multi_selection.contains(&current_item_id);
+
+                            let additional_paths: Vec<std::path::PathBuf> = if include_selected_set
+                            {
+                                params
+                                    .multi_selection
+                                    .iter()
+                                    .filter(|id| *id != &current_item_id)
+                                    .filter_map(|id| match parse_node_id(id) {
+                                        Some(SchemaNodeId::ScriptFile { path }) => {
+                                            Some(std::path::PathBuf::from(path))
+                                        }
+                                        Some(SchemaNodeId::ScriptsFolder { path: Some(p) }) => {
+                                            Some(std::path::PathBuf::from(p))
+                                        }
+                                        _ => None,
+                                    })
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+
+                            let total_count = 1 + additional_paths.len();
+                            let preview_label = if total_count > 1 {
+                                format!("{} (+{} more)", label, total_count - 1)
+                            } else {
+                                label.clone()
+                            };
+
+                            el.on_drag(
+                                ScriptsDragState {
+                                    path,
+                                    additional_paths,
+                                    label: preview_label,
+                                },
+                                |state, _, _, cx| {
+                                    cx.new(|_| ScriptsDragPreview {
+                                        label: state.label.clone(),
+                                    })
+                                },
+                            )
+                        } else {
+                            el
+                        }
+                    },
+                )
+                // Scripts folder drop target (before/into/after zones)
+                .when(
+                    matches!(
+                        node_kind,
+                        SchemaNodeKind::ScriptsFolder | SchemaNodeKind::ScriptsRoot
+                    ),
+                    |el| {
+                        let sidebar_for_drop = sidebar_entity.clone();
+                        let sidebar_for_move = sidebar_entity.clone();
+                        let item_id_for_drop = item_id.to_string();
+                        let item_id_for_move = item_id.to_string();
+                        let item_id_for_move_drag_move = item_id_for_move.clone();
+                        let drop_target_bg = theme.drop_target;
+
+                        let scripts_drop_target = params.scripts_drop_target.as_ref();
+                        let is_scripts_drop_into = scripts_drop_target.is_some_and(|t| {
+                            t.item_id == item_id.as_ref() && t.position == DropPosition::Into
+                        });
+                        let is_scripts_drop_before = scripts_drop_target.is_some_and(|t| {
+                            t.item_id == item_id.as_ref() && t.position == DropPosition::Before
+                        });
+                        let is_scripts_drop_after = scripts_drop_target.is_some_and(|t| {
+                            t.item_id == item_id.as_ref() && t.position == DropPosition::After
+                        });
+
+                        let el = if is_scripts_drop_into {
+                            el.bg(drop_target_bg)
+                        } else {
+                            el
+                        };
+
+                        let el = if is_scripts_drop_before {
+                            el.border_t_2().border_color(ChromeColors::tint(theme))
+                        } else if is_scripts_drop_after {
+                            el.border_b_2().border_color(ChromeColors::tint(theme))
+                        } else {
+                            el
+                        };
+
+                        el.drag_over::<ScriptsDragState>(move |style, _, _, _| style)
+                            .on_drag_move::<ScriptsDragState>(move |event, _, cx| {
+                                let target_id = parse_node_id(&item_id_for_move_drag_move);
+                                let is_root_target = matches!(
+                                    target_id,
+                                    Some(SchemaNodeId::ScriptsFolder { path: None })
+                                        | Some(SchemaNodeId::ScriptsRoot { .. })
+                                );
+
+                                let managed_root = sidebar_for_move
+                                    .read(cx)
+                                    .app_state
+                                    .read(cx)
+                                    .scripts_directory()
+                                    .map(|dir| dir.root_path().to_path_buf());
+
+                                let target_path = match target_id.as_ref() {
+                                    Some(SchemaNodeId::ScriptsFolder { path: Some(p) })
+                                    | Some(SchemaNodeId::ScriptsRoot { path: p }) => {
+                                        Some(std::path::PathBuf::from(p))
+                                    }
+                                    Some(SchemaNodeId::ScriptsFolder { path: None }) => {
+                                        managed_root
+                                    }
+                                    _ => None,
+                                };
+
+                                let source_paths = event.drag(cx).all_paths();
+
+                                // A folder row and the folder a drop beside it
+                                // lands in share a root (roots only take drops
+                                // into them), so the row path decides it.
+                                let crosses_roots = target_path.as_ref().is_some_and(|target| {
+                                    !sidebar_for_move
+                                        .read(cx)
+                                        .app_state
+                                        .read(cx)
+                                        .scripts_directory()
+                                        .is_some_and(|dir| dir.share_root(&source_paths, target))
+                                });
+
+                                let invalid_target = crosses_roots
+                                    || target_path.as_ref().is_some_and(|target| {
+                                        source_paths.iter().any(|source| {
+                                            *target == *source || target.starts_with(source)
+                                        })
+                                    });
+
+                                if invalid_target {
+                                    sidebar_for_move.update(cx, |this, cx| {
+                                        if this.scripts_drop_target.is_some() {
+                                            this.scripts_drop_target = None;
+                                            cx.notify();
+                                        }
+                                    });
+                                    return;
+                                }
+
+                                let top = event.bounds.origin.y;
+                                let height = event.bounds.size.height;
+                                let zone_top = top + (height / 3.0);
+                                let zone_bottom = top + (height * (2.0 / 3.0));
+
+                                let drop_position = if is_root_target {
+                                    DropPosition::Into
+                                } else if event.event.position.y < zone_top {
+                                    DropPosition::Before
+                                } else if event.event.position.y > zone_bottom {
+                                    DropPosition::After
+                                } else {
+                                    DropPosition::Into
+                                };
+
+                                sidebar_for_move.update(cx, |this, cx| {
+                                    this.scripts_drop_target = Some(DropTarget {
+                                        item_id: item_id_for_move_drag_move.clone(),
+                                        position: drop_position,
+                                    });
+                                    cx.notify();
+                                });
+                            })
+                            .on_drop(move |state: &ScriptsDragState, _, cx| {
+                                sidebar_for_drop.update(cx, |this, cx| {
+                                    let target_matches_row = this
+                                        .scripts_drop_target
+                                        .as_ref()
+                                        .is_some_and(|t| t.item_id == item_id_for_drop);
+
+                                    if !target_matches_row {
+                                        this.scripts_drop_target = Some(DropTarget {
+                                            item_id: item_id_for_drop.clone(),
+                                            position: DropPosition::Into,
+                                        });
+                                    }
+
+                                    this.handle_script_drop_with_position(state, cx);
+                                });
+                            })
+                    },
+                )
+                // Menu button for items that have context menus
+                .when(has_context_menu, |el| {
+                    let sidebar_for_menu = sidebar_entity.clone();
+                    let item_id_for_menu = item_id.clone();
+                    let hover_bg = theme.secondary;
+
+                    // Render the ⋯ button as fully transparent when the row is not hovered.
+                    // The button still occupies its layout slot so no reflow happens on hover.
+                    // Visibility is driven by `params.hovered_item_id` which the sidebar
+                    // entity updates on `on_mouse_enter` for the list item.
+                    let is_row_hovered = params
+                        .hovered_item_id
+                        .as_ref()
+                        .is_some_and(|id| id == &item_id_for_menu);
+
+                    let btn_opacity: f32 = if is_row_hovered { 1.0 } else { 0.0 };
+
+                    el.child(
+                        div()
+                            .id(SharedString::from(format!("menu-btn-{}", item_id_for_menu)))
+                            .debug_selector({
+                                let item_id = item_id_for_menu.clone();
+                                move || format!("menu-btn-{item_id}")
+                            })
+                            // The button draws only an ellipsis, so it is named
+                            // after the row it opens the menu for.
+                            .role(Role::Button)
+                            .aria_label(datatab_i18n::t!(
+                                "sidebar.row.actions",
+                                name = label_text.clone()
+                            ))
+                            .flex_shrink_0()
+                            .ml_auto()
+                            .px_1()
+                            .rounded(Radii::SM)
+                            .cursor_pointer()
+                            .opacity(btn_opacity)
+                            .hover(move |d| d.bg(hover_bg))
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                cx.stop_propagation();
+                            })
+                            .on_click({
+                                let sidebar = sidebar_for_menu.clone();
+                                let item_id = item_id_for_menu.clone();
+                                move |event, _, cx| {
+                                    cx.stop_propagation();
+                                    let position = event.position();
+                                    sidebar.update(cx, |this, cx| {
+                                        cx.emit(SidebarEvent::RequestFocus);
+                                        this.open_menu_for_item(&item_id, position, cx);
+                                    });
+                                }
+                            })
+                            .child("\u{22EF}"),
+                    )
+                })
+                // Right-click context menu
+                .when(has_context_menu, |el| {
+                    let sidebar_for_ctx = sidebar_entity.clone();
+                    let item_id_for_ctx = item_id.clone();
+
+                    el.on_mouse_down(MouseButton::Right, move |event, _, cx| {
+                        cx.stop_propagation();
+                        let position = event.position;
+                        sidebar_for_ctx.update(cx, |this, cx| {
+                            cx.emit(SidebarEvent::RequestFocus);
+                            this.open_menu_for_item(&item_id_for_ctx, position, cx);
+                        });
+                    })
+                }),
+        );
+
+    // Track which row is hovered so the ⋯ button opacity can be driven by
+    // `hovered_item_id` on the next render. Clearing on mouse-leave is handled
+    // by the sidebar container's `on_mouse_leave` in render.rs.
+    let sidebar_for_hover = sidebar_entity.clone();
+    let item_id_for_hover = item_id.clone();
+    list_item = list_item.on_mouse_enter(move |_, _, cx| {
+        sidebar_for_hover.update(cx, |this, cx| {
+            if this.hovered_item_id.as_ref() != Some(&item_id_for_hover) {
+                this.hovered_item_id = Some(item_id_for_hover.clone());
+                cx.notify();
+            }
+        });
+    });
+
+    if node_kind.shows_pointer_cursor() {
+        list_item = list_item.cursor(CursorStyle::PointingHand);
+    }
+
+    list_item
+}
+
+/// One row-tall slice of the failed-connection block under `profile_id`.
+///
+/// Every slice lays out the whole block and shows the band of it that
+/// falls on its row, so the rows read as one block.
+fn render_failure_slice(
+    params: &TreeRenderParams,
+    ix: usize,
+    profile_id: Uuid,
+    slice: usize,
+    depth: usize,
+    cx: &App,
+) -> ListItem {
+    let theme = cx.theme();
+    let danger = theme.danger;
+    let muted = theme.muted_foreground;
+    let row_height = datatab_components::fonts::ui_px(cx, TreeMetrics::ROW_HEIGHT);
+    let block_left = TreeMetrics::PADDING_X
+        + datatab_components::fonts::ui_px(cx, TreeMetrics::INDENT) * depth as f32
+        + Spacing::SM;
+
+    let failure = params
+        .failure_details
+        .get(&profile_id)
+        .cloned()
+        .unwrap_or_else(|| ConnectionFailure::from_error(""));
+
+    let action = |name: &'static str, icon: AppIcon, label: String| {
+        Button::new(
+            SharedString::from(format!("connect-failure-{name}-{profile_id}-{slice}")),
+            label,
+        )
+        .icon(icon)
+        .icon_size(ShellMetrics::FAILURE_ACTION_ICON)
+        .icon_only()
+        .tab_stop(false)
+    };
+
+    let retry_sidebar = params.sidebar_entity.clone();
+    let edit_sidebar = params.sidebar_entity.clone();
+    let audit_sidebar = params.sidebar_entity.clone();
+
+    let block = div()
+        .absolute()
+        .top(ShellMetrics::FAILURE_MARGIN_TOP - row_height * slice as f32)
+        .left(block_left)
+        .right(ShellMetrics::FAILURE_MARGIN_RIGHT)
+        .flex()
+        .flex_col()
+        .py(ShellMetrics::FAILURE_PADDING_Y)
+        .px(ShellMetrics::FAILURE_PADDING_X)
+        .bg(danger.opacity(ShellMetrics::FAILURE_ALPHA))
+        .border_l(ShellMetrics::FAILURE_EDGE)
+        .border_color(danger)
+        .child(
+            div()
+                .font_family(datatab_components::fonts::editor_family(cx))
+                .text_size(ShellMetrics::FAILURE_FONT)
+                .line_height(ShellMetrics::FAILURE_LINE_HEIGHT)
+                .text_color(muted)
+                .map(|text| match failure.detail {
+                    Some(detail) => text
+                        .child(div().truncate().child(failure.summary))
+                        .child(div().truncate().child(detail)),
+                    // A one-line error gets both lines of the block.
+                    None => text.child(
+                        div()
+                            .overflow_hidden()
+                            .text_ellipsis()
+                            .line_clamp(2)
+                            .child(failure.summary),
+                    ),
+                }),
+        )
+        .child(
+            div()
+                .flex()
+                .gap(ShellMetrics::FAILURE_ACTION_GAP)
+                .pt(ShellMetrics::FAILURE_ACTIONS_GAP_TOP)
+                .child(
+                    action(
+                        "retry",
+                        AppIcon::RefreshCcw,
+                        datatab_i18n::t!("sidebar.failure.retry"),
+                    )
+                    .on_click(move |_, _, cx| {
+                        retry_sidebar.update(cx, |sidebar, cx| {
+                            sidebar.connect_to_profile(profile_id, cx);
+                        });
+                    }),
+                )
+                .child(
+                    action(
+                        "edit",
+                        AppIcon::Pencil,
+                        datatab_i18n::t!("sidebar.failure.edit"),
+                    )
+                    .on_click(move |_, _, cx| {
+                        edit_sidebar.update(cx, |_, cx| {
+                            cx.emit(SidebarEvent::RequestEditConnection { profile_id });
+                        });
+                    }),
+                )
+                .child(
+                    action(
+                        "audit",
+                        AppIcon::FingerprintPattern,
+                        datatab_i18n::t!("sidebar.failure.audit"),
+                    )
+                    .on_click(move |_, _, cx| {
+                        audit_sidebar.update(cx, |sidebar, cx| {
+                            sidebar.app_state.update(cx, |state, cx| {
+                                state.request_open_audit(None, cx);
+                            });
+                        });
+                    }),
+                ),
+        );
+
+    ListItem::new(ix).h(row_height).p_0().child(
+        div()
+            .id(SharedString::from(failure_slice_element_id(
+                profile_id, slice,
+            )))
+            .relative()
+            .w_full()
+            .h(row_height)
+            .overflow_hidden()
+            .child(block),
+    )
+}
+
+fn failure_slice_element_id(profile_id: Uuid, slice: usize) -> String {
+    format!("connect-failure-{profile_id}-{slice}")
+}
+
+/// Returns the icon variant for a node kind without any color or theme context.
+///
+/// This is the testable core of `resolve_node_icon`. It covers only the icon
+/// selection; callers are responsible for applying the appropriate color.
+/// Returns `None` for kinds that fall through to the `_ =>` fallback (no
+/// dedicated icon).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn icon_for_node_kind(
+    node_kind: SchemaNodeKind,
+    label: &str,
+    parsed_id: &Option<SchemaNodeId>,
+) -> Option<AppIcon> {
+    match node_kind {
+        SchemaNodeKind::ConnectionFolder => Some(AppIcon::Folder),
+        SchemaNodeKind::Profile => None, // icon comes from the driver's Icon, handled separately
+        SchemaNodeKind::DatabasesFolder => Some(AppIcon::Database),
+        SchemaNodeKind::Database => Some(AppIcon::Database),
+        SchemaNodeKind::EmptyDatabasesFolder => Some(AppIcon::EyeOff),
+        SchemaNodeKind::Schema => Some(AppIcon::Layers),
+        SchemaNodeKind::TablesFolder => Some(AppIcon::Table),
+        SchemaNodeKind::ViewsFolder => Some(AppIcon::Eye),
+        SchemaNodeKind::TypesFolder => Some(AppIcon::Braces),
+        SchemaNodeKind::Table => Some(AppIcon::Table),
+        SchemaNodeKind::View => Some(AppIcon::Eye),
+        SchemaNodeKind::CustomType => Some(AppIcon::Braces),
+        SchemaNodeKind::ColumnsFolder => Some(AppIcon::Columns),
+        SchemaNodeKind::IndexesFolder | SchemaNodeKind::SchemaIndexesFolder => Some(AppIcon::Hash),
+        SchemaNodeKind::ForeignKeysFolder | SchemaNodeKind::SchemaForeignKeysFolder => {
+            Some(AppIcon::KeyRound)
+        }
+        SchemaNodeKind::RoutinesFolder => Some(AppIcon::Parentheses),
+        SchemaNodeKind::Routine => Some(resolve_routine_kind_icon(label)),
+        SchemaNodeKind::ConstraintsFolder => Some(AppIcon::Lock),
+        SchemaNodeKind::Column => Some(resolve_column_type_icon(label)),
+        SchemaNodeKind::Index | SchemaNodeKind::SchemaIndex => Some(AppIcon::Hash),
+        SchemaNodeKind::ForeignKey | SchemaNodeKind::SchemaForeignKey => Some(AppIcon::KeyRound),
+        SchemaNodeKind::Constraint => Some(AppIcon::Lock),
+        SchemaNodeKind::CollectionsFolder => Some(AppIcon::Folder),
+        SchemaNodeKind::Collection => Some(AppIcon::Box),
+        SchemaNodeKind::CollectionChild => Some(AppIcon::ScrollText),
+        SchemaNodeKind::DatabaseIndexesFolder | SchemaNodeKind::CollectionIndexesFolder => {
+            Some(AppIcon::Hash)
+        }
+        SchemaNodeKind::CollectionFieldsFolder => Some(AppIcon::Columns),
+        SchemaNodeKind::CollectionField => Some(resolve_collection_field_type_icon(label)),
+        SchemaNodeKind::CollectionIndex => Some(AppIcon::Hash),
+        SchemaNodeKind::ScriptsFolder => Some(AppIcon::Folder),
+        SchemaNodeKind::ScriptsRoot => Some(AppIcon::HardDrive),
+        SchemaNodeKind::ScriptFile => {
+            let icon = parsed_id
+                .as_ref()
+                .and_then(|n| match n {
+                    SchemaNodeId::ScriptFile { path } => Some(path.as_str()),
+                    _ => None,
+                })
+                .and_then(|p| datatab_core::QueryLanguage::from_path(std::path::Path::new(p)))
+                .map(|lang| AppIcon::for_language(&lang))
+                .unwrap_or(AppIcon::ScrollText);
+            Some(icon)
+        }
+        SchemaNodeKind::DependentsFolder => Some(AppIcon::Link2),
+        SchemaNodeKind::DependentItem => Some(AppIcon::ExternalLink),
+        SchemaNodeKind::MetricsFolder => Some(AppIcon::ChartSpline),
+        SchemaNodeKind::MetricNamespaceFolder => Some(AppIcon::Folder),
+        SchemaNodeKind::MetricLeaf => Some(AppIcon::ChartSpline),
+        SchemaNodeKind::DashboardsFolder => Some(AppIcon::ChartColumnBig),
+        SchemaNodeKind::DashboardItem => Some(AppIcon::ChartColumnBig),
+        SchemaNodeKind::RemoteDashboardsFolder => Some(AppIcon::ChartColumnBig),
+        SchemaNodeKind::RemoteDashboardItem => Some(AppIcon::ChartColumnBig),
+        SchemaNodeKind::SavedChartsFolder => Some(AppIcon::ChartArea),
+        SchemaNodeKind::SavedChartItem => Some(AppIcon::ChartArea),
+        SchemaNodeKind::InstanceMetricsFolder => Some(AppIcon::ChartSpline),
+        SchemaNodeKind::InstanceMetricLeaf => Some(AppIcon::ChartSpline),
+        SchemaNodeKind::InstanceInspectorsFolder => Some(AppIcon::Server),
+        SchemaNodeKind::InstanceInspectorLeaf => Some(AppIcon::Server),
+        SchemaNodeKind::InstanceOverviewLeaf => Some(AppIcon::Layers),
+        SchemaNodeKind::InstanceFolder => Some(AppIcon::Server),
+        SchemaNodeKind::RootSectionItem => Some(AppIcon::Box),
+        SchemaNodeKind::RootSection => Some(AppIcon::Box),
+        SchemaNodeKind::SecretStore => Some(AppIcon::Lock),
+        SchemaNodeKind::SecretPath => Some(AppIcon::Folder),
+        _ => None,
+    }
+}
+
+fn resolve_node_icon(
+    node_kind: SchemaNodeKind,
+    parsed_id: &Option<SchemaNodeId>,
+    profile_icons: &HashMap<Uuid, AppIcon>,
+    is_connected: bool,
+    theme: &gpui_component::Theme,
+    params: &TreeRenderParams,
+    label: &str,
+) -> (Option<AppIcon>, &'static str, Hsla) {
+    match node_kind {
+        SchemaNodeKind::ConnectionFolder => (Some(AppIcon::Folder), "", theme.muted_foreground),
+        SchemaNodeKind::DatabasesFolder => (Some(AppIcon::Database), "", params.color_orange),
+        SchemaNodeKind::Profile => {
+            let icon = parsed_id
+                .as_ref()
+                .and_then(|n| n.profile_id())
+                .and_then(|id| profile_icons.get(&id).copied());
+
+            let color = if is_connected {
+                params.color_green
+            } else {
+                theme.muted_foreground
+            };
+
+            // When no driver icon is set, signal that a status diamond should render
+            // (the icon slot handles this via the `use_status_dot` branch).
+            let unicode = "";
+            (icon, unicode, color)
+        }
+        SchemaNodeKind::Database => (Some(AppIcon::Database), "", params.color_orange),
+        SchemaNodeKind::EmptyDatabasesFolder => (Some(AppIcon::EyeOff), "", theme.input),
+        SchemaNodeKind::Schema => (Some(AppIcon::Layers), "", params.color_schema),
+        SchemaNodeKind::TablesFolder => (Some(AppIcon::Table), "", params.color_teal),
+        SchemaNodeKind::ViewsFolder => (Some(AppIcon::Eye), "", params.color_yellow),
+        SchemaNodeKind::TypesFolder => (Some(AppIcon::Braces), "", params.color_purple),
+        SchemaNodeKind::Table => (Some(AppIcon::Table), "", params.color_teal),
+        SchemaNodeKind::View => (Some(AppIcon::Eye), "", params.color_yellow),
+        SchemaNodeKind::CustomType => (Some(AppIcon::Braces), "", params.color_purple),
+        SchemaNodeKind::ColumnsFolder => (Some(AppIcon::Columns), "", params.color_blue),
+        SchemaNodeKind::IndexesFolder | SchemaNodeKind::SchemaIndexesFolder => {
+            (Some(AppIcon::Hash), "", params.color_purple)
+        }
+        SchemaNodeKind::ForeignKeysFolder | SchemaNodeKind::SchemaForeignKeysFolder => {
+            (Some(AppIcon::KeyRound), "", params.color_orange)
+        }
+        SchemaNodeKind::RoutinesFolder => (Some(AppIcon::Parentheses), "", params.color_blue),
+        SchemaNodeKind::Routine => {
+            let icon = resolve_routine_kind_icon(label);
+            (Some(icon), "", params.color_blue)
+        }
+        SchemaNodeKind::ConstraintsFolder => (Some(AppIcon::Lock), "", params.color_yellow),
+        SchemaNodeKind::Column => {
+            let icon = resolve_column_type_icon(label);
+            (Some(icon), "", params.color_blue)
+        }
+        SchemaNodeKind::Index | SchemaNodeKind::SchemaIndex => {
+            (Some(AppIcon::Hash), "", params.color_purple)
+        }
+        SchemaNodeKind::ForeignKey | SchemaNodeKind::SchemaForeignKey => {
+            (Some(AppIcon::KeyRound), "", params.color_orange)
+        }
+        SchemaNodeKind::Constraint => (Some(AppIcon::Lock), "", params.color_yellow),
+        SchemaNodeKind::CollectionsFolder => (Some(AppIcon::Folder), "", params.color_teal),
+        SchemaNodeKind::Collection => (Some(AppIcon::Box), "", params.color_teal),
+        SchemaNodeKind::CollectionChild => (Some(AppIcon::ScrollText), "", params.color_teal),
+        SchemaNodeKind::DatabaseIndexesFolder | SchemaNodeKind::CollectionIndexesFolder => {
+            (Some(AppIcon::Hash), "", params.color_purple)
+        }
+        SchemaNodeKind::CollectionFieldsFolder => (Some(AppIcon::Columns), "", params.color_blue),
+        SchemaNodeKind::CollectionField => {
+            let icon = resolve_collection_field_type_icon(label);
+            (Some(icon), "", params.color_blue)
+        }
+        SchemaNodeKind::CollectionIndex => (Some(AppIcon::Hash), "", params.color_purple),
+        SchemaNodeKind::ScriptsFolder => (Some(AppIcon::Folder), "", theme.muted_foreground),
+        SchemaNodeKind::ScriptsRoot => (Some(AppIcon::HardDrive), "", params.color_purple),
+        SchemaNodeKind::ScriptFile => {
+            let icon = parsed_id
+                .as_ref()
+                .and_then(|n| match n {
+                    SchemaNodeId::ScriptFile { path } => Some(path.as_str()),
+                    _ => None,
+                })
+                .and_then(|p| datatab_core::QueryLanguage::from_path(std::path::Path::new(p)))
+                .map(|lang| AppIcon::for_language(&lang))
+                .unwrap_or(AppIcon::ScrollText);
+            (Some(icon), "", theme.muted_foreground)
+        }
+        SchemaNodeKind::DependentsFolder => (Some(AppIcon::Link2), "", params.color_gray),
+        SchemaNodeKind::DependentItem => (Some(AppIcon::ExternalLink), "", theme.muted_foreground),
+        SchemaNodeKind::MetricsFolder => (Some(AppIcon::ChartSpline), "", params.color_orange),
+        SchemaNodeKind::MetricNamespaceFolder => (Some(AppIcon::Folder), "", params.color_orange),
+        SchemaNodeKind::MetricLeaf => (Some(AppIcon::ChartSpline), "", params.color_teal),
+        SchemaNodeKind::DashboardsFolder => {
+            (Some(AppIcon::ChartColumnBig), "", params.color_orange)
+        }
+        SchemaNodeKind::DashboardItem => {
+            (Some(AppIcon::ChartColumnBig), "", theme.muted_foreground)
+        }
+        SchemaNodeKind::RemoteDashboardsFolder => {
+            (Some(AppIcon::ChartColumnBig), "", params.color_orange)
+        }
+        SchemaNodeKind::RemoteDashboardItem => {
+            (Some(AppIcon::ChartColumnBig), "", theme.muted_foreground)
+        }
+        SchemaNodeKind::SavedChartsFolder => (Some(AppIcon::ChartArea), "", params.color_orange),
+        SchemaNodeKind::SavedChartItem => (Some(AppIcon::ChartArea), "", theme.muted_foreground),
+        SchemaNodeKind::InstanceMetricsFolder => {
+            (Some(AppIcon::ChartSpline), "", params.color_orange)
+        }
+        SchemaNodeKind::InstanceMetricLeaf => (Some(AppIcon::ChartSpline), "", params.color_teal),
+        SchemaNodeKind::InstanceInspectorsFolder | SchemaNodeKind::InstanceFolder => {
+            (Some(AppIcon::Server), "", params.color_orange)
+        }
+        SchemaNodeKind::InstanceInspectorLeaf => (Some(AppIcon::Server), "", params.color_teal),
+        SchemaNodeKind::InstanceOverviewLeaf => (Some(AppIcon::Layers), "", params.color_orange),
+        SchemaNodeKind::RootSectionItem => (Some(AppIcon::Box), "", params.color_teal),
+        SchemaNodeKind::RootSection => (Some(AppIcon::Box), "", params.color_orange),
+        SchemaNodeKind::SecretStore => (Some(AppIcon::Lock), "", params.color_orange),
+        SchemaNodeKind::SecretPath => (Some(AppIcon::Folder), "", theme.muted_foreground),
+        _ => (None, "", theme.muted_foreground),
+    }
+}
+
+/// Label format: `"col_name: type_name? PK"` — extracts the type portion.
+fn resolve_column_type_icon(label: &str) -> AppIcon {
+    let type_name = label
+        .split_once(": ")
+        .map(|(_, rest)| {
+            rest.trim_end_matches(" PK")
+                .trim_end_matches('?')
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_default();
+
+    let base = type_name.split('(').next().unwrap_or("").trim();
+
+    match base {
+        "varchar" | "char" | "character" | "character varying" | "nchar" | "nvarchar"
+        | "bpchar" | "string" => AppIcon::CaseSensitive,
+
+        "text" | "tinytext" | "mediumtext" | "longtext" | "clob" | "ntext" | "citext" => {
+            AppIcon::ScrollText
+        }
+
+        _ => AppIcon::Columns,
+    }
+}
+
+/// Label format: `"routine_name (fn|proc|agg|win)"` — extracts the kind token.
+fn resolve_routine_kind_icon(label: &str) -> AppIcon {
+    let kind = label
+        .rsplit_once('(')
+        .and_then(|(_, rest)| rest.strip_suffix(')'))
+        .unwrap_or("")
+        .trim();
+
+    match kind {
+        "fn" => AppIcon::Parentheses,
+        "proc" => AppIcon::SquareTerminal,
+        "agg" => AppIcon::Sigma,
+        "win" => AppIcon::Box,
+        _ => AppIcon::Code,
+    }
+}
+
+/// Label format: `"field_name: BsonType (85%)"` — extracts the BSON type.
+fn resolve_collection_field_type_icon(label: &str) -> AppIcon {
+    let type_name = label
+        .split_once(": ")
+        .map(|(_, rest)| {
+            rest.split_once(' ')
+                .map(|(t, _)| t)
+                .unwrap_or(rest)
+                .to_ascii_lowercase()
+        })
+        .unwrap_or_default();
+
+    match type_name.as_str() {
+        "string" => AppIcon::CaseSensitive,
+        "int32" | "int64" | "double" | "decimal128" => AppIcon::Hash,
+        "boolean" => AppIcon::Zap,
+        "datetime" | "timestamp" => AppIcon::Clock,
+        "objectid" => AppIcon::KeyRound,
+        "document" => AppIcon::Braces,
+        "array" => AppIcon::Rows3,
+        "binary" => AppIcon::HardDrive,
+        _ => AppIcon::Columns,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        icon_for_node_kind, is_error_retry_row, reads_expanded, sidebar_tree_label,
+        split_folder_count,
+    };
+    use datatab_components::typography::AppFonts;
+    use datatab_core::SchemaNodeKind;
+    use gpui::FontWeight;
+    use gpui::SharedString;
+
+    #[gpui::test]
+    fn folder_chevron_bounds_and_name_click_are_independent(cx: &mut gpui::TestAppContext) {
+        use crate::table_loading::object_tree_adapter_tests::test_app_state;
+        use datatab_components::accessibility::FrameCapture;
+        use datatab_core::{ConnectionTreeNode, SchemaNodeId};
+
+        let state = test_app_state(cx);
+        let folder = ConnectionTreeNode::new_folder("Folder", None, 1000);
+        let folder_id = folder.id;
+        let child = ConnectionTreeNode::new_folder("Child", Some(folder_id), 1000);
+        state.update(cx, |state, _| {
+            state.connection_tree_mut().add_node(folder);
+            state.connection_tree_mut().add_node(child);
+        });
+        let (sidebar, window) =
+            cx.add_window_view(|window, cx| crate::Sidebar::new(state.clone(), window, cx));
+        let capture = FrameCapture::observe(window);
+        let frame = capture.frame(window);
+        let item_id = SchemaNodeId::ConnectionFolder { node_id: folder_id }.to_string();
+        let bounds = |id: &str| {
+            frame
+                .nodes()
+                .find(|(_, node)| node.id() == id)
+                .map(|(_, node)| node.bounds())
+                .expect("tree part is laid out")
+        };
+        let chevron = bounds(&format!("chevron-{item_id}"));
+        let label = bounds(&format!("row-label-{item_id}"));
+        assert!(
+            chevron.size.width
+                >= datatab_components::tokens::Heights::MIN_HIT_TARGET
+                    .to_pixels(gpui::px(datatab_components::tokens::BASE_REM)),
+            "chevron width must be at least 24 px"
+        );
+        assert!(
+            chevron.size.height
+                >= datatab_components::tokens::Heights::MIN_HIT_TARGET
+                    .to_pixels(gpui::px(datatab_components::tokens::BASE_REM)),
+            "chevron height must be at least 24 px"
+        );
+        let before = sidebar.read_with(window, |sidebar, cx| {
+            sidebar
+                .active_tree_state()
+                .read(cx)
+                .entry(0)
+                .expect("folder entry")
+                .is_expanded()
+        });
+        window.simulate_click(chevron.center(), gpui::Modifiers::default());
+        let expanded = sidebar.read_with(window, |sidebar, cx| {
+            sidebar
+                .active_tree_state()
+                .read(cx)
+                .entry(0)
+                .expect("folder entry")
+                .is_expanded()
+        });
+        assert_ne!(expanded, before, "clicking the chevron toggles the folder");
+        window.simulate_click(label.center(), gpui::Modifiers::default());
+        let (selected, still_expanded) = sidebar.read_with(window, |sidebar, cx| {
+            let tree = sidebar.active_tree_state().read(cx);
+            (
+                tree.selected_entry()
+                    .map(|entry| entry.item().id.to_string()),
+                tree.entry(0).expect("folder entry").is_expanded(),
+            )
+        });
+        assert_eq!(
+            selected.as_deref(),
+            Some(item_id.as_str()),
+            "clicking the name selects the folder"
+        );
+        assert_eq!(
+            still_expanded, expanded,
+            "clicking the name must not toggle the chevron"
+        );
+    }
+
+    #[test]
+    fn leaf_rows_leave_the_chevron_slot_empty() {
+        let source = include_str!("render_tree.rs");
+        let render_code = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("render_tree.rs has code before its tests");
+
+        assert!(
+            !render_code.contains('\u{2022}'),
+            "a leaf row must not draw a bullet where the chevron goes (P1Sidebar)"
+        );
+    }
+
+    #[test]
+    fn a_profile_without_children_reads_collapsed() {
+        assert!(!reads_expanded(SchemaNodeKind::Profile, true, false));
+        assert!(reads_expanded(SchemaNodeKind::Profile, true, true));
+        assert!(!reads_expanded(SchemaNodeKind::Profile, false, true));
+        assert!(reads_expanded(SchemaNodeKind::Database, true, false));
+    }
+
+    #[test]
+    fn error_placeholder_rows_are_recognised_by_their_retry_prefix() {
+        assert!(is_error_retry_row("object-retry|profile|db"));
+        assert!(is_error_retry_row("metrics-retry|profile|db"));
+        assert!(is_error_retry_row("root-sections-retry|profile"));
+        assert!(is_error_retry_row("root-section-retry|profile|buckets"));
+        assert!(!is_error_retry_row("connect-failure|profile|0"));
+    }
+
+    #[test]
+    fn sidebar_tree_items_use_interface_family_and_hierarchy_weights() {
+        let leaf = sidebar_tree_label(
+            SharedString::from("users"),
+            SchemaNodeKind::Table,
+            false,
+            false,
+            gpui::blue(),
+        )
+        .inspect();
+
+        let folder = sidebar_tree_label(
+            SharedString::from("Tables"),
+            SchemaNodeKind::TablesFolder,
+            false,
+            false,
+            gpui::yellow(),
+        )
+        .inspect();
+
+        let active_profile = sidebar_tree_label(
+            SharedString::from("prod-postgres"),
+            SchemaNodeKind::Profile,
+            true,
+            false,
+            gpui::red(),
+        )
+        .inspect();
+
+        let active_database = sidebar_tree_label(
+            SharedString::from("analytics"),
+            SchemaNodeKind::Database,
+            false,
+            true,
+            gpui::green(),
+        )
+        .inspect();
+
+        for inspection in [leaf, folder, active_profile, active_database] {
+            assert_eq!(inspection.family, AppFonts::INTERFACE);
+            assert!(inspection.fallbacks.is_empty());
+            assert_eq!(inspection.size_override, None);
+            assert!(inspection.has_custom_color_override);
+        }
+
+        assert_eq!(leaf.weight_override, Some(FontWeight::NORMAL));
+        assert_eq!(folder.weight_override, Some(FontWeight::NORMAL));
+        assert_eq!(active_profile.weight_override, Some(FontWeight::SEMIBOLD));
+        assert_eq!(active_database.weight_override, Some(FontWeight::SEMIBOLD));
+    }
+
+    #[test]
+    fn folder_counts_split_off_a_trailing_parenthesized_number() {
+        assert_eq!(split_folder_count("Tables (36)"), ("Tables", Some("36")));
+        assert_eq!(
+            split_folder_count("Foreign Keys (1)"),
+            ("Foreign Keys", Some("1"))
+        );
+        assert_eq!(split_folder_count("Tables"), ("Tables", None));
+        assert_eq!(split_folder_count("users (view)"), ("users (view)", None));
+        assert_eq!(split_folder_count("Indexes ()"), ("Indexes ()", None));
+    }
+
+    // -----------------------------------------------------------------------
+    // Icon resolver — new dashboard / saved-charts node kinds
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dashboards_folder_icon_is_some() {
+        let icon = icon_for_node_kind(SchemaNodeKind::DashboardsFolder, "", &None);
+        assert!(
+            icon.is_some(),
+            "DashboardsFolder must have a dedicated icon (was None)"
+        );
+    }
+
+    #[test]
+    fn dashboard_item_icon_is_some() {
+        let icon = icon_for_node_kind(SchemaNodeKind::DashboardItem, "", &None);
+        assert!(
+            icon.is_some(),
+            "DashboardItem must have a dedicated icon (was None)"
+        );
+    }
+
+    #[test]
+    fn saved_charts_folder_icon_is_some() {
+        let icon = icon_for_node_kind(SchemaNodeKind::SavedChartsFolder, "", &None);
+        assert!(
+            icon.is_some(),
+            "SavedChartsFolder must have a dedicated icon (was None)"
+        );
+    }
+
+    #[test]
+    fn saved_chart_item_icon_is_some() {
+        let icon = icon_for_node_kind(SchemaNodeKind::SavedChartItem, "", &None);
+        assert!(
+            icon.is_some(),
+            "SavedChartItem must have a dedicated icon (was None)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Icon resolver — instance metrics / inspectors node kinds (UX1)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn instance_metrics_folder_icon_is_some() {
+        let icon = icon_for_node_kind(SchemaNodeKind::InstanceMetricsFolder, "", &None);
+        assert!(
+            icon.is_some(),
+            "InstanceMetricsFolder must have a dedicated icon (was None)"
+        );
+    }
+
+    #[test]
+    fn instance_metric_leaf_icon_is_some() {
+        let icon = icon_for_node_kind(SchemaNodeKind::InstanceMetricLeaf, "", &None);
+        assert!(
+            icon.is_some(),
+            "InstanceMetricLeaf must have a dedicated icon (was None)"
+        );
+    }
+
+    #[test]
+    fn instance_inspectors_folder_icon_is_some() {
+        let icon = icon_for_node_kind(SchemaNodeKind::InstanceInspectorsFolder, "", &None);
+        assert!(
+            icon.is_some(),
+            "InstanceInspectorsFolder must have a dedicated icon (was None)"
+        );
+    }
+
+    #[test]
+    fn instance_inspector_leaf_icon_is_some() {
+        let icon = icon_for_node_kind(SchemaNodeKind::InstanceInspectorLeaf, "", &None);
+        assert!(
+            icon.is_some(),
+            "InstanceInspectorLeaf must have a dedicated icon (was None)"
+        );
+    }
+}

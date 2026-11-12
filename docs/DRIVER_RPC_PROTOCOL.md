@@ -1,0 +1,472 @@
+# Driver RPC Protocol Specification
+
+This document defines how DataTab discovers, launches, and talks to RPC services over local IPC.
+
+DataTab now activates three runtime service families:
+
+- `RpcServiceKind::Driver` -> runtime database drivers
+- `RpcServiceKind::AuthProvider` -> runtime auth-provider registries in the app and MCP server
+- `RpcServiceKind::SecretProvider` -> runtime secret providers in every connection's value resolver; see [Secret Provider RPC Protocol](SECRET_PROVIDER_RPC_PROTOCOL.md)
+
+## Source of truth
+
+For active driver services, **the service is the source of truth** for:
+
+- driver kind (`DbKind`)
+- driver metadata (`DriverMetadataDto`: name, icon, category, capabilities, query language, etc.)
+- connection form definition (`DriverFormDefDto`)
+
+DataTab stores launch configuration in its SQLite-backed services config. RPC services are created and edited from **Settings → RPC Services**.
+
+## Integration model
+
+At app startup, DataTab loads configured RPC services from `~/.local/share/datatab/datatab.db`, then for each service:
+
+1. discovers the persisted service descriptor, including `RpcServiceKind`
+2. branches by `kind`
+3. ensures the service is running (starts it if needed)
+4. performs the family-specific `Hello` handshake
+5. reads runtime metadata from the service
+6. registers the adapted runtime service in the appropriate in-memory registry
+
+If any step fails, that service is skipped without aborting startup. Driver failures do not break auth providers, and auth-provider failures do not break drivers.
+
+Important behavior:
+
+- Service configuration is read at startup. Restart DataTab after changing RPC service settings.
+- `socket_id` is used as-is (it is not rewritten by DataTab).
+- Internal registry key is `rpc:<socket_id>`.
+
+## Transport
+
+DataTab uses local sockets via `interprocess`:
+
+- **Linux**: abstract namespace Unix sockets (`\0name`)
+- **Windows**: named pipes (`\\.\pipe\...`)
+
+Messages are framed as:
+
+- 4-byte little-endian length (`u32`)
+- postcard payload
+
+Maximum message size: `16 MiB`.
+
+Socket cleanup is automatic on process exit/drop (provided by `interprocess`).
+
+## Runtime configuration
+
+Primary storage: `~/.local/share/datatab/datatab.db` (`cfg_services`, `cfg_service_args`, `cfg_service_env`)
+
+Settings UI: **Settings → RPC Services**
+
+Notes:
+
+- `socket_id` is required.
+- `kind` supports `driver` and `auth_provider`.
+- `command` is optional.
+  - If `command` is omitted and `args` is empty, DataTab expects the service to already be running.
+  - For `driver`, if `command` is omitted and `args` is non-empty, DataTab launches `datatab-driver-host`.
+  - For `auth_provider`, managed launch requires an explicit `command`; DataTab does not assume a default host binary.
+- `args`, `env`, and `startup_timeout_ms` are optional.
+- DataTab derives an internal driver registry key as `rpc:<socket_id>`.
+- Only `driver` services are registered as database drivers.
+- `auth_provider` services are registered only in auth-provider registries and never receive a `rpc:<socket_id>` driver identity.
+
+## Handshake contract
+
+DataTab connects and sends `Hello` first.
+
+The active driver RPC API family is `driver_rpc`. In the current dedicated driver RPC transport, that family is implicit in the protocol itself rather than transmitted on the wire during `Hello`. Compatibility is enforced by the driver RPC endpoint plus the selected protocol major version; minor versions are negotiated deterministically within that major line. Minor versions up to v1.7 are additive; v1.8 is a wire-format fix that changes how some existing payloads are encoded, and every shape that decoded before is byte-identical (see **Wire-format fix** below). v1.9 is additive again.
+
+Client request:
+
+```rust
+DriverRequestBody::Hello(DriverHelloRequest {
+    client_name: "datatab_driver_ipc".to_string(),
+    client_version: "<version>".to_string(),
+    supported_versions: vec![
+        ProtocolVersion::new(1, 0),
+        ProtocolVersion::new(1, 1),
+        ProtocolVersion::new(1, 2),
+        ProtocolVersion::new(1, 3),
+        ProtocolVersion::new(1, 4),
+        ProtocolVersion::new(1, 5),
+        ProtocolVersion::new(1, 6),
+        ProtocolVersion::new(1, 7),
+        ProtocolVersion::new(1, 8),
+        ProtocolVersion::new(1, 9),
+    ],
+    requested_capabilities: vec![
+        DriverCapability::Cancellation,
+        DriverCapability::ChunkedResults,
+        DriverCapability::SchemaIntrospection,
+        DriverCapability::MultiDatabase,
+    ],
+})
+```
+
+Server response must include:
+
+- `selected_version`
+- `capabilities`
+- `driver_kind`
+- `driver_metadata`
+- `form_definition`
+
+Example:
+
+```rust
+DriverResponseBody::Hello(DriverHelloResponse {
+    server_name: "my-driver".to_string(),
+    server_version: "1.0.0".to_string(),
+    selected_version: DRIVER_RPC_VERSION,
+    capabilities: vec![DriverCapability::SchemaIntrospection],
+    driver_kind: DbKind::SQLite,
+    driver_metadata: DriverMetadataDto {
+        id: "my-driver".to_string(),
+        display_name: "My Driver".to_string(),
+        description: "External RPC driver".to_string(),
+        category: DatabaseCategory::Relational,
+        query_language: QueryLanguageDto::Sql,
+        capabilities: DriverCapabilities::RELATIONAL_BASE.bits(),
+        default_port: None,
+        uri_scheme: "mydriver".to_string(),
+        icon: Icon::Database,
+    },
+    form_definition: DriverFormDefDto {
+        tabs: vec![
+            // ...
+        ],
+    },
+})
+```
+
+If multiple compatible minors overlap, the host must select the highest mutual minor version.
+
+If no compatible version exists, return `DriverRpcErrorCode::VersionMismatch`.
+
+After `Hello`, every request and response envelope must use the negotiated `selected_version`. A peer that receives a different post-handshake envelope version must reject it as a version mismatch.
+
+Current validation boundary:
+
+- DataTab persists per-service API family/version metadata for discovery and future runtime seams.
+- The live driver handshake currently validates negotiated protocol versions, but it does not transmit or separately re-validate the API family string on the wire because the driver RPC transport is already family-specific.
+
+### Audit emission from drivers (v1.2+)
+
+A driver that advertises `DriverCapability::AuditEmit` (driver RPC ≥ 1.2) may write to the host audit log by sending `EmitAuditEvent` intermediate frames (`done=false`) during any request/response cycle. The host sanitizes every event before persisting it to `aud_audit_events`.
+
+Allowed categories: `Connection`, `Query`, `System`. All other categories are silently dropped.
+
+The host overrides identity fields (`actor_type` → `ExternalDriver`, `actor_id`, `source_id`, `driver_id`, `correlation_id`) and the connection context from `AppState`, and truncates `details_json` to the configured limit. Rate limiting is shared with auth providers: 100 events per 60 seconds per `socket_id`; overflow events are dropped without erroring the session. Peers that negotiate below v1.2 or omit the capability remain silent. See [Audit § external audit emission](AUDIT.md) for the full sanitization contract.
+
+### Key-value read size gate (v1.3+)
+
+`KeyGetRequest` carries `max_value_bytes: Option<u64>`, an optional upper bound on the value bytes a `KvGetKey` call may transfer. `None` means unbounded, which is also what a peer negotiating below v1.3 gets: the field is additive and defaults to `None` when absent from the wire payload, so older drivers and hosts keep fetching the full value.
+
+`KeyGetResult` carries `load_state: KeyLoadState`, reporting whether `value` is the complete payload:
+
+- `Loaded` — the full value was fetched. Default when the field is absent from the wire payload.
+- `Truncated { returned_bytes, total_bytes }` — only part of the value was fetched (for example a driver-side item cap on a collection type); `total_bytes` is the full size when the driver knows it.
+- `TooLarge { size_bytes, limit_bytes }` — the value was not fetched because it exceeds `max_value_bytes`; `value` is empty.
+
+Both fields are plain, `#[serde(default)]` struct fields on existing request/response types, not a new capability flag: no `Hello` negotiation gates them, and a driver ignoring `max_value_bytes` simply always returns `Loaded`.
+
+### Bulk schema columns (v1.4+)
+
+`SchemaColumns { database, schema }` fetches the columns of every relation in a schema in a single call and answers `SchemaColumns { columns: Vec<SchemaColumnInfo> }`, where each entry carries its `table_name` next to the usual `ColumnInfo`. The host dispatches the request to the connection's `schema_columns` seam, exactly like `SchemaIndexes` and `SchemaForeignKeys`.
+
+Unlike the v1.3 fields above, this operation is not additive on the wire: frames are encoded with postcard, which tags enum variants with a varint discriminant index, never a name. `SchemaColumns` is therefore appended after the last v1.3 variant of both the request and the response enum; inserting it mid-enum would shift every later variant's index, so a peer that negotiated v1.3 would decode the shifted variants as the wrong ones and leave the rest of the frame undecoded, desynchronising the stream. The client also gates locally: `IpcConnection::schema_columns` inspects the version selected during `Hello` and returns `DbError::NotSupported` without sending anything when the negotiated minor is below 1.4, so an older host never receives the new variant at all. Consumers treat that error the same as the trait's own `NotSupported` default and fall back to per-table `table_details` loads.
+
+### Key count (v1.5+)
+
+`KvKeyCount { keyspace }` asks for the number of keys in a keyspace (`None` means the session's current one) and answers `KvKeyCountResult { count }`. The host dispatches the request to the connection's `KeyValueApi::key_count` seam; a driver that does not implement it answers with the trait's `NotSupported` default, which reaches the client as `UnsupportedMethod`.
+
+Both variants are appended after the last v1.4 variant of their enum, for the wire-index reason described above. The client gates locally in the same way: `IpcConnection::key_count` returns `DbError::NotSupported` without sending anything when the negotiated minor is below 1.5. The key browser treats that error as "no total" and shows only the page count.
+
+### Request row limit (v1.6+)
+
+`Execute` and `ExecuteWithHandle` may carry `QueryRequestDto::limit`, the editor row limit. A host answers them with `ExecuteResultWithTruncation { result, rows_truncated }` and `ExecuteWithHandleResultWithTruncation { handle_id, result, rows_truncated }` instead of `ExecuteResult` and `ExecuteWithHandleResult`, because `QueryResultDto` has no room for the flag. `rows_truncated` is `true` only when the driver dropped rows to honour the limit.
+
+Both response variants are appended after `KvKeyCountResult`, for the wire-index reason described above. A host sends them for execute calls only on sessions that negotiated v1.6 exactly; v1.7 replaces them with the result-set responses below, and older sessions keep the v1.5 responses. See **Protected execution** below for which requests carry a limit.
+
+### Result sets (v1.7+)
+
+A statement batch or a stored procedure can return several result sets, and each of them can omit rows on its own. From v1.7 a host answers with every result set instead of only the first one:
+
+| Request | v1.7 response |
+| --- | --- |
+| `Execute` | `ExecuteResultSets { results }` |
+| `ExecuteWithHandle` | `ExecuteWithHandleResultSets { handle_id, results }` |
+| `BrowseTable`, `BrowseCollection`, `Explain`, `DescribeTable` | `BrowseResultSets { results }` |
+
+`results` is a `QueryResultSetsDto { primary, additional }`. Each entry is a `ResultSetDto { result, rows_truncated }`: `primary` is the first result set and `additional` holds the rest in the order the driver returned them. `rows_truncated` is `true` only when the driver dropped rows from that result set, so a driver that never caps rows always sends `false`.
+
+The three variants are appended after `ExecuteWithHandleResultWithTruncation`, for the wire-index reason described above. A host sends them only on sessions that negotiated v1.7 or newer. A v1.6 session keeps `ExecuteResultWithTruncation`, `ExecuteWithHandleResultWithTruncation` and `BrowseResult`, and an older session keeps the v1.5 responses; on those sessions only the primary result set crosses the wire. The client accepts every variant whatever the negotiated version, so a host never needs to know which client build it talks to.
+
+### Wire-format fix (v1.8)
+
+v1.8 adds no request or response variant. It changes how some existing payloads are encoded, so that every payload the protocol defines can be decoded with postcard:
+
+| Payload | v1.8 encoding |
+| --- | --- |
+| JSON documents: the `filter`, `projection` and `sort` of `BrowseCollection` (`CollectionBrowseRequestDto`), the `filter` of `CountCollection` (`CollectionCountRequestDto`), the filter and update of `UpdateDocument` (`DocumentUpdateDto`), the documents of `InsertDocument` (`DocumentInsertDto`), the filter of `DeleteDocument` (`DocumentDeleteDto`), and the `metadata_extra` values of `CrudResult` (`CrudResultDto`) | JSON text: a postcard string holding the serialized JSON, parsed back at the protocol boundary |
+| Optional and list fields that used to carry `skip_serializing_if`, such as `semantic_filter` and `columns` on browse and count requests, `enum_values` on `ColumnInfo`, `metadata_extra` on `CrudResult`, `type_name` on `ColumnAssignment`, `source` on `ExecutionContext` and `icon` on `FormSection` | always encoded, as `None` or an empty list when unset |
+| `IndexData` | externally tagged: the variant index, then the list of indexes |
+
+A raw `serde_json::Value` could be written but never read back, because it deserializes only through `deserialize_any`, which postcard does not support. A skipped field shortened the frame while the decoder still read it, so every later field shifted. An internally tagged `IndexData` could not be encoded at all, so `TableDetails` and `GenerateCode` failed for any table with indexes.
+
+The encoding is not gated by the negotiated version. A shape that decoded before v1.8 is byte-identical in v1.8; only shapes that no peer could decode change their bytes, so peers on older minors keep working.
+
+### Root sections (v1.9+)
+
+A driver can declare sections shown at the root of its connection in the sidebar, such as S3 buckets. The payloads are the `datatab_core` root section types, carried as they are:
+
+| Request | Response |
+| --- | --- |
+| `RootSections` | `RootSections { sections }`, a `Vec<RootSectionDef>` in display order |
+| `RootSectionItems { section_id, page_token }` | `RootSectionPage { page }`; `page_token` is `None` for the first page and the previous page's `next_page_token` afterwards |
+| `ExecuteRootSectionAction { section_id, item_id, action_id }` | `RootSectionActionDone` |
+
+The host dispatches the three requests to the connection's `Connection::root_section_source`. A driver without a source answers `UnsupportedMethod` (`Driver does not declare root sections`), and a driver error answers as any other `Error`. A host refuses the requests on a session that negotiated an older minor with `VersionMismatch` (`root section requests require driver RPC protocol 1.9 or newer`), without calling the driver.
+
+The six variants are appended after the last v1.8 variant of their enum, for the wire-index reason described above. The client exposes root sections only when the session negotiated v1.9 or newer and the driver metadata declares `DriverCapabilities::ROOT_SECTIONS`; otherwise `IpcConnection` clears that capability and sends nothing. `IpcConnection` fetches the declaration once per connection and caches it; a failed fetch is returned as an error and not cached, so the host shows it with a retry row and asks again from there. A section id must not contain `|`; the host rejects and reports such a declaration. The host hides a section whose presentation opens an object-store document on a connection without `object_store_api`. `IpcConnection` has none, because no object-store RPC exists yet, and both presentations shipped so far (`ObjectContainerTable` and `ObjectBrowser`) are of that kind, so an external driver's sections stay hidden until a presentation without that need ships. Every `RootSectionAction` carries its `ExecutionClassification`, so the host confirms and audits actions the same way for external drivers as for built-in ones.
+
+## Auth-provider RPC contract
+
+The active auth-provider RPC API family is `auth_provider_rpc` at `1.3`.
+
+DataTab uses persisted `api_family` / `api_major` metadata as a startup preflight. Compatible rows then negotiate the highest shared minor version during `Hello`.
+
+Client request:
+
+```rust
+AuthProviderRequestBody::Hello(AuthProviderHelloRequest {
+    client_name: "datatab_ipc".to_string(),
+    client_version: "<version>".to_string(),
+    supported_versions: vec![
+        ProtocolVersion::new(1, 3),
+        ProtocolVersion::new(1, 2),
+        ProtocolVersion::new(1, 1),
+        ProtocolVersion::new(1, 0),
+    ],
+    auth_token: Some("<token>".to_string()),
+})
+```
+
+Server response must include:
+
+- `selected_version`
+- `provider_id`
+- `display_name`
+- `form_definition`
+
+The v1.2 `Hello` response additionally carries `secret_dependency_opt_in` (`bool`), declaring whether the provider opts in to receiving secret field values inside dependency maps for dynamic option lookups. When `false` (default), DataTab strips secret values from dependency maps before forwarding `FetchDynamicOptions` requests.
+
+The v1.3 `Hello` response additionally carries `audit_emit_opt_in` (`bool`). Set this to `true` to enable audit event emission (see below). Default is `false`.
+
+Supported request / response flow:
+
+| Request → Response | Purpose |
+|---|---|
+| `Hello` → `Hello` | protocol negotiation + provider identity |
+| `ValidateSession` → `SessionState` | validate cached auth state |
+| `Login` → `LoginUrlProgress?` + `LoginResult` | optional verification URL + terminal login result |
+| `ResolveCredentials` → `Credentials` | resolve runtime credential fields |
+| `FetchDynamicOptions` → `DynamicOptions` | resolve dynamic dropdown options for a `DynamicSelect` form field (v1.2+) |
+| (any request) → `EmitAuditEvent` (intermediate) | audit event emission (v1.3+) |
+
+Notes:
+
+- `Login` may emit zero or one `LoginUrlProgress` event before `LoginResult`.
+- If no progress event is sent, DataTab treats the verification URL callback as `None`.
+- `FetchDynamicOptions` is available only when the negotiated version is at least `1.2`. Providers that negotiate below v1.2 receive a permanent "not supported" outcome from the host without an IPC round-trip.
+- `detect_importable_profiles`, profile write-back hooks, and provider-specific value-provider registration are intentionally out of scope for the RPC contract in this change.
+- Auth-provider runtime failures surface through existing `DbError` handling and do not abort startup.
+
+### Audit emission from auth providers (v1.3+)
+
+Auth providers that negotiate v1.3+ and set `audit_emit_opt_in: true` may send `EmitAuditEvent` intermediate frames (`done=false`) during any request/response cycle. The host sanitizes and writes them to `aud_audit_events`.
+
+Allowed category: `Connection` only. All other categories are silently dropped.
+
+The `AuditEventEmitDto` payload follows the same structure as driver emit frames. The host overrides identity fields (`actor_type`, `actor_id`, `source_id`, `driver_id`, `correlation_id`). Rate limiting is shared with drivers: 100 events per 60 seconds per `socket_id`.
+
+## Form contract
+
+The connection form shown in DataTab is built from `form_definition` returned in `Hello`.
+
+- The service defines fields/tabs/sections.
+- DataTab validates required fields in UI.
+- On connect/save, DataTab sends collected values through `DbConfig::External.values` in `OpenSession` profile JSON.
+
+If `form_definition.tabs` is empty, the connection form will show no driver-specific inputs.
+
+## Session lifecycle
+
+1. `Hello`
+2. `OpenSession`
+3. request/response operations
+4. `CloseSession`
+
+`OpenSession` still returns `SessionOpened` with metadata. Keep this consistent with `Hello` metadata.
+
+DataTab sends the saved profile JSON to `OpenSession`. For external drivers, the profile config is:
+
+```rust
+DbConfig::External {
+    kind: DbKind,
+    values: HashMap<String, String>,
+}
+```
+
+`values` contains the field values collected from your `form_definition`.
+
+The service should parse `profile_json`, expect `DbConfig::External`, and validate required fields again server-side.
+
+## Request/response overview
+
+| Request → Response | Purpose |
+|---|---|
+| `Hello` → `Hello` | protocol negotiation + driver identity |
+| `OpenSession` → `SessionOpened` | open connection/session |
+| `CloseSession` → `SessionClosed` | close session |
+| `Ping` → `Pong` | liveness |
+| `Execute` → `ExecuteResult` (`ExecuteResultSets` from v1.7) | query execution |
+| `Schema` → `Schema` | schema snapshot |
+| `ListDatabases` → `Databases` | database list |
+| `RootSections` → `RootSections`, `RootSectionItems` → `RootSectionPage`, `ExecuteRootSectionAction` → `RootSectionActionDone` (v1.9+) | sidebar root sections |
+
+The protocol also supports browse, CRUD, key-value, and code generation operations. See `crates/datatab_ipc/src/driver_protocol.rs` for the full enum set.
+
+**Protected execution:** on a session that negotiated v1.6 or newer, a driver whose metadata declares `DriverCapabilities::REQUEST_ROW_LIMIT` receives `QueryRequestDto::limit`. It must either enforce the limit while it collects rows, counting it once across all result sets, and set `rows_truncated` only when rows were dropped, or refuse the request before running anything. The host session refuses a limited request with `UnsupportedMethod` when the driver does not declare the capability. Below v1.6 the client never sends a limit: `IpcConnection` does not advertise `REQUEST_ROW_LIMIT` and rejects `Execute` and `ExecuteWithHandle` with `NotSupported` before sending the RPC when `QueryRequest.limit` is `Some(n)` (including `Some(0)`). On every version the client refuses a `statement_timeout` or read-only enforcement the same way, and the host refuses a `statement_timeout`. Below v1.7 only the primary result set crosses the wire, so additional result sets and their flags are dropped; from v1.7 every result set crosses with its own flag (see **Result sets** above). The client trusts the driver's declaration: a driver that declares `REQUEST_ROW_LIMIT` and ignores the limit returns uncapped rows marked as not truncated. Browse and CRUD operations are unaffected.
+
+## Audit emission from drivers (v1.2+)
+
+Drivers that negotiate protocol version v1.2 or higher may emit audit events back to the host as intermediate response frames (`done=false`). The host sanitizes, rate-limits, and writes them to `aud_audit_events`.
+
+### Opting in
+
+Include `DriverCapability::AuditEmit` in your `Hello` response `capabilities` list. Drivers that do not advertise this capability will have any `EmitAuditEvent` frames silently discarded by the host.
+
+### Sending an audit frame
+
+Emit a `DriverResponseEnvelope` with `done = false` and `body = DriverResponseBody::EmitAuditEvent(AuditEventEmitDto { .. })` at any point during a request before the terminal response:
+
+```rust
+DriverResponseEnvelope {
+    protocol_version: negotiated_version,
+    request_id: request.request_id,
+    session_id: request.session_id,
+    done: false,
+    body: DriverResponseBody::EmitAuditEvent(AuditEventEmitDto {
+        ts_ms: chrono::Utc::now().timestamp_millis(),
+        level: EventSeverityDto::Info,
+        category: EventCategoryDto::Connection,
+        action: "session.open".to_string(),
+        outcome: EventOutcomeDto::Success,
+        summary: "Database session opened".to_string(),
+        object_type: None,
+        object_id: None,
+        duration_ms: Some(42),
+        error_code: None,
+        error_message: None,
+        details_json: None,
+    }),
+}
+```
+
+Then send the terminal response as usual.
+
+### What the host supplies
+
+The host always overrides these fields; do not include them in the DTO (they are intentionally absent from `AuditEventEmitDto`):
+
+- `actor_type`, `actor_id`, `source_id`, `driver_id` — always set to `ExternalDriver` / `rpc:<socket_id>`
+- `connection_id`, `database_name` — resolved from the active session context
+- `correlation_id` — one per session, host-generated
+
+### Allowed categories
+
+Drivers may emit `Connection`, `Query`, and `System` events. All other categories are silently dropped.
+
+### Rate limit
+
+100 events per 60 seconds per `socket_id`. Excess frames are dropped and counted in `AuditService::external_audit_dropped_count()`.
+
+## Error handling
+
+Return structured errors through `DriverResponseBody::Error(DriverRpcError { ... })`.
+
+Common codes:
+
+- `InvalidRequest`
+- `UnsupportedMethod`
+- `VersionMismatch`
+- `SessionNotFound`
+- `Timeout`
+- `Cancelled`
+- `Transport`
+- `Driver`
+- `Internal`
+
+Use `InvalidRequest` for malformed profiles/form values and `UnsupportedMethod` for methods intentionally not implemented. Auth-provider RPC uses the parallel `AuthProviderRpcErrorCode` set with the same operational meaning (`VersionMismatch`, `UnsupportedMethod`, `Timeout`, `Transport`, etc.).
+
+## Process lifecycle and cleanup
+
+When DataTab starts a service process itself (via `command` or the supported default host command), that process is tracked as a managed host.
+
+On DataTab shutdown:
+
+- all tracked managed hosts are killed (`kill + wait`)
+- hosts started manually outside DataTab are not tracked and are not killed
+
+This guarantees DataTab cleans up only the processes it owns.
+
+If a managed host exits early or times out before the socket is ready, DataTab reports the service id together with a bounded tail of recent stdout/stderr to aid troubleshooting.
+
+## Minimal implementation checklist
+
+Your service should:
+
+1. bind socket via `interprocess`
+2. handle `Hello` and return metadata/kind
+3. return a form definition in `Hello`
+4. handle `OpenSession`/`CloseSession`
+5. implement at least one useful operation (`Execute`)
+6. return `UnsupportedMethod` for non-implemented operations
+
+Recommended:
+
+7. validate `DbConfig::External.values` in `OpenSession`
+8. return clear `InvalidRequest` errors for missing/invalid form values
+9. keep `Hello` metadata and `SessionOpened` metadata consistent
+10. stamp every post-`Hello` envelope with the negotiated version instead of assuming the latest constant
+
+## Working example in this repository
+
+Use:
+
+- `examples/custom_driver/src/main.rs`
+- `examples/custom_driver/README.md`
+- `examples/custom_auth_provider/src/main.rs`
+- `examples/custom_auth_provider/README.md`
+
+Those examples are compatible with the current active driver-service integration model.
+
+Quick test path:
+
+1. add a new **Driver** service in **Settings → RPC Services**
+2. point `command` to your built example binary
+3. set `args` to `--socket <your-socket-id>`
+4. restart DataTab
+5. create either a connection (driver example) or an auth profile (auth-provider example) through the UI forms exposed by the service
+
+## References
+
+- `crates/datatab_ipc/src/driver_protocol.rs`
+- `crates/datatab_driver_ipc/src/transport.rs`
+- `crates/datatab_driver_host/src/main.rs`
+- `crates/datatab/src/app.rs`
+- `crates/datatab_driver_ipc/src/driver.rs`
+- `docs/RPC_SERVICES_CONFIG.md`
