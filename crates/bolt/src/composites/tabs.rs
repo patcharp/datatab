@@ -57,6 +57,23 @@ pub fn document_tab(id: impl Into<ElementId>, active: bool, cx: &App) -> Statefu
         .child(document_tab_shape(active, cx))
 }
 
+/// Width reserved for a document tab's title and chrome.
+pub fn document_tab_width(
+    title_width: gpui::Pixels,
+    dirty: bool,
+    rem_size: gpui::Pixels,
+) -> gpui::Pixels {
+    let chrome = TabMetrics::DOCUMENT_TAB_PADDING_X * 2.0
+        + TabMetrics::DOCUMENT_TAB_GAP * if dirty { 3.0 } else { 2.0 }
+        + (TabMetrics::ICON + TabMetrics::CLOSE_ICON).to_pixels(rem_size)
+        + if dirty {
+            crate::tokens::Feedback::STATUS_DIAMOND_COMPACT.to_pixels(rem_size)
+        } else {
+            gpui::Pixels::ZERO
+        };
+    (title_width + chrome).min(TabMetrics::DOCUMENT_TAB_MAX_WIDTH.to_pixels(rem_size))
+}
+
 /// Title of a document or result tab: 13 px, strong and 600 when active,
 /// muted otherwise.
 pub fn document_tab_title(title: impl Into<SharedString>, active: bool, cx: &App) -> Text {

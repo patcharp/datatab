@@ -2305,7 +2305,7 @@ mod tests {
         let mut values = FormValues::default();
         values.insert(
             "uri".to_string(),
-            "postgres://alice:s3cr3t@db.example/app".to_string(),
+            "postgres://alice:s3cr3t@db.example.com/app".to_string(),
         );
 
         let graph = simple_graph(&profile, values);

@@ -33,11 +33,12 @@ const PLAINTEXT_SECRET: &str = "prod/notify/webhook-token";
 const BINARY_SECRET: &str = "prod/tls/signing-key";
 const DENIED_PARAMETER: &str = "/app/prod/db/password";
 /// A `.env` file a user stored in a secret: the line breaks are the point.
-const MULTILINE_SECRET: &str = "PORT=3000\nENV=prod\nDATABASE_URL=postgres://app@db:5432/app";
+const MULTILINE_SECRET: &str =
+    "PORT=3000\nENV=prod\nDATABASE_URL=postgres://app@db.example.com:5432/app";
 /// JSON that does not open as key/value, because an object and an array are
 /// not scalar values. Its keys are in the order pretty-printing keeps.
 const NESTED_JSON_SECRET: &str =
-    r#"{"database":{"host":"db.internal","port":5432},"flags":["a,b","c"]}"#;
+    r#"{"database":{"host":"db.example.com","port":5432},"flags":["a,b","c"]}"#;
 
 struct Opened<'a> {
     doc: Entity<SecretStoreDocument>,
@@ -755,7 +756,7 @@ fn a_multiline_value_opens_in_the_viewer_with_every_line() {
         vec![
             "PORT=3000",
             "ENV=prod",
-            "DATABASE_URL=postgres://app@db:5432/app",
+            "DATABASE_URL=postgres://app@db.example.com:5432/app",
         ]
     );
 }
@@ -786,7 +787,7 @@ fn nested_json_is_drawn_pretty_printed() {
         vec![
             "{",
             "  \"database\": {",
-            "    \"host\": \"db.internal\",",
+            "    \"host\": \"db.example.com\",",
             "    \"port\": 5432",
             "  },",
             "  \"flags\": [",
@@ -870,7 +871,7 @@ fn the_viewer_scrolls_after_about_fourteen_lines_and_wraps_long_ones(cx: &mut Te
     use datatab_components::tokens::DocumentMetrics;
 
     /// Longer than the details pane: it has to wrap to be readable.
-    const LONG_LINE: &str = "DATABASE_URL postgres app secret db.internal 5432 app sslmode require application_name datatab connect_timeout ten keepalives_idle thirty pool_max twenty";
+    const LONG_LINE: &str = "DATABASE_URL postgres app secret db.example.com 5432 app sslmode require application_name datatab connect_timeout ten keepalives_idle thirty pool_max twenty";
     let many_lines = (0..40)
         .map(|index| format!("KEY_{index}=value"))
         .collect::<Vec<_>>()
@@ -997,7 +998,8 @@ fn a_long_pretty_printed_json_line_wraps(cx: &mut TestAppContext) {
     use datatab_components::fonts;
     use datatab_components::tokens::DocumentMetrics;
 
-    let long_value = "postgres://app:secret@db.internal:5432/app sslmode require pool_max twenty";
+    let long_value =
+        "postgres://app:secret@db.example.com:5432/app sslmode require pool_max twenty";
     let secret = format!(r#"{{"target":{{"url":"{long_value}"}}}}"#);
 
     let mut opened = open(cx, FAKE_SECRETS_STORE_ID, None);

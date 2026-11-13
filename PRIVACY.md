@@ -61,7 +61,7 @@ DataTab uses your platform's standard directories.
 |----------|----------------|------------------|
 | **Linux** | `~/.local/share/datatab/` | `~/.config/datatab/` |
 | **Windows** | `%APPDATA%\datatab\` | `%APPDATA%\datatab\` |
-| **macOS** (experimental) | `~/Library/Application Support/datatab/` | `~/Library/Application Support/datatab/` |
+| **macOS** | `~/Library/Application Support/datatab/` | `~/Library/Application Support/datatab/` |
 
 The data directory holds:
 
@@ -114,7 +114,7 @@ your operating system's keyring, **not** in `datatab.db`.
 |----------|-----------------|
 | **Linux** | Secret Service (GNOME Keyring / KWallet, via libsecret) |
 | **Windows** | Windows Credential Manager |
-| **macOS** (experimental) | Keychain |
+| **macOS** | Keychain |
 
 All entries are stored under the service name **`datatab`**. The database holds
 only a reference string per secret:

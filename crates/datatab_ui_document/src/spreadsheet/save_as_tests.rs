@@ -10,7 +10,7 @@ use datatab_ui_base::{SaveTargetOutcome, SaveTargetProvider};
 use gpui::{Entity, TestAppContext, VisualTestContext};
 
 use super::document::SpreadsheetDocument;
-use super::tests::{TestDirectory, fixture, open_local, toast_count};
+use super::tests::{TestDirectory, fixture, last_toast_occurrences, open_local, toast_count};
 use crate::keyboard_coverage::SPREADSHEET;
 
 /// A picker that answers every Save As with `path` and counts how often it
@@ -181,7 +181,9 @@ fn xls_is_never_replaced(cx: &mut TestAppContext) {
 
     assert_eq!(std::fs::read(&path).expect("the source stays"), original);
     assert!(opened.borrow().is_empty());
-    assert_eq!(toast_count(window), 2);
+    // The same refusal again merges into its toast.
+    assert_eq!(toast_count(window), 1);
+    assert_eq!(last_toast_occurrences(window), Some(2));
 }
 
 #[gpui::test]

@@ -130,6 +130,7 @@ pub fn report_error(err: UserFacingError, cx: &mut App) {
 
     let mut toast = match err.severity {
         EventSeverity::Warn => Toast::warning(err.summary.clone()),
+        EventSeverity::Fatal => Toast::fatal(err.summary.clone()),
         _ => Toast::error(err.summary.clone()),
     };
 
@@ -146,6 +147,9 @@ pub fn report_error(err: UserFacingError, cx: &mut App) {
         "view-in-audit",
         datatab_i18n::t!("errors.action.view_in_audit"),
     )
+    // The status-bar badge and the audit row keep the error after its toast
+    // closes, so this link does not hold the toast open.
+    .lets_toast_close()
     .on_click(move |cx: &mut App| {
         if let Some(g) = cx.try_global::<AppStateGlobal>() {
             let entity = g.entity.clone();
@@ -404,5 +408,111 @@ mod i18n_tests {
 
         assert!(clipboard.starts_with("boom\n"));
         assert!(clipboard.ends_with(&detail));
+    }
+}
+
+#[cfg(test)]
+mod lifetime_tests {
+    use std::time::Duration;
+
+    use datatab_core::observability::EventSeverity;
+    use datatab_storage::bootstrap::StorageRuntime;
+    use gpui::{AppContext as _, Entity, TestAppContext};
+
+    use super::{ErrorKind, UserFacingError, report_error};
+    use crate::app_state_entity::{AppStateEntity, AppStateGlobal};
+    use crate::toast::{ToastGlobal, ToastHost};
+
+    fn setup(cx: &mut TestAppContext) -> (Entity<AppStateEntity>, Entity<ToastHost>) {
+        let app_state = cx.update(|cx| {
+            cx.new(|_| {
+                AppStateEntity::new_with_storage_runtime(
+                    StorageRuntime::in_memory().expect("isolated storage runtime"),
+                )
+                .expect("test storage setup")
+            })
+        });
+        let host = cx.update(|cx| {
+            let host = cx.new(|_| ToastHost::new());
+            cx.set_global(ToastGlobal { host: host.clone() });
+            cx.set_global(AppStateGlobal {
+                entity: app_state.clone(),
+            });
+            host
+        });
+        (app_state, host)
+    }
+
+    fn toasts_shown(host: &Entity<ToastHost>, cx: &TestAppContext) -> usize {
+        host.read_with(cx, |host, _| host.toast_count())
+    }
+
+    fn tick(cx: &TestAppContext, duration: Duration) {
+        cx.executor().advance_clock(duration);
+        cx.run_until_parked();
+    }
+
+    /// The toast carries Copy and "View in Audit", and still closes after
+    /// twice the base delay. The error stays reachable: the status bar badge
+    /// still counts it and the notification center still holds its row.
+    #[gpui::test]
+    fn a_reported_error_toast_closes_and_the_error_stays_reachable(cx: &mut TestAppContext) {
+        let (app_state, host) = setup(cx);
+        let error = UserFacingError::new(ErrorKind::Storage, "disk full");
+        let correlation_id = error.correlation_id;
+
+        cx.update(|cx| report_error(error, cx));
+        assert_eq!(toasts_shown(&host, cx), 1);
+
+        tick(cx, Duration::from_secs(15));
+        assert_eq!(toasts_shown(&host, cx), 1, "shown before twice the delay");
+
+        tick(cx, Duration::from_secs(2));
+        assert_eq!(toasts_shown(&host, cx), 0, "closed on its own");
+
+        cx.update(|cx| {
+            let state = app_state.read(cx);
+            assert_eq!(state.unread_error_count, 1, "the badge keeps counting it");
+            assert!(state.notifications.error(correlation_id).is_some());
+        });
+    }
+
+    #[gpui::test]
+    fn a_fatal_report_stays_until_dismissed(cx: &mut TestAppContext) {
+        let (_app_state, host) = setup(cx);
+        let error = UserFacingError::new(ErrorKind::Storage, "database is gone")
+            .with_severity(EventSeverity::Fatal);
+
+        cx.update(|cx| report_error(error, cx));
+
+        tick(cx, Duration::from_secs(600));
+        assert_eq!(toasts_shown(&host, cx), 1);
+    }
+
+    /// Each occurrence still counts on the badge and records its own error
+    /// with its own correlation id; only the toast merges.
+    #[gpui::test]
+    fn a_repeated_report_merges_the_toast_but_records_every_occurrence(cx: &mut TestAppContext) {
+        let (app_state, host) = setup(cx);
+        let first = UserFacingError::new(ErrorKind::Network, "no route");
+        let second = UserFacingError::new(ErrorKind::Network, "no route");
+        let (first_id, second_id) = (first.correlation_id, second.correlation_id);
+
+        cx.update(|cx| {
+            report_error(first, cx);
+            report_error(second, cx);
+        });
+
+        assert_eq!(toasts_shown(&host, cx), 1);
+        assert_eq!(
+            host.read_with(cx, |host, _| host.last_toast_occurrences()),
+            Some(2)
+        );
+        cx.update(|cx| {
+            let state = app_state.read(cx);
+            assert_eq!(state.unread_error_count, 2);
+            assert!(state.notifications.error(first_id).is_some());
+            assert!(state.notifications.error(second_id).is_some());
+        });
     }
 }

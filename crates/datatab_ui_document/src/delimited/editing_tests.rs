@@ -22,9 +22,9 @@ use super::document::DelimitedDocument;
 use super::document::read_first_page;
 use super::document_tests::{
     CITIES, SMALL_PAGES, WINDOWS_1252_NAMES, column_titles, connect_profile, covered_ids, dialect,
-    first_column, has_more_records, last_toast_title, load_more, numbered_csv, open, open_local,
-    open_local_in_small_pages, open_object_in_small_pages, pane_action_ids, row_count,
-    run_pane_action, set_overrides, state, toast_count, warnings,
+    first_column, has_more_records, last_toast_occurrences, last_toast_title, load_more,
+    numbered_csv, open, open_local, open_local_in_small_pages, open_object_in_small_pages,
+    pane_action_ids, row_count, run_pane_action, set_overrides, state, toast_count, warnings,
 };
 use super::tests::{BUCKET, FakeConnection, KEY, TestDirectory};
 use crate::delimited::DelimitedWarning;
@@ -1200,7 +1200,9 @@ fn a_reread_commits_the_open_inline_edit_and_is_refused(cx: &mut TestAppContext)
     window.update(|_, cx| document.update(cx, |document, cx| document.reload(cx)));
     window.run_until_parked();
 
-    assert_eq!(toast_count(window), 2);
+    // The same refusal again merges into its toast.
+    assert_eq!(toast_count(window), 1);
+    assert_eq!(last_toast_occurrences(window), Some(2));
     assert_eq!(
         last_toast_title(window).as_deref(),
         Some("Could not re-read cities.csv")
@@ -1679,7 +1681,9 @@ fn a_row_cannot_be_added_to_a_file_without_columns(cx: &mut TestAppContext) {
 
     run_pane_action(&document, window, "delimited-insert-above");
 
-    assert_eq!(toast_count(window), 2);
+    // The same refusal again merges into its toast.
+    assert_eq!(toast_count(window), 1);
+    assert_eq!(last_toast_occurrences(window), Some(2));
     assert!(!has_pending_operations(&document, window));
     assert!(!is_dirty(&document, window));
 

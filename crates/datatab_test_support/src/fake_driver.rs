@@ -413,6 +413,9 @@ impl DbDriver for FakeDriver {
                 request_timeout_seconds: values
                     .get("request_timeout_seconds")
                     .and_then(|value| value.parse().ok()),
+                allow_insecure_http_password: values
+                    .get("allow_insecure_http_password")
+                    .is_some_and(|value| value == "true"),
             },
             DbKind::Turso => DbConfig::Turso {
                 url: get_string(values, "url", ""),
@@ -581,6 +584,7 @@ impl DbDriver for FakeDriver {
                 user,
                 database,
                 request_timeout_seconds,
+                allow_insecure_http_password,
             } => {
                 values.insert("url".to_string(), url.clone());
                 values.insert("user".to_string(), user.clone());
@@ -591,6 +595,12 @@ impl DbDriver for FakeDriver {
                         .map(|timeout| timeout.to_string())
                         .unwrap_or_default(),
                 );
+                if *allow_insecure_http_password {
+                    values.insert(
+                        "allow_insecure_http_password".to_string(),
+                        "true".to_string(),
+                    );
+                }
             }
             DbConfig::Turso { url } => {
                 values.insert("url".to_string(), url.clone());

@@ -342,7 +342,7 @@ mod tests {
         assert!(validate_url("").is_err());
         assert!(validate_url("db.turso.io").is_err());
         assert!(validate_url("ftp://db.turso.io").is_err());
-        assert!(validate_url("libsql://user:pw@db.turso.io").is_err());
+        assert!(validate_url("libsql://user:pw@db.example.com").is_err());
         assert!(validate_url("libsql://db.turso.io?authToken=x").is_err());
         assert!(validate_url("libsql://db.turso.io#frag").is_err());
         assert!(validate_url("libsql://db.turso.io/v2/pipeline").is_err());

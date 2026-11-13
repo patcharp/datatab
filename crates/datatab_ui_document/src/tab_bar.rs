@@ -4,11 +4,11 @@ use std::rc::Rc;
 use super::tab_manager::TabManager;
 use super::types::{DocumentId, DocumentMetaSnapshot, DocumentState};
 use datatab_components::composites::{
-    MenuItem, document_tab, document_tab_bar, document_tab_title,
+    MenuItem, document_tab, document_tab_bar, document_tab_title, document_tab_width,
 };
 use datatab_components::controls::Button;
 use datatab_components::icons::AppIcon;
-use datatab_components::primitives::{Icon, Status, StatusIndicator};
+use datatab_components::primitives::{Icon, Status, StatusIndicator, TextVariant};
 use datatab_components::tokens::{ChromeColors, TabMetrics};
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -54,7 +54,7 @@ impl TabBar {
             tab_manager,
             focus_handle: cx.focus_handle(),
             context_menu: None,
-            active_tab_center_x: Rc::new(Cell::new(px(0.0))),
+            active_tab_center_x: Rc::new(Cell::new(Pixels::ZERO)),
             dragging_tab: None,
             drop_target_index: None,
         }
@@ -233,7 +233,7 @@ pub fn prev_actionable_index(current: usize, items: &[MenuItem]) -> usize {
 }
 
 impl Render for TabBar {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let manager = self.tab_manager.read(cx);
         let active_id = manager.active_id();
         let drop_target_index = self.drop_target_index;
@@ -260,6 +260,7 @@ impl Render for TabBar {
                     idx,
                     active_id,
                     drop_target_index,
+                    window,
                     cx,
                 )
                 .into_any_element(),
@@ -276,9 +277,11 @@ impl Render for TabBar {
             .child(
                 div()
                     .id("document-tab-list")
+                    .debug_selector(|| "document-tab-list".to_string())
                     .role(Role::TabList)
                     .flex()
                     .h_full()
+                    .flex_1()
                     .min_w_0()
                     .items_end()
                     .overflow_x_scroll()
@@ -299,6 +302,7 @@ impl TabBar {
         idx: usize,
         active_id: Option<DocumentId>,
         drop_target_index: Option<usize>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let id = meta.id;
@@ -308,6 +312,32 @@ impl TabBar {
         let is_drop_target = drop_target_index == Some(idx);
 
         let title = meta.title.clone();
+        let text: SharedString = title.replace('\n', " ").into();
+        let mut font = TextVariant::Body.resolved_font(cx);
+        font.weight = if is_active {
+            FontWeight::SEMIBOLD
+        } else {
+            FontWeight::NORMAL
+        };
+        let run = TextRun {
+            len: text.len(),
+            font,
+            color: cx.theme().foreground,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let title_width = window
+            .text_system()
+            .shape_line(
+                text,
+                TextVariant::Body
+                    .density_size(cx)
+                    .to_pixels(window.rem_size()),
+                &[run],
+                None,
+            )
+            .width;
 
         let tab_manager = self.tab_manager.clone();
 
@@ -338,8 +368,10 @@ impl TabBar {
         .debug_selector(|| format!("tab-{}", id.0))
         .role(Role::Tab)
         .aria_selected(is_active)
+        .w(document_tab_width(title_width, is_dirty, window.rem_size()))
         .min_w(TabMetrics::DOCUMENT_TAB_MIN_WIDTH)
         .max_w(TabMetrics::DOCUMENT_TAB_MAX_WIDTH)
+        .flex_shrink(1.0)
         .when(is_active, |el| {
             el.child(
                 canvas(
@@ -387,8 +419,19 @@ impl TabBar {
                 cx.notify();
             }),
         )
-        .child(Icon::new(icon).size(TabMetrics::ICON).color(icon_color))
-        .child(div().flex_1().min_w_0().truncate().child(title_element))
+        .child(
+            div()
+                .flex_shrink_0()
+                .child(Icon::new(icon).size(TabMetrics::ICON).color(icon_color)),
+        )
+        .child(
+            div()
+                .w(title_width)
+                .flex_shrink(1.0)
+                .min_w_0()
+                .truncate()
+                .child(title_element),
+        )
         // Dirty indicator: a tint diamond when the document has unsaved
         // changes. Shows the change summary in a tooltip on hover.
         .when(is_dirty, |el| {
@@ -428,9 +471,13 @@ impl TabBar {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         if is_executing {
-            return Icon::new(AppIcon::Loader)
-                .size(TabMetrics::CLOSE_ICON)
-                .color(ChromeColors::tint(cx.theme()))
+            return div()
+                .flex_shrink_0()
+                .child(
+                    Icon::new(AppIcon::Loader)
+                        .size(TabMetrics::CLOSE_ICON)
+                        .color(ChromeColors::tint(cx.theme())),
+                )
                 .into_any_element();
         }
 
@@ -511,6 +558,7 @@ mod tests {
     use datatab_components::composites::document_tab_title;
     use datatab_components::primitives::TextVariant;
     use datatab_components::theme;
+    use datatab_components::tokens::TabMetrics;
     use datatab_components::typography::AppFonts;
     use datatab_core::QueryLanguage;
     use datatab_storage::bootstrap::StorageRuntime;
@@ -686,6 +734,85 @@ mod tests {
         );
     }
 
+    #[gpui::test]
+    fn crowded_long_tabs_are_bounded_and_scroll(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(theme::init);
+        let app_state = cx.update(|cx| {
+            cx.new(|_| {
+                AppStateEntity::new_with_storage_runtime(
+                    StorageRuntime::in_memory().expect("isolated storage runtime"),
+                )
+                .expect("test storage setup")
+            })
+        });
+        let manager = cx.update(|cx| cx.new(|_| TabManager::new()));
+        let (_, window) = cx.add_window_view({
+            let manager = manager.clone();
+            move |_, cx| TabBar::new(manager, cx)
+        });
+        let ids: Vec<_> = (0..15)
+            .map(|index| {
+                let app_state = app_state.clone();
+                let id = window.update(|window, cx| {
+                    let document = cx.new(|cx| {
+                        CodeDocument::new_with_language(
+                            app_state,
+                            None,
+                            QueryLanguage::Sql,
+                            window,
+                            cx,
+                        )
+                        .with_title(format!(
+                            "A very long document title that must truncate number {index}.sql"
+                        ))
+                    });
+                    let id = document.read(cx).id();
+                    let pane = CodeDocument::into_pane(document, cx);
+                    manager.update(cx, |manager, cx| {
+                        manager.open(Tab::Pane(Box::new(pane)), cx)
+                    });
+                    id
+                });
+                if index == 0 {
+                    window.update(|window, _| window.refresh());
+                    window.run_until_parked();
+                    let selector = Box::leak(format!("tab-{}", id.0).into_boxed_str());
+                    let tab = window.debug_bounds(selector).expect("tab laid out");
+                    assert!(
+                        tab.size.width
+                            <= TabMetrics::DOCUMENT_TAB_MAX_WIDTH
+                                .to_pixels(gpui::px(datatab_components::tokens::BASE_REM)),
+                        "single tab exceeds cap: {:?}",
+                        tab.size.width
+                    );
+                }
+                id
+            })
+            .collect();
+        window.update(|window, _| window.refresh());
+        window.run_until_parked();
+        let bar = window.debug_bounds("tab-bar").expect("bar laid out");
+        let list = window
+            .debug_bounds("document-tab-list")
+            .expect("list laid out");
+        assert!(
+            list.size.width <= bar.size.width,
+            "tab list must stay within the row"
+        );
+        let rem = gpui::px(datatab_components::tokens::BASE_REM);
+        for id in ids {
+            let selector = Box::leak(format!("tab-{}", id.0).into_boxed_str());
+            let tab = window.debug_bounds(selector).expect("tab laid out");
+            assert!(tab.size.width >= TabMetrics::DOCUMENT_TAB_MIN_WIDTH.to_pixels(rem));
+            assert!(
+                tab.size.width <= TabMetrics::DOCUMENT_TAB_MAX_WIDTH.to_pixels(rem),
+                "tab exceeds cap: {:?}",
+                tab.size.width
+            );
+        }
+    }
+
     /// Keeps the latest rendered accessibility frame of the window it observes.
     #[derive(Default)]
     struct FrameCapture(Mutex<Option<AccessibilityFrame>>);
@@ -733,6 +860,7 @@ mod tests {
             window.update(|window, cx| {
                 let document = cx.new(|cx| {
                     CodeDocument::new_with_language(app_state, None, QueryLanguage::Sql, window, cx)
+                        .with_title("A long document title.sql".to_string())
                 });
                 let document_id = document.read(cx).id();
                 let pane = CodeDocument::into_pane(document, cx);
@@ -753,6 +881,11 @@ mod tests {
         let tab_bounds = window
             .debug_bounds(active_selector)
             .expect("active tab laid out");
+        assert!(
+            tab_bounds.size.width > gpui::px(180.0),
+            "a title should use the available row space: {:?}",
+            tab_bounds.size.width
+        );
         assert_eq!(
             tab_bounds.bottom(),
             bar_bounds.bottom(),

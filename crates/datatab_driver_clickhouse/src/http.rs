@@ -14,6 +14,11 @@ const MAX_ERROR_BYTES: u64 = 64 * 1024;
 pub(crate) enum ClickHouseHttpError {
     #[error("invalid ClickHouse endpoint: {0}")]
     InvalidEndpoint(String),
+    #[error(
+        "The server URL uses http:// and a password is set. Use https://, or turn on \
+         \"Allow password over unencrypted HTTP\" for this connection."
+    )]
+    InsecureHttpPassword,
     #[error("ClickHouse HTTP request failed: {0}")]
     Transport(String),
     #[error("ClickHouse returned HTTP {status}: {body}")]
@@ -58,21 +63,25 @@ impl ClickHouseHttpClient {
         parse_endpoint(endpoint).map(|_| ())
     }
 
+    /// `allow_insecure_http_password` is the connection's opt-in to send a
+    /// non-empty password over a non-loopback `http://` endpoint.
     pub(crate) fn new(
         endpoint: &str,
         user: String,
         password: Option<SecretString>,
         default_database: String,
         timeout: Duration,
+        allow_insecure_http_password: bool,
     ) -> Result<Self, ClickHouseHttpError> {
         let mut endpoint = parse_endpoint(endpoint)?;
         let has_password = password
             .as_ref()
             .is_some_and(|password| !password.expose_secret().is_empty());
         if endpoint.scheme() == "http" && has_password && !is_loopback_endpoint(&endpoint) {
-            return Err(ClickHouseHttpError::InvalidEndpoint(
-                "non-empty passwords require HTTPS for non-loopback endpoints".to_string(),
-            ));
+            if !allow_insecure_http_password {
+                return Err(ClickHouseHttpError::InsecureHttpPassword);
+            }
+            log::warn!("ClickHouse password is sent over unencrypted HTTP");
         }
         endpoint.set_query(None);
 
@@ -529,12 +538,20 @@ mod tests {
     use std::time::Duration;
 
     fn client(url: &str) -> Result<ClickHouseHttpClient, ClickHouseHttpError> {
+        client_with_opt_in(url, false)
+    }
+
+    fn client_with_opt_in(
+        url: &str,
+        allow_insecure_http_password: bool,
+    ) -> Result<ClickHouseHttpClient, ClickHouseHttpError> {
         ClickHouseHttpClient::new(
             url,
             "default".to_string(),
             Some(SecretString::from("secret".to_string())),
             "default".to_string(),
             Duration::from_secs(1),
+            allow_insecure_http_password,
         )
     }
 
@@ -567,24 +584,55 @@ mod tests {
 
     #[test]
     fn rejects_password_over_remote_http() {
+        let Err(error) = client("http://clickhouse.example.com") else {
+            panic!("a password over remote http must be refused without the opt-in");
+        };
+        assert_eq!(
+            error.to_string(),
+            "The server URL uses http:// and a password is set. Use https://, or turn on \
+             \"Allow password over unencrypted HTTP\" for this connection."
+        );
         assert!(matches!(
             client("http://clickhouse.example.com"),
-            Err(ClickHouseHttpError::InvalidEndpoint(_))
+            Err(ClickHouseHttpError::InsecureHttpPassword)
         ));
         assert!(client("http://127.0.0.1:8123").is_ok());
         assert!(client("http://[::1]:8123").is_ok());
     }
 
     #[test]
+    fn opt_in_accepts_password_over_remote_http() {
+        assert!(client_with_opt_in("http://clickhouse.example.com", true).is_ok());
+        assert!(client_with_opt_in("http://10.0.0.5:8123", true).is_ok());
+    }
+
+    #[test]
+    fn opt_in_leaves_https_and_loopback_unchanged() {
+        for allow in [false, true] {
+            assert!(client_with_opt_in("https://clickhouse.example.com", allow).is_ok());
+            assert!(client_with_opt_in("http://127.0.0.1:8123", allow).is_ok());
+            assert!(client_with_opt_in("http://[::1]:8123", allow).is_ok());
+            assert!(client_with_opt_in("http://localhost:8123", allow).is_ok());
+            assert!(matches!(
+                client_with_opt_in("https://default:secret@clickhouse.example.com", allow),
+                Err(ClickHouseHttpError::InvalidEndpoint(_))
+            ));
+        }
+    }
+
+    #[test]
     fn accepts_empty_password_over_remote_http() {
-        let result = ClickHouseHttpClient::new(
-            "http://clickhouse.example.com",
-            "default".to_string(),
-            Some(SecretString::from(String::new())),
-            "default".to_string(),
-            Duration::from_secs(1),
-        );
-        assert!(result.is_ok());
+        for allow in [false, true] {
+            let result = ClickHouseHttpClient::new(
+                "http://clickhouse.example.com",
+                "default".to_string(),
+                Some(SecretString::from(String::new())),
+                "default".to_string(),
+                Duration::from_secs(1),
+                allow,
+            );
+            assert!(result.is_ok());
+        }
     }
 
     #[test]

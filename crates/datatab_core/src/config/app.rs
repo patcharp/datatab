@@ -385,9 +385,9 @@ pub struct GeneralSettings {
 
     // -- Notifications --
     /// Auto-dismiss delay for toasts, in seconds. Success and Info toasts
-    /// close after it and Warning toasts after twice it; an Error toast and
-    /// a toast with actions or progress stay until it is dismissed. `0`
-    /// keeps every toast until the user dismisses it.
+    /// close after it and Warning and Error toasts after twice it; a Fatal
+    /// toast, and a toast with progress or an action to answer, stay until it
+    /// is dismissed. `0` keeps every toast until the user dismisses it.
     #[serde(default = "default_toast_auto_dismiss_secs")]
     pub toast_auto_dismiss_secs: u32,
 

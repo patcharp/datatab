@@ -32,6 +32,7 @@ fn connect(config: &ClickHouseConfig) -> Result<Box<dyn Connection>, DbError> {
             user: config.user.clone(),
             database: config.database.clone(),
             request_timeout_seconds: Some(30),
+            allow_insecure_http_password: false,
         },
     );
     let password = SecretString::from(config.password.clone());

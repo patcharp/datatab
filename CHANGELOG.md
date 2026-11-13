@@ -2,7 +2,33 @@
 
 All notable changes to DataTab will be documented in this file.
 
-## [Unreleased]
+## [0.1.2] - 2026-11-13
+
+### Added
+
+* **ClickHouse over HTTP** — A per-connection "Allow password over unencrypted HTTP" option, off by default, for servers that have only plain HTTP. Without it, the connection error now says how to fix the problem.
+
+### Changed
+
+* **macOS** — macOS is a fully supported platform, on Intel and Apple Silicon, like Windows and Linux.
+* **Error toasts** — With the toast delay on, an error toast closes on its own after twice the delay, unless it shows progress or an action that needs you. A repeat of the same error merges into the visible toast with a count. Fatal errors stay until dismissed. Reported errors stay in the status-bar badge and the audit log after their toast closes.
+
+### Fixed
+
+* **Charts** — The hover marker is a diamond on every platform, and the crosshair and readout clear when the pointer leaves the chart.
+* **Tabs** — Document tabs keep a readable title in a crowded row, and Windows script paths no longer show the `\\?\` prefix.
+
+### Upgrading
+
+* **Windows** — Close DataTab, then run the new `datatab-windows-amd64-setup.exe`. It installs over 0.1.1 and keeps your data.
+* **Debian and Ubuntu** — Close DataTab, then run `sudo apt install ./datatab-linux-amd64.deb` with the new package.
+* **macOS** — Close DataTab, then replace `DataTab.app` with the new one, and run `xattr -dr com.apple.quarantine /Applications/DataTab.app` before you start it. Your data stays in its folder.
+
+### Rollback
+
+* **Windows** — Uninstall DataTab in Settings, Installed apps, then run the 0.1.1 installer. Your data folder stays.
+* **Debian and Ubuntu** — Run `sudo apt install --allow-downgrades ./datatab-linux-amd64.deb` with the 0.1.1 package.
+* **macOS** — Close DataTab, then replace `DataTab.app` with the 0.1.1 one, and run `xattr -dr com.apple.quarantine /Applications/DataTab.app` before you start it. Your data stays in its folder.
 
 ## [0.1.1] - 2026-11-12
 

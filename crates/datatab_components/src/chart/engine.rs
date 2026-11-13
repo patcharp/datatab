@@ -10,8 +10,8 @@ use std::rc::Rc;
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Bounds, Context, Hsla, PathBuilder, Pixels, Render, ShapedLine, SharedString,
-    TextRun, Window, canvas, div, fill, font, point,
+    AnyElement, App, Bounds, Context, Hsla, PathBuilder, Pixels, Point, Render, ShapedLine,
+    SharedString, TextRun, Window, canvas, div, fill, font, point,
 };
 use gpui_component::ActiveTheme;
 
@@ -816,6 +816,19 @@ impl ChartView {
         cx.notify();
     }
 
+    /// Drops the pointer's hover (crosshair, dots and readout) once the pointer
+    /// has left the chart. A keyboard point is not the pointer and stays.
+    fn clear_pointer_hover(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.hover_x_screen.is_none() && self.hover_y_screen.is_none() {
+            return false;
+        }
+
+        self.hover_x_screen = None;
+        self.hover_y_screen = None;
+        cx.notify();
+        true
+    }
+
     /// The window-space X the crosshair is drawn at: the pointer, or the
     /// keyboard point once a paint has recorded the plot bounds.
     fn crosshair_x_screen(&self) -> Option<Pixels> {
@@ -1468,9 +1481,17 @@ impl Render for ChartView {
             .overflow_hidden()
             .child(
                 div()
+                    .id("chart-plot-area")
                     .flex_grow(1.0)
                     .relative()
                     .overflow_hidden()
+                    // `on_mouse_move` below fires only while the pointer is over
+                    // this container, so leaving it needs its own signal.
+                    .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                        if !*hovered {
+                            this.clear_pointer_hover(cx);
+                        }
+                    }))
                     .on_mouse_move(cx.listener(
                         move |this, ev: &gpui::MouseMoveEvent, _window, cx| {
                             let inside = plot_bounds_for_hover
@@ -2115,29 +2136,44 @@ fn paint_hover_overlay(
             .copied()
             .unwrap_or(gpui::hsla(0.6, 0.6, 0.5, 1.0));
 
-        let r = 3.5_f32;
-        let radii = point(gpui::px(r), gpui::px(r));
-        let right = point(gpui::px(dot_sx + r), gpui::px(dot_sy));
-        let left = point(gpui::px(dot_sx - r), gpui::px(dot_sy));
+        let [first, rest @ ..] = hover_marker_vertices(dot_sx, dot_sy, HOVER_MARKER_HALF_DIAGONAL);
 
         let mut fill_builder = PathBuilder::fill();
-        fill_builder.move_to(right);
-        fill_builder.arc_to(radii, gpui::px(0.0), false, true, left);
-        fill_builder.arc_to(radii, gpui::px(0.0), false, true, right);
+        fill_builder.move_to(first);
+        for vertex in rest {
+            fill_builder.line_to(vertex);
+        }
         fill_builder.close();
         if let Ok(path) = fill_builder.build() {
             window.paint_path(path, theme.background);
         }
 
         let mut stroke_builder = PathBuilder::stroke(gpui::px(1.5));
-        stroke_builder.move_to(right);
-        stroke_builder.arc_to(radii, gpui::px(0.0), false, true, left);
-        stroke_builder.arc_to(radii, gpui::px(0.0), false, true, right);
+        stroke_builder.move_to(first);
+        for vertex in rest {
+            stroke_builder.line_to(vertex);
+        }
         stroke_builder.close();
         if let Ok(path) = stroke_builder.build() {
             window.paint_path(path, series_color);
         }
     }
+}
+
+/// Half of the hover marker's diagonal: the marker is a 7 px diamond, the
+/// same shape and size as the status mark.
+const HOVER_MARKER_HALF_DIAGONAL: f32 = 3.5;
+
+/// The four corners of the hover marker, clockwise from the top. A plain
+/// four-point path, so every platform draws the same shape: an arc-built
+/// circle came out square on Windows.
+fn hover_marker_vertices(center_x: f32, center_y: f32, half_diagonal: f32) -> [Point<Pixels>; 4] {
+    [
+        point(gpui::px(center_x), gpui::px(center_y - half_diagonal)),
+        point(gpui::px(center_x + half_diagonal), gpui::px(center_y)),
+        point(gpui::px(center_x), gpui::px(center_y + half_diagonal)),
+        point(gpui::px(center_x - half_diagonal), gpui::px(center_y)),
+    ]
 }
 
 /// Paint Y-axis tick labels right-aligned against the effective left margin.
@@ -3801,6 +3837,118 @@ mod tests {
                 "the keyboard point stands in for the pointer"
             );
         });
+    }
+
+    #[test]
+    fn hover_marker_is_a_four_point_diamond_around_the_point() {
+        let center = (120.0_f32, 48.0_f32);
+        let half = HOVER_MARKER_HALF_DIAGONAL;
+        let vertices = hover_marker_vertices(center.0, center.1, half);
+
+        let corners: Vec<(f32, f32)> = vertices
+            .iter()
+            .map(|vertex| (f32::from(vertex.x), f32::from(vertex.y)))
+            .collect();
+        assert_eq!(
+            corners,
+            vec![
+                (center.0, center.1 - half),
+                (center.0 + half, center.1),
+                (center.0, center.1 + half),
+                (center.0 - half, center.1),
+            ],
+            "top, right, bottom and left corners, each one half-diagonal from the point"
+        );
+        assert_eq!(half * 2.0, 7.0, "the 7 px size of the status diamond");
+    }
+
+    /// Hosts a chart in a box smaller than the window, so the pointer can
+    /// leave the chart while staying inside the window.
+    struct ChartHost {
+        chart: gpui::Entity<ChartView>,
+    }
+
+    impl Render for ChartHost {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                div()
+                    .w(gpui::px(400.0))
+                    .h(gpui::px(300.0))
+                    .child(self.chart.clone()),
+            )
+        }
+    }
+
+    fn drawn_chart(
+        cx: &mut gpui::TestAppContext,
+    ) -> (gpui::Entity<ChartView>, &mut gpui::VisualTestContext) {
+        cx.update(gpui_component::init);
+
+        let mut spec = simple_spec(0, &[1]);
+        spec.binding.group_by = Some(2);
+        let chart = cx.new(|_| {
+            ChartView::build(&partially_overlapping_hosts(), spec).expect("build should succeed")
+        });
+        let (_host, window) = cx.add_window_view({
+            let chart = chart.clone();
+            move |_, _| ChartHost { chart }
+        });
+        window.run_until_parked();
+
+        (chart, window)
+    }
+
+    /// The pointer leaving the chart for another part of the window sends the
+    /// chart no mouse move, so the crosshair and readout must clear on the
+    /// hover change instead. A keyboard point is not the pointer and stays.
+    #[gpui::test]
+    fn hover_clears_when_the_pointer_leaves_the_chart(cx: &mut gpui::TestAppContext) {
+        let (chart, window) = drawn_chart(cx);
+        let hover = |window: &mut gpui::VisualTestContext| {
+            chart.read_with(window, |chart, _| {
+                (chart.hover_x_screen, chart.hover_y_screen)
+            })
+        };
+
+        window.simulate_mouse_move(
+            point(gpui::px(200.0), gpui::px(150.0)),
+            None,
+            Default::default(),
+        );
+        assert_eq!(
+            hover(window),
+            (Some(gpui::px(200.0)), Some(gpui::px(150.0))),
+            "the pointer inside the plot sets the hover"
+        );
+
+        window.simulate_mouse_move(
+            point(gpui::px(900.0), gpui::px(600.0)),
+            None,
+            Default::default(),
+        );
+        assert_eq!(
+            hover(window),
+            (None, None),
+            "the pointer outside the chart clears the hover"
+        );
+
+        window.simulate_mouse_move(
+            point(gpui::px(200.0), gpui::px(150.0)),
+            None,
+            Default::default(),
+        );
+        chart.update(window, |chart, cx| {
+            assert!(chart.step_keyboard_point(1, cx))
+        });
+        window.simulate_mouse_move(
+            point(gpui::px(900.0), gpui::px(600.0)),
+            None,
+            Default::default(),
+        );
+        assert!(
+            chart.read_with(window, |chart, _| chart.keyboard_point().is_some()),
+            "leaving the chart keeps the keyboard point"
+        );
     }
 
     fn grouped_stacked_view() -> ChartView {

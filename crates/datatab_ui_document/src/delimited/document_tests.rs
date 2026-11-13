@@ -183,6 +183,17 @@ pub(super) fn last_toast_title(window: &mut VisualTestContext) -> Option<String>
     window.update(|_, cx| cx.global::<ToastGlobal>().host.read(cx).last_toast_title())
 }
 
+/// How many times the newest toast was raised while it was on screen: a
+/// repeat of the same error merges into its toast and counts here.
+pub(super) fn last_toast_occurrences(window: &mut VisualTestContext) -> Option<u32> {
+    window.update(|_, cx| {
+        cx.global::<ToastGlobal>()
+            .host
+            .read(cx)
+            .last_toast_occurrences()
+    })
+}
+
 /// The ids of the clickable elements the coverage check found in the frame.
 pub(super) fn covered_ids(
     document: &Entity<DelimitedDocument>,

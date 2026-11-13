@@ -2037,8 +2037,11 @@ mod tests {
         });
 
         let browses = connection.browses();
+        // Which browse comes last depends on how the executor orders the tabs'
+        // first loads, so the test looks for the one under the equality.
         let reload = browses
-            .last()
+            .iter()
+            .find(|browse| browse.filter.is_some())
             .expect("the fresh tab reloaded under the equality");
         assert_eq!(reload.pagination.offset(), 0);
         assert_eq!(reload.filter.as_deref(), Some("\"id\" = 7"));

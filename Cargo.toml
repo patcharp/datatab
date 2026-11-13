@@ -64,7 +64,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 rust-version = "1.88"
-version = "0.1.1"
+version = "0.1.2"
 authors = ["PCPLab <me@pcplab.me>"]
 description = "A fast, keyboard-first database client"
 repository = "https://github.com/patcharp/datatab"

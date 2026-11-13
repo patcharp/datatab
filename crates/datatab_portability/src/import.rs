@@ -3033,7 +3033,7 @@ encryption = "none"
         // The exporter stores the skeleton URI (empty password) in fields
         conn.fields.insert(
             "uri".to_string(),
-            "postgres://alice:@db.example/app".to_string(),
+            "postgres://alice:@db.example.com/app".to_string(),
         );
         conn.uri_secret_fields = vec!["uri".to_string()];
 

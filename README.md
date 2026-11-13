@@ -25,14 +25,14 @@
 
 ## What it is
 
-DataTab is a native desktop database client for Linux and Windows, with an experimental macOS build, written in Rust with GPUI. Tables, documents, keys, logs and objects all open in tabs, and you can reach every action from the keyboard.
+DataTab is a native desktop database client for Linux, Windows and macOS, written in Rust with GPUI. Tables, documents, keys, logs and objects all open in tabs, and you can reach every action from the keyboard.
 
 - **Keyboard first.** Move with `j`, `k`, `h` and `l`, run anything from the command palette with `Ctrl+Shift+P`, and keep your hands on the keys.
 - **Many databases, one workspace.** The interface adapts through driver metadata and has no special case for a driver.
 - **Yours alone.** DataTab talks only to the servers you configure. It has no telemetry, no crash reporter, no update check and no account. See the [Privacy Policy](PRIVACY.md).
 - **A record of what ran.** An audit log on your machine covers queries, connections, hooks, scripts and AI tool calls. It redacts by default, and you can turn it off.
 
-**Status: early release.** Installers for Linux (`.deb`) and Windows, and an experimental `DataTab.app` for macOS on Intel and Apple Silicon, are on the [releases page](https://github.com/patcharp/datatab/releases) once published. You can also [build it from source](#build-from-source).
+**Status: early release.** Installers for Linux (`.deb`) and Windows, and a `DataTab.app` for macOS on Intel and Apple Silicon, are on the [releases page](https://github.com/patcharp/datatab/releases). You can also [build it from source](#build-from-source).
 
 ## Databases
 
@@ -107,7 +107,7 @@ sh scripts/build-linux.sh --deb                                     # Linux: bin
 powershell -ExecutionPolicy Bypass -File scripts\build-windows.ps1   # Windows: datatab.exe and installer
 ```
 
-[Building from source](docs/BUILDING.md) lists the prerequisites, options and fixes for common failures. A full release build peaked at about 8 GB of RAM with 2 build jobs. macOS is experimental: the guide covers `scripts/build-macos.sh`.
+[Building from source](docs/BUILDING.md) lists the prerequisites, options and fixes for common failures. A full release build can peak above 8 GB of RAM; use fewer build jobs on a machine with less memory. For macOS, the guide covers `scripts/build-macos.sh`.
 
 ## Contributing
 

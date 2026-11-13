@@ -331,18 +331,18 @@ mod tests {
     #[test]
     fn test_redact_error_message_covers_every_connection_scheme() {
         let urls = [
-            "postgres://u:hunter2pw@h:5432/db",
-            "postgresql://u:hunter2pw@h:5432/db",
-            "mysql://u:hunter2pw@h:3306/db",
-            "mariadb://u:hunter2pw@h/db",
-            "mongodb://u:hunter2pw@h1,h2/db",
+            "postgres://u:hunter2pw@h.example.com:5432/db",
+            "postgresql://u:hunter2pw@h.example.com:5432/db",
+            "mysql://u:hunter2pw@h.example.com:3306/db",
+            "mariadb://u:hunter2pw@h.example.com/db",
+            "mongodb://u:hunter2pw@h1.example.com,h2.example.com/db",
             "mongodb+srv://u:hunter2pw@cluster.example.net/db",
-            "redis://:hunter2pw@h:6379",
-            "rediss://default:hunter2pw@h:6380",
-            "sqlserver://sa:hunter2pw@h:1433",
-            "clickhouse://u:hunter2pw@h:8123",
-            "http://u:hunter2pw@h:8086",
-            "https://u:hunter2pw@h",
+            "redis://:hunter2pw@h.example.com:6379",
+            "rediss://default:hunter2pw@h.example.com:6380",
+            "sqlserver://sa:hunter2pw@h.example.com:1433",
+            "clickhouse://u:hunter2pw@h.example.com:8123",
+            "http://u:hunter2pw@h.example.com:8086",
+            "https://u:hunter2pw@h.example.com",
             "postgresql://u:hunter%40pw@[::1]:5432/db",
             "postgresql://h/db?password=hunter2pw",
         ];
@@ -361,13 +361,14 @@ mod tests {
 
     #[test]
     fn test_redact_json_value_with_postgresql_url_under_neutral_key() {
-        let json = r#"{"detail": "dial postgresql://alice:hunter2pw@db:5432/app failed"}"#;
+        let json =
+            r#"{"detail": "dial postgresql://alice:hunter2pw@db.example.com:5432/app failed"}"#;
         let result = redact_json(json, true);
         assert!(!result.redacted.contains("hunter2pw"));
         assert!(
             result
                 .redacted
-                .contains("postgresql://alice:[REDACTED]@db:5432/app")
+                .contains("postgresql://alice:[REDACTED]@db.example.com:5432/app")
         );
     }
 

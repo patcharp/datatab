@@ -25,14 +25,15 @@ pub fn now_hms() -> String {
 
 /// Builds the standard "Copy" action attached to error toasts. The payload
 /// argument is captured by the click handler so the clipboard text matches
-/// what the user saw, even if the toast is later dismissed.
+/// what the user saw, even if the toast is later dismissed. Copying settles
+/// nothing, so it does not keep the toast from closing on its own.
 pub fn copy_action(payload: impl Into<String>) -> ToastAction {
     let payload = payload.into();
-    ToastAction::new("copy-error", datatab_i18n::t!("toast.action.copy")).on_click(
-        move |cx: &mut App| {
+    ToastAction::new("copy-error", datatab_i18n::t!("toast.action.copy"))
+        .lets_toast_close()
+        .on_click(move |cx: &mut App| {
             cx.write_to_clipboard(gpui::ClipboardItem::new_string(payload.clone()));
-        },
-    )
+        })
 }
 
 /// The product's toast glyphs: the same `AppIcon` catalogue the toast drew
@@ -107,16 +108,10 @@ pub fn flush_pending_toast<T>(
     };
 
     if toast.is_error {
-        let payload = toast.message.clone();
+        let message = toast.message.clone();
         Toast::error(toast.message)
             .meta_right(now_hms())
-            .action(
-                ToastAction::new("copy-error", datatab_i18n::t!("toast.action.copy")).on_click(
-                    move |cx: &mut App| {
-                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(payload.clone()));
-                    },
-                ),
-            )
+            .action(copy_action(message))
             .push(cx);
     } else {
         Toast::success(toast.message).meta_right(now_hms()).push(cx);
@@ -158,6 +153,14 @@ mod i18n_tests {
         let label =
             datatab_i18n::translate_in("en", "toast.stack.hidden_more").replace("%{count}", "3");
         assert_eq!(label, "3 more");
+    }
+
+    /// The repeat count a merged error toast draws is answered by the
+    /// catalogue, so it never renders empty.
+    #[test]
+    fn repeat_count_label_interpolates_the_count() {
+        let label = datatab_i18n::translate_in("en", "toast.repeat_count").replace("%{count}", "3");
+        assert_eq!(label, "×3");
     }
 }
 

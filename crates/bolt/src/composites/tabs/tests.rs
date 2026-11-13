@@ -58,3 +58,20 @@ fn document_tab_reaches_bottom_of_shorter_bar(cx: &mut TestAppContext) {
     let tab = window.debug_bounds("tab").expect("tab laid out");
     assert_eq!(tab.bottom(), bar.bottom(), "tab meets its content");
 }
+
+#[test]
+fn document_tab_width_includes_chrome_and_caps_long_titles() {
+    let rem = gpui::px(crate::tokens::BASE_REM);
+    assert_eq!(
+        document_tab_width(gpui::px(100.0), false, rem),
+        gpui::px(166.0)
+    );
+    assert_eq!(
+        document_tab_width(gpui::px(100.0), true, rem),
+        gpui::px(180.0)
+    );
+    assert_eq!(
+        document_tab_width(gpui::px(1000.0), false, rem),
+        gpui::px(220.0)
+    );
+}

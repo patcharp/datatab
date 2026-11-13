@@ -337,7 +337,7 @@ const SENSITIVE_URI_PARAMETERS: &[&str] = &[
 /// Redacts credentials from every URL embedded in `text`, whatever its scheme.
 ///
 /// For each `scheme://` occurrence it replaces:
-/// - the password of the userinfo (`scheme://user:password@host`), keeping the
+/// - the password of the userinfo (`scheme://user:<password>@host:port`), keeping the
 ///   user name and host so the message stays useful. The last `@` of the
 ///   authority ends the userinfo, so an unencoded `@` inside the password is
 ///   still covered, and bracketed IPv6 hosts are left intact;
@@ -622,30 +622,54 @@ mod tests {
     #[test]
     fn redacts_userinfo_password_for_every_scheme() {
         let cases = [
-            ("postgres://u:pw@h:5432/db", "postgres://u:***@h:5432/db"),
             (
-                "postgresql://u:pw@h:5432/db",
-                "postgresql://u:***@h:5432/db",
+                "postgres://u:pw@h.example.com:5432/db",
+                "postgres://u:***@h.example.com:5432/db",
             ),
-            ("mysql://root:pw@h:3306/app", "mysql://root:***@h:3306/app"),
-            ("mariadb://root:pw@h/app", "mariadb://root:***@h/app"),
             (
-                "mongodb://u:pw@h1:27017,h2:27017/db",
-                "mongodb://u:***@h1:27017,h2:27017/db",
+                "postgresql://u:pw@h.example.com:5432/db",
+                "postgresql://u:***@h.example.com:5432/db",
+            ),
+            (
+                "mysql://root:pw@h.example.com:3306/app",
+                "mysql://root:***@h.example.com:3306/app",
+            ),
+            (
+                "mariadb://root:pw@h.example.com/app",
+                "mariadb://root:***@h.example.com/app",
+            ),
+            (
+                "mongodb://u:pw@h1.example.com:27017,h2.example.com:27017/db",
+                "mongodb://u:***@h1.example.com:27017,h2.example.com:27017/db",
             ),
             (
                 "mongodb+srv://u:pw@cluster.example.net/db",
                 "mongodb+srv://u:***@cluster.example.net/db",
             ),
-            ("redis://:pw@h:6379/0", "redis://:***@h:6379/0"),
-            ("rediss://default:pw@h:6380", "rediss://default:***@h:6380"),
             (
-                "sqlserver://sa:pw@h:1433/master",
-                "sqlserver://sa:***@h:1433/master",
+                "redis://:pw@h.example.com:6379/0",
+                "redis://:***@h.example.com:6379/0",
             ),
-            ("clickhouse://u:pw@h:8123", "clickhouse://u:***@h:8123"),
-            ("http://u:pw@h:8086/api", "http://u:***@h:8086/api"),
-            ("https://u:pw@h/path", "https://u:***@h/path"),
+            (
+                "rediss://default:pw@h.example.com:6380",
+                "rediss://default:***@h.example.com:6380",
+            ),
+            (
+                "sqlserver://sa:pw@h.example.com:1433/master",
+                "sqlserver://sa:***@h.example.com:1433/master",
+            ),
+            (
+                "clickhouse://u:pw@h.example.com:8123",
+                "clickhouse://u:***@h.example.com:8123",
+            ),
+            (
+                "http://u:pw@h.example.com:8086/api",
+                "http://u:***@h.example.com:8086/api",
+            ),
+            (
+                "https://u:pw@h.example.com/path",
+                "https://u:***@h.example.com/path",
+            ),
         ];
 
         for (input, expected) in cases {
@@ -656,7 +680,7 @@ mod tests {
     #[test]
     fn leaves_uris_without_password_unchanged() {
         for input in [
-            "postgres://u@h:5432/db",
+            "postgres://u@h.example.com:5432/db",
             "postgresql://h/db",
             "mongodb://h:27017/db?replicaSet=rs0",
             "redis://[::1]:6379",
@@ -675,7 +699,7 @@ mod tests {
             "postgresql://alice:***@localhost/app"
         );
         assert_eq!(
-            redact("postgresql://alice:p@ss:w0rd@localhost/app"),
+            redact("postgresql://alice:p@example.com:1234@localhost/app"),
             "postgresql://alice:***@localhost/app"
         );
     }
@@ -712,13 +736,13 @@ mod tests {
     #[test]
     fn redacts_urls_inside_free_text() {
         let (output, count) = redact_uri_credentials(
-            "Failed to connect using URI postgresql://u:pw@h:5432: refused; retry mysql://r:x@h2/db",
+            "Failed to connect using URI postgresql://u:pw@h.example.com:5432/db: refused; retry mysql://r:x@h2.example.com/db",
             "[REDACTED]",
         );
 
         assert_eq!(
             output,
-            "Failed to connect using URI postgresql://u:[REDACTED]@h:5432: refused; retry mysql://r:[REDACTED]@h2/db"
+            "Failed to connect using URI postgresql://u:[REDACTED]@h.example.com:5432/db: refused; retry mysql://r:[REDACTED]@h2.example.com/db"
         );
         assert_eq!(count, 2);
     }
@@ -726,10 +750,10 @@ mod tests {
     #[test]
     fn stops_at_quotes_and_ignores_schemeless_separators() {
         assert_eq!(
-            redact(r#"{"uri":"redis://u:pw@h:6379","note":"a@b"}"#),
-            r#"{"uri":"redis://u:***@h:6379","note":"a@b"}"#
+            redact(r#"{"uri":"redis://u:pw@h.example.com:6379","note":"a@b.example.com"}"#),
+            r#"{"uri":"redis://u:***@h.example.com:6379","note":"a@b.example.com"}"#
         );
-        assert_eq!(redact("://u:pw@h"), "://u:pw@h");
+        assert_eq!(redact("://u:pw@h.example.com"), "://u:pw@h.example.com");
     }
 
     #[test]

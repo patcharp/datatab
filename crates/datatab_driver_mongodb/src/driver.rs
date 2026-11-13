@@ -4766,7 +4766,9 @@ mod tests {
         let driver = MongoDriver::new();
         let config = DbConfig::MongoDB {
             use_uri: true,
-            uri: Some("mongodb://user:pass@host:27017/app?authSource=admin".to_string()),
+            uri: Some(
+                "mongodb://user:pass@host.example.com:27017/app?authSource=admin".to_string(),
+            ),
             host: String::new(),
             port: 27017,
             user: Some("user".to_string()),
@@ -4833,7 +4835,7 @@ mod tests {
     #[test]
     fn parse_uri_srv_preserves_original_string() {
         let driver = MongoDriver::new();
-        let original = "mongodb+srv://user:pass@cluster.mongodb.net/mydb";
+        let original = "mongodb+srv://user:pass@cluster.example.net/mydb";
         let values = driver.parse_uri(original).expect("SRV URI should parse");
 
         assert_eq!(values.get("use_uri").map(String::as_str), Some("true"));
@@ -4844,7 +4846,7 @@ mod tests {
     fn parse_uri_srv_without_credentials() {
         let driver = MongoDriver::new();
         let values = driver
-            .parse_uri("mongodb+srv://cluster.mongodb.net/mydb")
+            .parse_uri("mongodb+srv://cluster.example.net/mydb")
             .expect("SRV URI without credentials should parse");
 
         assert_eq!(values.get("use_uri").map(String::as_str), Some("true"));
@@ -4885,7 +4887,7 @@ mod tests {
         values.insert("use_uri".to_string(), "true".to_string());
         values.insert(
             "uri".to_string(),
-            "mongodb+srv://user:pass@cluster.mongodb.net/mydb".to_string(),
+            "mongodb+srv://user:pass@cluster.example.net/mydb".to_string(),
         );
 
         let config = driver.build_config(&values).expect("config should build");
@@ -4903,7 +4905,7 @@ mod tests {
         assert!(use_uri);
         assert_eq!(
             uri.as_deref(),
-            Some("mongodb+srv://user:pass@cluster.mongodb.net/mydb")
+            Some("mongodb+srv://user:pass@cluster.example.net/mydb")
         );
         // host/port are defaults when use_uri=true
         assert_eq!(host, "localhost");
@@ -4919,7 +4921,7 @@ mod tests {
     #[test]
     fn srv_uri_full_round_trip_parse_config_extract() {
         let driver = MongoDriver::new();
-        let original = "mongodb+srv://user:pass@cluster.mongodb.net/mydb?authSource=admin";
+        let original = "mongodb+srv://user:pass@cluster.example.net/mydb?authSource=admin";
 
         // Phase 1: parse_uri (simulates user pasting URI into connection form)
         let parsed = driver.parse_uri(original).expect("SRV URI should parse");
@@ -5029,22 +5031,22 @@ mod tests {
     #[test]
     fn inject_credentials_preserves_srv_prefix() {
         let injected = inject_credentials_into_uri(
-            "mongodb+srv://cluster.mongodb.net/mydb",
+            "mongodb+srv://cluster.example.net/mydb",
             Some("alice"),
             Some("pw"),
         );
         assert!(injected.starts_with("mongodb+srv://"));
         assert!(!injected.contains(":27017"));
-        assert_eq!(injected, "mongodb+srv://alice:pw@cluster.mongodb.net/mydb");
+        assert_eq!(injected, "mongodb+srv://alice:pw@cluster.example.net/mydb");
 
         let untouched = inject_credentials_into_uri(
-            "mongodb+srv://existing:creds@cluster.mongodb.net/mydb",
+            "mongodb+srv://existing:creds@cluster.example.net/mydb",
             Some("alice"),
             Some("pw"),
         );
         assert_eq!(
             untouched,
-            "mongodb+srv://existing:creds@cluster.mongodb.net/mydb"
+            "mongodb+srv://existing:creds@cluster.example.net/mydb"
         );
     }
 
@@ -5061,7 +5063,7 @@ mod tests {
 
         // Now parse an SRV URI — host/port must be cleared
         let new = driver
-            .parse_uri("mongodb+srv://cluster.mongodb.net/otherdb")
+            .parse_uri("mongodb+srv://cluster.example.net/otherdb")
             .expect("SRV URI should parse");
         assert_eq!(new.get("host").map(String::as_str), Some(""));
         assert_eq!(new.get("port").map(String::as_str), Some(""));
@@ -5093,18 +5095,18 @@ mod tests {
     #[test]
     fn inject_credentials_skips_when_user_is_empty() {
         let result = inject_credentials_into_uri(
-            "mongodb://cluster.mongodb.net/mydb",
+            "mongodb://cluster.example.net/mydb",
             Some(""),
             Some("secretpw"),
         );
-        assert_eq!(result, "mongodb://cluster.mongodb.net/mydb");
+        assert_eq!(result, "mongodb://cluster.example.net/mydb");
 
         let result_none = inject_credentials_into_uri(
-            "mongodb+srv://cluster.mongodb.net/mydb",
+            "mongodb+srv://cluster.example.net/mydb",
             None,
             Some("secretpw"),
         );
-        assert_eq!(result_none, "mongodb+srv://cluster.mongodb.net/mydb");
+        assert_eq!(result_none, "mongodb+srv://cluster.example.net/mydb");
 
         let both_none = inject_credentials_into_uri("mongodb://localhost:27017/admin", None, None);
         assert_eq!(both_none, "mongodb://localhost:27017/admin");
@@ -5114,7 +5116,7 @@ mod tests {
     fn parse_srv_uri_clears_optional_fields_when_absent() {
         let driver = MongoDriver::new();
         let values = driver
-            .parse_uri("mongodb+srv://cluster.mongodb.net")
+            .parse_uri("mongodb+srv://cluster.example.net")
             .expect("SRV URI without optional fields should parse");
 
         assert_eq!(values.get("user").map(String::as_str), Some(""));
@@ -5129,7 +5131,7 @@ mod tests {
         let driver = MongoDriver::new();
 
         let with_user = driver
-            .parse_uri("mongodb+srv://alice:pw@cluster.mongodb.net/db1?authSource=admin")
+            .parse_uri("mongodb+srv://alice:pw@cluster.example.net/db1?authSource=admin")
             .expect("SRV URI with user should parse");
         assert_eq!(with_user.get("user").map(String::as_str), Some("alice"));
         assert_eq!(with_user.get("database").map(String::as_str), Some("db1"));
@@ -5139,7 +5141,7 @@ mod tests {
         );
 
         let without_user = driver
-            .parse_uri("mongodb+srv://cluster.mongodb.net")
+            .parse_uri("mongodb+srv://cluster.example.net")
             .expect("SRV URI without user should parse");
         assert_eq!(without_user.get("user").map(String::as_str), Some(""));
         assert_eq!(without_user.get("database").map(String::as_str), Some(""));
@@ -5152,11 +5154,11 @@ mod tests {
     #[test]
     fn inject_credentials_fills_password_for_username_only_uri_authority() {
         let srv = inject_credentials_into_uri(
-            "mongodb+srv://user@cluster.mongodb.net/mydb",
+            "mongodb+srv://user@cluster.example.net/mydb",
             Some("separate-user"),
             Some("secret"),
         );
-        assert_eq!(srv, "mongodb+srv://user:secret@cluster.mongodb.net/mydb");
+        assert_eq!(srv, "mongodb+srv://user:secret@cluster.example.net/mydb");
 
         let standard = inject_credentials_into_uri(
             "mongodb://encoded%40user:@localhost:27017/admin",
@@ -5176,13 +5178,13 @@ mod tests {
         assert_eq!(complete, "mongodb://existing:creds@localhost:27017/admin");
 
         let without_password = inject_credentials_into_uri(
-            "mongodb+srv://user@cluster.mongodb.net/mydb",
+            "mongodb+srv://user@cluster.example.net/mydb",
             Some("separate-user"),
             None,
         );
         assert_eq!(
             without_password,
-            "mongodb+srv://user@cluster.mongodb.net/mydb"
+            "mongodb+srv://user@cluster.example.net/mydb"
         );
 
         let query_at = inject_credentials_into_uri(

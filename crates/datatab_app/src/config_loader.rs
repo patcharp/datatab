@@ -2555,6 +2555,42 @@ mod tests {
     }
 
     #[test]
+    fn clickhouse_insecure_http_opt_in_round_trips_and_defaults_to_off() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+
+        let clickhouse = |allow_insecure_http_password| DbConfig::ClickHouse {
+            url: "http://clickhouse.example.com:8123".to_string(),
+            user: "analytics".to_string(),
+            database: "events".to_string(),
+            request_timeout_seconds: None,
+            allow_insecure_http_password,
+        };
+        let opted_in = ConnectionProfile::new("opted-in", clickhouse(true));
+        let default = ConnectionProfile::new("default", clickhouse(false));
+
+        save_profiles(&runtime, &[opted_in.clone(), default.clone()])
+            .expect("save clickhouse profiles");
+
+        let loaded = load_config(&runtime).expect("load configuration").profiles;
+        let allows_insecure_http = |id| {
+            let profile = loaded
+                .iter()
+                .find(|candidate| candidate.id == id)
+                .expect("reloaded profile");
+            matches!(
+                profile.config,
+                DbConfig::ClickHouse {
+                    allow_insecure_http_password: true,
+                    ..
+                }
+            )
+        };
+
+        assert!(allows_insecure_http(opted_in.id));
+        assert!(!allows_insecure_http(default.id));
+    }
+
+    #[test]
     fn env_and_dotenv_value_refs_round_trip() {
         let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
 
@@ -2736,6 +2772,7 @@ mod tests {
                 ref user,
                 ref database,
                 request_timeout_seconds: None,
+                allow_insecure_http_password: false,
             } if url == "http://localhost:8123" && user == "default" && database == "default"
         ));
     }

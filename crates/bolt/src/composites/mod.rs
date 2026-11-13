@@ -51,6 +51,6 @@ pub use split_button::SplitButton;
 pub use splitter::{SplitAxis, Splitter};
 pub use status_chip::StatusChip;
 pub use tabs::{
-    document_tab, document_tab_bar, document_tab_title, inline_tab, inline_tab_bar, result_tab,
-    result_tab_bar,
+    document_tab, document_tab_bar, document_tab_title, document_tab_width, inline_tab,
+    inline_tab_bar, result_tab, result_tab_bar,
 };

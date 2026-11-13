@@ -159,6 +159,15 @@ pub static CLICKHOUSE_FORM: LazyLock<DriverFormDef> = LazyLock::new(|| DriverFor
                         field_password(),
                         "Stored securely; sent using HTTP Basic Auth",
                     ),
+                    with_help(
+                        field(
+                            "allow_insecure_http_password",
+                            "Allow password over unencrypted HTTP",
+                            FormFieldKind::Checkbox,
+                            "",
+                        ),
+                        "Sends the password in clear text over http://. Use it only on a network you trust.",
+                    ),
                 ],
             },
         ],
@@ -222,11 +231,15 @@ impl DbDriver for ClickHouseDriver {
                 "Request timeout must not exceed {MAX_REQUEST_TIMEOUT_SECONDS} seconds"
             )));
         }
+        let allow_insecure_http_password = values
+            .get("allow_insecure_http_password")
+            .is_some_and(|value| value == "true");
         Ok(DbConfig::ClickHouse {
             url,
             user,
             database,
             request_timeout_seconds,
+            allow_insecure_http_password,
         })
     }
 
@@ -237,6 +250,7 @@ impl DbDriver for ClickHouseDriver {
             user,
             database,
             request_timeout_seconds,
+            allow_insecure_http_password,
         } = config
         {
             values.insert("url".to_string(), url.clone());
@@ -247,6 +261,15 @@ impl DbDriver for ClickHouseDriver {
                 request_timeout_seconds
                     .unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECONDS)
                     .to_string(),
+            );
+            values.insert(
+                "allow_insecure_http_password".to_string(),
+                if *allow_insecure_http_password {
+                    "true"
+                } else {
+                    ""
+                }
+                .to_string(),
             );
         }
         values
@@ -263,6 +286,7 @@ impl DbDriver for ClickHouseDriver {
             user,
             database,
             request_timeout_seconds,
+            allow_insecure_http_password,
         } = &profile.config
         else {
             return Err(DbError::InvalidProfile(
@@ -281,6 +305,7 @@ impl DbDriver for ClickHouseDriver {
             password.cloned(),
             database.clone(),
             Duration::from_secs(timeout),
+            *allow_insecure_http_password,
         )
         .map_err(|error| {
             crate::error_formatter::ClickHouseErrorFormatter::into_connection_error(&error)
@@ -358,9 +383,11 @@ pub(crate) static READ_ONLY_GENERATOR: ReadOnlyClickHouseGenerator =
 #[cfg(test)]
 mod tests {
     use super::{ClickHouseDriver, MAX_REQUEST_TIMEOUT_SECONDS, METADATA, READ_ONLY_GENERATOR};
+    use datatab_core::secrecy::SecretString;
     use datatab_core::{
-        Comparator, DbConfig, DbDriver, DriverCapabilities, FilterNode, FormValues, LiteralValue,
-        Predicate, PredicateValue, Projection, QueryGenerator, SourceTable, VisualQuerySpec,
+        Comparator, ConnectionProfile, DbConfig, DbDriver, DriverCapabilities, FilterNode,
+        FormFieldKind, FormValues, LiteralValue, Predicate, PredicateValue, Projection,
+        QueryGenerator, SourceTable, VisualQuerySpec,
     };
 
     #[test]
@@ -423,6 +450,110 @@ mod tests {
             extracted.get("database").map(String::as_str),
             Some("events")
         );
+    }
+
+    #[test]
+    fn form_offers_insecure_http_opt_in_off_by_default() {
+        let field = super::CLICKHOUSE_FORM
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.sections.iter())
+            .filter(|section| section.title == "Authentication")
+            .flat_map(|section| section.fields.iter())
+            .find(|field| field.id == "allow_insecure_http_password")
+            .expect("Authentication section has the opt-in");
+        assert_eq!(field.kind, FormFieldKind::Checkbox);
+        assert_eq!(field.label, "Allow password over unencrypted HTTP");
+        assert_eq!(
+            field.help.as_deref(),
+            Some(
+                "Sends the password in clear text over http://. Use it only on a network you trust."
+            )
+        );
+        assert_ne!(field.default_value, "true");
+    }
+
+    #[test]
+    fn insecure_http_opt_in_round_trips_through_form_values() {
+        let driver = ClickHouseDriver::new();
+        let mut values = FormValues::from([
+            (
+                "url".to_string(),
+                "http://clickhouse.example.com:8123".to_string(),
+            ),
+            ("user".to_string(), "analytics".to_string()),
+            ("database".to_string(), "events".to_string()),
+        ]);
+
+        let config = driver.build_config(&values).expect("valid config");
+        assert!(matches!(
+            config,
+            DbConfig::ClickHouse {
+                allow_insecure_http_password: false,
+                ..
+            }
+        ));
+        assert_eq!(
+            driver
+                .extract_values(&config)
+                .get("allow_insecure_http_password")
+                .map(String::as_str),
+            Some("")
+        );
+
+        values.insert(
+            "allow_insecure_http_password".to_string(),
+            "true".to_string(),
+        );
+        let config = driver.build_config(&values).expect("valid config");
+        assert!(matches!(
+            config,
+            DbConfig::ClickHouse {
+                allow_insecure_http_password: true,
+                ..
+            }
+        ));
+        let extracted = driver.extract_values(&config);
+        assert_eq!(
+            extracted
+                .get("allow_insecure_http_password")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(matches!(
+            driver.build_config(&extracted).expect("rebuild"),
+            DbConfig::ClickHouse {
+                allow_insecure_http_password: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn connect_refuses_password_over_remote_http_without_opt_in() {
+        let profile = ConnectionProfile::new(
+            "clickhouse",
+            DbConfig::ClickHouse {
+                url: "http://clickhouse.example.com:8123".to_string(),
+                user: "analytics".to_string(),
+                database: "events".to_string(),
+                request_timeout_seconds: None,
+                allow_insecure_http_password: false,
+            },
+        );
+        let password = SecretString::from("secret".to_string());
+
+        let Err(error) =
+            ClickHouseDriver::new().connect_with_secrets(&profile, Some(&password), None)
+        else {
+            panic!("a password over remote http must be refused without the opt-in");
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("Use https://, or turn on \"Allow password over unencrypted HTTP\""),
+            "unexpected error: {message}"
+        );
+        assert!(!message.contains("secret"));
     }
 
     #[test]

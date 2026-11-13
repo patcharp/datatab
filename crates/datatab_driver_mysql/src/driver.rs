@@ -4991,7 +4991,7 @@ mod tests {
     fn build_and_parse_uri_roundtrip_basics() {
         let driver = MysqlDriver::new(DbKind::MySQL);
         let mut values = FormValues::new();
-        values.insert("host".to_string(), "127.0.0.1".to_string());
+        values.insert("host".to_string(), "localhost".to_string());
         values.insert("port".to_string(), "3307".to_string());
         values.insert("user".to_string(), "root user".to_string());
         values.insert("database".to_string(), "app".to_string());
@@ -4999,14 +4999,14 @@ mod tests {
         let uri = driver
             .build_uri(&values, "s3cr@t")
             .expect("mysql driver should support URI building");
-        assert_eq!(uri, "mysql://root%20user:s3cr%40t@127.0.0.1:3307/app");
+        assert_eq!(uri, "mysql://root%20user:s3cr%40t@localhost:3307/app");
 
         let parsed = driver
             .parse_uri(&uri)
             .expect("uri built by driver should parse");
 
         assert_eq!(parsed.get("user").map(String::as_str), Some("root user"));
-        assert_eq!(parsed.get("host").map(String::as_str), Some("127.0.0.1"));
+        assert_eq!(parsed.get("host").map(String::as_str), Some("localhost"));
         assert_eq!(parsed.get("port").map(String::as_str), Some("3307"));
         assert_eq!(parsed.get("database").map(String::as_str), Some("app"));
     }
@@ -5471,7 +5471,7 @@ mod tests {
         values.insert("use_uri".to_string(), "true".to_string());
         values.insert(
             "uri".to_string(),
-            "mysql://root:s3cr3t@db.example:3306/app".to_string(),
+            "mysql://root:s3cr3t@db.example.com:3306/app".to_string(),
         );
 
         let transform = driver.export_field_transform("uri", &values);

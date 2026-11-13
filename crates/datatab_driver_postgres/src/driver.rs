@@ -6061,7 +6061,7 @@ fn format_pg_uri_error(e: &postgres::Error, uri: &str) -> DbError {
 
 /// Extract the password from a postgres/postgresql URI into a `SplitSecret` transform.
 ///
-/// When the URI carries embedded credentials (`scheme://user:pass@host/db`), this
+/// When the URI carries embedded credentials (`scheme://user:<password>@host:port/db`), this
 /// returns the URI with an empty password placeholder as the skeleton and the
 /// extracted (URL-decoded) password as the secret.
 ///
@@ -7363,11 +7363,14 @@ mod tests {
         let driver = PostgresDriver::new();
 
         let short = driver
-            .parse_uri("postgres://user:pass@db.local:5433/app?sslmode=require")
+            .parse_uri("postgres://user:pass@db.example.com:5433/app?sslmode=require")
             .expect("short postgres URI should parse");
 
         assert_eq!(short.get("user").map(String::as_str), Some("user"));
-        assert_eq!(short.get("host").map(String::as_str), Some("db.local"));
+        assert_eq!(
+            short.get("host").map(String::as_str),
+            Some("db.example.com")
+        );
         assert_eq!(short.get("port").map(String::as_str), Some("5433"));
         assert_eq!(short.get("database").map(String::as_str), Some("app"));
 
@@ -8498,7 +8501,7 @@ mod tests {
         values.insert("use_uri".to_string(), "true".to_string());
         values.insert(
             "uri".to_string(),
-            "postgres://alice:s3cr3t@db.example/app".to_string(),
+            "postgres://alice:s3cr3t@db.example.com/app".to_string(),
         );
 
         let transform = driver.export_field_transform("uri", &values);
@@ -8529,7 +8532,10 @@ mod tests {
         let driver = PostgresDriver::new();
         let mut values = FormValues::new();
         values.insert("use_uri".to_string(), "true".to_string());
-        values.insert("uri".to_string(), "postgres://db.example/app".to_string());
+        values.insert(
+            "uri".to_string(),
+            "postgres://db.example.com/app".to_string(),
+        );
 
         assert!(
             matches!(

@@ -5155,7 +5155,7 @@ mod tests {
         let config = DbConfig::Redis {
             use_uri: false,
             uri: None,
-            host: "cache.local".to_string(),
+            host: "cache.example.com".to_string(),
             port: 6380,
             user: Some("svc".to_string()),
             database: Some(3),
@@ -5172,7 +5172,10 @@ mod tests {
         };
 
         let values = driver.extract_values(&config);
-        assert_eq!(values.get("host").map(String::as_str), Some("cache.local"));
+        assert_eq!(
+            values.get("host").map(String::as_str),
+            Some("cache.example.com")
+        );
         assert_eq!(values.get("port").map(String::as_str), Some("6380"));
         assert_eq!(values.get("database").map(String::as_str), Some("3"));
         // SSL mode is owned by the generic TRANSPORT control, not by the form values.
@@ -5346,7 +5349,7 @@ mod tests {
     fn build_uri_keeps_user_and_db_without_tls_field() {
         let driver = RedisDriver::new();
         let mut values = FormValues::new();
-        values.insert("host".to_string(), "cache.local".to_string());
+        values.insert("host".to_string(), "cache.example.com".to_string());
         values.insert("port".to_string(), "6380".to_string());
         values.insert("user".to_string(), "service user".to_string());
         values.insert("database".to_string(), "2".to_string());
@@ -5354,10 +5357,16 @@ mod tests {
         let uri = driver
             .build_uri(&values, "s3cr@t")
             .expect("redis driver should support uri build");
-        assert_eq!(uri, "redis://service%20user:s3cr%40t@cache.local:6380/2");
+        assert_eq!(
+            uri,
+            "redis://service%20user:s3cr%40t@cache.example.com:6380/2"
+        );
 
         let parsed = driver.parse_uri(&uri).expect("uri should parse");
-        assert_eq!(parsed.get("host").map(String::as_str), Some("cache.local"));
+        assert_eq!(
+            parsed.get("host").map(String::as_str),
+            Some("cache.example.com")
+        );
         assert_eq!(parsed.get("port").map(String::as_str), Some("6380"));
         assert_eq!(parsed.get("user").map(String::as_str), Some("service user"));
         assert_eq!(parsed.get("database").map(String::as_str), Some("2"));
@@ -5926,7 +5935,7 @@ mod tests {
         // %GG is an invalid percent sequence; parse_uri must return Some (no panic, no None)
         // and the username segment must equal the original raw text.
         let v = driver
-            .parse_uri("redis://%GGuser:pass@host:6379/0")
+            .parse_uri("redis://%GGuser:pass@host.example.com:6379/0")
             .expect("URI should parse even with invalid percent sequence");
         assert_eq!(
             v.get("user").map(String::as_str),

@@ -193,31 +193,31 @@ mod tests {
 
     #[test]
     fn proxy_url_no_auth() {
-        let proxy = http_proxy("proxy.local", 8080);
-        assert_eq!(proxy.proxy_url(None), "http://proxy.local:8080");
+        let proxy = http_proxy("proxy.example.com", 8080);
+        assert_eq!(proxy.proxy_url(None), "http://proxy.example.com:8080");
     }
 
     #[test]
     fn proxy_url_basic_no_password() {
-        let proxy = basic_auth_proxy("proxy.local", 8080, "user");
-        assert_eq!(proxy.proxy_url(None), "http://user@proxy.local:8080");
+        let proxy = basic_auth_proxy("proxy.example.com", 8080, "user");
+        assert_eq!(proxy.proxy_url(None), "http://user@proxy.example.com:8080");
     }
 
     #[test]
     fn proxy_url_basic_with_password() {
-        let proxy = basic_auth_proxy("proxy.local", 8080, "user");
+        let proxy = basic_auth_proxy("proxy.example.com", 8080, "user");
         assert_eq!(
             proxy.proxy_url(Some("pass")),
-            "http://user:pass@proxy.local:8080"
+            "http://user:pass@proxy.example.com:8080"
         );
     }
 
     #[test]
     fn proxy_url_special_chars_encoded() {
-        let proxy = basic_auth_proxy("proxy.local", 8080, "a@b");
+        let proxy = basic_auth_proxy("proxy.example.com", 8080, "a@b");
         assert_eq!(
             proxy.proxy_url(Some("c:d/e")),
-            "http://a%40b:c%3Ad%2Fe@proxy.local:8080"
+            "http://a%40b:c%3Ad%2Fe@proxy.example.com:8080"
         );
     }
 
@@ -225,30 +225,33 @@ mod tests {
     fn proxy_url_socks5_scheme() {
         let proxy = ProxyProfile {
             kind: ProxyKind::Socks5,
-            ..http_proxy("proxy.local", 1080)
+            ..http_proxy("proxy.example.com", 1080)
         };
-        assert_eq!(proxy.proxy_url(None), "socks5://proxy.local:1080");
+        assert_eq!(proxy.proxy_url(None), "socks5://proxy.example.com:1080");
     }
 
     #[test]
     fn proxy_url_https_scheme() {
         let proxy = ProxyProfile {
             kind: ProxyKind::Https,
-            ..http_proxy("proxy.local", 8080)
+            ..http_proxy("proxy.example.com", 8080)
         };
-        assert_eq!(proxy.proxy_url(None), "https://proxy.local:8080");
+        assert_eq!(proxy.proxy_url(None), "https://proxy.example.com:8080");
     }
 
     #[test]
     fn display_url_masks_password() {
-        let proxy = basic_auth_proxy("proxy.local", 8080, "user");
-        assert_eq!(proxy.display_url(), "http://user:***@proxy.local:8080");
+        let proxy = basic_auth_proxy("proxy.example.com", 8080, "user");
+        assert_eq!(
+            proxy.display_url(),
+            "http://user:***@proxy.example.com:8080"
+        );
     }
 
     #[test]
     fn display_url_no_auth() {
-        let proxy = http_proxy("proxy.local", 8080);
-        assert_eq!(proxy.display_url(), "http://proxy.local:8080");
+        let proxy = http_proxy("proxy.example.com", 8080);
+        assert_eq!(proxy.display_url(), "http://proxy.example.com:8080");
     }
 
     #[test]
@@ -277,7 +280,7 @@ mod tests {
         let proxy = ProxyProfile {
             no_proxy: Some("localhost,127.0.0.1".to_string()),
             save_secret: true,
-            ..basic_auth_proxy("proxy.local", 3128, "admin")
+            ..basic_auth_proxy("proxy.example.com", 3128, "admin")
         };
 
         let json = serde_json::to_string(&proxy).unwrap();
@@ -316,7 +319,7 @@ mod tests {
         let id = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
         let proxy = ProxyProfile {
             id,
-            ..http_proxy("proxy.local", 8080)
+            ..http_proxy("proxy.example.com", 8080)
         };
         assert_eq!(
             proxy.secret_ref(),

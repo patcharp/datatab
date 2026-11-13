@@ -62,7 +62,7 @@ fn connect_mssql(uri: String) -> Result<(Box<dyn Connection>, MssqlDriver), DbEr
     Ok((connection, driver))
 }
 
-/// Parse host and port from a `sqlserver://sa:pw@host:port/db` test URI.
+/// Parse host and port from a `sqlserver://user:<password>@host:port/db` test URI.
 ///
 /// The container helper hands us a URI; the form-mode and ssl-mode tests need
 /// the host and port as separate values to populate `DbConfig::SqlServer`.

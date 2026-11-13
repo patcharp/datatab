@@ -231,6 +231,17 @@ pub(super) fn toast_count(window: &mut VisualTestContext) -> usize {
     window.update(|_, cx| cx.global::<ToastGlobal>().host.read(cx).toast_count())
 }
 
+/// How many times the newest toast was raised while it was on screen: a
+/// repeat of the same error merges into its toast and counts here.
+pub(super) fn last_toast_occurrences(window: &mut VisualTestContext) -> Option<u32> {
+    window.update(|_, cx| {
+        cx.global::<ToastGlobal>()
+            .host
+            .read(cx)
+            .last_toast_occurrences()
+    })
+}
+
 /// Selects the cell at zero-based `row` and `column` and returns what the
 /// formula readout says about it.
 pub(super) fn readout_at(

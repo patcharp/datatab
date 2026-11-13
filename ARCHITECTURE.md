@@ -1058,5 +1058,5 @@ DataTab supports the Model Context Protocol (MCP) for AI client integration with
 - Build and run: see [Building DataTab from source](docs/BUILDING.md) for platform requirements and commands.
 - Test: `cargo test -p <crate> --locked` for each crate a change touches.
 - Lint/format: `python3 scripts/lint.py clippy`, `python3 scripts/lint.py fmt`.
-- Releases: one GitHub Actions workflow in the public repository builds a Linux `.deb`, the Windows installer, and a macOS `DataTab.app` on Intel and on Apple Silicon (macOS is experimental). It uploads the artifacts and their SHA-256 sums to a draft GitHub release. The private repository has no CI.
+- Releases: one GitHub Actions workflow in the public repository builds a Linux `.deb`, the Windows installer, and a macOS `DataTab.app` on Intel and on Apple Silicon. It uploads the artifacts and their SHA-256 sums to a draft GitHub release. The private repository has no CI.
 - Deployment model: desktop GUI app; no server runtime in this repo.

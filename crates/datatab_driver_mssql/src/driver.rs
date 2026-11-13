@@ -1119,7 +1119,7 @@ impl MssqlDriver {
         // Prefer our own URL parser when the URI looks like one
         // (`sqlserver://` / `mssql://`). Tiberius's ADO parser is too
         // permissive: it accepts our URL as a single key=value pair
-        // (key=`sqlserver://sa:pw@host/?instance`, value=`NAME`) and
+        // (key=`sqlserver://user:<password>@host:port/?instance`, value=`NAME`) and
         // returns a Config with empty host/auth that then dials a
         // default `localhost:1433`. ADO/JDBC parsers stay available for
         // genuine `Server=…;` / `jdbc:sqlserver://…` connection strings.
@@ -4295,7 +4295,7 @@ fn inject_password_into_mssql_uri(base_uri: &str, password: Option<&str>) -> Str
     base_uri.to_string()
 }
 
-/// Parse a `sqlserver://user:pass@host:port/db?...` URI into a tiberius Config.
+/// Parse a `sqlserver://user:<password>@host:port/db?...` URI into a tiberius Config.
 struct ParsedMssqlUri<'a> {
     credentials: &'a str,
     host: &'a str,
@@ -5664,7 +5664,7 @@ mod tests {
 
     #[test]
     fn inject_password_skips_when_already_present() {
-        let input = "sqlserver://sa:already@host:1433/db";
+        let input = "sqlserver://sa:already@host.example.com:1433/db";
         assert_eq!(
             inject_password_into_mssql_uri(input, Some("override")),
             input
@@ -5673,10 +5673,10 @@ mod tests {
 
     #[test]
     fn inject_password_adds_when_missing() {
-        let input = "sqlserver://sa@host:1433/db";
+        let input = "sqlserver://sa@host.example.com:1433/db";
         assert_eq!(
             inject_password_into_mssql_uri(input, Some("p@ss")),
-            "sqlserver://sa:p%40ss@host:1433/db"
+            "sqlserver://sa:p%40ss@host.example.com:1433/db"
         );
     }
 
@@ -5909,7 +5909,7 @@ mod tests {
         values.insert("use_uri".into(), "true".into());
         values.insert(
             "uri".into(),
-            "sqlserver://sa@h:1433/db?encrypt=required".into(),
+            "sqlserver://sa@h.example.com:1433/db?encrypt=required".into(),
         );
         values.insert("ssl_root_cert_path".into(), "/etc/ssl/corp-ca.pem".into());
         assert_eq!(extract_root_cert(values), None);

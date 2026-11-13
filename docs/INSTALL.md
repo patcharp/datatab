@@ -1,6 +1,6 @@
 # Installing DataTab
 
-DataTab supports Windows and Linux. macOS is experimental, on Intel and on Apple Silicon. Download the installer from the releases of the public repository, `https://github.com/patcharp/datatab/releases`, once a release is published.
+DataTab supports Windows, Linux and macOS, on Intel and on Apple Silicon. Download the installer from the releases of the public repository, `https://github.com/patcharp/datatab/releases`.
 
 ## Windows
 
@@ -20,9 +20,9 @@ sudo apt install ./datatab-linux-amd64.deb
 
 Use the file name of the package you received. The package is unsigned.
 
-## macOS (experimental)
+## macOS
 
-The release has a `DataTab.app` for Intel and one for Apple Silicon. Both are unsigned and built on a best-effort basis. Drag the app to `/Applications`. A downloaded app needs its quarantine flag cleared before its first start:
+The release has a `DataTab.app` for Intel and one for Apple Silicon. Both are unsigned and need macOS 11 or later. Drag the app to `/Applications`. A downloaded app needs its quarantine flag cleared before its first start:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/DataTab.app

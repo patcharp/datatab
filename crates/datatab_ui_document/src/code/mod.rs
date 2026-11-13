@@ -67,6 +67,7 @@ mod completion;
 mod completion_tests;
 mod context_bar;
 mod diagnostics;
+mod display_path;
 mod execution;
 mod execution_session;
 mod file_ops;

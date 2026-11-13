@@ -38,6 +38,7 @@ pub use bolt::composites::{
     scroll_strip,
 };
 
+pub use bolt::composites::document_tab_width;
 pub use breadcrumb::{Breadcrumb, BreadcrumbSegment};
 pub use control_shell::control_shell;
 pub use header::{

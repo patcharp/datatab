@@ -1,10 +1,18 @@
 #!/bin/sh
-# Build DataTab.app on a Mac. macOS is an experimental platform: this bundle is
-# unsigned (ad-hoc only) and built on a best-effort basis.
+# Build DataTab.app on a Mac. The bundle is unsigned (ad-hoc signature only).
 #
 # Run from the root of a DataTab checkout:
-#   sh scripts/build-macos.sh            # 4 build jobs
+#   sh scripts/build-macos.sh                       # for this Mac, 4 build jobs
 #   JOBS=8 sh scripts/build-macos.sh
+#   sh scripts/build-macos.sh x86_64-apple-darwin   # Intel app, on any Mac
+#   sh scripts/build-macos.sh aarch64-apple-darwin  # Apple Silicon app, on any Mac
+#
+# The optional argument is the target triple. Without it, cargo builds for this
+# Mac. Building for the other architecture needs its standard library first:
+#   rustup target add x86_64-apple-darwin
+# OpenSSL is always built from source (the vendored-openssl feature), so the app
+# never depends on a Homebrew OpenSSL and the cross build needs none for the
+# other architecture.
 #
 # Needs: rustup, full Xcode (not only the Command Line Tools: GPUI compiles its
 # Metal shaders with `xcrun metal`), and cmake (brew install cmake).
@@ -18,18 +26,31 @@ fail() {
 }
 
 [ "$(uname -s)" = Darwin ] || fail "run this on macOS"
+[ "$#" -le 1 ] || fail "usage: sh scripts/build-macos.sh [x86_64-apple-darwin|aarch64-apple-darwin]"
+target=${1:-}
+case $target in
+    '') expected_arch=$(uname -m) ;;
+    x86_64-apple-darwin) expected_arch=x86_64 ;;
+    aarch64-apple-darwin) expected_arch=arm64 ;;
+    *) fail "unsupported target '$target'; use x86_64-apple-darwin or aarch64-apple-darwin" ;;
+esac
 repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$repo_root"
 for required in Cargo.toml packaging/icons/512x512/apps/datatab.png LICENSE-MIT LICENSE-APACHE; do
     [ -e "$required" ] || fail "missing $required; is this a DataTab checkout?"
 done
-for tool in git cargo rustc xcrun iconutil sips plutil codesign shasum; do
+for tool in git cargo rustc xcrun iconutil sips plutil codesign shasum lipo; do
     command -v "$tool" >/dev/null 2>&1 || fail "required tool not found: $tool; install rustup from https://rustup.rs and Xcode from the App Store"
 done
 xcrun -sdk macosx -f metal >/dev/null 2>&1 ||
     fail "the Metal compiler is missing. Install full Xcode, run 'sudo xcode-select -s /Applications/Xcode.app', and on Xcode 26 or later also 'xcodebuild -downloadComponent MetalToolchain'"
 command -v cmake >/dev/null 2>&1 ||
     echo "build-macos: note: cmake not found; if the build fails in aws-lc-sys, run 'brew install cmake'" >&2
+if [ -n "$target" ]; then
+    sysroot=$(rustc --print sysroot) || fail "rustc --print sysroot failed"
+    [ -d "$sysroot/lib/rustlib/$target/lib" ] ||
+        fail "the Rust standard library for $target is not installed; run 'rustup target add $target'"
+fi
 
 commit=$(git rev-parse HEAD)
 dirty=""
@@ -48,15 +69,25 @@ case $jobs in
     '' | *[!0-9]* | 0) fail "JOBS must be a positive whole number, got '$jobs'" ;;
 esac
 target_dir=${CARGO_TARGET_DIR:-target}
+build_command="cargo build -p datatab --release --locked --features vendored-openssl"
+if [ -n "$target" ]; then
+    build_command="$build_command --target $target"
+    binary="$target_dir/$target/release/datatab"
+else
+    binary="$target_dir/release/datatab"
+fi
 start=$(date +%s)
 set +e
-CARGO_BUILD_JOBS=$jobs cargo build -p datatab --release --locked
+# shellcheck disable=SC2086 # the command is built from fixed words only
+CARGO_BUILD_JOBS=$jobs $build_command
 build_exit=$?
 set -e
 minutes=$(( ($(date +%s) - start) / 60 ))
 [ "$build_exit" -eq 0 ] || fail "cargo build failed with exit code $build_exit; if it ran out of memory, try JOBS=2 or JOBS=1"
-binary="$target_dir/release/datatab"
 [ -f "$binary" ] || fail "cargo finished but $binary is missing"
+binary_arch=$(lipo -archs "$binary") || fail "lipo could not read $binary"
+[ "$binary_arch" = "$expected_arch" ] ||
+    fail "$binary is built for '$binary_arch', expected '$expected_arch'"
 
 # 2. Assemble the bundle.
 stage="$target_dir/macos-package"
@@ -116,12 +147,14 @@ binary_hash=${hash_output%% *}
 [ -n "$binary_hash" ] || fail "shasum printed no hash for the bundle binary"
 report="$stage/report.txt"
 cat >"$report" <<EOF
-macOS build report (experimental platform)
+macOS build report
 - commit: $commit$dirty
 - macOS $(sw_vers -productVersion) on $(uname -m)
 - $(rustc --version)
 - version: $version (bundle version $bundle_version)
-- cargo build -p datatab --release --locked: exit $build_exit, about $minutes min, jobs $jobs
+- $build_command: exit $build_exit, about $minutes min, jobs $jobs
+- release profile overrides: lto ${CARGO_PROFILE_RELEASE_LTO:-from Cargo.toml}, codegen-units ${CARGO_PROFILE_RELEASE_CODEGEN_UNITS:-from Cargo.toml}
+- binary architecture: $binary_arch
 - DataTab.app/Contents/MacOS/datatab SHA-256: $binary_hash
 - bundle: $(cd "$stage" && pwd)/DataTab.app
 EOF

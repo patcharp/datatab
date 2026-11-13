@@ -4198,7 +4198,7 @@ settings:
       group: "Notifications"
     toast_timeout:
       label: "Toast timeout"
-      hint: "Success, Info and Warning toasts close on their own after this. Errors, and toasts with an action or progress, stay until dismissed. Hovering a toast holds its timer."
+      hint: "Success and Info toasts close on their own after this, and Warning and Error toasts after twice as long. Fatal errors, and toasts with progress or an action to answer, stay until dismissed. Hovering a toast holds its timer."
       option:
         "4s": "4 seconds"
         "8s": "8 seconds"
@@ -5498,6 +5498,7 @@ toast:
     dismiss: Dismiss
   stack:
     hidden_more: "%{count} more"
+  repeat_count: "×%{count}"
 workspace:
   rail:
     connections: "Connections"

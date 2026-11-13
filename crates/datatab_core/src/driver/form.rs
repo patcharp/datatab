@@ -235,7 +235,7 @@ pub enum FieldExportTransform {
     /// connect (e.g. `inject_password_into_pg_uri`).
     SplitSecret {
         /// URI with the password component replaced by an empty placeholder
-        /// (e.g. `postgres://alice:@host/db`). Contains NO credential.
+        /// (e.g. `postgres://alice:@host.example.com/db`). Contains NO credential.
         skeleton: String,
         /// The extracted password. Staged into `[secrets]` and written to
         /// `connection_secret_ref` on import so the runtime injection path picks it up.

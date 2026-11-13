@@ -36,7 +36,7 @@ fn nested_json_array_or_plain_text_is_not_key_value() {
         r#"{"hosts":["a","b"]}"#,
         r#"["a","b"]"#,
         r#"{}"#,
-        "postgres://shop_app:secret@host:5432/shop",
+        "postgres://shop_app:secret@host.example.com:5432/shop",
         "42",
     ] {
         let value = SecretValue::text(None, text);

@@ -756,7 +756,7 @@ fn panic_report_redacts_secrets_in_the_message() {
 
     service
         .record_panic_report_best_effort(&datatab_audit::PanicReport {
-            message: "connect failed: https://admin:hunter2@db.internal/app",
+            message: "connect failed: https://admin:hunter2@db.example.com/app",
             location: Some("src/main.rs:1:1"),
             thread: None,
         })

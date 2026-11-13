@@ -12,6 +12,8 @@ use datatab_core::{DbConfig, DbKind, SshAuthMethod, SshTunnelConfig};
 use crate::bootstrap::OwnedConnection;
 use crate::error::StorageError;
 
+const CLICKHOUSE_INSECURE_HTTP_PASSWORD_KEY: &str = "allow_insecure_http_password";
+
 /// DTO for connection driver config (native columns for DbConfig).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionDriverConfigDto {
@@ -380,16 +382,26 @@ impl ConnectionDriverConfigDto {
                 dto.dynamo_endpoint = endpoint.clone();
                 dto.s3_access_key_id = access_key_id.clone();
             }
+            // The insecure-HTTP opt-in rides in the external values column,
+            // the way DuckDB keeps its extras, so ClickHouse needs no schema
+            // migration. It is written only when on, so existing rows match.
             DbConfig::ClickHouse {
                 url,
                 user,
                 database,
                 request_timeout_seconds,
+                allow_insecure_http_password,
             } => {
                 dto.uri = Some(url.clone());
                 dto.user = Some(user.clone());
                 dto.database_name = Some(database.clone());
                 dto.connect_timeout_secs = persist_timeout_seconds(*request_timeout_seconds);
+                if *allow_insecure_http_password {
+                    dto.external_values_json = Some(
+                        serde_json::json!({ CLICKHOUSE_INSECURE_HTTP_PASSWORD_KEY: true })
+                            .to_string(),
+                    );
+                }
             }
             DbConfig::Turso { url } => {
                 dto.uri = Some(url.clone());
@@ -645,6 +657,12 @@ impl ConnectionDriverConfigDto {
                 request_timeout_seconds: self
                     .connect_timeout_secs
                     .and_then(|timeout| u64::try_from(timeout).ok()),
+                allow_insecure_http_password: self
+                    .external_values_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                    .and_then(|values| values.get(CLICKHOUSE_INSECURE_HTTP_PASSWORD_KEY)?.as_bool())
+                    .unwrap_or(false),
             }),
             DbKind::Turso => Some(DbConfig::Turso {
                 url: self.uri.clone().unwrap_or_default(),
@@ -1328,6 +1346,7 @@ mod tests {
             user: "analytics".to_string(),
             database: "events".to_string(),
             request_timeout_seconds: Some(45),
+            allow_insecure_http_password: false,
         };
 
         let dto = ConnectionDriverConfigDto::from_db_config(profile_id.clone(), &config);
@@ -1344,14 +1363,58 @@ mod tests {
                 user,
                 database,
                 request_timeout_seconds,
+                allow_insecure_http_password,
             } => {
                 assert_eq!(url, "https://clickhouse.example.com:8443");
                 assert_eq!(user, "analytics");
                 assert_eq!(database, "events");
                 assert_eq!(request_timeout_seconds, Some(45));
+                assert!(!allow_insecure_http_password);
             }
             other => panic!("unexpected config: {other:?}"),
         }
+        assert!(restored.external_values_json.is_none());
+    }
+
+    #[test]
+    fn clickhouse_insecure_http_opt_in_roundtrips_through_repository() {
+        let (_temp_dir, repo) = temp_repo();
+        let profile_id = uuid::Uuid::new_v4().to_string();
+
+        repo.conn()
+            .execute(
+                r#"
+                INSERT INTO cfg_connection_profiles (
+                    id, name, driver_id, kind, created_at, updated_at
+                ) VALUES (?1, 'ClickHouse', 'clickhouse', 'ClickHouse', datetime('now'), datetime('now'))
+                "#,
+                params![profile_id],
+            )
+            .expect("insert profile");
+
+        let config = DbConfig::ClickHouse {
+            url: "http://clickhouse.example.com:8123".to_string(),
+            user: "analytics".to_string(),
+            database: "events".to_string(),
+            request_timeout_seconds: None,
+            allow_insecure_http_password: true,
+        };
+
+        let dto = ConnectionDriverConfigDto::from_db_config(profile_id.clone(), &config);
+        repo.insert(&dto).expect("insert config");
+
+        let restored = repo
+            .get_for_profile(&profile_id)
+            .expect("load config")
+            .expect("stored config");
+
+        assert!(matches!(
+            restored.to_db_config().expect("db config"),
+            DbConfig::ClickHouse {
+                allow_insecure_http_password: true,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -1370,6 +1433,7 @@ mod tests {
             user: "default".to_string(),
             database: "default".to_string(),
             request_timeout_seconds: Some(i32::MAX as u64 + 1),
+            allow_insecure_http_password: false,
         };
 
         let dto = ConnectionDriverConfigDto::from_db_config("profile".to_string(), &config);

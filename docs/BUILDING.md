@@ -2,7 +2,7 @@
 
 Each platform builds on its own operating system. Windows cannot be cross-compiled from Linux, because the GPUI Windows crate compiles its shaders with `fxc.exe` only on a Windows host and `crates/datatab/build.rs` embeds the icon and version resources only on a Windows host.
 
-DataTab supports Windows and Linux. macOS is experimental, on Intel and on Apple Silicon: it has a local build script, described at the end.
+DataTab supports Windows, Linux and macOS, on Intel and on Apple Silicon. macOS has a local build script, described at the end.
 
 Every script below:
 
@@ -119,9 +119,9 @@ cargo build -p datatab --release --no-default-features --features sqlite,postgre
 
 The binary is `target/release/datatab` on Linux and `target\release\datatab.exe` on Windows.
 
-## macOS (experimental)
+## macOS
 
-macOS is an experimental platform. It is built and shipped on a best-effort basis, on Intel and on Apple Silicon, and the release workflow builds a `DataTab.app` for each. `scripts/build-macos.sh` is the local macOS build. The bundle is unsigned (ad-hoc signature only). A bug that shows only on macOS may take longer to fix than one on Windows or Linux.
+macOS is supported on Intel and on Apple Silicon, and the release workflow builds a `DataTab.app` for each. `scripts/build-macos.sh` is the local macOS build. The bundle is unsigned (ad-hoc signature only).
 
 Prerequisites: rustup, `cmake` (`brew install cmake`), and the full Xcode app from the App Store. The Command Line Tools are not enough: GPUI compiles its Metal shaders with `xcrun metal`. After installing Xcode:
 
@@ -137,10 +137,20 @@ sh scripts/build-macos.sh
 JOBS=2 sh scripts/build-macos.sh   # fewer build jobs
 ```
 
+Without an argument, the script builds for the Mac it runs on. To build for the other architecture, add its standard library once and pass its target triple. The release workflow builds the Intel app this way on an Apple Silicon runner:
+
+```bash
+rustup target add x86_64-apple-darwin
+sh scripts/build-macos.sh x86_64-apple-darwin    # Intel app
+sh scripts/build-macos.sh aarch64-apple-darwin   # Apple Silicon app
+```
+
+The script builds OpenSSL from source (the `vendored-openssl` feature), so the app does not depend on a Homebrew OpenSSL. That step uses `perl` and `make`, which macOS and Xcode provide. The script checks the binary's architecture with `lipo -archs` before it builds the bundle.
+
 It writes:
 
 - `target/macos-package/DataTab.app`, with the icon, `Info.plist` and an ad-hoc signature;
-- `target/macos-package/report.txt`: commit, macOS version, `rustc --version`, exit code and SHA-256 of the binary.
+- `target/macos-package/report.txt`: commit, macOS version, `rustc --version`, the cargo command and its exit code, the binary's architecture and its SHA-256.
 
 Open it with `open target/macos-package/DataTab.app`, or drag it to `/Applications`. For a bundle you copied from another Mac, clear the quarantine flag first:
 
@@ -152,5 +162,6 @@ xattr -dr com.apple.quarantine DataTab.app
 
 - **"The Metal compiler is missing".** Xcode is not selected or lacks the Metal toolchain. Run the two commands above.
 - **The build fails in `aws-lc-sys`.** `cmake` is missing. Run `brew install cmake`.
-- **The build runs out of memory.** Run `JOBS=1 sh scripts/build-macos.sh`.
+- **The build runs out of memory.** Run `JOBS=1 sh scripts/build-macos.sh`. If the final link of `datatab` alone runs out of memory, turn thin LTO off for that build: `CARGO_PROFILE_RELEASE_LTO=false sh scripts/build-macos.sh`.
+- **"the Rust standard library for x86_64-apple-darwin is not installed".** Run `rustup target add x86_64-apple-darwin` in the checkout, then build again.
 - **macOS says the app is damaged or from an unidentified developer.** The bundle is not notarized. Clear the quarantine flag as shown above, or open it from its context menu.

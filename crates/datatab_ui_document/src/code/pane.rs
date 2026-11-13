@@ -223,7 +223,7 @@ impl CodeDocument {
                     .editor
                     .path
                     .as_ref()
-                    .map(|path| path.display().to_string().into())
+                    .map(|path| super::display_path::display_path(path).into())
             })
         });
 

@@ -14,9 +14,9 @@ use gpui::{Entity, Modifiers, TestAppContext, VisualTestContext};
 use super::columns::LoadingRest;
 use super::document::DelimitedDocument;
 use super::document_tests::{
-    CITIES, column_titles, covered_ids, first_column, has_more_records, last_toast_title,
-    open_local, open_local_in_small_pages, pane_action_ids, run_pane_action, set_overrides,
-    toast_count,
+    CITIES, column_titles, covered_ids, first_column, has_more_records, last_toast_occurrences,
+    last_toast_title, open_local, open_local_in_small_pages, pane_action_ids, run_pane_action,
+    set_overrides, toast_count,
 };
 use super::editing::CellEditRefusal;
 use super::editing_tests::{
@@ -780,7 +780,9 @@ fn column_changes_refuse_a_dialect_override_and_a_reload(cx: &mut TestAppContext
 
     press(window, "f5");
 
-    assert_eq!(toast_count(window), 2);
+    // The same refusal again merges into its toast.
+    assert_eq!(toast_count(window), 1);
+    assert_eq!(last_toast_occurrences(window), Some(2));
     assert!(!window.update(|_, cx| document.read(cx).is_rereading()));
     assert_eq!(
         column_titles(&document, window),
@@ -1278,7 +1280,9 @@ fn a_save_is_refused_while_the_rest_of_the_file_loads(cx: &mut TestAppContext) {
 
     select(&document, window, 0);
     press(window, "ctrl-s");
-    assert_eq!(toast_count(window), 2);
+    // The same refusal again merges into its toast.
+    assert_eq!(toast_count(window), 1);
+    assert_eq!(last_toast_occurrences(window), Some(2));
 
     let started = window.update(|window, cx| {
         let pane = DelimitedDocument::into_pane(document.clone(), cx);

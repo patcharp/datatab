@@ -180,7 +180,7 @@ pub static REDSHIFT_FORM: LazyLock<DriverFormDef> = LazyLock::new(|| DriverFormD
                                 "uri",
                                 "Connection URI",
                                 FormFieldKind::Text,
-                                "redshift://user:pass@cluster.abc123.us-east-1.redshift.amazonaws.com:5439/dev",
+                                "redshift://user:<password>@cluster.abc123.us-east-1.redshift.amazonaws.com:5439/dev",
                             ),
                             "use_uri",
                         ),

@@ -83,7 +83,10 @@ fn refusal_error_key(kind: WriteKind) -> &'static str {
 fn refusal_error(kind: WriteKind, path: &std::path::Path, cause: String) -> UserFacingError {
     UserFacingError::new(
         ErrorKind::Storage,
-        datatab_i18n::t!(refusal_error_key(kind), path = path.display().to_string()),
+        datatab_i18n::t!(
+            refusal_error_key(kind),
+            path = super::display_path::display_path(path)
+        ),
     )
     .with_cause(cause)
     .with_suggested_action(datatab_i18n::t!(
@@ -168,7 +171,7 @@ async fn finish_physical_write(
                             if used_fallback {
                                 datatab_ui_base::toast::Toast::warning(datatab_i18n::t!(
                                     "document.code.file_ops.native_picker_fallback",
-                                    path = path.display().to_string()
+                                    path = super::display_path::display_path(&path)
                                 ))
                                 .meta_right(datatab_ui_base::toast::now_hms())
                                 .push(cx);
@@ -240,7 +243,7 @@ async fn finish_physical_write(
                             ErrorKind::Storage,
                             datatab_i18n::t!(
                                 refusal_error_key(write.kind),
-                                path = write.path.display().to_string()
+                                path = super::display_path::display_path(&write.path)
                             ),
                         )
                         .with_cause(format!("{e}")),
@@ -626,7 +629,7 @@ impl CodeDocument {
                             ErrorKind::Storage,
                             datatab_i18n::t!(
                                 "document.code.file_ops.error.auto_save_failed",
-                                path = target.display().to_string()
+                                path = super::display_path::display_path(&target)
                             ),
                         )
                         .with_cause(format!("{e}")),

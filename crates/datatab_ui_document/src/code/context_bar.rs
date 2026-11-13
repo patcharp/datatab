@@ -14,8 +14,15 @@ use datatab_ui_base::user_error::{ErrorKind, UserFacingError, report_error};
 /// `path` with a leading `home` directory written as `~`, the way the board
 /// shows a script location (`~/.local/share/datatab/scripts/Query 7.sql`).
 fn home_relative_path(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
-    let Some(relative) = home.and_then(|home| path.strip_prefix(home).ok()) else {
-        return path.display().to_string();
+    let verbatim = path.to_string_lossy().starts_with(r"\\?\");
+    let display = super::display_path::display_path(path);
+    let display_path = if verbatim {
+        std::path::Path::new(&display)
+    } else {
+        path
+    };
+    let Some(relative) = home.and_then(|home| display_path.strip_prefix(home).ok()) else {
+        return display;
     };
 
     if relative.as_os_str().is_empty() {
@@ -2074,6 +2081,21 @@ mod tests {
         assert_eq!(
             home_relative_path(&script, None),
             script.display().to_string()
+        );
+    }
+
+    #[test]
+    fn script_path_hides_windows_verbatim_prefix() {
+        assert_eq!(
+            home_relative_path(std::path::Path::new(r"\\?\C:\Users\ana\Query 1.sql"), None),
+            r"C:\Users\ana\Query 1.sql"
+        );
+        assert_eq!(
+            home_relative_path(
+                std::path::Path::new(r"\\?\UNC\server\share\Query.sql"),
+                None
+            ),
+            r"\\server\share\Query.sql"
         );
     }
     use datatab_core::{ExecutionSourceContext, QueryLanguage};

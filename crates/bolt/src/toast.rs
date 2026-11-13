@@ -147,6 +147,9 @@ pub enum ToastKind {
     Info,
     Warning,
     Error,
+    /// Drawn like an Error, but it never closes on its own: the user reads it
+    /// and dismisses it.
+    Fatal,
 }
 
 impl ToastKind {
@@ -156,7 +159,7 @@ impl ToastKind {
             Self::Success => &icons.success,
             Self::Info => &icons.info,
             Self::Warning => &icons.warning,
-            Self::Error => &icons.error,
+            Self::Error | Self::Fatal => &icons.error,
         };
         if has_progress {
             icons.loader.clone()
@@ -174,7 +177,7 @@ impl ToastKind {
             Self::Success => banners.success_fg,
             Self::Info => banners.info_fg,
             Self::Warning => banners.warning_fg,
-            Self::Error => banners.error_fg,
+            Self::Error | Self::Fatal => banners.error_fg,
         }
     }
 }
@@ -191,6 +194,9 @@ pub struct ToastAction {
     pub callback: Option<ToastActionCallback>,
     /// Close the toast after the callback runs.
     pub dismisses: bool,
+    /// The toast stays until it is resolved while this action is on it.
+    /// Cleared by [`Self::lets_toast_close`].
+    pub holds_toast_open: bool,
     /// Key chord that runs the same action, in the syntax `KeyBinding` and
     /// `Keystroke::parse` take (`ctrl-z`), shown as a keycap next to the
     /// label. Set it through [`Self::key_hint`].
@@ -205,6 +211,7 @@ impl ToastAction {
             primary: false,
             callback: None,
             dismisses: false,
+            holds_toast_open: true,
             key_hint: None,
         }
     }
@@ -226,6 +233,15 @@ impl ToastAction {
     /// the toast was about (for example "Skip").
     pub fn dismisses(mut self) -> Self {
         self.dismisses = true;
+        self
+    }
+
+    /// Marks an action that only leads somewhere else (copy the text, open
+    /// the audit), so it does not keep the toast from closing on its own. A
+    /// toast whose actions are all like this still closes on its timer; any
+    /// other action holds it open until the user resolves it.
+    pub fn lets_toast_close(mut self) -> Self {
+        self.holds_toast_open = false;
         self
     }
 
@@ -269,8 +285,10 @@ pub const VISIBLE_TOAST_LIMIT: usize = 4;
 /// How long a toast stays before the stack closes it on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToastAutoDismiss {
-    /// Success and Info toasts close after this long, and Warning toasts
-    /// after twice it. A toast with actions or progress stays.
+    /// Success and Info toasts close after this long, and Warning and Error
+    /// toasts after twice it. A Fatal toast stays, and so does a toast with
+    /// progress or with an action that holds it open (see
+    /// [`ToastAction::lets_toast_close`]).
     After(Duration),
     /// Every toast stays until the user dismisses it.
     Never,
@@ -298,7 +316,7 @@ impl Default for ToastAutoDismiss {
 /// Toast model + fluent builder.
 ///
 /// Constructed via [`Toast::success`] / [`Toast::info`] / [`Toast::warning`] /
-/// [`Toast::error`]. The fluent setters consume `self`; [`Toast::push`]
+/// [`Toast::error`] / [`Toast::fatal`]. The fluent setters consume `self`; [`Toast::push`]
 /// resolves [`ToastGlobal`] and forwards the toast to the [`ToastHost`].
 pub struct Toast {
     kind: ToastKind,
@@ -318,7 +336,7 @@ impl Toast {
     fn with_kind(kind: ToastKind, title: impl Into<SharedString>) -> Self {
         // Errors collapse details by default — they typically carry a code
         // block and a long body that would otherwise dominate the stack.
-        let details_collapsible = matches!(kind, ToastKind::Error);
+        let details_collapsible = matches!(kind, ToastKind::Error | ToastKind::Fatal);
         Self {
             kind,
             title: title.into(),
@@ -348,6 +366,10 @@ impl Toast {
 
     pub fn error(title: impl Into<SharedString>) -> Self {
         Self::with_kind(ToastKind::Error, title)
+    }
+
+    pub fn fatal(title: impl Into<SharedString>) -> Self {
+        Self::with_kind(ToastKind::Fatal, title)
     }
 
     pub fn subtitle(mut self, value: impl Into<SharedString>) -> Self {
@@ -414,14 +436,17 @@ impl Toast {
         };
 
         // A toast with a follow-up to settle stays until it is resolved.
-        let settles_on_its_own = self.progress.is_none() && self.actions.is_empty();
+        let settles_on_its_own =
+            self.progress.is_none() && !self.actions.iter().any(|action| action.holds_toast_open);
 
         match self.kind {
             ToastKind::Success if settles_on_its_own => Some(base),
             ToastKind::Info if settles_on_its_own => Some(base),
-            // A warning reports something worth reading but needs no reply,
-            // so it outlives Success and Info.
-            ToastKind::Warning if settles_on_its_own => Some(base * 2),
+            // A warning or an error reports something worth reading but needs
+            // no reply, so it outlives Success and Info. An error stays
+            // reachable after it closes: the status bar badge and the audit
+            // row keep it.
+            ToastKind::Warning | ToastKind::Error if settles_on_its_own => Some(base * 2),
             _ => None,
         }
     }
@@ -451,6 +476,9 @@ struct StoredToast {
     progress: Option<f32>,
     actions: Vec<ToastAction>,
     details_collapsible: bool,
+    /// How many times this toast has been raised while it was on screen: 1
+    /// for a toast shown once. A repeat of an error merges into the toast.
+    occurrences: u32,
     /// Auto-dismiss delay this toast was stored with; `None` keeps it until
     /// the user dismisses it.
     delay: Option<Duration>,
@@ -465,6 +493,18 @@ struct StoredToast {
 }
 
 impl StoredToast {
+    /// Whether `toast` raises the same error again: the same kind, title and
+    /// message. The details carry what differs per occurrence (the correlation
+    /// id), so they are not compared.
+    fn repeats(&self, toast: &Toast) -> bool {
+        matches!(toast.kind, ToastKind::Error | ToastKind::Fatal)
+            && self.kind == toast.kind
+            && self.title == toast.title
+            && self.subtitle == toast.subtitle
+            && self.body == toast.body
+            && self.code_block == toast.code_block
+    }
+
     fn has_collapsible_content(&self) -> bool {
         self.body.is_some() || self.details.is_some() || self.code_block.is_some()
     }
@@ -509,6 +549,25 @@ impl ToastHost {
     }
 
     pub fn push_rich(&mut self, toast: Toast, cx: &mut Context<Self>) {
+        let delay = toast.effective_auto_dismiss(self.auto_dismiss);
+
+        // An error repeated while its toast is still on screen merges into it,
+        // so a burst of the same failure cannot fill the corner. Errors skip
+        // the throttle below on purpose, and the merge is what bounds them.
+        if let Some(existing) = self.toasts.iter_mut().rev().find(|t| t.repeats(&toast)) {
+            existing.occurrences = existing.occurrences.saturating_add(1);
+            // The newest occurrence's time, correlation id and actions, so
+            // "View in Audit" opens the row of the error just raised.
+            existing.meta_right = toast.meta_right;
+            existing.details = toast.details;
+            existing.actions = toast.actions;
+            existing.delay = delay;
+            let id = existing.id;
+            self.restart_timer(id, cx);
+            cx.notify();
+            return;
+        }
+
         if matches!(toast.kind, ToastKind::Warning | ToastKind::Info)
             && !self.warn_info_bucket.try_consume()
         {
@@ -527,8 +586,6 @@ impl ToastHost {
         // past the visible limit for the rest of the session.
         self.stack_expanded = false;
 
-        let delay = toast.effective_auto_dismiss(self.auto_dismiss);
-
         // Initially-collapsed when the toast opts in AND there's something to hide.
         let stored = StoredToast {
             id,
@@ -542,6 +599,7 @@ impl ToastHost {
             progress: toast.progress,
             actions: toast.actions,
             details_collapsible: toast.details_collapsible,
+            occurrences: 1,
             delay,
             paused_remaining: None,
             timer_armed_at: None,
@@ -688,6 +746,28 @@ impl ToastHost {
         .detach();
     }
 
+    /// Starts the timer of toast `id` over with its stored delay, after a
+    /// repeat merged into it. A toast the pointer holds keeps waiting: it
+    /// restarts with the full delay once the pointer leaves.
+    fn restart_timer(&mut self, id: u64, cx: &mut Context<Self>) {
+        let Some(toast) = self.toasts.iter_mut().find(|toast| toast.id == id) else {
+            return;
+        };
+
+        match toast.delay {
+            None => {
+                // Cancels a timer armed under an earlier policy.
+                toast.timer_generation = toast.timer_generation.wrapping_add(1);
+                toast.timer_armed_at = None;
+                toast.paused_remaining = None;
+            }
+            Some(delay) if toast.paused_remaining.is_some() => {
+                toast.paused_remaining = Some(delay);
+            }
+            Some(delay) => self.arm_timer(id, delay, cx),
+        }
+    }
+
     /// Closes toast `id` when `generation` is still the armed timer, which it
     /// is not after the timer was replaced or paused.
     fn fire_timer(&mut self, id: u64, generation: u64, cx: &mut Context<Self>) {
@@ -750,6 +830,12 @@ impl ToastHost {
     /// Returns the title of the most-recently-pushed toast, if any. For use in tests only.
     pub fn last_toast_title(&self) -> Option<String> {
         self.toasts.last().map(|t| t.title.to_string())
+    }
+
+    /// Returns how many times the most-recently-pushed toast was raised while
+    /// on screen, if any. For use in tests only.
+    pub fn last_toast_occurrences(&self) -> Option<u32> {
+        self.toasts.last().map(|t| t.occurrences)
     }
 
     /// Returns the `ToastKind` of the most-recently-pushed toast, if any. For use in tests only.
@@ -830,10 +916,33 @@ impl ToastHost {
             .gap(Feedback::TOAST_TITLE_LINE_GAP)
             .child(
                 gpui::div()
-                    .text_size(FontSizes::BASE)
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(strong)
-                    .child(toast.title.clone()),
+                    .flex()
+                    .flex_row()
+                    .items_baseline()
+                    .gap(Spacing::SM)
+                    .child(
+                        gpui::div()
+                            .min_w_0()
+                            .text_size(FontSizes::BASE)
+                            .font_weight(FontWeight::BOLD)
+                            .text_color(strong)
+                            .child(toast.title.clone()),
+                    )
+                    .when(toast.occurrences > 1, |el| {
+                        el.child(
+                            gpui::div()
+                                .id(("toast-repeat-count", toast_id))
+                                .flex_shrink_0()
+                                .font_family(fonts::editor_family(cx))
+                                .text_size(Feedback::TOAST_META_FONT)
+                                .text_color(accent)
+                                .child(strings::text_with(
+                                    cx,
+                                    "toast.repeat_count",
+                                    &[("count", &toast.occurrences.to_string())],
+                                )),
+                        )
+                    }),
             )
             .when_some(toast.subtitle.clone(), |el, subtitle| {
                 el.child(
@@ -1320,8 +1429,8 @@ mod auto_dismiss_tests {
     }
 
     /// The stored delay follows the kind, the content and the policy: a
-    /// Warning outlives a Success, an action or an Error keeps the toast, and
-    /// the policy can turn auto-dismiss off entirely.
+    /// Warning or an Error outlives a Success, an action that holds the toast
+    /// open keeps it, and the policy can turn auto-dismiss off entirely.
     #[gpui::test]
     fn delays_follow_kind_content_and_policy(cx: &mut TestAppContext) {
         let host = new_host(cx);
@@ -1351,7 +1460,11 @@ mod auto_dismiss_tests {
                 host.toasts[2].delay, None,
                 "a warning with an action stays until it is resolved"
             );
-            assert_eq!(host.toasts[3].delay, None, "an error stays");
+            assert_eq!(
+                host.toasts[3].delay,
+                Some(Duration::from_secs(16)),
+                "an error gets twice the base delay"
+            );
             assert_eq!(
                 host.toasts[4].delay, None,
                 "a success with an action stays until it is resolved"
@@ -1392,15 +1505,182 @@ mod auto_dismiss_tests {
     }
 
     #[gpui::test]
-    fn an_error_toast_stays_until_dismissed(cx: &mut TestAppContext) {
+    fn an_error_toast_closes_after_twice_the_delay(cx: &mut TestAppContext) {
         let host = new_host(cx);
         host.update(cx, |host, cx| host.push_rich(Toast::error("boom"), cx));
+
+        tick(cx, Duration::from_secs(15));
+        assert_eq!(shown(&host, cx), 1, "an error outlives a warning's delay");
+
+        tick(cx, Duration::from_secs(2));
+        assert_eq!(shown(&host, cx), 0, "closed once its longer delay passes");
+    }
+
+    #[gpui::test]
+    fn hovering_holds_an_error_toast_and_leaving_restarts_its_timer(cx: &mut TestAppContext) {
+        let host = new_host(cx);
+        host.update(cx, |host, cx| host.push_rich(Toast::error("boom"), cx));
+
+        // The held time is measured on the real clock, which the test clock
+        // does not move, so the toast resumes with its full 16 s.
+        host.update(cx, |host, cx| host.pause_timer(1, cx));
+        tick(cx, Duration::from_secs(600));
+        assert_eq!(shown(&host, cx), 1, "a held error does not close");
+
+        host.update(cx, |host, cx| host.resume_timer(1, cx));
+        tick(cx, Duration::from_secs(15));
+        assert_eq!(shown(&host, cx), 1, "leaving restarts the timer");
+
+        tick(cx, Duration::from_secs(2));
+        assert_eq!(shown(&host, cx), 0);
+    }
+
+    /// An action that only leads elsewhere (like "View in Audit") does not
+    /// keep an error open; any other action does.
+    #[gpui::test]
+    fn only_an_action_that_holds_the_toast_open_keeps_an_error(cx: &mut TestAppContext) {
+        let host = new_host(cx);
+        host.update(cx, |host, cx| {
+            host.push_rich(
+                Toast::error("passive")
+                    .action(ToastAction::new("audit", "View in Audit").lets_toast_close()),
+                cx,
+            );
+            host.push_rich(
+                Toast::error("answer")
+                    .action(ToastAction::new("audit", "View in Audit").lets_toast_close())
+                    .action(ToastAction::new("retry", "Retry")),
+                cx,
+            );
+        });
+
+        tick(cx, Duration::from_secs(17));
+        assert_eq!(shown(&host, cx), 1);
+        assert_eq!(
+            host.read_with(cx, |host, _| host.last_toast_title()),
+            Some("answer".to_string()),
+            "the toast with another action stays"
+        );
+    }
+
+    #[gpui::test]
+    fn a_fatal_toast_stays_until_dismissed(cx: &mut TestAppContext) {
+        let host = new_host(cx);
+        host.update(cx, |host, cx| host.push_rich(Toast::fatal("down"), cx));
 
         tick(cx, Duration::from_secs(600));
         assert_eq!(shown(&host, cx), 1);
 
         host.update(cx, |host, cx| host.dismiss(1, cx));
         assert_eq!(shown(&host, cx), 0);
+    }
+
+    #[gpui::test]
+    fn the_never_setting_keeps_an_error_toast(cx: &mut TestAppContext) {
+        let host = new_host(cx);
+        host.update(cx, |host, _| host.set_auto_dismiss(ToastAutoDismiss::Never));
+        host.update(cx, |host, cx| host.push_rich(Toast::error("boom"), cx));
+
+        tick(cx, Duration::from_secs(600));
+        assert_eq!(shown(&host, cx), 1);
+    }
+
+    /// A repeat of an error on screen adds to its count and restarts its
+    /// timer instead of opening a second toast.
+    #[gpui::test]
+    fn a_repeated_error_merges_into_one_toast_and_restarts_its_timer(cx: &mut TestAppContext) {
+        let host = new_host(cx);
+        let raise = |host: &mut ToastHost, cx: &mut gpui::Context<ToastHost>| {
+            host.push_rich(Toast::error("boom").body("connection lost"), cx)
+        };
+
+        host.update(cx, |host, cx| raise(host, cx));
+        tick(cx, Duration::from_secs(10));
+        host.update(cx, |host, cx| raise(host, cx));
+        host.update(cx, |host, cx| raise(host, cx));
+
+        assert_eq!(shown(&host, cx), 1, "the repeats opened no toast");
+        assert_eq!(
+            host.read_with(cx, |host, _| host.last_toast_occurrences()),
+            Some(3)
+        );
+
+        tick(cx, Duration::from_secs(10));
+        assert_eq!(
+            shown(&host, cx),
+            1,
+            "the first timer would have closed it at 16 s; the repeat restarted it"
+        );
+
+        tick(cx, Duration::from_secs(7));
+        assert_eq!(shown(&host, cx), 0, "closed 16 s after the last repeat");
+    }
+
+    /// The newest occurrence's details and actions replace the older ones, so
+    /// "View in Audit" opens the row of the error just raised.
+    #[gpui::test]
+    fn a_merged_repeat_carries_the_newest_details_and_actions(cx: &mut TestAppContext) {
+        let host = new_host(cx);
+        host.update(cx, |host, cx| {
+            host.push_rich(
+                Toast::error("boom")
+                    .details("id 1")
+                    .action(ToastAction::new("first", "First")),
+                cx,
+            );
+            host.push_rich(
+                Toast::error("boom")
+                    .details("id 2")
+                    .action(ToastAction::new("second", "Second")),
+                cx,
+            );
+        });
+
+        host.read_with(cx, |host, _| {
+            assert_eq!(host.toasts.len(), 1);
+            assert_eq!(host.toasts[0].details.as_deref(), Some("id 2"));
+            assert_eq!(host.toasts[0].actions.len(), 1);
+            assert_eq!(host.toasts[0].actions[0].id, "second");
+        });
+    }
+
+    /// A repeat while the pointer holds the toast does not start a timer
+    /// under the pointer: the toast waits, then runs the full delay.
+    #[gpui::test]
+    fn a_repeat_of_a_held_error_waits_for_the_pointer_to_leave(cx: &mut TestAppContext) {
+        let host = new_host(cx);
+        host.update(cx, |host, cx| host.push_rich(Toast::error("boom"), cx));
+        tick(cx, Duration::from_secs(10));
+        host.update(cx, |host, cx| host.pause_timer(1, cx));
+
+        host.update(cx, |host, cx| host.push_rich(Toast::error("boom"), cx));
+        tick(cx, Duration::from_secs(600));
+        assert_eq!(shown(&host, cx), 1, "still held");
+
+        host.update(cx, |host, cx| host.resume_timer(1, cx));
+        tick(cx, Duration::from_secs(15));
+        assert_eq!(shown(&host, cx), 1, "the repeat restored the full delay");
+
+        tick(cx, Duration::from_secs(2));
+        assert_eq!(shown(&host, cx), 0);
+    }
+
+    #[gpui::test]
+    fn a_different_message_or_kind_opens_its_own_toast(cx: &mut TestAppContext) {
+        let host = new_host(cx);
+        host.update(cx, |host, cx| {
+            host.push_rich(Toast::error("boom").body("connection lost"), cx);
+            host.push_rich(Toast::error("boom").body("timed out"), cx);
+            host.push_rich(Toast::error("other").body("connection lost"), cx);
+            host.push_rich(Toast::fatal("boom").body("connection lost"), cx);
+        });
+        assert_eq!(shown(&host, cx), 4);
+
+        host.update(cx, |host, cx| {
+            host.push_rich(Toast::warning("careful"), cx);
+            host.push_rich(Toast::warning("careful"), cx);
+        });
+        assert_eq!(shown(&host, cx), 6, "only errors merge");
     }
 
     #[gpui::test]

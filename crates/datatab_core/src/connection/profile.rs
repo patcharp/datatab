@@ -95,8 +95,9 @@ pub fn ssl_mode_id_is_cert_active(id: &str) -> bool {
 ///
 /// On load, legacy enum variant names are normalised to the canonical Postgres id strings
 /// so that subsequent saves write the new format.
-/// Serde helper for the legacy Redis `tls` field. Used as `skip_serializing_if` so new
-/// saves never include `tls: false` in the output.
+/// Serde helper for flags that are off by default: the legacy Redis `tls` field and the
+/// ClickHouse insecure-HTTP opt-in. Used as `skip_serializing_if` so new saves never
+/// include them as `false`.
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -614,6 +615,10 @@ pub enum DbConfig {
         database: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         request_timeout_seconds: Option<u64>,
+        /// Lets the driver send a non-empty password over a non-loopback
+        /// `http://` endpoint. Off by default: HTTP Basic auth is clear text.
+        #[serde(default, skip_serializing_if = "is_false")]
+        allow_insecure_http_password: bool,
     },
     /// Remote Turso endpoint; its auth token is only stored in the canonical keyring slot.
     Turso { url: String },
@@ -871,6 +876,7 @@ impl DbConfig {
             user: "default".to_string(),
             database: "default".to_string(),
             request_timeout_seconds: None,
+            allow_insecure_http_password: false,
         }
     }
 
@@ -1382,12 +1388,14 @@ impl DbConfig {
                 url,
                 user,
                 request_timeout_seconds,
+                allow_insecure_http_password,
                 ..
             } => Ok(DbConfig::ClickHouse {
                 url,
                 user,
                 database: database.to_string(),
                 request_timeout_seconds,
+                allow_insecure_http_password,
             }),
             _ => Err("Changing database is not supported for this database type".to_string()),
         }
@@ -2003,6 +2011,7 @@ mod tests {
             user,
             database,
             request_timeout_seconds,
+            allow_insecure_http_password,
         } = &config
         else {
             panic!("expected DbConfig::ClickHouse");
@@ -2012,6 +2021,7 @@ mod tests {
         assert_eq!(user, "default");
         assert_eq!(database, "default");
         assert_eq!(*request_timeout_seconds, None);
+        assert!(!allow_insecure_http_password);
         assert_eq!(config.kind(), DbKind::ClickHouse);
         assert!(!config.has_ssh_tunnel());
         assert_eq!(config.host_port(), None);
@@ -2326,6 +2336,58 @@ mod tests {
     }
 
     #[test]
+    fn clickhouse_profile_without_insecure_http_flag_loads_as_off() {
+        let json = r#"{
+            "id": "00000000-0000-0000-0000-000000000182",
+            "name": "saved-before-flag",
+            "config": {
+                "ClickHouse": {
+                    "url": "http://clickhouse.example.com:8123",
+                    "user": "analytics",
+                    "database": "events"
+                }
+            }
+        }"#;
+
+        let profile: ConnectionProfile =
+            serde_json::from_str(json).expect("clickhouse profile should deserialize");
+
+        assert!(matches!(
+            profile.config,
+            DbConfig::ClickHouse {
+                allow_insecure_http_password: false,
+                ..
+            }
+        ));
+        let serialized = serde_json::to_string(&profile.config).expect("serialize");
+        assert!(!serialized.contains("allow_insecure_http_password"));
+    }
+
+    #[test]
+    fn clickhouse_insecure_http_flag_survives_serde_and_database_change() {
+        let config = DbConfig::ClickHouse {
+            url: "http://clickhouse.example.com:8123".to_string(),
+            user: "analytics".to_string(),
+            database: "events".to_string(),
+            request_timeout_seconds: None,
+            allow_insecure_http_password: true,
+        };
+
+        let json = serde_json::to_string(&config).expect("serialize");
+        let restored: DbConfig = serde_json::from_str(&json).expect("deserialize");
+        let switched = restored.with_database("logs").expect("change database");
+
+        assert!(matches!(
+            switched,
+            DbConfig::ClickHouse {
+                ref database,
+                allow_insecure_http_password: true,
+                ..
+            } if database == "logs"
+        ));
+    }
+
+    #[test]
     fn dynamodb_profile_serde_roundtrip_preserves_optional_fields() {
         let profile = ConnectionProfile::new(
             "dynamo",
@@ -2571,6 +2633,7 @@ mod tests {
             user: "default".to_string(),
             database: "default".to_string(),
             request_timeout_seconds: None,
+            allow_insecure_http_password: false,
         };
 
         let extracted = config.strip_uri_password();

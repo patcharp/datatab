@@ -13,17 +13,33 @@
 # Runner facts, checked against the current GitHub documentation:
 #   https://docs.github.com/en/actions/reference/runners/github-hosted-runners
 #   https://github.com/actions/runner-images
-# - ubuntu-24.04: 4 cores, 16 GB RAM. Docker is installed; mold is not.
+# - ubuntu-24.04: 4 cores, 16 GB RAM, 14 GB SSD. Docker is installed; mold is
+#   not. The image carries .NET, Android and GHC toolchains this build never
+#   uses.
 # - windows-2025: 4 cores, 16 GB RAM. Inno Setup 6 is installed.
-# - macos-26-intel: 4 cores, 14 GB RAM, x86_64.
-# - macos-26: 3 cores (M1), 7 GB RAM, arm64.
-# - The macOS images ship Xcode 26. Its Metal toolchain is preinstalled, but
-#   it has been missing on some runs, so the macOS job checks it first.
-# A full release build peaked at about 8 GB of RAM with 2 build jobs, so JOBS
-# is 2 on the 14 and 16 GB runners and 1 on the 7 GB runner.
+# - macos-26: 3 cores (M1), 7 GB RAM, arm64. It ships Xcode 26, whose macOS
+#   SDK builds for both arm64 and x86_64. Its Metal toolchain is preinstalled,
+#   but it has been missing on some runs, so the macOS job checks it first.
+# - The Intel macOS runner is much slower, so both macOS apps are built on
+#   macos-26: the x86_64 app by cross-compiling. Apple: "You can build a
+#   universal binary on either an Apple silicon or Intel-based Mac computer."
+#   https://developer.apple.com/documentation/apple-silicon/building-a-universal-macos-binary
 #
-# No cargo cache: releases are rare, and a release binary is always built from
-# a clean state, so a restored cache can never change what ships.
+# Build jobs and memory:
+# - Linux and Windows build with all 4 cores (JOBS=4) and keep the release
+#   profile from Cargo.toml (thin LTO). Linux first frees disk space and adds a
+#   12 GB swap file, so a memory peak spills to swap instead of killing the
+#   runner.
+# - macOS turns LTO off. With thin LTO the final crate is one rustc process
+#   that needs about 9 GB, more than the 7 GB runner has. Without LTO the
+#   peak is the parallel compile of the large crates, so JOBS is 3, one per
+#   core. macOS adds swap on its own, but a build at the memory limit can
+#   still be killed or swap until it times out. If that happens, use JOBS=2.
+#
+# No cargo cache. A release runs on a tag, and a cache saved on a tag can be
+# read only by later runs on that same tag, not by the next release. A cache
+# would need regular builds on the default branch to write it, and this
+# repository has none. A release binary is therefore always built cold.
 
 name: Release
 
@@ -51,7 +67,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     env:
-      JOBS: "2"
+      JOBS: "4"
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -67,6 +83,20 @@ jobs:
             libxkbcommon-x11-dev libpipewire-0.3-dev libgbm-dev libegl-dev \
             libxcb-randr0-dev libclang-dev libfontconfig1-dev libvulkan-dev \
             binutils gettext-base
+
+      - name: Make room for the release build
+        # Remove toolchains this job never uses, so the swap file and the build
+        # fit on the 14 GB disk. Then replace the image's swap with 12 GB.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo swapoff -a
+          sudo rm -f /swapfile /mnt/swapfile
+          sudo fallocate -l 12G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          free -h
+          df -h /
 
       - name: Install the pinned Rust toolchain
         run: |
@@ -90,7 +120,7 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 240
     env:
-      JOBS: "2"
+      JOBS: "4"
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -134,21 +164,25 @@ jobs:
 
   macos:
     name: macOS ${{ matrix.arch }} (.app)
-    runs-on: ${{ matrix.runner }}
+    # Both apps build on the Apple Silicon runner; see the header.
+    runs-on: macos-26
     timeout-minutes: 340
     strategy:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-26-intel
-            arch: x86_64
-            jobs: "2"
-          - runner: macos-26
-            arch: arm64
-            jobs: "1"
+          - arch: x86_64
+            target: x86_64-apple-darwin
+          - arch: arm64
+            target: aarch64-apple-darwin
     env:
       ARCH: ${{ matrix.arch }}
-      JOBS: ${{ matrix.jobs }}
+      TARGET: ${{ matrix.target }}
+      JOBS: "3"
+      # macOS only: thin LTO does not fit in the runner's 7 GB. Linux and
+      # Windows keep the release profile from Cargo.toml.
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -159,8 +193,8 @@ jobs:
       - name: Check the runner architecture
         run: |
           machine=$(uname -m)
-          if [ "$machine" != "$ARCH" ]; then
-            echo "expected a $ARCH runner, got $machine" >&2
+          if [ "$machine" != arm64 ]; then
+            echo "expected an arm64 (Apple Silicon) runner, got $machine" >&2
             exit 1
           fi
 
@@ -173,16 +207,25 @@ jobs:
             xcrun -sdk macosx metal --version
           fi
 
-      - name: Install the pinned Rust toolchain
+      - name: Install the pinned Rust toolchain and the target
+        # Run in the checkout, so the target is added to the toolchain that
+        # rust-toolchain.toml pins. For arm64 it is already there.
         run: |
           rustup toolchain install
+          rustup target add "$TARGET"
           rustc --version
 
       - name: Build DataTab.app
-        run: sh scripts/build-macos.sh
+        run: sh scripts/build-macos.sh "$TARGET"
 
       - name: Zip the app
         run: |
+          binary_arch=$(lipo -archs target/macos-package/DataTab.app/Contents/MacOS/datatab)
+          if [ "$binary_arch" != "$ARCH" ]; then
+            echo "the app binary is built for '$binary_arch', expected '$ARCH'" >&2
+            exit 1
+          fi
+          file target/macos-package/DataTab.app/Contents/MacOS/datatab
           mkdir -p dist
           ditto -c -k --keepParent target/macos-package/DataTab.app "dist/datatab-macos-$ARCH.zip"
 

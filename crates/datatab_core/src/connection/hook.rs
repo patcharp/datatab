@@ -2165,6 +2165,7 @@ mod tests {
                 user: "alice".to_string(),
                 database: "default".to_string(),
                 request_timeout_seconds: None,
+                allow_insecure_http_password: false,
             },
         );
 

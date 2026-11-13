@@ -21,10 +21,16 @@ the endpoint is a URL and not a host/port pair.
 | Request timeout | `30` seconds | Must be greater than zero |
 | User | `default` | |
 | Password | — | Held in the OS keyring and sent as HTTP Basic auth |
+| Allow password over unencrypted HTTP | Off | Lets a password go to a non-loopback `http://` server |
 
 ## Features
 
 - Blocking HTTP(S) transport built on rustls, authenticating with HTTP Basic.
+- A password is sent only over `https://` or to a loopback server. For a
+  server that has only plain HTTP, the connection's **Allow password over
+  unencrypted HTTP** checkbox lets the driver send it over `http://`. The box is
+  off by default. When it is on and used, the driver logs one warning per
+  connect, with no host, user or secret in it.
 - Native console (`NATIVE_CONSOLE`): tables dock a console, and a database's sidebar menu opens one in its own tab, that runs one SQL line at a time through `Connection::execute` with the editor's validation, dangerous-query confirmation, audit rows and query history. The driver enforces `QueryRequest::limit` (`REQUEST_ROW_LIMIT`), so console commands carry the editor row limit.
 - Arbitrary single-statement SQL, with responses forced to `JSONCompact` so column
   names and types arrive alongside the rows.
@@ -75,6 +81,9 @@ arrives fully structured rather than as raw text:
 ## Limitations
 
 - No SSH tunnels.
+- With **Allow password over unencrypted HTTP** on, the password crosses the
+  network in clear text, Base64-encoded in the HTTP Basic header. Anyone on the
+  path can read it. Use it only on a network you trust, and prefer `https://`.
 - No transactions, prepared statements, or query cancellation. Statement
   timeouts, and row limits on instance metric or inspector queries, are refused
   before dispatch. An error the server reports after the row-limit cut is

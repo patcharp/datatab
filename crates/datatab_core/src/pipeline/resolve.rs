@@ -219,6 +219,7 @@ fn patch_config_field(config: &mut DbConfig, field: &str, value: &ResolvedValue)
             user,
             database,
             request_timeout_seconds,
+            allow_insecure_http_password,
         } => match field {
             "url" => *url = val.to_string(),
             "user" => *user = val.to_string(),
@@ -228,6 +229,7 @@ fn patch_config_field(config: &mut DbConfig, field: &str, value: &ResolvedValue)
                     *request_timeout_seconds = Some(timeout);
                 }
             }
+            "allow_insecure_http_password" => *allow_insecure_http_password = val == "true",
             _ => {}
         },
 
@@ -428,6 +430,10 @@ mod tests {
             ValueRef::literal("45"),
         );
         refs.insert(
+            "allow_insecure_http_password".to_string(),
+            ValueRef::literal("true"),
+        );
+        refs.insert(
             "password".to_string(),
             ValueRef::secret("stub", "clickhouse-pass", None),
         );
@@ -446,6 +452,7 @@ mod tests {
             user,
             database,
             request_timeout_seconds,
+            allow_insecure_http_password,
         } = patched.config
         else {
             panic!("expected ClickHouse");
@@ -454,6 +461,7 @@ mod tests {
         assert_eq!(user, "analytics");
         assert_eq!(database, "events");
         assert_eq!(request_timeout_seconds, Some(45));
+        assert!(allow_insecure_http_password);
         assert_eq!(
             password.unwrap().expose_secret(),
             "resolved-clickhouse-pass"

@@ -836,6 +836,7 @@ mod tests {
             None,
             "default".to_string(),
             Duration::from_secs(5),
+            false,
         )
         .expect("loopback endpoint");
         ClickHouseConnection::new(client, "default".to_string())
