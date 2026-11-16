@@ -16,9 +16,7 @@ use datatab_components::tokens::{FontSizes, Spacing};
 use datatab_core::LogErr;
 use datatab_core::access::AccessKind;
 use datatab_core::secrecy::SecretString;
-use datatab_portability::{
-    AuthExportMode, AwsRef, EncryptionChoice, ExportOptions, IncludeExclude,
-};
+use datatab_portability::{AuthExportMode, EncryptionChoice, ExportOptions, IncludeExclude};
 use datatab_ui_base::{AppStateEntity, SaveTargetOutcome};
 use gpui::prelude::*;
 use gpui::*;
@@ -84,12 +82,10 @@ const AUTH_MODE_REQUIRED: &str = "required";
 const AUTH_MODE_EXCLUDE: &str = "exclude";
 
 /// A read-only description of one auth profile referenced by the exported
-/// connection. `locked` marks AWS reflected profiles, which travel only as a
-/// mappable reference and therefore expose a disabled control.
+/// connection.
 struct AuthProfileRow {
     id: Uuid,
     name: String,
-    locked: bool,
 }
 
 /// A short, read-only summary of everything that will travel in the bundle.
@@ -140,13 +136,10 @@ pub struct ExportBundleModal {
     embed_ssh_keys: bool,
     /// Per auth-profile export mode. Absent = default (`IncludeValues`).
     auth_modes: HashMap<Uuid, AuthExportMode>,
-    /// The single auth profile (if any) the exported connection references,
-    /// together with whether it is locked (AWS reflected). The export is scoped
-    /// to one connection, which references at most one auth profile.
+    /// The connection's referenced auth profile, or the standalone auth target.
     auth_profile: Option<AuthProfileRow>,
     /// Dropdown for the single referenced auth profile's export mode. Absent when
-    /// the connection has no auth profile, or when it is AWS-locked (a muted
-    /// label is shown instead).
+    /// the connection has no auth profile.
     auth_dropdown: Option<Entity<Dropdown>>,
     auth_dropdown_sub: Option<Subscription>,
 
@@ -267,8 +260,7 @@ impl ExportBundleModal {
     ///
     /// Resets all run state to defaults, computes the read-only summary of the
     /// target (and, for a connection, its referenced profiles), and seeds the
-    /// per-secret defaults appropriate for the target kind. AWS reflected auth
-    /// profiles are locked to a reference.
+    /// per-secret defaults appropriate for the target kind.
     pub fn open_target(
         &mut self,
         target: ExportTarget,
@@ -301,8 +293,7 @@ impl ExportBundleModal {
         self.validation_error = None;
 
         // The connection references at most one auth profile; a standalone auth
-        // target is itself the single profile. Seed the default export mode (AWS
-        // reflected = locked reference; everything else = include values).
+        // target is itself the single profile. Default to including values.
         self.auth_profile = self
             .summary
             .as_ref()
@@ -310,20 +301,15 @@ impl ExportBundleModal {
             .map(|row| AuthProfileRow {
                 id: row.id,
                 name: row.name.clone(),
-                locked: row.locked,
             });
 
         self.auth_modes.clear();
         if let Some(auth) = self.auth_profile.as_ref() {
-            let mode = if auth.locked {
-                AuthExportMode::MappableReference
-            } else {
-                AuthExportMode::IncludeValues
-            };
-            self.auth_modes.insert(auth.id, mode);
+            self.auth_modes
+                .insert(auth.id, AuthExportMode::IncludeValues);
         }
 
-        self.build_auth_dropdown(window, cx);
+        self.build_auth_dropdown(cx);
 
         self.passphrase_input
             .update(cx, |state, cx| state.set_value("", window, cx));
@@ -357,19 +343,14 @@ impl ExportBundleModal {
     }
 
     /// Build (or clear) the auth-profile export-mode dropdown for the single
-    /// referenced auth profile. AWS-locked profiles get no dropdown — the render
-    /// shows a muted "Reference (AWS profile)" label and the mode stays forced to
-    /// `MappableReference`.
-    fn build_auth_dropdown(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    /// referenced auth profile.
+    fn build_auth_dropdown(&mut self, cx: &mut Context<Self>) {
         self.auth_dropdown = None;
         self.auth_dropdown_sub = None;
 
         let Some(auth) = self.auth_profile.as_ref() else {
             return;
         };
-        if auth.locked {
-            return;
-        }
 
         let auth_id = auth.id;
         let current = self
@@ -459,7 +440,6 @@ impl ExportBundleModal {
                 auth_profiles.push(AuthProfileRow {
                     id: auth.id,
                     name: auth.name.clone(),
-                    locked: auth.read_only,
                 });
             }
         }
@@ -507,7 +487,6 @@ impl ExportBundleModal {
             auth_profiles: vec![AuthProfileRow {
                 id: auth.id,
                 name: auth.name.clone(),
-                locked: auth.read_only,
             }],
             proxy_name: None,
             ssh_name: None,
@@ -638,6 +617,14 @@ impl ExportBundleModal {
         let Some(target) = self.target else {
             return;
         };
+
+        if let ExportTarget::Connection(profile_id) = target
+            && let Some(error) = self.app_state.read(cx).value_ref_load_error(profile_id)
+        {
+            self.validation_error = Some(error);
+            cx.notify();
+            return;
+        }
 
         let output_value = self.output_input.read(cx).value().trim().to_string();
         if output_value.is_empty() {
@@ -800,12 +787,6 @@ impl ExportBundleModal {
                 let all_auth = state.list_auth_profiles();
                 let auth = all_auth.iter().find(|a| a.id == auth_id)?;
 
-                // AWS reflected profiles are read-only mirrors of ~/.aws and have
-                // no standalone payload; the Settings UI disables Export for them.
-                if auth.read_only {
-                    return None;
-                }
-
                 ExportInputs {
                     auth_profiles: vec![auth.clone()],
                     ..Default::default()
@@ -849,19 +830,11 @@ impl ExportBundleModal {
         let values = driver.extract_values(&profile.config);
 
         let mut auth_profiles: Vec<datatab_core::AuthProfile> = Vec::new();
-        let mut aws_references: Vec<AwsRef> = Vec::new();
 
         if let Some(auth_id) = profile.auth_profile_id {
             let all_auth = state.list_auth_profiles();
             if let Some(auth) = all_auth.iter().find(|a| a.id == auth_id) {
-                if auth.read_only {
-                    aws_references.push(AwsRef {
-                        provider_id: auth.provider_id.clone(),
-                        name: auth.name.clone(),
-                    });
-                } else {
-                    auth_profiles.push(auth.clone());
-                }
+                auth_profiles.push(auth.clone());
             }
         }
 
@@ -891,7 +864,6 @@ impl ExportBundleModal {
         Some(ExportInputs {
             connections_with_values: vec![(profile, values)],
             auth_profiles,
-            aws_references,
             ssh_tunnels,
             proxies,
         })
@@ -1097,10 +1069,7 @@ impl ExportBundleModal {
         let mut lines: Vec<String> = Vec::new();
         if is_connection {
             for auth in &summary.auth_profiles {
-                lines.push(crate::labels::export_summary_auth_profile_line(
-                    &auth.name,
-                    auth.locked,
-                ));
+                lines.push(crate::labels::export_summary_auth_profile_line(&auth.name));
             }
             if let Some(proxy) = &summary.proxy_name {
                 lines.push(crate::labels::export_summary_proxy_line(proxy));
@@ -1257,24 +1226,11 @@ impl ExportBundleModal {
         col.into_any_element()
     }
 
-    /// The single referenced auth profile's export-mode control: a dropdown for
-    /// normal profiles, or a muted "Reference (AWS profile)" label for AWS-locked
-    /// ones.
+    /// The referenced auth profile's export-mode dropdown.
     fn render_auth_mode_section(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let theme = cx.theme().clone();
         let auth = self.auth_profile.as_ref()?;
-
-        let control: AnyElement = if auth.locked {
-            Text::body(datatab_i18n::t!(
-                "connection_manager.export.field.reference_aws_profile"
-            ))
-            .color(theme.muted_foreground)
-            .into_any_element()
-        } else if let Some(dropdown) = self.auth_dropdown.as_ref() {
-            dropdown.clone().into_any_element()
-        } else {
-            return None;
-        };
+        let control = self.auth_dropdown.as_ref()?.clone().into_any_element();
 
         let row = div()
             .flex()
@@ -1492,7 +1448,6 @@ mod tests {
         "connection_manager.export.field.include_ssh_password",
         "connection_manager.export.field.embed_ssh_keys",
         "connection_manager.export.field.auth_export_mode",
-        "connection_manager.export.field.reference_aws_profile",
         "connection_manager.export.field.disable_encryption",
         "connection_manager.export.field.confirm_passphrase",
         "connection_manager.export.field.encryption",
@@ -1512,7 +1467,6 @@ mod tests {
         "connection_manager.export.error.failed",
         "connection_manager.export.error.write_failed",
         "connection_manager.export.summary.auth_profile_line",
-        "connection_manager.export.summary.auth_profile_line_reference",
         "connection_manager.export.summary.proxy_line",
         "connection_manager.export.summary.ssh_line",
         "connection_manager.export.action.export",
@@ -1601,6 +1555,7 @@ mod tests {
 
 #[cfg(test)]
 mod keyboard_tests {
+    mod value_refs;
     // Explicit imports rather than the parent glob: combining `use super::*`
     // with `#[gpui::test]` sends the gpui_macros expansion into unbounded
     // recursion.

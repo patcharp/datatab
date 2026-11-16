@@ -20,8 +20,8 @@ pub use dotenv::{
 pub use resolver::CompositeValueResolver;
 pub use secret_file::{MAX_FILE_BYTES as SECRET_FILE_MAX_FILE_BYTES, read_secret_file};
 
-/// Structured error from a value provider (Secrets Manager, SSM, etc.)
-/// with enough context to display actionable diagnostics in the UI.
+/// Structured error from a value provider, with enough context to display
+/// actionable diagnostics in the UI.
 #[derive(Debug, Clone)]
 pub struct ProviderError {
     pub provider: String,
@@ -72,18 +72,6 @@ pub trait SecretProvider: Send + Sync {
     ) -> impl Future<Output = Result<secrecy::SecretString, DbError>> + Send;
 }
 
-pub trait ParameterProvider: Send + Sync {
-    fn provider_id(&self) -> &'static str;
-
-    fn display_name(&self) -> &'static str;
-
-    fn get_parameter(
-        &self,
-        name: &str,
-        json_key: Option<&str>,
-    ) -> impl Future<Output = Result<String, DbError>> + Send;
-}
-
 #[async_trait::async_trait]
 pub trait DynSecretProvider: Send + Sync {
     fn provider_id(&self) -> &str;
@@ -132,30 +120,6 @@ impl<T: SecretProvider> DynSecretProvider for T {
     }
 }
 
-#[async_trait::async_trait]
-pub trait DynParameterProvider: Send + Sync {
-    fn provider_id(&self) -> &'static str;
-
-    fn display_name(&self) -> &'static str;
-
-    async fn get_parameter(&self, name: &str, json_key: Option<&str>) -> Result<String, DbError>;
-}
-
-#[async_trait::async_trait]
-impl<T: ParameterProvider> DynParameterProvider for T {
-    fn provider_id(&self) -> &'static str {
-        ParameterProvider::provider_id(self)
-    }
-
-    fn display_name(&self) -> &'static str {
-        ParameterProvider::display_name(self)
-    }
-
-    async fn get_parameter(&self, name: &str, json_key: Option<&str>) -> Result<String, DbError> {
-        ParameterProvider::get_parameter(self, name, json_key).await
-    }
-}
-
 #[derive(Debug, Default)]
 pub struct ResolveContext<'a> {
     pub credentials: Option<&'a ResolvedCredentials>,
@@ -189,12 +153,6 @@ pub enum ValueRef {
     Secret {
         provider: String,
         locator: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        json_key: Option<String>,
-    },
-    Parameter {
-        provider: String,
-        name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         json_key: Option<String>,
     },
@@ -236,26 +194,6 @@ impl ValueRef {
         Self::Secret {
             provider: provider.into(),
             locator: locator.into(),
-            json_key,
-        }
-    }
-
-    pub fn parameter(provider: impl Into<String>, name: impl Into<String>) -> Self {
-        Self::Parameter {
-            provider: provider.into(),
-            name: name.into(),
-            json_key: None,
-        }
-    }
-
-    pub fn parameter_with_key(
-        provider: impl Into<String>,
-        name: impl Into<String>,
-        json_key: Option<String>,
-    ) -> Self {
-        Self::Parameter {
-            provider: provider.into(),
-            name: name.into(),
             json_key,
         }
     }
@@ -329,10 +267,6 @@ pub enum ValueOrigin {
     SecretProvider {
         provider: String,
         locator_summary: String,
-    },
-    ParameterProvider {
-        provider: String,
-        name: String,
     },
     AuthCredential {
         field: String,
@@ -431,6 +365,68 @@ mod tests {
                 if path == "~/.config/db.json" && key == "password"
         ));
         assert_eq!(serde_json::to_string(&fv.0).expect("serialize"), json);
+    }
+
+    /// The JSON written for each kept variant, which driver hosts read from
+    /// `OpenSession.profile_json`. Both directions are pinned to the literal
+    /// text so the shape cannot drift.
+    #[test]
+    fn kept_variants_keep_their_json_shape() {
+        let cases = [
+            (
+                ValueRef::literal("db.internal"),
+                r#"{"source":"literal","value":"db.internal"}"#,
+            ),
+            (
+                ValueRef::env("DB_HOST"),
+                r#"{"source":"env","key":"DB_HOST"}"#,
+            ),
+            (
+                ValueRef::dotenv("~/.config/app.env", "DB_HOST"),
+                r#"{"source":"dotenv","path":"~/.config/app.env","key":"DB_HOST"}"#,
+            ),
+            (
+                ValueRef::file("/run/secrets/db", None),
+                r#"{"source":"file","path":"/run/secrets/db"}"#,
+            ),
+            (
+                ValueRef::file("/run/secrets/db.json", Some("host".to_string())),
+                r#"{"source":"file","path":"/run/secrets/db.json","json_key":"host"}"#,
+            ),
+            (
+                ValueRef::secret("vault", "kv/db", None),
+                r#"{"source":"secret","provider":"vault","locator":"kv/db"}"#,
+            ),
+            (
+                ValueRef::secret("vault", "kv/db", Some("host".to_string())),
+                r#"{"source":"secret","provider":"vault","locator":"kv/db","json_key":"host"}"#,
+            ),
+            (
+                ValueRef::auth("token"),
+                r#"{"source":"auth","field":"token"}"#,
+            ),
+        ];
+
+        for (value_ref, json) in cases {
+            assert_eq!(serde_json::to_string(&value_ref).expect("serialize"), json);
+
+            let parsed: ValueRef = serde_json::from_str(json).expect("deserialize");
+            assert_eq!(serde_json::to_string(&parsed).expect("serialize"), json);
+        }
+    }
+
+    #[test]
+    fn parameter_source_is_rejected() {
+        let json = r#"{"source":"parameter","provider":"aws-ssm","name":"/db/host"}"#;
+
+        let error = serde_json::from_str::<ValueRef>(json)
+            .expect_err("the removed Parameter source must not parse");
+        assert!(
+            error.to_string().contains("unknown variant `parameter`"),
+            "{error}"
+        );
+
+        assert!(serde_json::from_str::<FieldValue>(json).is_err());
     }
 
     #[test]

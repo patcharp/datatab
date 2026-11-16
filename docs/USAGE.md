@@ -12,7 +12,7 @@ launch to your first query; otherwise pick the page for what you are doing.
 - [Getting Started](GETTING_STARTED.md) — first launch, creating a connection,
   and your first query.
 - [Connecting](CONNECTIONS.md) — the Connection Manager, drivers, SSH tunnels,
-  proxies, AWS SSO, and value sources.
+  proxies, auth profiles, and value sources.
 - [Browsing the Schema](SCHEMA_BROWSER.md) — the sidebar, the schema tree,
   routines, and the schema diagram.
 - [Running Queries](EDITOR.md) — query tabs, execution, scripts, the

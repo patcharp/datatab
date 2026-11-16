@@ -15,6 +15,7 @@ use std::sync::Arc;
 use datatab_byte_source::FileSource;
 use datatab_core::Connection;
 
+use crate::code::display_path::display_path;
 use crate::file_source::{
     FileLocation, LocationSource, ObjectSource, SourceVersion, StorageError, head_object,
     local_version, object_store, object_version, open_local_file, read_version,
@@ -187,6 +188,16 @@ pub(crate) fn verify_version(
     Ok(())
 }
 
+/// The failure of a staged save whose temporary file could not be created in
+/// `directory`, naming the file or object being saved.
+fn temporary_file_error(target: &Path, directory: &Path, error: std::io::Error) -> StorageError {
+    StorageError::TemporaryFile {
+        target: display_path(target),
+        directory: directory.to_path_buf(),
+        source: error,
+    }
+}
+
 fn save_local<W>(
     path: &Path,
     captured: &SourceVersion,
@@ -210,15 +221,11 @@ where
 
     let source = LocationSource::Local(FileSource::new(file));
 
-    let target = path.display().to_string();
+    let target = display_path(path);
     let directory = parent_directory(&destination);
     let staged_path = stage_path(directory);
 
-    let staging_error = |error| StorageError::TemporaryFile {
-        target: target.clone(),
-        directory: directory.to_path_buf(),
-        source: error,
-    };
+    let staging_error = |error| temporary_file_error(path, directory, error);
 
     let staged = create_staging_file(&staged_path).map_err(staging_error)?;
 
@@ -295,11 +302,7 @@ pub(crate) fn check_local_save(path: &Path) -> Result<(), StorageError> {
     let directory = parent_directory(&destination);
     let probe = stage_path(directory);
 
-    create_staging_file(&probe).map_err(|error| StorageError::TemporaryFile {
-        target: path.display().to_string(),
-        directory: directory.to_path_buf(),
-        source: error,
-    })?;
+    create_staging_file(&probe).map_err(|error| temporary_file_error(path, directory, error))?;
 
     discard_staging(&probe);
 
@@ -514,7 +517,7 @@ mod tests {
 
     use datatab_byte_source::ByteSource;
 
-    use super::{SaveOutcome, StageWriteError, save_staging_objects_in};
+    use super::{SaveOutcome, StageWriteError, save_staging_objects_in, temporary_file_error};
     use crate::file_source::{FileLocation, StorageError, read_version};
 
     const ORIGINAL: &[u8] = b"original bytes";
@@ -563,6 +566,22 @@ mod tests {
 
     fn unused_staging() -> &'static Path {
         Path::new("/nonexistent-object-staging")
+    }
+
+    /// A failed staged save names the file being saved as the user should read
+    /// it, never in the extended-length form Windows canonicalisation returns.
+    #[test]
+    fn a_failed_staged_save_hides_the_windows_verbatim_prefix() {
+        let error = temporary_file_error(
+            Path::new(r"\\?\C:\Users\ana\sheet.xlsx"),
+            Path::new(r"\\?\C:\Users\ana"),
+            std::io::Error::other("access denied"),
+        );
+
+        let message = error.to_string();
+
+        assert!(message.contains(r"C:\Users\ana\sheet.xlsx"), "{message}");
+        assert!(!message.contains(r"\\?\"), "{message}");
     }
 
     #[test]

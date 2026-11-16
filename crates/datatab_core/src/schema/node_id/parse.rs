@@ -5,19 +5,18 @@ use super::ParseSchemaNodeIdError;
 use super::SchemaNodeId;
 use super::{
     P_BASE_TYPE, P_COLL_FIELD, P_COLL_FIELDS_FOLDER, P_COLL_IDX_FOLDER, P_COLL_INDEX, P_COLLECTION,
-    P_COLLECTION_CHILD, P_COLLECTION_CHILDREN_MORE, P_COLLECTIONS_FOLDER, P_COLUMN,
-    P_COLUMNS_FOLDER, P_CONN_FOLDER, P_CONSTRAINT, P_CONSTRAINTS_FOLDER, P_CUSTOM_TYPE,
-    P_DASHBOARD_ITEM, P_DASHBOARDS_FOLDER, P_DATABASE, P_DATABASES_FOLDER, P_DB_IDX_FOLDER,
-    P_DEPENDENT_ITEM, P_DEPENDENTS_FOLDER, P_EMPTY_DATABASES_FOLDER, P_ENUM_VALUE, P_FK,
-    P_FK_FOLDER, P_INDEX, P_INDEXES_FOLDER, P_INST_FOLDER, P_INST_INSPECTOR_LEAF,
-    P_INST_INSPECTORS_FOLDER, P_INST_METRIC_LEAF, P_INST_METRICS_FOLDER, P_INST_OVERVIEW_LEAF,
-    P_LOADING, P_METRIC_LEAF, P_METRIC_NS_FOLDER, P_METRICS_FOLDER, P_PLACEHOLDER, P_PROFILE,
-    P_REMOTE_DASHBOARD_ITEM, P_REMOTE_DASHBOARDS_FOLDER, P_ROOT_SECTION, P_ROOT_SECTION_ITEM,
-    P_ROOT_SECTION_MORE, P_ROUTINE, P_ROUTINES_FOLDER, P_ROUTINES_LOADING, P_SAVED_CHART_ITEM,
-    P_SAVED_CHARTS_FOLDER, P_SCHEMA, P_SCHEMA_FK, P_SCHEMA_FK_FOLDER, P_SCHEMA_FK_LOADING,
-    P_SCHEMA_IDX_FOLDER, P_SCHEMA_IDX_LOADING, P_SCHEMA_INDEX, P_SCRIPT_FILE, P_SCRIPTS_FOLDER,
-    P_SCRIPTS_ROOT, P_SECRET_PATH, P_SECRET_STORE, P_STORAGE_HINT_ITEM, P_STORAGE_HINTS_FOLDER,
-    P_TABLE, P_TABLES_FOLDER, P_TYPES_FOLDER, P_TYPES_LOADING, P_VIEW, P_VIEWS_FOLDER,
+    P_COLLECTIONS_FOLDER, P_COLUMN, P_COLUMNS_FOLDER, P_CONN_FOLDER, P_CONSTRAINT,
+    P_CONSTRAINTS_FOLDER, P_CUSTOM_TYPE, P_DASHBOARD_ITEM, P_DASHBOARDS_FOLDER, P_DATABASE,
+    P_DATABASES_FOLDER, P_DB_IDX_FOLDER, P_DEPENDENT_ITEM, P_DEPENDENTS_FOLDER,
+    P_EMPTY_DATABASES_FOLDER, P_ENUM_VALUE, P_FK, P_FK_FOLDER, P_INDEX, P_INDEXES_FOLDER,
+    P_INST_FOLDER, P_INST_INSPECTOR_LEAF, P_INST_INSPECTORS_FOLDER, P_INST_METRIC_LEAF,
+    P_INST_METRICS_FOLDER, P_INST_OVERVIEW_LEAF, P_LOADING, P_PLACEHOLDER, P_PROFILE,
+    P_ROOT_SECTION, P_ROOT_SECTION_ITEM, P_ROOT_SECTION_MORE, P_ROUTINE, P_ROUTINES_FOLDER,
+    P_ROUTINES_LOADING, P_SAVED_CHART_ITEM, P_SAVED_CHARTS_FOLDER, P_SCHEMA, P_SCHEMA_FK,
+    P_SCHEMA_FK_FOLDER, P_SCHEMA_FK_LOADING, P_SCHEMA_IDX_FOLDER, P_SCHEMA_IDX_LOADING,
+    P_SCHEMA_INDEX, P_SCRIPT_FILE, P_SCRIPTS_FOLDER, P_SCRIPTS_ROOT, P_STORAGE_HINT_ITEM,
+    P_STORAGE_HINTS_FOLDER, P_TABLE, P_TABLES_FOLDER, P_TYPES_FOLDER, P_TYPES_LOADING, P_VIEW,
+    P_VIEWS_FOLDER,
 };
 
 impl FromStr for SchemaNodeId {
@@ -63,12 +62,9 @@ impl FromStr for SchemaNodeId {
                 parse_folder_variants(prefix, &parts, err)
             }
 
-            P_TABLE
-            | P_VIEW
-            | P_COLLECTION
-            | P_COLLECTION_CHILD
-            | P_COLLECTION_CHILDREN_MORE
-            | P_CUSTOM_TYPE => parse_object_variants(prefix, &parts, err),
+            P_TABLE | P_VIEW | P_COLLECTION | P_CUSTOM_TYPE => {
+                parse_object_variants(prefix, &parts, err)
+            }
 
             P_COLUMNS_FOLDER
             | P_INDEXES_FOLDER
@@ -96,16 +92,9 @@ impl FromStr for SchemaNodeId {
                 parse_routine_variants(prefix, &parts, err)
             }
 
-            P_METRICS_FOLDER | P_METRIC_NS_FOLDER | P_METRIC_LEAF => {
-                parse_metric_variants(prefix, &parts, err)
+            P_DASHBOARDS_FOLDER | P_DASHBOARD_ITEM | P_SAVED_CHARTS_FOLDER | P_SAVED_CHART_ITEM => {
+                parse_dashboard_and_chart_variants(prefix, &parts, err)
             }
-
-            P_DASHBOARDS_FOLDER
-            | P_DASHBOARD_ITEM
-            | P_REMOTE_DASHBOARDS_FOLDER
-            | P_REMOTE_DASHBOARD_ITEM
-            | P_SAVED_CHARTS_FOLDER
-            | P_SAVED_CHART_ITEM => parse_dashboard_and_chart_variants(prefix, &parts, err),
 
             P_INST_METRICS_FOLDER
             | P_INST_METRIC_LEAF
@@ -117,8 +106,6 @@ impl FromStr for SchemaNodeId {
             P_ROOT_SECTION | P_ROOT_SECTION_ITEM | P_ROOT_SECTION_MORE => {
                 parse_root_section_variants(prefix, &parts, err)
             }
-
-            P_SECRET_STORE | P_SECRET_PATH => parse_secret_store_variants(prefix, &parts, err),
 
             _ => Err(err()),
         }
@@ -328,32 +315,6 @@ fn parse_object_variants(
                 profile_id,
                 database,
                 name,
-            })
-        }
-
-        P_COLLECTION_CHILD => {
-            let profile_id = Uuid::parse_str(parts.get(1).ok_or_else(err)?).map_err(|_| err())?;
-            let database = parts.get(2).ok_or_else(err)?.to_string();
-            let collection = parts.get(3).ok_or_else(err)?.to_string();
-            let child_id = parts.get(4).ok_or_else(err)?.to_string();
-            let name = parts.get(5).ok_or_else(err)?.to_string();
-            Ok(SchemaNodeId::CollectionChild {
-                profile_id,
-                database,
-                collection,
-                child_id,
-                name,
-            })
-        }
-
-        P_COLLECTION_CHILDREN_MORE => {
-            let profile_id = Uuid::parse_str(parts.get(1).ok_or_else(err)?).map_err(|_| err())?;
-            let database = parts.get(2).ok_or_else(err)?.to_string();
-            let collection = parts.get(3).ok_or_else(err)?.to_string();
-            Ok(SchemaNodeId::CollectionChildrenMore {
-                profile_id,
-                database,
-                collection,
             })
         }
 
@@ -735,50 +696,6 @@ fn parse_routine_variants(
     }
 }
 
-fn parse_metric_variants(
-    prefix: &str,
-    parts: &[&str],
-    err: impl Fn() -> ParseSchemaNodeIdError + Copy,
-) -> Result<SchemaNodeId, ParseSchemaNodeIdError> {
-    match prefix {
-        P_METRICS_FOLDER => {
-            let profile_id = Uuid::parse_str(parts.get(1).ok_or_else(err)?).map_err(|_| err())?;
-            let database = parts.get(2).ok_or_else(err)?.to_string();
-            Ok(SchemaNodeId::MetricsFolder {
-                profile_id,
-                database,
-            })
-        }
-
-        P_METRIC_NS_FOLDER => {
-            let profile_id = Uuid::parse_str(parts.get(1).ok_or_else(err)?).map_err(|_| err())?;
-            let database = parts.get(2).ok_or_else(err)?.to_string();
-            let namespace = parts.get(3).ok_or_else(err)?.to_string();
-            Ok(SchemaNodeId::MetricNamespaceFolder {
-                profile_id,
-                database,
-                namespace,
-            })
-        }
-
-        P_METRIC_LEAF => {
-            let profile_id = Uuid::parse_str(parts.get(1).ok_or_else(err)?).map_err(|_| err())?;
-            let database = parts.get(2).ok_or_else(err)?.to_string();
-            let namespace = parts.get(3).ok_or_else(err)?.to_string();
-            // metric_name may contain slashes; splitn(6) gives us all remaining content
-            let metric_name = parts.get(4).ok_or_else(err)?.to_string();
-            Ok(SchemaNodeId::MetricLeaf {
-                profile_id,
-                database,
-                namespace,
-                metric_name,
-            })
-        }
-
-        _ => Err(err()),
-    }
-}
-
 fn parse_dashboard_and_chart_variants(
     prefix: &str,
     parts: &[&str],
@@ -797,17 +714,6 @@ fn parse_dashboard_and_chart_variants(
                 profile_id,
                 dashboard_id,
             })
-        }
-
-        P_REMOTE_DASHBOARDS_FOLDER => {
-            let profile_id = Uuid::parse_str(parts.get(1).ok_or_else(err)?).map_err(|_| err())?;
-            Ok(SchemaNodeId::RemoteDashboardsFolder { profile_id })
-        }
-
-        P_REMOTE_DASHBOARD_ITEM => {
-            let profile_id = Uuid::parse_str(parts.get(1).ok_or_else(err)?).map_err(|_| err())?;
-            let name = parts.get(2).ok_or_else(err)?.to_string();
-            Ok(SchemaNodeId::RemoteDashboardItem { profile_id, name })
         }
 
         P_SAVED_CHARTS_FOLDER => {
@@ -908,40 +814,6 @@ fn parse_root_section_variants(
                 profile_id,
                 section_id,
                 item_id,
-            })
-        }
-
-        _ => Err(err()),
-    }
-}
-
-fn parse_secret_store_variants(
-    prefix: &str,
-    parts: &[&str],
-    err: impl Fn() -> ParseSchemaNodeIdError + Copy,
-) -> Result<SchemaNodeId, ParseSchemaNodeIdError> {
-    let profile_id = Uuid::parse_str(parts.get(1).ok_or_else(err)?).map_err(|_| err())?;
-    let store_id = parts.get(2).ok_or_else(err)?.to_string();
-
-    match prefix {
-        P_SECRET_STORE => Ok(SchemaNodeId::SecretStore {
-            profile_id,
-            store_id,
-        }),
-
-        P_SECRET_PATH => {
-            // A path may hold the separator, so everything after the store id
-            // is the path.
-            let path = parts
-                .get(3..)
-                .filter(|rest| !rest.is_empty())
-                .ok_or_else(err)?
-                .join("|");
-
-            Ok(SchemaNodeId::SecretPath {
-                profile_id,
-                store_id,
-                path,
             })
         }
 

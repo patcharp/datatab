@@ -184,7 +184,6 @@ fn driver_key_has_builtin_prefix_for_fake_drivers() {
         DbKind::MariaDB,
         DbKind::MongoDB,
         DbKind::Redis,
-        DbKind::DynamoDB,
     ];
 
     for kind in &kinds {
@@ -209,7 +208,6 @@ fn driver_key_is_unique_per_kind() {
         DbKind::MariaDB,
         DbKind::MongoDB,
         DbKind::Redis,
-        DbKind::DynamoDB,
     ];
 
     let keys: Vec<DriverKey> = kinds

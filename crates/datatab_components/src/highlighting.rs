@@ -3,7 +3,7 @@
 //! `gpui-component`'s `tree-sitter-languages` feature bundles roughly thirty
 //! grammars, but DataTab only ever opens the editor with the modes
 //! `QueryLanguage::editor_mode()` can return, plus `json` for the document
-//! tree, cell editor, document preview, and dashboard import modals.
+//! tree, cell editor, and document preview.
 //! Registering those individually through `bolt::syntax` keeps the release
 //! binary from linking grammars nothing in the app requests.
 
@@ -162,9 +162,6 @@ mod tests {
     fn all_query_languages() -> Vec<QueryLanguage> {
         vec![
             QueryLanguage::Sql,
-            QueryLanguage::CloudWatchLogsInsightsQl,
-            QueryLanguage::OpenSearchPpl,
-            QueryLanguage::OpenSearchSql,
             QueryLanguage::MongoQuery,
             QueryLanguage::RedisCommands,
             QueryLanguage::Cypher,

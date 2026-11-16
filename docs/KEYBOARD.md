@@ -52,7 +52,6 @@ the next click. A focused button, checkbox or list row takes `Enter` and
 | `Ctrl+Shift+X` | Open the most recent error in the audit viewer |
 | `Ctrl+Shift+Y` | Open the buttons of the newest toast in a menu |
 | `Ctrl+Shift+L` | Open auth profile login |
-| `Ctrl+Shift+O` | Open the AWS SSO wizard |
 | `Ctrl+Shift+C` | Open a saved chart |
 | `Ctrl+Shift+D` | New dashboard |
 | `Ctrl+Shift+M` | Open MCP approvals |
@@ -149,7 +148,7 @@ editors** and save: open editors switch over at once. It applies to every
 multi-line editor:
 
 - the code editor (SQL and the other query languages, Lua, Python, Bash);
-- the S3 object editor tab and the object browser's preview editor;
+- the object editor tab and the object browser's preview editor;
 - the cell editor and document preview dialogs;
 - the JSON editor of the import dashboard dialog and the query editor of the
   add panel dialog;
@@ -157,7 +156,7 @@ multi-line editor:
   pipeline editor.
 
 Read-only viewers take motions, Visual selection and yanks, and no edits: a
-decoded S3 object in the object editor tab or the object browser's preview, the
+decoded object in the object editor tab or the object browser's preview, the
 document tree's Raw JSON view, the query builder's SQL preview, the SQL and
 query preview dialogs, and the details of an external audit event. Single-line
 fields, search boxes, forms, and the command palette keep typing as usual.
@@ -893,7 +892,7 @@ field is being edited they leave it for the next or previous field, and
 `Ctrl+l` / `Ctrl+h` leave it for the next or previous tab. `PageDown` /
 `PageUp` move the highlight of an open dropdown a page at a time. After the
 password, the form's ring continues through the driver's other fields, such as
-the auth profile picker of an AWS connection, which `Enter` opens, then the SSL
+the auth profile picker of a connection that uses one, which `Enter` opens, then the SSL
 mode, whose choice `Left` / `Right` or `Enter` change, and the certificate
 pickers, where `Enter` browses. After a failed connection test, the banner's
 **Copy** button sits between **Test connection** and **Save**. On the Settings
@@ -921,7 +920,7 @@ Choosing an item or pressing `Escape` gives focus back to the control that held
 it before the dropdown. Dropdowns that belong to a keyboard ring, such as the
 execution context bar and the audit filters, are still driven by that ring's
 keys. The one multi-select of the execution context bar, the targets list of a
-source such as a log group or event stream, is the exception: `Enter` on it
+source context a driver declares, is the exception: `Enter` on it
 opens the list with keyboard focus, so the keys above drive it, and closing it
 returns focus to the bar.
 

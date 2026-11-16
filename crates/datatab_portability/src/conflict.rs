@@ -5,7 +5,7 @@
 /// no match is found.
 ///
 /// Identity predicates use content tuples, not display names:
-/// - Auth profiles: `(provider_id, name)` — mirrors the deterministic `aws_profile_uuid` derivation.
+/// - Auth profiles: `(provider_id, name)`.
 /// - SSH tunnels: `(host, port, user, ssh_config_host)` — the actual endpoint matters; a tunnel
 ///   renamed on the destination still refers to the same bastion. The alias is part of the key
 ///   because an aliased tunnel stores an empty host and user, so the alias is its only identity;
@@ -93,8 +93,6 @@ mod tests {
             fields: Default::default(),
             secret_fields: Default::default(),
             enabled: true,
-            read_only: false,
-            dangling_origin: None,
         }
     }
 

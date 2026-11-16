@@ -305,6 +305,8 @@ pub static REDIS_METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverMet
     ssl_cert_fields: Some(datatab_core::SslCertFields {
         root_cert: true,
         client_cert: true,
+        root_cert_modes: Some(&["verify"]),
+        client_cert_modes: Some(&["verify"]),
     }),
     classification_override: None,
     default_chunk_size: None,
@@ -582,24 +584,6 @@ impl RedisDriver {
         ssh_secret: Option<&str>,
         password: Option<&str>,
     ) -> Result<Box<dyn Connection>, DbError> {
-        // Checks the address `connect_direct` builds behind the tunnel, so a
-        // refused profile never logs in to the SSH host. The configured host is
-        // not used here, because one that does not parse would pass the check.
-        if config.topology == ConfiguredTopology::Sentinel {
-            let tls = redis_ssl_mode_to_config(
-                config.ssl_mode.as_deref(),
-                config.ssl_root_cert_path.as_deref(),
-                config.ssl_client_cert_path.as_deref(),
-                config.ssl_client_key_path.as_deref(),
-            )
-            .map_err(DbError::InvalidProfile)?;
-            refuse_sentinel_tls(&[direct_connection_uri(
-                &tls,
-                SSH_TUNNEL_LOCAL_HOST,
-                config.port,
-            )])?;
-        }
-
         let OpenedSshTunnel { tunnel, .. } =
             datatab_ssh::open_tunnel(tunnel_config, ssh_secret, &config.host, config.port)?;
         let local_port = tunnel.local_port();
@@ -937,12 +921,41 @@ impl DbDriver for RedisDriver {
         Some(values)
     }
 
+    fn validate_profile(&self, profile: &ConnectionProfile) -> Result<(), DbError> {
+        let config = extract_redis_config(&profile.config)?;
+        if config.topology != ConfiguredTopology::Sentinel {
+            return Ok(());
+        }
+
+        // URI mode ignores the manual TLS settings. Manual mode must not read
+        // certificate files just to refuse a topology that cannot use them.
+        let uses_tls = if config.use_uri {
+            is_tls_uri(config.uri.as_deref().unwrap_or_default())
+        } else {
+            !matches!(
+                classify_redis_ssl_mode(config.ssl_mode.as_deref())
+                    .map_err(DbError::InvalidProfile)?,
+                RedisSslMode::Plain
+            )
+        };
+        if uses_tls {
+            return Err(DbError::InvalidProfile(
+                "Redis TLS is not available with the Sentinel topology, because DataTab \
+                 cannot reach the Sentinel master over TLS yet. To connect through \
+                 Sentinel without TLS, set the TLS mode to off or use a redis:// URI"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn connect_with_secrets(
         &self,
         profile: &ConnectionProfile,
         password: Option<&SecretString>,
         ssh_secret: Option<&SecretString>,
     ) -> Result<Box<dyn Connection>, DbError> {
+        self.validate_profile(profile)?;
         let config = extract_redis_config(&profile.config)?;
 
         let password = password.map(|value| value.expose_secret());
@@ -1118,6 +1131,21 @@ fn extract_redis_config(config: &DbConfig) -> Result<ExtractedRedisConfig, DbErr
 /// Where `connect_via_ssh_tunnel` reaches the server once the tunnel is open.
 const SSH_TUNNEL_LOCAL_HOST: &str = "127.0.0.1";
 
+enum RedisSslMode {
+    Plain,
+    TlsInsecure,
+    TlsVerify,
+}
+
+fn classify_redis_ssl_mode(mode_id: Option<&str>) -> Result<RedisSslMode, String> {
+    match mode_id.unwrap_or("off") {
+        "" | "off" => Ok(RedisSslMode::Plain),
+        "on" => Ok(RedisSslMode::TlsInsecure),
+        "verify" => Ok(RedisSslMode::TlsVerify),
+        other => Err(format!("Unknown Redis SSL mode: '{}'", other)),
+    }
+}
+
 /// Native TLS configuration derived from an SSL mode id and optional cert paths.
 ///
 /// Returned by `redis_ssl_mode_to_config` and consumed by `connect_direct`.
@@ -1159,12 +1187,10 @@ fn redis_ssl_mode_to_config(
     client_cert_path: Option<&str>,
     client_key_path: Option<&str>,
 ) -> Result<RedisTlsConfig, String> {
-    let mode = mode_id.unwrap_or("off");
-
-    match mode {
-        "" | "off" => Ok(RedisTlsConfig::Plain),
-        "on" => Ok(RedisTlsConfig::TlsInsecure),
-        "verify" => {
+    match classify_redis_ssl_mode(mode_id)? {
+        RedisSslMode::Plain => Ok(RedisTlsConfig::Plain),
+        RedisSslMode::TlsInsecure => Ok(RedisTlsConfig::TlsInsecure),
+        RedisSslMode::TlsVerify => {
             let root_cert =
                 match root_cert_path.and_then(non_empty) {
                     Some(path) => Some(std::fs::read(path).map_err(|e| {
@@ -1202,7 +1228,6 @@ fn redis_ssl_mode_to_config(
                 root_cert,
             }))
         }
-        other => Err(format!("Unknown Redis SSL mode: '{}'", other)),
     }
 }
 
@@ -3465,8 +3490,8 @@ fn build_cluster_connection(
 /// Builds the list of Sentinel node URIs: the primary node followed by any
 /// configured additional nodes, all as plain `redis://` addresses.
 ///
-/// `primary_uri` is used as typed by the caller. `refuse_sentinel_tls` refuses
-/// the list when it carries a TLS address (see the driver README).
+/// `primary_uri` is used as typed by the caller, after `validate_profile`
+/// has refused TLS (see the driver README).
 fn build_sentinel_node_uris(primary_uri: &str, additional_nodes: &[(String, u16)]) -> Vec<String> {
     let mut nodes = vec![primary_uri.to_string()];
     nodes.extend(
@@ -3491,22 +3516,6 @@ fn is_tls_uri(uri: &str) -> bool {
     )
 }
 
-/// `connect_sentinel_master` connects to the resolved master without TLS, and
-/// `SentinelClient` cannot take the configured root CA or client certificate.
-/// Every TLS form is refused rather than send the password in clear behind a
-/// setting that says the connection is encrypted.
-fn refuse_sentinel_tls(sentinel_node_uris: &[String]) -> Result<(), DbError> {
-    if sentinel_node_uris.iter().any(|uri| is_tls_uri(uri)) {
-        return Err(DbError::InvalidProfile(
-            "Redis TLS is not available with the Sentinel topology, because DataTab \
-             cannot reach the Sentinel master over TLS yet. To connect through \
-             Sentinel without TLS, set the TLS mode to off or use a redis:// URI"
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
-
 /// Resolves a Sentinel master, runs the standard post-connect sequence, and
 /// wraps the result in a `RedisConnection` backed by `RedisTransport::SentinelMaster`.
 ///
@@ -3525,8 +3534,6 @@ fn connect_sentinel_master(
     ssh_tunnel: Option<SshTunnel>,
     format_error: impl Fn(&redis::RedisError) -> DbError,
 ) -> Result<Box<dyn Connection>, DbError> {
-    refuse_sentinel_tls(&sentinel_node_uris)?;
-
     let master_name = master_name
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
@@ -4522,6 +4529,9 @@ pub(crate) fn redis_first_line_range(query: &str) -> TextPositionRange {
 
 #[cfg(test)]
 mod tests {
+    mod pipeline;
+    mod tls_metadata;
+
     use super::*;
     use datatab_core::{
         DatabaseCategory, DbDriver, KeySetRequest, MutationRequest, QueryLanguage,
@@ -5408,6 +5418,7 @@ mod tests {
         uri: Option<&str>,
         ssl_mode: Option<&str>,
         ssh_tunnel: Option<SshTunnelConfig>,
+        legacy_tls: bool,
     ) -> ConnectionProfile {
         ConnectionProfile::new(
             "sentinel-tls",
@@ -5418,7 +5429,7 @@ mod tests {
                 port: 1,
                 user: None,
                 database: None,
-                tls: false,
+                tls: legacy_tls,
                 ssl_mode: ssl_mode.map(str::to_string),
                 ssl_root_cert_path: None,
                 ssl_client_cert_path: None,
@@ -5473,19 +5484,19 @@ mod tests {
         let not_refused: Vec<&str> = [
             (
                 "mode on",
-                sentinel_profile("127.0.0.1", None, Some("on"), tunnel()),
+                sentinel_profile("127.0.0.1", None, Some("on"), tunnel(), false),
             ),
             (
                 "mode on with a host that does not parse in a URI",
-                sentinel_profile("::1", None, Some("on"), tunnel()),
+                sentinel_profile("::1", None, Some("on"), tunnel(), false),
             ),
             (
                 "mode verify",
-                sentinel_profile("127.0.0.1", None, Some("verify"), tunnel()),
+                sentinel_profile("127.0.0.1", None, Some("verify"), tunnel(), false),
             ),
             (
                 "mode verify with a host that does not parse in a URI",
-                sentinel_profile("::1", None, Some("verify"), tunnel()),
+                sentinel_profile("::1", None, Some("verify"), tunnel(), false),
             ),
         ]
         .iter()
@@ -5506,7 +5517,7 @@ mod tests {
             ("a #insecure URI", "rediss://127.0.0.1:1/#insecure"),
             ("a rediss URI", "rediss://127.0.0.1:1/"),
         ] {
-            let profile = sentinel_profile("127.0.0.1", Some(uri), None, tunnel());
+            let profile = sentinel_profile("127.0.0.1", Some(uri), None, tunnel(), false);
             assert!(
                 matches!(connect(&profile), Err(DbError::InvalidProfile(_))),
                 "{case} should be refused before the SSH host"
@@ -5518,7 +5529,7 @@ mod tests {
             "a URI Sentinel profile dialed the SSH host"
         );
 
-        let plain = sentinel_profile("127.0.0.1", None, Some("off"), tunnel());
+        let plain = sentinel_profile("127.0.0.1", None, Some("off"), tunnel(), false);
         assert!(
             !matches!(connect(&plain), Err(DbError::InvalidProfile(_))),
             "plain Sentinel over a tunnel should not be refused"
@@ -5544,11 +5555,11 @@ mod tests {
         let not_refused: Vec<&str> = [
             (
                 "mode on",
-                sentinel_profile("127.0.0.1", None, Some("on"), None),
+                sentinel_profile("127.0.0.1", None, Some("on"), None, false),
             ),
             (
                 "mode verify",
-                sentinel_profile("127.0.0.1", None, Some("verify"), None),
+                sentinel_profile("127.0.0.1", None, Some("verify"), None, false),
             ),
             (
                 "a #insecure URI",
@@ -5557,6 +5568,7 @@ mod tests {
                     Some("rediss://127.0.0.1:1/#insecure"),
                     None,
                     None,
+                    false,
                 ),
             ),
             (
@@ -5566,19 +5578,38 @@ mod tests {
                     Some("rediss://127.0.0.1:1/#insecure "),
                     None,
                     None,
+                    false,
                 ),
             ),
             (
                 "a rediss URI",
-                sentinel_profile("127.0.0.1", Some("rediss://127.0.0.1:1/"), None, None),
+                sentinel_profile(
+                    "127.0.0.1",
+                    Some("rediss://127.0.0.1:1/"),
+                    None,
+                    None,
+                    false,
+                ),
             ),
             (
                 "a rediss URI with a trailing space",
-                sentinel_profile("127.0.0.1", Some("rediss://127.0.0.1:1/ "), None, None),
+                sentinel_profile(
+                    "127.0.0.1",
+                    Some("rediss://127.0.0.1:1/ "),
+                    None,
+                    None,
+                    false,
+                ),
             ),
             (
                 "a rediss URI with an upper-case scheme",
-                sentinel_profile("127.0.0.1", Some("REDISS://127.0.0.1:1/"), None, None),
+                sentinel_profile(
+                    "127.0.0.1",
+                    Some("REDISS://127.0.0.1:1/"),
+                    None,
+                    None,
+                    false,
+                ),
             ),
             (
                 "a rediss URI with mode off",
@@ -5587,6 +5618,7 @@ mod tests {
                     Some("rediss://127.0.0.1:1/"),
                     Some("off"),
                     None,
+                    false,
                 ),
             ),
         ]
@@ -5600,11 +5632,11 @@ mod tests {
         let refused: Vec<&str> = [
             (
                 "mode off",
-                sentinel_profile("127.0.0.1", None, Some("off"), None),
+                sentinel_profile("127.0.0.1", None, Some("off"), None, false),
             ),
             (
                 "a redis URI",
-                sentinel_profile("127.0.0.1", Some("redis://127.0.0.1:1/"), None, None),
+                sentinel_profile("127.0.0.1", Some("redis://127.0.0.1:1/"), None, None, false),
             ),
         ]
         .iter()

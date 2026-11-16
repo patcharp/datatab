@@ -97,47 +97,6 @@ impl Workspace {
             return Some(true);
         }
 
-        if self.sidebar.read(cx).has_child_picker_open() {
-            match cmd {
-                Command::SelectNext => {
-                    self.sidebar.update(cx, |s, cx| s.picker_select_next(cx));
-                    return Some(true);
-                }
-                Command::SelectPrev => {
-                    self.sidebar.update(cx, |s, cx| s.picker_select_prev(cx));
-                    return Some(true);
-                }
-                Command::SelectFirst => {
-                    self.sidebar.update(cx, |s, cx| s.picker_select_first(cx));
-                    return Some(true);
-                }
-                Command::SelectLast => {
-                    self.sidebar.update(cx, |s, cx| s.picker_select_last(cx));
-                    return Some(true);
-                }
-                Command::Execute => {
-                    self.sidebar.update(cx, |s, cx| s.picker_execute(cx));
-                    return Some(true);
-                }
-                Command::FocusSearch => {
-                    self.sidebar
-                        .update(cx, |s, cx| s.picker_focus_search(window, cx));
-                    return Some(true);
-                }
-                Command::Cancel => {
-                    if self.sidebar.read(cx).child_picker_filter_is_focused() {
-                        // Pop focus back to the list so subsequent Cancel closes the modal.
-                        self.sidebar
-                            .update(cx, |s, cx| s.picker_focus_list(window, cx));
-                    } else {
-                        self.sidebar.update(cx, |s, cx| s.close_child_picker(cx));
-                    }
-                    return Some(true);
-                }
-                _ => return Some(false),
-            }
-        }
-
         if self.focus_target == FocusTarget::Sidebar
             && self.sidebar.read(cx).search_input_is_focused(window, cx)
         {

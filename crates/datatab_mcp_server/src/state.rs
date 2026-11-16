@@ -24,6 +24,7 @@ use datatab_mcp::{
 };
 use datatab_storage::bootstrap::StorageRuntime;
 use datatab_storage::paths as storage_paths;
+use datatab_storage::repositories::connection_profile_value_refs::ValueRefLoadDiagnostic;
 use datatab_storage::repositories::governance_settings::GovernanceSettingsRepository;
 use datatab_storage::sqlite as storage_sqlite;
 
@@ -281,8 +282,7 @@ impl ServerState {
         let driver_registry = build_driver_registry();
         let auth_provider_registry = build_auth_provider_registry(&services);
         let secret_provider_registry = build_secret_provider_registry(&services);
-        let auth_profile_manager =
-            build_auth_profile_manager(stored_auth_profiles, &auth_provider_registry);
+        let auth_profile_manager = build_auth_profile_manager(stored_auth_profiles);
         let driver_settings = Arc::new(load_driver_settings(&storage_runtime)?);
         let secret_manager = Arc::new(SecretManager::new(Box::new(KeyringSecretStore::new())));
 
@@ -316,25 +316,11 @@ impl ServerState {
     }
 }
 
-/// Mirrors `AppState::list_auth_profiles`: AWS profiles are not stored, they are
-/// reflected from `~/.aws`, and connections reference their stable reflected ids.
+/// Builds the auth manager from all stored profiles.
 fn build_auth_profile_manager(
     stored_profiles: Vec<datatab_core::AuthProfile>,
-    auth_provider_registry: &HashMap<String, Arc<dyn DynAuthProvider>>,
 ) -> AuthProfileManager {
-    const AWS_REFLECTED_PROVIDER_IDS: &[&str] =
-        &["aws-sso", "aws-sso-session", "aws-shared-credentials"];
-
-    let mut profiles: Vec<datatab_core::AuthProfile> = stored_profiles
-        .into_iter()
-        .filter(|profile| !AWS_REFLECTED_PROVIDER_IDS.contains(&profile.provider_id.as_str()))
-        .collect();
-
-    for provider in auth_provider_registry.values() {
-        profiles.extend(provider.reflect_profiles());
-    }
-
-    AuthProfileManager::with_items(profiles, None, "auth profiles")
+    AuthProfileManager::with_items(stored_profiles, None, "auth profiles")
 }
 
 fn load_driver_settings(
@@ -562,14 +548,17 @@ fn load_auth_profiles(runtime: &StorageRuntime) -> Result<Vec<datatab_core::Auth
                 // them.
                 secret_fields: std::collections::HashMap::new(),
                 enabled: dto.enabled,
-                read_only: false,
-                dangling_origin: dto.dangling_origin,
             })
         })
         .collect()
 }
 
-fn load_profiles(
+/// Loads persisted profiles, refusing malformed value references before secret reads.
+///
+/// A profile without a usable driver config, or with a malformed value
+/// reference, is rejected alone and recorded in the returned errors; the
+/// other profiles still load.
+pub fn load_profiles(
     runtime: &StorageRuntime,
 ) -> Result<(Vec<ConnectionProfile>, HashMap<uuid::Uuid, String>), String> {
     let repo = runtime.connection_profiles();
@@ -596,17 +585,25 @@ fn load_profiles(
                 dto.kind
                     .as_deref()
                     .and_then(str_to_db_kind)
-                    .map(default_db_config_for_kind)
-            })
-            .ok_or_else(|| {
-                format!(
-                    "Connection profile '{}' is missing a valid driver config",
-                    profile_id
-                )
-            })?;
+                    .and_then(default_db_config_for_kind)
+            });
+        let Some(config) = config else {
+            let error =
+                format!("Connection profile '{profile_id}' is missing a valid driver config");
+            log::warn!("Rejected connection profile '{profile_id}': {error}");
+            profile_load_errors.insert(id, error);
+            continue;
+        };
 
         let connection_settings = load_connection_settings(&repo, &profile_id)?;
-        let value_refs = load_profile_value_refs(&repo, &profile_id)?;
+        let value_refs = match load_profile_value_refs(&repo, &profile_id) {
+            Ok(value_refs) => value_refs,
+            Err(error) => {
+                log::warn!("Rejected connection profile '{profile_id}': {error}");
+                profile_load_errors.insert(id, error);
+                continue;
+            }
+        };
         let access_kind = load_access_kind(&repo, &dto, &profile_id)?;
         let mcp_governance = load_profile_governance(&repo, &profile_id)?;
 
@@ -1091,16 +1088,24 @@ fn load_profile_value_refs(
         .get_for_profile(profile_id)
         .map_err(|e| format!("Failed to load value refs for '{}': {}", profile_id, e))?;
 
+    let diagnostics: Vec<_> = value_refs
+        .iter()
+        .filter_map(|entry| entry.load_diagnostic())
+        .collect();
+    if !diagnostics.is_empty() {
+        return Err(diagnostics
+            .iter()
+            .map(ValueRefLoadDiagnostic::message)
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+
     let mut resolved = HashMap::with_capacity(value_refs.len());
 
     for entry in value_refs {
-        let Some(kind) =
-            datatab_storage::repositories::connection_profile_value_refs::RefKind::try_parse(
-                &entry.ref_kind,
-            )
-        else {
-            continue;
-        };
+        let kind = entry
+            .load_kind()
+            .map_err(|diagnostic| diagnostic.message())?;
 
         let value_ref = match kind {
             datatab_storage::repositories::connection_profile_value_refs::RefKind::Literal => {
@@ -1115,9 +1120,7 @@ fn load_profile_value_refs(
             }
             datatab_storage::repositories::connection_profile_value_refs::RefKind::Dotenv => {
                 ValueRef::Dotenv {
-                    key: entry.env_key.ok_or_else(|| {
-                        format!("Dotenv value ref '{}' is missing its key", entry.ref_key)
-                    })?,
+                    key: entry.env_key.ok_or("Invalid stored value reference")?,
                     path: entry.ref_value,
                 }
             }
@@ -1129,22 +1132,8 @@ fn load_profile_value_refs(
             }
             datatab_storage::repositories::connection_profile_value_refs::RefKind::Secret => {
                 ValueRef::Secret {
-                    provider: entry.ref_provider.ok_or_else(|| {
-                        format!("Secret value ref '{}' is missing provider", entry.ref_key)
-                    })?,
+                    provider: entry.ref_provider.ok_or("Invalid stored value reference")?,
                     locator: entry.secret_locator.unwrap_or(entry.ref_value),
-                    json_key: entry.ref_json_key,
-                }
-            }
-            datatab_storage::repositories::connection_profile_value_refs::RefKind::Param => {
-                ValueRef::Parameter {
-                    provider: entry.ref_provider.ok_or_else(|| {
-                        format!(
-                            "Parameter value ref '{}' is missing provider",
-                            entry.ref_key
-                        )
-                    })?,
-                    name: entry.param_name.unwrap_or(entry.ref_value),
                     json_key: entry.ref_json_key,
                 }
             }
@@ -1277,39 +1266,42 @@ fn str_to_db_kind(value: &str) -> Option<datatab_core::DbKind> {
         "MariaDB" => Some(datatab_core::DbKind::MariaDB),
         "MongoDB" => Some(datatab_core::DbKind::MongoDB),
         "Redis" => Some(datatab_core::DbKind::Redis),
-        "DynamoDB" => Some(datatab_core::DbKind::DynamoDB),
-        "CloudWatchLogs" => Some(datatab_core::DbKind::CloudWatchLogs),
         "InfluxDB" => Some(datatab_core::DbKind::InfluxDB),
         "SqlServer" => Some(datatab_core::DbKind::SqlServer),
         "Redshift" => Some(datatab_core::DbKind::Redshift),
         "ClickHouse" => Some(datatab_core::DbKind::ClickHouse),
-        "S3" => Some(datatab_core::DbKind::S3),
         "Turso" => Some(datatab_core::DbKind::Turso),
         "DuckDB" => Some(datatab_core::DbKind::DuckDB),
-        "AwsSecrets" => Some(datatab_core::DbKind::AwsSecrets),
+        // The names of the removed AWS drivers ("DynamoDB", "CloudWatchLogs",
+        // "S3", "AwsSecrets") are unknown like any other string.
         _ => None,
     }
 }
 
-fn default_db_config_for_kind(kind: datatab_core::DbKind) -> datatab_core::DbConfig {
-    match kind {
-        datatab_core::DbKind::Postgres => datatab_core::DbConfig::default_postgres(),
-        datatab_core::DbKind::SQLite => datatab_core::DbConfig::default_sqlite(),
-        datatab_core::DbKind::MySQL => datatab_core::DbConfig::default_mysql(),
-        datatab_core::DbKind::MariaDB => datatab_core::DbConfig::default_mysql(),
-        datatab_core::DbKind::MongoDB => datatab_core::DbConfig::default_mongodb(),
-        datatab_core::DbKind::Redis => datatab_core::DbConfig::default_redis(),
-        datatab_core::DbKind::DynamoDB => datatab_core::DbConfig::default_dynamodb(),
-        datatab_core::DbKind::CloudWatchLogs => datatab_core::DbConfig::default_cloudwatch_logs(),
-        datatab_core::DbKind::InfluxDB => datatab_core::DbConfig::default_influxdb(),
-        datatab_core::DbKind::SqlServer => datatab_core::DbConfig::default_sqlserver(),
-        datatab_core::DbKind::Redshift => datatab_core::DbConfig::default_redshift(),
-        datatab_core::DbKind::ClickHouse => datatab_core::DbConfig::default_clickhouse(),
-        datatab_core::DbKind::S3 => datatab_core::DbConfig::default_s3(),
-        datatab_core::DbKind::AwsSecrets => datatab_core::DbConfig::default_aws_secrets(),
-        datatab_core::DbKind::Turso => datatab_core::DbConfig::default_turso(),
-        datatab_core::DbKind::DuckDB => datatab_core::DbConfig::default_duckdb(),
-    }
+/// The config a profile row gets when it has no driver-config row. `None` for
+/// a reserved wire slot, which has no config.
+fn default_db_config_for_kind(kind: datatab_core::DbKind) -> Option<datatab_core::DbConfig> {
+    use datatab_core::{DbConfig, DbKind};
+
+    let config = match kind {
+        DbKind::Postgres => DbConfig::default_postgres(),
+        DbKind::SQLite => DbConfig::default_sqlite(),
+        DbKind::MySQL | DbKind::MariaDB => DbConfig::default_mysql(),
+        DbKind::MongoDB => DbConfig::default_mongodb(),
+        DbKind::Redis => DbConfig::default_redis(),
+        DbKind::InfluxDB => DbConfig::default_influxdb(),
+        DbKind::SqlServer => DbConfig::default_sqlserver(),
+        DbKind::Redshift => DbConfig::default_redshift(),
+        DbKind::ClickHouse => DbConfig::default_clickhouse(),
+        DbKind::Turso => DbConfig::default_turso(),
+        DbKind::DuckDB => DbConfig::default_duckdb(),
+        DbKind::ReservedDynamoDb
+        | DbKind::ReservedCloudWatchLogs
+        | DbKind::ReservedS3
+        | DbKind::ReservedAwsSecrets => return None,
+    };
+
+    Some(config)
 }
 
 fn load_governance_settings(
@@ -1620,14 +1612,6 @@ fn build_driver_registry() -> HashMap<String, Arc<dyn DbDriver>> {
         );
     }
 
-    #[cfg(feature = "dynamodb")]
-    {
-        registry.insert(
-            "dynamodb".to_string(),
-            Arc::new(datatab_driver_dynamodb::DynamoDriver::new()),
-        );
-    }
-
     #[cfg(feature = "redshift")]
     {
         registry.insert(
@@ -1666,26 +1650,7 @@ fn build_driver_registry() -> HashMap<String, Arc<dyn DbDriver>> {
 fn build_auth_provider_registry(
     services: &[ServiceConfig],
 ) -> HashMap<String, Arc<dyn DynAuthProvider>> {
-    #[allow(unused_mut)]
     let mut registry: HashMap<String, Arc<dyn DynAuthProvider>> = HashMap::new();
-
-    #[cfg(feature = "aws")]
-    {
-        let sso = Arc::new(datatab_aws::AwsSsoAuthProvider::new()) as Arc<dyn DynAuthProvider>;
-        registry.insert(sso.provider_id().to_string(), sso);
-
-        let shared = Arc::new(datatab_aws::AwsSharedCredentialsAuthProvider::new())
-            as Arc<dyn DynAuthProvider>;
-        registry.insert(shared.provider_id().to_string(), shared);
-
-        let sso_session =
-            Arc::new(datatab_aws::AwsSsoSessionAuthProvider::new()) as Arc<dyn DynAuthProvider>;
-        registry.insert(sso_session.provider_id().to_string(), sso_session);
-
-        // aws-static-credentials provider removed (ADR-7): DataTab no longer
-        // stores AWS long-lived secrets. Shared-credentials profiles are
-        // reflected from ~/.aws/credentials via AwsSharedCredentialsAuthProvider.
-    }
 
     load_external_auth_providers(&mut registry, services);
 
@@ -1778,8 +1743,7 @@ fn validate_auth_provider_contract(service: &ServiceConfig) -> Result<(), String
     Ok(())
 }
 
-/// Probes every enabled secret-provider service; built-in AWS providers are registered per
-/// connection by their auth provider, so they never enter this map and their ids are reserved.
+/// Probes every enabled external secret-provider service.
 fn build_secret_provider_registry(
     services: &[ServiceConfig],
 ) -> HashMap<String, Arc<dyn DynSecretProvider>> {
@@ -1858,6 +1822,9 @@ fn validate_secret_provider_contract(service: &ServiceConfig) -> Result<(), Stri
 
 #[cfg(test)]
 mod tests {
+    mod driver_config;
+    mod value_refs;
+
     use super::*;
 
     use datatab_core::auth::{AuthProfile, AuthSessionState, UrlCallback};
@@ -1886,101 +1853,27 @@ mod tests {
         assert_eq!(driver.driver_key(), "builtin:clickhouse");
     }
 
-    struct ReflectingAuthProvider {
-        provider_id: &'static str,
-        reflected: Vec<AuthProfile>,
-    }
-
-    #[async_trait::async_trait]
-    impl DynAuthProvider for ReflectingAuthProvider {
-        fn provider_id(&self) -> &str {
-            self.provider_id
-        }
-
-        fn display_name(&self) -> &str {
-            "Reflecting Test Provider"
-        }
-
-        fn form_def(&self) -> &datatab_core::AuthFormDef {
-            static FORM: std::sync::OnceLock<datatab_core::AuthFormDef> =
-                std::sync::OnceLock::new();
-            FORM.get_or_init(|| datatab_core::AuthFormDef { tabs: vec![] })
-        }
-
-        async fn validate_session(
-            &self,
-            _profile: &AuthProfile,
-        ) -> Result<AuthSessionState, datatab_core::DbError> {
-            Ok(AuthSessionState::LoginRequired)
-        }
-
-        async fn login(
-            &self,
-            _profile: &AuthProfile,
-            _url_callback: UrlCallback,
-        ) -> Result<datatab_core::auth::AuthSession, datatab_core::DbError> {
-            Err(datatab_core::DbError::connection_failed("not supported"))
-        }
-
-        async fn resolve_credentials(
-            &self,
-            _profile: &AuthProfile,
-        ) -> Result<datatab_core::auth::ResolvedCredentials, datatab_core::DbError> {
-            Ok(datatab_core::auth::ResolvedCredentials::default())
-        }
-
-        fn reflect_profiles(&self) -> Vec<AuthProfile> {
-            self.reflected.clone()
-        }
-    }
-
-    fn reflecting_registry(
-        provider_id: &'static str,
-        reflected: Vec<AuthProfile>,
-    ) -> HashMap<String, Arc<dyn DynAuthProvider>> {
-        HashMap::from([(
-            provider_id.to_string(),
-            Arc::new(ReflectingAuthProvider {
-                provider_id,
-                reflected,
-            }) as Arc<dyn DynAuthProvider>,
-        )])
-    }
-
     #[test]
-    fn auth_profile_manager_includes_reflected_profile_without_stored_row() {
-        let mut reflected = AuthProfile::new("dev", "aws-sso", HashMap::new());
-        reflected.read_only = true;
-        let reflected_id = reflected.id;
-        let registry = reflecting_registry("aws-sso", vec![reflected]);
-
-        let manager = build_auth_profile_manager(Vec::new(), &registry);
-
-        assert!(
-            manager
-                .items
-                .iter()
-                .any(|profile| profile.id == reflected_id)
-        );
-    }
-
-    #[test]
-    fn auth_profile_manager_replaces_stored_row_of_reflecting_provider() {
-        let mut reflected = AuthProfile::new("dev", "aws-sso", HashMap::new());
-        reflected.read_only = true;
-        let reflected_id = reflected.id;
-        let registry = reflecting_registry("aws-sso", vec![reflected]);
-
-        let stale_stored = AuthProfile::new("dev", "aws-sso", HashMap::new());
-        let other_stored = AuthProfile::new("rpc", "rpc-auth", HashMap::new());
-        let other_stored_id = other_stored.id;
-
-        let manager = build_auth_profile_manager(vec![stale_stored, other_stored], &registry);
-
-        let ids: Vec<_> = manager.items.iter().map(|profile| profile.id).collect();
-        assert_eq!(ids.len(), 2);
-        assert!(ids.contains(&reflected_id));
-        assert!(ids.contains(&other_stored_id));
+    fn auth_profile_manager_keeps_all_stored_provider_rows() {
+        let runtime = StorageRuntime::in_memory().expect("storage");
+        let rpc = AuthProfile::new("RPC", "rpc-auth", HashMap::new());
+        let leftover = AuthProfile::new("Leftover", "aws-sso", HashMap::new());
+        for profile in [&rpc, &leftover] {
+            runtime
+                .auth_profiles()
+                .insert(
+                    &datatab_storage::repositories::auth_profiles::AuthProfileDto::new(
+                        profile.id,
+                        profile.name.clone(),
+                        profile.provider_id.clone(),
+                    ),
+                )
+                .expect("store auth profile");
+        }
+        let manager =
+            build_auth_profile_manager(load_auth_profiles(&runtime).expect("load profiles"));
+        let ids: std::collections::HashSet<_> = manager.items.iter().map(|p| p.id).collect();
+        assert_eq!(ids, std::collections::HashSet::from([rpc.id, leftover.id]));
     }
 
     fn temp_runtime() -> (tempfile::TempDir, StorageRuntime) {
@@ -2241,7 +2134,6 @@ mod tests {
                     supported: true,
                     verification_url_progress: true,
                 },
-                edit: None,
             },
             supported_versions: datatab_ipc::auth_provider_rpc_supported_versions().to_vec(),
             expected_connections: 5,
@@ -2366,10 +2258,7 @@ mod tests {
         )];
 
         let auth_registry = build_auth_provider_registry(&services);
-        let external_auth_ids: Vec<&String> = auth_registry
-            .keys()
-            .filter(|provider_id| !provider_id.starts_with("aws-"))
-            .collect();
+        let external_auth_ids: Vec<&String> = auth_registry.keys().collect();
 
         assert!(
             external_auth_ids.is_empty(),
@@ -2416,7 +2305,6 @@ mod tests {
                     supported: true,
                     verification_url_progress: false,
                 },
-                edit: None,
             },
             supported_versions: datatab_ipc::auth_provider_rpc_supported_versions().to_vec(),
             expected_connections: 2,
@@ -2482,7 +2370,6 @@ mod tests {
                     supported: true,
                     verification_url_progress: true,
                 },
-                edit: None,
             },
             supported_versions: datatab_ipc::auth_provider_rpc_supported_versions().to_vec(),
             expected_connections: 4,
@@ -2831,7 +2718,7 @@ mod tests {
         assert_eq!(str_to_db_kind("Turso"), Some(datatab_core::DbKind::Turso));
         assert!(matches!(
             default_db_config_for_kind(datatab_core::DbKind::Turso),
-            datatab_core::DbConfig::Turso { ref url } if url.is_empty()
+            Some(datatab_core::DbConfig::Turso { ref url }) if url.is_empty()
         ));
     }
 }

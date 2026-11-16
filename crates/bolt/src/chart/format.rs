@@ -3,21 +3,35 @@
 //! The data owner formats its cells; the chart formats the resolved numeric
 //! values it plots — an X position on the axis and a Y readout value.
 
-use chrono::DateTime;
+use chrono::{DateTime, FixedOffset, Local, Offset, TimeZone};
 
-/// Format an X readout value: wall-clock time for a time axis, otherwise a
-/// fixed three-decimal number.
+/// `ms` (Unix milliseconds) as a datetime in `tz`, expressed at a fixed offset.
+///
+/// The zone's own offset type stays out of the return type, so callers can
+/// format the value without naming it.
+pub fn datetime_in_zone<Z: TimeZone>(tz: &Z, ms: f64) -> Option<DateTime<FixedOffset>> {
+    if !ms.is_finite() {
+        return None;
+    }
+    let utc = DateTime::from_timestamp_millis(ms.round() as i64)?;
+    let offset = tz.offset_from_utc_datetime(&utc.naive_utc()).fix();
+    Some(utc.with_timezone(&offset))
+}
+
+/// Format an X readout value in the machine's local zone: wall-clock time for
+/// a time axis, otherwise a fixed three-decimal number.
 ///
 /// A time value arrives as Unix milliseconds; out-of-range values fall back
 /// to the numeric form rather than failing the readout.
 pub fn format_x_value(x: f64, is_time: bool) -> String {
-    if is_time {
-        let secs = (x / 1000.0).trunc() as i64;
-        let nsecs = ((x.rem_euclid(1000.0)) * 1_000_000.0) as u32;
-        match DateTime::from_timestamp(secs, nsecs) {
-            Some(dt) => dt.format("%Y-%m-%d %H:%M:%S").to_string(),
-            None => format!("{:.3}", x),
-        }
+    format_x_value_in(&Local, x, is_time)
+}
+
+/// Format an X readout value in `tz`: wall-clock time for a time axis,
+/// otherwise a fixed three-decimal number.
+pub fn format_x_value_in<Z: TimeZone>(tz: &Z, x: f64, is_time: bool) -> String {
+    if is_time && let Some(dt) = datetime_in_zone(tz, x) {
+        dt.format("%Y-%m-%d %H:%M:%S").to_string()
     } else {
         format!("{:.3}", x)
     }
@@ -76,9 +90,66 @@ mod tests {
     use super::*;
 
     #[test]
+    fn datetime_in_zone_shifts_the_clock_by_the_offset() {
+        let plus_seven = chrono::FixedOffset::east_opt(7 * 3_600).expect("valid offset");
+        let halfway = chrono::FixedOffset::east_opt(5 * 3_600 + 30 * 60).expect("valid offset");
+
+        assert_eq!(
+            datetime_in_zone(&plus_seven, 0.0)
+                .expect("epoch in range")
+                .format("%Y-%m-%d %H:%M")
+                .to_string(),
+            "1970-01-01 07:00"
+        );
+        assert_eq!(
+            datetime_in_zone(&halfway, 0.0)
+                .expect("epoch in range")
+                .format("%H:%M")
+                .to_string(),
+            "05:30"
+        );
+    }
+
+    fn fixed_offset(hours: i32, minutes: i32) -> FixedOffset {
+        let negative = hours < 0 || minutes < 0;
+        let magnitude = hours.abs() * 3_600 + minutes.abs() * 60;
+        FixedOffset::east_opt(if negative { -magnitude } else { magnitude })
+            .expect("valid fixed zone offset")
+    }
+
+    #[test]
     fn format_x_value_time_formats_unix_ms() {
-        let s = format_x_value(0.0, true);
-        assert!(s.starts_with("1970-01-01"), "got: {s}");
+        let utc = fixed_offset(0, 0);
+        let s = format_x_value_in(&utc, 0.0, true);
+        assert_eq!(s, "1970-01-01 00:00:00");
+    }
+
+    #[test]
+    fn format_x_value_in_uses_the_injected_zone() {
+        assert_eq!(
+            format_x_value_in(&fixed_offset(7, 0), 0.0, true),
+            "1970-01-01 07:00:00"
+        );
+        assert_eq!(
+            format_x_value_in(&fixed_offset(5, 30), 0.0, true),
+            "1970-01-01 05:30:00"
+        );
+        assert_eq!(
+            format_x_value_in(&fixed_offset(-8, 0), 0.0, true),
+            "1969-12-31 16:00:00"
+        );
+        assert_eq!(
+            format_x_value_in(&fixed_offset(7, 0), 42.5, false),
+            "42.500"
+        );
+    }
+
+    #[test]
+    fn format_x_value_wraps_the_machine_zone() {
+        assert_eq!(
+            format_x_value(0.0, true),
+            format_x_value_in(&Local, 0.0, true)
+        );
     }
 
     #[test]

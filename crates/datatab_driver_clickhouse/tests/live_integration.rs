@@ -437,7 +437,7 @@ fn clickhouse_metric_raw_names_exist_in_their_system_tables() -> Result<(), DbEr
             "SELECT count() FROM datatab_live_events_probe",
         ))?;
 
-        for (raw_name, metric_id, .., source) in METRIC_DEFS {
+        for (raw_name, metric_id, _, _, _, source, _) in METRIC_DEFS {
             let (table, key_column) = match source {
                 MetricSource::Metrics => ("system.metrics", "metric"),
                 MetricSource::Events => ("system.events", "event"),

@@ -1,6 +1,6 @@
 //! Chart view-mode state and helpers for `AuditDocument`.
 //!
-//! File-level extraction following the KeyValueView/LogStreamView pattern:
+//! Chart rendering and aggregation helpers for the audit document:
 //! `impl Render` stays in `mod.rs` (single `Context<T>` borrow constraint);
 //! chart-specific state, helpers, and the render sub-function live here.
 //!
@@ -11,7 +11,7 @@
 //!   │ chart area (ChartShell via Standalone host)  │
 //!   └──────────────────────────────────────────────┘
 
-use super::{AuditDocument, AuditDocumentSource};
+use super::AuditDocument;
 use crate::chart::ChartShell;
 use datatab_audit::{AuditAggregateParams, AuditGroupColumn};
 use datatab_components::chart::{AggKind, AuditGroupBy, BindingSpec};
@@ -221,12 +221,8 @@ impl AuditDocument {
 
     /// Spawns the aggregate behind the timeline strip: event counts per level
     /// in about `DocumentMetrics::TIMELINE_BUCKETS` buckets over the current
-    /// window. Only the local audit store has an aggregate.
+    /// window in the local audit store.
     pub(super) fn trigger_timeline(&mut self, cx: &mut Context<Self>) {
-        let AuditDocumentSource::Internal { adapter } = &self.source else {
-            return;
-        };
-
         self.timeline.load_id += 1;
         let load_id = self.timeline.load_id;
 
@@ -239,7 +235,7 @@ impl AuditDocument {
         let bucket_ms = Self::timeline_bucket_ms(start_ms, end_ms);
 
         let filter = self.active_filter(None, None);
-        let adapter = adapter.clone();
+        let adapter = self.source.clone();
 
         let task: Task<Result<QueryResult, String>> = cx.background_executor().spawn(async move {
             adapter.aggregate(&AuditAggregateParams {
@@ -304,20 +300,15 @@ impl AuditDocument {
     /// Spawns a background aggregate task for the current filters and chart
     /// group-by, then stashes the result in `chart.pending_result`.
     ///
-    /// Only operates when the source is `Internal` (the local audit store).
     /// Increments `chart.load_id` so that stale completions can be detected.
     pub(super) fn trigger_chart_aggregate(&mut self, cx: &mut Context<Self>) {
-        let AuditDocumentSource::Internal { adapter } = &self.source else {
-            return;
-        };
-
         self.chart.load_id += 1;
         let load_id = self.chart.load_id;
 
         let storage_filter = self.active_filter(None, None);
         let bucket_ms = Self::compute_bucket_ms(self.filters.start_ms, self.filters.end_ms);
         let group_by = Self::audit_group_column(self.chart.group_by);
-        let adapter = adapter.clone();
+        let adapter = self.source.clone();
 
         let agg_task: Task<Result<QueryResult, String>> =
             cx.background_executor().spawn(async move {

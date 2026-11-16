@@ -32,12 +32,12 @@ use datatab_core::{
 use secrecy::ExposeSecret;
 
 use crate::{
-    AwsRef, EncryptionChoice, ExportGraph, ExportOptions, ExportReport, ExportTransformResolver,
+    EncryptionChoice, ExportGraph, ExportOptions, ExportReport, ExportTransformResolver,
     FieldHintResolver, PortabilityError, SecretReader,
     bundle::{
-        AccessEntry, AuthEntry, AuthRef, AuthRefKind, Bundle, BundleMeta, CURRENT_FORMAT_VERSION,
-        ConnectionEntry, DriverRef, EncryptionMode, ProxyEntry, RequiredRef, RequiredRefKind,
-        SecretsSection, SshAuthMethodKind, SshEntry,
+        AccessEntry, AuthEntry, Bundle, BundleMeta, CURRENT_FORMAT_VERSION, ConnectionEntry,
+        DriverRef, EncryptionMode, ProxyEntry, RequiredRef, RequiredRefKind, SecretsSection,
+        SshAuthMethodKind, SshEntry,
     },
 };
 
@@ -182,12 +182,7 @@ pub fn export(
             }
         }
 
-        let auth_ref = resolve_auth_ref(profile, &graph.aws_references);
-        let auth_profile_local_id = if auth_ref.is_none() {
-            profile.auth_profile_id.map(|id| id.to_string())
-        } else {
-            None
-        };
+        let auth_profile_local_id = profile.auth_profile_id.map(|id| id.to_string());
 
         let access = build_access_entry(profile);
 
@@ -264,7 +259,6 @@ pub fn export(
             fields: include_fields,
             local_path_fields,
             required_refs,
-            auth_ref,
             auth_profile_local_id,
             access,
             value_refs,
@@ -323,28 +317,6 @@ fn driver_ref_for(driver_id: &str) -> DriverRef {
     DriverRef { reference }
 }
 
-fn resolve_auth_ref(
-    profile: &datatab_core::ConnectionProfile,
-    aws_refs: &[AwsRef],
-) -> Option<AuthRef> {
-    if aws_refs.is_empty() {
-        return None;
-    }
-
-    profile.auth_profile_id.and_then(|auth_id| {
-        use datatab_core::auth::aws_profile_uuid;
-
-        aws_refs
-            .iter()
-            .find(|r| aws_profile_uuid(&r.provider_id, &r.name) == auth_id)
-            .map(|r| AuthRef {
-                kind: AuthRefKind::AwsReference,
-                provider_id: r.provider_id.clone(),
-                name: r.name.clone(),
-            })
-    })
-}
-
 fn build_access_entry(profile: &datatab_core::ConnectionProfile) -> Option<AccessEntry> {
     use datatab_core::access::AccessKind;
 
@@ -370,7 +342,7 @@ fn build_access_entry(profile: &datatab_core::ConnectionProfile) -> Option<Acces
 /// All `ValueRef` variants — including `Literal` — are serialized as cleartext
 /// references in the output map. A `Literal` is a static inline value (not a secret
 /// locator) and carries no inherent secrecy; it belongs in the cleartext section
-/// alongside `Env`, `Parameter`, `Auth`, and `Secret` locators.
+/// alongside `Env`, `Auth`, and `Secret` locators.
 ///
 /// Conversion failures push a warning rather than silently dropping the entry.
 fn build_value_refs(
@@ -775,8 +747,8 @@ mod tests {
     use secrecy::SecretString;
 
     use crate::{
-        AwsRef, ConnectionWithValues, EncryptionChoice, ExportGraph, ExportOptions,
-        FieldHintResolver, SecretReader, export::export,
+        ConnectionWithValues, EncryptionChoice, ExportGraph, ExportOptions, FieldHintResolver,
+        SecretReader, export::export,
     };
 
     struct IncludeAllHints;
@@ -938,7 +910,6 @@ mod tests {
         ExportGraph {
             connections: vec![ConnectionWithValues { profile, values }],
             auth_profiles: vec![],
-            aws_references: vec![],
             ssh_tunnels: vec![],
             proxies: vec![],
         }
@@ -1166,52 +1137,6 @@ mod tests {
     }
 
     #[test]
-    fn aws_reference_recorded_as_auth_ref_not_cleartext() {
-        let mut profile = postgres_profile();
-        let aws_ref = AwsRef {
-            provider_id: "aws-sso".to_string(),
-            name: "My AWS SSO".to_string(),
-        };
-        profile.auth_profile_id = Some(datatab_core::auth::aws_profile_uuid(
-            &aws_ref.provider_id,
-            &aws_ref.name,
-        ));
-
-        let values = FormValues::default();
-
-        let graph = ExportGraph {
-            connections: vec![ConnectionWithValues {
-                profile: &profile,
-                values,
-            }],
-            auth_profiles: vec![],
-            aws_references: vec![aws_ref],
-            ssh_tunnels: vec![],
-            proxies: vec![],
-        };
-
-        let (bytes, _) = export(
-            &graph,
-            &default_opts_plaintext(),
-            &IncludeAllHints,
-            &NoTransforms,
-            &NoSecrets,
-        )
-        .expect("export");
-
-        let text = String::from_utf8(bytes).expect("utf8");
-        assert!(
-            text.contains("aws_reference"),
-            "auth_ref kind must be aws_reference: {text}"
-        );
-        assert!(
-            text.contains("My AWS SSO"),
-            "AWS profile name must appear: {text}"
-        );
-        assert!(text.contains("aws-sso"), "provider_id must appear: {text}");
-    }
-
-    #[test]
     fn ssh_alias_survives_export_to_bundle() {
         use datatab_core::{SshTunnelConfig, SshTunnelProfile};
 
@@ -1234,7 +1159,6 @@ mod tests {
                 values,
             }],
             auth_profiles: vec![],
-            aws_references: vec![],
             ssh_tunnels: vec![&ssh],
             proxies: vec![],
         };
@@ -1290,7 +1214,6 @@ mod tests {
                 values,
             }],
             auth_profiles: vec![],
-            aws_references: vec![],
             ssh_tunnels: vec![&ssh],
             proxies: vec![],
         };
@@ -1506,7 +1429,7 @@ mod tests {
     // --- P3: ValueRef::Literal is a cleartext reference, not a secret ---
     //
     // A Literal is a static inline value (username, region, etc.), not a secret locator.
-    // It belongs in the cleartext value_refs map alongside Env/Parameter/Auth/Secret locators.
+    // It belongs in the cleartext value_refs map alongside Env/Auth/Secret locators.
 
     #[test]
     fn value_ref_literal_appears_in_cleartext_value_refs() {
@@ -1621,8 +1544,6 @@ mod tests {
                 m
             },
             enabled: true,
-            read_only: false,
-            dangling_origin: None,
         };
         profile.auth_profile_id = Some(auth.id);
 
@@ -1633,7 +1554,6 @@ mod tests {
                 values,
             }],
             auth_profiles: vec![&auth],
-            aws_references: vec![],
             ssh_tunnels: vec![],
             proxies: vec![],
         };
@@ -1691,8 +1611,6 @@ mod tests {
                 m
             },
             enabled: true,
-            read_only: false,
-            dangling_origin: None,
         };
         profile.auth_profile_id = Some(auth.id);
 
@@ -1703,7 +1621,6 @@ mod tests {
                 values,
             }],
             auth_profiles: vec![&auth],
-            aws_references: vec![],
             ssh_tunnels: vec![],
             proxies: vec![],
         };
@@ -1823,7 +1740,6 @@ mod tests {
         let graph = ExportGraph {
             connections: vec![],
             auth_profiles: vec![],
-            aws_references: vec![],
             ssh_tunnels: vec![],
             proxies: vec![&proxy],
         };
@@ -1856,7 +1772,6 @@ mod tests {
         let graph2 = ExportGraph {
             connections: vec![],
             auth_profiles: vec![],
-            aws_references: vec![],
             ssh_tunnels: vec![],
             proxies: vec![&proxy_http],
         };
@@ -2013,7 +1928,6 @@ mod tests {
                 values,
             }],
             auth_profiles: vec![],
-            aws_references: vec![],
             ssh_tunnels: vec![&ssh],
             proxies: vec![],
         };
@@ -2066,7 +1980,6 @@ mod tests {
                 values,
             }],
             auth_profiles: vec![],
-            aws_references: vec![],
             ssh_tunnels: vec![&ssh],
             proxies: vec![],
         };
@@ -2130,7 +2043,6 @@ mod tests {
                 values,
             }],
             auth_profiles: vec![],
-            aws_references: vec![],
             ssh_tunnels: vec![],
             proxies: vec![&proxy],
         };
@@ -2221,7 +2133,6 @@ mod tests {
                 values,
             }],
             auth_profiles: vec![],
-            aws_references: vec![],
             ssh_tunnels: vec![&ssh],
             proxies: vec![],
         };
@@ -2255,8 +2166,6 @@ mod tests {
                 m
             },
             enabled: true,
-            read_only: false,
-            dangling_origin: None,
         };
         profile.auth_profile_id = Some(auth.id);
 
@@ -2267,7 +2176,6 @@ mod tests {
                 values,
             }],
             auth_profiles: vec![&auth],
-            aws_references: vec![],
             ssh_tunnels: vec![],
             proxies: vec![],
         };
@@ -2432,7 +2340,6 @@ mod tests {
                 values,
             }],
             auth_profiles: vec![],
-            aws_references: vec![],
             ssh_tunnels: vec![&ssh],
             proxies: vec![],
         };
@@ -2477,7 +2384,6 @@ mod tests {
                 values,
             }],
             auth_profiles: vec![],
-            aws_references: vec![],
             ssh_tunnels: vec![&ssh],
             proxies: vec![],
         };

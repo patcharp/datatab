@@ -1122,7 +1122,6 @@ pub(crate) fn audit_category_label(category: datatab_core::EventCategory) -> Str
         EventCategory::ObjectStorage => {
             datatab_i18n::t!("document.audit.category.object_storage")
         }
-        EventCategory::SecretStore => datatab_i18n::t!("document.audit.category.secret_store"),
     }
 }
 
@@ -1202,18 +1201,6 @@ pub(crate) fn audit_actor_type_label(actor_type: datatab_core::EventActorType) -
     }
 }
 
-/// Task-panel description for loading an external audit event stream, with
-/// the document's tab title interpolated.
-pub(crate) fn audit_loading_event_stream_task_label(title: &str) -> String {
-    datatab_i18n::t!("document.audit.task.loading_event_stream", title = title)
-}
-
-/// Toast text when export is attempted on an audit document source that does
-/// not support it (an external event stream, not the built-in viewer).
-pub(crate) fn audit_export_unsupported_source_toast() -> String {
-    datatab_i18n::t!("document.audit.export.unsupported_source")
-}
-
 /// Toast text after a successful audit export, with the exported event count
 /// and destination path interpolated.
 ///
@@ -1247,13 +1234,7 @@ pub(crate) fn audit_export_failed_error(error: &str) -> String {
     datatab_i18n::t!("document.audit.export.failed", error = error)
 }
 
-/// Status line for the audit viewer when an external event source points at
-/// a connection that no longer exists.
-pub(crate) fn audit_event_source_connection_not_found() -> String {
-    datatab_i18n::t!("document.audit.source.connection_not_found")
-}
-
-/// Status line and task detail when loading events from an external source
+/// Status line when loading events from the audit store
 /// fails; `error` is the cause as reported and stays untranslated.
 pub(crate) fn audit_events_load_failed(error: &str) -> String {
     datatab_i18n::t!("document.audit.source.load_failed", error = error)
@@ -1708,47 +1689,6 @@ pub(crate) fn chart_toolbar_points_label(count: usize) -> String {
     } else {
         datatab_i18n::t!("document.chart.toolbar.points.many", count = count)
     }
-}
-
-/// Label for the trailing "Custom…" entry appended to the metric picker's
-/// period and statistic dropdowns.
-pub(crate) fn metric_picker_custom_dropdown_label() -> String {
-    datatab_i18n::t!("document.chart.metric_picker.dropdown.custom")
-}
-
-/// Inline error shown beneath the metric picker's dimensions section when
-/// the background fetch fails or the connection cannot serve one.
-pub(crate) fn metric_picker_dimensions_error_label(message: &str) -> String {
-    datatab_i18n::t!(
-        "document.chart.metric_picker.dimensions.error",
-        message = message
-    )
-}
-
-/// Inline error shown beneath the metric picker's period "Custom…" input.
-pub(crate) fn metric_picker_period_error_label(message: &str) -> String {
-    datatab_i18n::t!(
-        "document.chart.metric_picker.period.error",
-        message = message
-    )
-}
-
-/// Inline error shown beneath the metric picker's statistic "Custom…"
-/// input.
-pub(crate) fn metric_picker_statistic_error_label(message: &str) -> String {
-    datatab_i18n::t!(
-        "document.chart.metric_picker.statistic.error",
-        message = message
-    )
-}
-
-/// Validation error for a non-numeric custom period entry, with the raw
-/// user input interpolated as it was debug-formatted before this change.
-pub(crate) fn metric_picker_period_not_a_number_error(raw: &str) -> String {
-    datatab_i18n::t!(
-        "document.chart.metric_picker.period.validation.not_a_number",
-        value = format!("{raw:?}")
-    )
 }
 
 /// Label for a [`datatab_transfer::TableMappingMode`] shown in the import
@@ -3879,10 +3819,8 @@ mod tests {
         MutationItemKind, VisualMutationTaskMode, add_member_modal_placeholders,
         add_member_modal_section_label, add_member_modal_title, agg_fn_display,
         assignment_value_kind_label, audit_actor_type_label, audit_category_label,
-        audit_event_source_connection_not_found, audit_events_load_failed,
-        audit_export_exported_toast, audit_export_failed_error,
-        audit_export_unsupported_source_toast, audit_export_write_failed_error,
-        audit_level_chip_label, audit_level_label, audit_loading_event_stream_task_label,
+        audit_events_load_failed, audit_export_exported_toast, audit_export_failed_error,
+        audit_export_write_failed_error, audit_level_chip_label, audit_level_label,
         audit_outcome_label, auto_refresh_unavailable_toast, bool_op_label,
         bucket_encryption_choice_label, buckets_table_summary_line, builder_mode_label,
         bulk_delete_success_label, chart_degraded_copy, chart_dock_shape_label,
@@ -3904,20 +3842,17 @@ mod tests {
         image_decode_error, image_header_error, import_mapping_mode_label, import_rail_labels,
         import_summary_label, import_table_status_line, import_wizard_task_label,
         incomplete_aggregate_rows_label, join_kind_label, live_output_lines_label,
-        live_output_truncated_label, metric_picker_custom_dropdown_label,
-        metric_picker_dimensions_error_label, metric_picker_period_error_label,
-        metric_picker_period_not_a_number_error, metric_picker_statistic_error_label,
-        migrate_mapping_unmapped_count_label, migrate_running_position_label,
-        migrate_running_rows_label, migrate_source_target_checked_count_label,
-        migrate_summary_label, migrate_table_status_line,
-        migrate_wizard_target_schema_read_failed_error, migrate_wizard_task_label,
-        mutation_chunk_size_adjusted_toast, mutation_chunk_size_reduced_toast,
-        mutation_chunked_execution_failed_error, mutation_delete_document_task_label,
-        mutation_delete_row_task_label, mutation_delete_task_label,
-        mutation_execution_cancelled_toast, mutation_execution_completed_toast,
-        mutation_execution_failed_error, mutation_insert_document_task_label,
-        mutation_insert_row_task_label, mutation_read_only_error,
-        mutation_save_document_task_label, mutation_save_row_task_label,
+        live_output_truncated_label, migrate_mapping_unmapped_count_label,
+        migrate_running_position_label, migrate_running_rows_label,
+        migrate_source_target_checked_count_label, migrate_summary_label,
+        migrate_table_status_line, migrate_wizard_target_schema_read_failed_error,
+        migrate_wizard_task_label, mutation_chunk_size_adjusted_toast,
+        mutation_chunk_size_reduced_toast, mutation_chunked_execution_failed_error,
+        mutation_delete_document_task_label, mutation_delete_row_task_label,
+        mutation_delete_task_label, mutation_execution_cancelled_toast,
+        mutation_execution_completed_toast, mutation_execution_failed_error,
+        mutation_insert_document_task_label, mutation_insert_row_task_label,
+        mutation_read_only_error, mutation_save_document_task_label, mutation_save_row_task_label,
         mutation_update_document_field_task_label, object_browser_copied_uri_toast,
         object_browser_status_summary, object_browser_versions_count_label, partial_delete_label,
         pending_change_count_label, pending_edits_summary, pk_details_fetch_failed_error,
@@ -4963,7 +4898,6 @@ mod tests {
         EventCategory::Mcp,
         EventCategory::Governance,
         EventCategory::ObjectStorage,
-        EventCategory::SecretStore,
     ];
 
     const ALL_EVENT_OUTCOMES: &[EventOutcome] = &[
@@ -5004,7 +4938,6 @@ mod tests {
             EventCategory::Mcp => "document.audit.category.mcp",
             EventCategory::Governance => "document.audit.category.governance",
             EventCategory::ObjectStorage => "document.audit.category.object_storage",
-            EventCategory::SecretStore => "document.audit.category.secret_store",
         }
     }
 
@@ -5916,128 +5849,6 @@ mod tests {
         assert_eq!(chart_toolbar_points_label(1), "1 pt");
         assert_eq!(chart_toolbar_points_label(0), "0 pts");
         assert_eq!(chart_toolbar_points_label(240), "240 pts");
-    }
-
-    // ── PR 25: chart/{metric_picker,metric_picker_render}.rs ────────────────
-
-    const METRIC_PICKER_KEYS: &[&str] = &[
-        "document.chart.metric_picker.apply",
-        "document.chart.metric_picker.dropdown.custom",
-        "document.chart.metric_picker.period.placeholder",
-        "document.chart.metric_picker.period.error",
-        "document.chart.metric_picker.period.validation.not_a_number",
-        "document.chart.metric_picker.period.validation.too_low",
-        "document.chart.metric_picker.period.validation.too_high",
-        "document.chart.metric_picker.statistic.placeholder",
-        "document.chart.metric_picker.statistic.error",
-        "document.chart.metric_picker.statistic.validation.empty",
-        "document.chart.metric_picker.dimensions.title",
-        "document.chart.metric_picker.dimensions.loading",
-        "document.chart.metric_picker.dimensions.error",
-        "document.chart.metric_picker.dimensions.retry",
-        "document.chart.metric_picker.dimensions.aggregate_all",
-        "document.chart.metric_picker.dimensions.empty",
-        "document.chart.metric_picker.dimensions.connection_not_found",
-        "document.chart.metric_picker.dimensions.catalog_unsupported",
-    ];
-
-    /// PR 25: every `document.chart.metric_picker.*` key resolves to a
-    /// non-empty, non-fallback value in English.
-    #[test]
-    fn metric_picker_keys_resolve_in_english() {
-        for key in METRIC_PICKER_KEYS {
-            let value = datatab_i18n::t!(*key, locale = "en");
-
-            assert!(!value.is_empty(), "{key} resolved empty in en");
-            assert_ne!(value, *key, "{key} resolved to its own key in en");
-            assert_ne!(value, format!("en.{key}"), "{key} missing from en catalog");
-        }
-    }
-
-    /// PR 25: the trailing "Custom…" dropdown entry matches the pre-i18n
-    /// English literal.
-    #[test]
-    fn metric_picker_custom_dropdown_label_matches_english() {
-        let value = metric_picker_custom_dropdown_label();
-        assert!(
-            !value.is_empty(),
-            "metric_picker_custom_dropdown_label must not resolve empty"
-        );
-
-        let en = datatab_i18n::t!(
-            "document.chart.metric_picker.dropdown.custom",
-            locale = "en"
-        );
-
-        assert_eq!(en, "Custom…");
-    }
-
-    /// PR 25: `PERIOD_PRESETS` labels ("1 min", "5 min", …) stay English
-    /// data, same as `STATISTIC_PRESETS` — the vocabulary rule for this
-    /// change explicitly excludes period values from translation.
-    #[test]
-    fn period_presets_stay_untranslated_data() {
-        use crate::chart::metric_picker::PERIOD_PRESETS;
-
-        let labels: Vec<&str> = PERIOD_PRESETS.iter().map(|(_, label)| *label).collect();
-        assert_eq!(labels, vec!["1 min", "5 min", "15 min", "1 hr"]);
-    }
-
-    /// PR 25: the dimensions-section error interpolates the underlying
-    /// message.
-    #[test]
-    fn metric_picker_dimensions_error_label_interpolates_message() {
-        let value = metric_picker_dimensions_error_label("boom");
-        assert!(
-            value.contains("boom"),
-            "dimensions error must interpolate the message: {value}"
-        );
-    }
-
-    /// PR 25: the period "Custom…" inline error interpolates the underlying
-    /// message.
-    #[test]
-    fn metric_picker_period_error_label_interpolates_message() {
-        let value = metric_picker_period_error_label("must be a number");
-        assert!(
-            value.contains("must be a number"),
-            "period error must interpolate the message: {value}"
-        );
-    }
-
-    /// PR 25: the statistic "Custom…" inline error interpolates the
-    /// underlying message.
-    #[test]
-    fn metric_picker_statistic_error_label_interpolates_message() {
-        let value = metric_picker_statistic_error_label("must not be empty");
-        assert!(
-            value.contains("must not be empty"),
-            "statistic error must interpolate the message: {value}"
-        );
-    }
-
-    /// PR 25: `validate_period`'s non-numeric error interpolates the raw
-    /// input, debug-formatted as it was in the pre-i18n literal.
-    #[test]
-    fn metric_picker_period_not_a_number_error_interpolates_raw_input() {
-        let value = metric_picker_period_not_a_number_error("abc");
-        assert!(
-            value.contains("\"abc\""),
-            "non-numeric error must interpolate the debug-formatted input: {value}"
-        );
-    }
-
-    /// PR 25: `document.chart.metric_picker.dimensions.title` matches the
-    /// mixed-case section label in English.
-    #[test]
-    fn metric_picker_dimensions_title_matches_english_catalog() {
-        assert_eq!(
-            datatab_i18n::t!(
-                "document.chart.metric_picker.dimensions.title",
-                locale = "en"
-            ),
-            "Dimensions"
-        );
     }
 
     // ── PR 26a: import_wizard/*.rs ───────────────────────────────────────
@@ -7180,16 +6991,12 @@ mod tests {
 
     #[test]
     fn audit_event_source_status_messages_resolve_in_english() {
-        for key in [
-            "document.audit.source.connection_not_found",
-            "document.audit.source.load_failed",
-        ] {
-            let value = datatab_i18n::t!(key, locale = "en");
+        let key = "document.audit.source.load_failed";
+        let value = datatab_i18n::t!(key, locale = "en");
 
-            assert!(!value.is_empty());
-            assert_ne!(value, key);
-            assert_ne!(value, format!("en.{key}"));
-        }
+        assert!(!value.is_empty());
+        assert_ne!(value, key);
+        assert_ne!(value, format!("en.{key}"));
     }
 
     #[test]
@@ -7198,7 +7005,6 @@ mod tests {
 
         assert!(value.contains("socket closed"));
         assert_ne!(value, "document.audit.source.load_failed");
-        assert!(!audit_event_source_connection_not_found().is_empty());
     }
 
     #[test]
@@ -7330,10 +7136,6 @@ mod tests {
                 mutation_delete_row_task_label,
                 "document.data.mutation.task.delete_row",
             ),
-            (
-                audit_export_unsupported_source_toast,
-                "document.audit.export.unsupported_source",
-            ),
         ];
 
         for (label_fn, key) in cases {
@@ -7360,14 +7162,6 @@ mod tests {
         assert_ne!(chunked, direct);
         assert_ne!(direct, single);
         assert_ne!(chunked, single);
-    }
-
-    #[test]
-    fn audit_loading_event_stream_task_label_interpolates_title() {
-        let value = audit_loading_event_stream_task_label("Application Logs");
-
-        assert!(value.contains("Application Logs"));
-        assert_ne!(value, "document.audit.task.loading_event_stream");
     }
 
     #[test]

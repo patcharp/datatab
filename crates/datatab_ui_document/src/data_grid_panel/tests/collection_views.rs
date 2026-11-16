@@ -803,3 +803,103 @@ fn time_series_collection_chart_draws_one_line_per_tag_value(cx: &mut TestAppCon
         });
     });
 }
+
+/// The point inspector and stats rail window bounds format time values in the
+/// injected axis zone, never unlabeled UTC (#186).
+#[gpui::test]
+fn point_inspector_and_stats_readout_use_the_injected_zone(cx: &mut TestAppContext) {
+    use chrono::{FixedOffset, TimeZone, Utc};
+    use datatab_components::chart::{
+        AggKind, AxisKind, AxisSpec, BindingSpec, ChartKind, ChartSpec, ChartView, SeriesSpec,
+        YScale,
+    };
+
+    let column = |name: &str, kind: ColumnKind| ColumnMeta {
+        name: name.to_string(),
+        type_name: String::new(),
+        kind,
+        nullable: true,
+        is_primary_key: false,
+    };
+
+    let start = Utc
+        .with_ymd_and_hms(2025, 1, 2, 12, 0, 0)
+        .single()
+        .expect("valid test instant");
+    let end = start + chrono::Duration::minutes(10);
+    let result = QueryResult::table(
+        vec![
+            column("time", ColumnKind::Timestamp),
+            column("qps", ColumnKind::Float),
+        ],
+        vec![
+            vec![
+                datatab_core::Value::DateTime(start),
+                datatab_core::Value::Float(100.0),
+            ],
+            vec![
+                datatab_core::Value::DateTime(end),
+                datatab_core::Value::Float(200.0),
+            ],
+        ],
+        None,
+        Duration::ZERO,
+    );
+    let spec = ChartSpec {
+        kind: ChartKind::Line,
+        x_axis: AxisSpec {
+            column_index: 0,
+            label: "time".to_string(),
+            kind: AxisKind::Time,
+            unit: None,
+        },
+        series: vec![SeriesSpec {
+            column_index: 1,
+            label: "qps".to_string(),
+            color_slot: 0,
+            group_value: None,
+        }],
+        legend_visible: true,
+        decimation_threshold: 10_000,
+        binding: BindingSpec {
+            x: 0,
+            y: vec![1],
+            group_by: None,
+            filter: None,
+            aggregation: AggKind::None,
+        },
+        track_source_indices: false,
+        y_scale: YScale::Linear,
+    };
+
+    let chart = cx.new(|_| ChartView::build(&result, spec).expect("chart builds"));
+    chart.update(cx, |view, cx| {
+        assert!(view.jump_keyboard_point(false, cx));
+    });
+
+    let plus_seven = FixedOffset::east_opt(7 * 3_600).expect("valid +07:00 offset");
+    let minus_eight = FixedOffset::east_opt(-8 * 3_600).expect("valid -08:00 offset");
+
+    let (series, hovered_x_plus7, hovered_y) = chart.read_with(cx, |view, _| {
+        super::super::render::format_point_inspector_readout_in(&plus_seven, view)
+            .expect("hovered point produces inspector readout")
+    });
+    assert_eq!(series, "qps");
+    assert_eq!(hovered_x_plus7, "2025-01-02 19:00:00");
+    assert_eq!(hovered_y, "100");
+
+    let (_, hovered_x_minus8, _) = chart.read_with(cx, |view, _| {
+        super::super::render::format_point_inspector_readout_in(&minus_eight, view)
+            .expect("hovered point produces inspector readout")
+    });
+    assert_eq!(hovered_x_minus8, "2025-01-02 04:00:00");
+
+    let (x_min, x_max, x_is_time) = chart.read_with(cx, |view, _| {
+        let (min, max) = view.data_x_bounds();
+        (min, max, view.x_is_time())
+    });
+    let (start_plus7, end_plus7) =
+        super::super::render::format_stats_window_bounds_in(&plus_seven, x_min, x_max, x_is_time);
+    assert_eq!(start_plus7, "2025-01-02 19:00:00");
+    assert_eq!(end_plus7, "2025-01-02 19:10:00");
+}

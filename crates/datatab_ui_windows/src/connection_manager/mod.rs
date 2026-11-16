@@ -41,12 +41,9 @@ use datatab_core::{
     DbDriver, DbKind, DriverCapabilities, DriverFormDef, FormFieldDef, FormFieldKind,
     GlobalOverrides, LogErr, SshAuthMethod, SshTunnelProfile, ValueRef,
 };
-use datatab_ui_base::platform;
-use datatab_ui_base::sso_wizard::SsoWizard;
+use datatab_ui_base::AppStateEntity;
 use datatab_ui_base::user_error::{ErrorKind, UserFacingError, report_error};
-use datatab_ui_base::{AppStateEntity, AuthProfileCreated};
 use gpui::*;
-use gpui_component::Root;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -57,7 +54,7 @@ const AUTH_PROFILE_NONE_INDEX: usize = 0;
 ///
 /// `field_id` is the `FormFieldDef.id` of the field, or, for a fixed input
 /// without a form definition, the snake_case id the connection manager already
-/// uses for it (`name`, `ssh_host`, `ssm_region`, ...). The id stays the same
+/// uses for it (`name`, `ssh_host`, `ssh_port`, ...). The id stays the same
 /// across runs, so UI automation can address the input by it.
 fn cm_field_id(field_id: &str) -> SharedString {
     format!("cm-field-{field_id}").into()
@@ -107,6 +104,7 @@ fn auth_profile_ref_field_id(driver: Option<&Arc<dyn DbDriver>>) -> Option<Strin
 fn ssl_mode_from_config(config: &DbConfig) -> Option<String> {
     match config {
         DbConfig::Postgres { ssl_mode, .. }
+        | DbConfig::Redshift { ssl_mode, .. }
         | DbConfig::MySQL { ssl_mode, .. }
         | DbConfig::MongoDB { ssl_mode, .. }
         | DbConfig::Redis { ssl_mode, .. }
@@ -177,16 +175,10 @@ enum FormFocus {
     ProxySelector,
     ProxyClear,
     ProxyEditInSettings,
-    SsmInstanceIdValueSource,
-    SsmInstanceId,
-    SsmRegionValueSource,
-    SsmRegion,
-    SsmRemotePortValueSource,
-    SsmRemotePort,
-    SsmAuthProfile,
-    SsmAuthManage,
-    SsmAuthLogin,
-    SsmAuthRefresh,
+    AccessAuthProfile,
+    AccessAuthManage,
+    AccessAuthLogin,
+    AccessAuthRefresh,
     // Settings tab fields
     SettingsRefreshPolicy,
     SettingsRefreshInterval,
@@ -250,7 +242,6 @@ enum AccessTabMode {
     Direct,
     Ssh,
     Proxy,
-    ManagedSsm,
 }
 
 /// A Main-tab control the keyboard ring reaches through
@@ -451,7 +442,7 @@ struct SshManualValues {
     user: String,
 }
 
-/// SSH tunnel, proxy, and SSM inline connection access widgets.
+/// SSH tunnel and proxy inline connection access widgets.
 struct AccessState {
     ssh_enabled: bool,
     ssh_auth_method: SshAuthSelection,
@@ -476,15 +467,6 @@ struct AccessState {
     access_method_dropdown: Entity<Dropdown>,
     access_kind: Option<AccessKind>,
     access_tab_mode: AccessTabMode,
-    input_ssm_instance_id: Entity<InputState>,
-    ssm_instance_id_value_source_selector: Entity<ValueSourceSelector>,
-    input_ssm_region: Entity<InputState>,
-    ssm_region_value_source_selector: Entity<ValueSourceSelector>,
-    input_ssm_remote_port: Entity<InputState>,
-    ssm_remote_port_value_source_selector: Entity<ValueSourceSelector>,
-    ssm_auth_profile_dropdown: Entity<Dropdown>,
-    ssm_auth_profile_uuids: Vec<Uuid>,
-    selected_ssm_auth_profile_id: Option<Uuid>,
 }
 
 /// Auth profile dropdown and per-session login state.
@@ -495,8 +477,6 @@ struct AuthProfileState {
     auth_profile_session_states: HashMap<Uuid, AuthSessionState>,
     auth_profile_login_in_progress: bool,
     auth_profile_action_message: Option<String>,
-    pending_wizard_auth_profile_selection: bool,
-    known_auth_profile_ids: HashSet<Uuid>,
 }
 
 /// Per-connection settings and hooks tab widgets.
@@ -549,7 +529,6 @@ struct McpTabState {
 struct PendingActions {
     proxy_selection: Option<Uuid>,
     auth_profile_selection: Option<Option<Uuid>>,
-    ssm_auth_profile_selection: Option<Option<Uuid>>,
     ssh_tunnel_selection: Option<Uuid>,
     /// Pending SSH config host picker index, drained into the inline form
     /// on the next render where a `Window` is available.
@@ -576,6 +555,7 @@ pub struct ConnectionManagerWindow {
     /// grid navigation steps by it.
     driver_grid_columns: usize,
     editing_profile_id: Option<uuid::Uuid>,
+    value_ref_notice: Option<SharedString>,
     /// The pending keyring read of the edited profile's secrets; dropping it
     /// with the window cancels the apply step.
     secrets_read_task: Option<Task<()>>,
@@ -640,9 +620,6 @@ impl ConnectionManagerWindow {
             &self.form.database_value_source_selector,
             &self.form.user_value_source_selector,
             &self.form.password_value_source_selector,
-            &self.access.ssm_instance_id_value_source_selector,
-            &self.access.ssm_region_value_source_selector,
-            &self.access.ssm_remote_port_value_source_selector,
         ] {
             selector.update(cx, |selector, cx| {
                 selector.set_external_secret_providers(secret_providers.clone(), cx);
@@ -761,26 +738,6 @@ impl ConnectionManagerWindow {
         let access_method_dropdown = cx.new(|_cx| {
             Dropdown::new("access-method-dropdown")
                 .placeholder(datatab_i18n::t!("connection_manager.access_method.direct"))
-        });
-
-        let input_ssm_instance_id =
-            cx.new(|cx| InputState::new(window, cx).placeholder("i-0123456789abcdef0"));
-        let ssm_instance_id_value_source_selector =
-            value_source_selector("cm-ssm-instance-id", &secret_providers, window, cx);
-        let input_ssm_region = cx.new(|cx| InputState::new(window, cx).placeholder("us-east-1"));
-        let ssm_region_value_source_selector =
-            value_source_selector("cm-ssm-region", &secret_providers, window, cx);
-        let input_ssm_remote_port = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("5432")
-                .default_value("5432")
-        });
-        let ssm_remote_port_value_source_selector =
-            value_source_selector("cm-ssm-remote-port", &secret_providers, window, cx);
-        let ssm_auth_profile_dropdown = cx.new(|_cx| {
-            Dropdown::new("ssm-auth-profile-dropdown").placeholder(datatab_i18n::t!(
-                "connection_manager.placeholder.use_connection_auth_profile"
-            ))
         });
 
         let conn_refresh_policy_dropdown = cx.new(|_cx| {
@@ -913,13 +870,6 @@ impl ConnectionManagerWindow {
             },
         );
 
-        let ssm_auth_profile_dropdown_sub = cx.subscribe(
-            &ssm_auth_profile_dropdown,
-            |this, _dropdown, event: &DropdownSelectionChanged, cx| {
-                this.handle_ssm_auth_profile_dropdown_selection(event, cx);
-            },
-        );
-
         let mcp_role_dropdown_sub = cx.subscribe(
             &conn_mcp_role_dropdown,
             |this, _dropdown, _event: &DropdownSelectionChanged, cx| {
@@ -965,11 +915,6 @@ impl ConnectionManagerWindow {
                 this.handle_app_state_changed(cx);
             },
         );
-
-        let auth_profile_created_sub =
-            cx.subscribe(&app_state, |this, _, event: &AuthProfileCreated, cx| {
-                this.handle_auth_profile_created(event.profile_id, cx);
-            });
 
         // Helper to create input subscriptions for handling Enter/Blur
         fn subscribe_input(
@@ -1059,13 +1004,11 @@ impl ConnectionManagerWindow {
             proxy_dropdown_subscription,
             auth_profile_dropdown_sub,
             access_method_dropdown_sub,
-            ssm_auth_profile_dropdown_sub,
             mcp_role_dropdown_sub,
             mcp_policy_dropdown_sub,
             mcp_role_multi_select_sub,
             mcp_policy_multi_select_sub,
             app_state_changed_sub,
-            auth_profile_created_sub,
             subscribe_input(cx, window, &input_name),
             password_change_sub,
             subscribe_input(cx, window, &input_ssh_host),
@@ -1074,9 +1017,6 @@ impl ConnectionManagerWindow {
             subscribe_input(cx, window, &input_ssh_key_path),
             subscribe_input(cx, window, &input_ssh_key_passphrase),
             subscribe_input(cx, window, &input_ssh_password),
-            subscribe_input(cx, window, &input_ssm_instance_id),
-            subscribe_input(cx, window, &input_ssm_region),
-            subscribe_input(cx, window, &input_ssm_remote_port),
             subscribe_input(cx, window, &conn_pre_hook_extra_input),
             subscribe_input(cx, window, &conn_post_hook_extra_input),
             subscribe_input(cx, window, &conn_pre_disconnect_hook_extra_input),
@@ -1096,6 +1036,7 @@ impl ConnectionManagerWindow {
             available_drivers,
             driver_grid_columns: render_driver_select::DEFAULT_GRID_COLUMNS,
             editing_profile_id: None,
+            value_ref_notice: None,
             secrets_read_task: None,
             deferred_after_secrets_read: None,
             inputs_edited_during_read: HashSet::new(),
@@ -1164,15 +1105,6 @@ impl ConnectionManagerWindow {
                 access_method_dropdown,
                 access_kind: None,
                 access_tab_mode: AccessTabMode::Direct,
-                input_ssm_instance_id,
-                ssm_instance_id_value_source_selector,
-                input_ssm_region,
-                ssm_region_value_source_selector,
-                input_ssm_remote_port,
-                ssm_remote_port_value_source_selector,
-                ssm_auth_profile_dropdown,
-                ssm_auth_profile_uuids: Vec::new(),
-                selected_ssm_auth_profile_id: None,
             },
             auth_profile: AuthProfileState {
                 auth_profile_dropdown,
@@ -1181,13 +1113,6 @@ impl ConnectionManagerWindow {
                 auth_profile_session_states: HashMap::new(),
                 auth_profile_login_in_progress: false,
                 auth_profile_action_message: None,
-                pending_wizard_auth_profile_selection: false,
-                known_auth_profile_ids: app_state
-                    .read(cx)
-                    .list_auth_profiles()
-                    .iter()
-                    .map(|profile| profile.id)
-                    .collect(),
             },
             settings_tab: SettingsTabState {
                 conn_override_refresh_policy: false,
@@ -1267,6 +1192,17 @@ impl ConnectionManagerWindow {
     ) -> Self {
         let mut instance = Self::new(app_state.clone(), window, cx);
         instance.editing_profile_id = Some(profile.id);
+        instance.value_ref_notice =
+            app_state
+                .read(cx)
+                .value_ref_load_error(profile.id)
+                .map(|error| {
+                    format!(
+                        "{error}\n{}",
+                        datatab_i18n::t!("connection_manager.banner.broken_value_ref_save_first")
+                    )
+                    .into()
+                });
 
         let driver = app_state.read(cx).driver_for_profile(profile);
         instance.form.selected_driver = driver.clone();
@@ -1400,7 +1336,6 @@ impl ConnectionManagerWindow {
 
         instance.access.selected_proxy_id = profile.proxy_profile_id;
         instance.auth_profile.selected_auth_profile_id = profile.auth_profile_id;
-        instance.access.selected_ssm_auth_profile_id = None;
         instance.access.access_kind = profile.access_kind.clone();
 
         if let Some(AccessKind::Proxy { proxy_profile_id }) = &profile.access_kind {
@@ -1430,37 +1365,6 @@ impl ConnectionManagerWindow {
                 if tunnel.save_secret {
                     bound_tunnel = Some(tunnel);
                 }
-            }
-        }
-
-        // Populate SSM fields if access kind is a managed aws-ssm access
-        if let Some(AccessKind::Managed { provider, params }) = &profile.access_kind
-            && provider == "aws-ssm"
-        {
-            let instance_id = params.get("instance_id").cloned().unwrap_or_default();
-            let region = params.get("region").cloned().unwrap_or_default();
-            let remote_port = params.get("remote_port").cloned().unwrap_or_default();
-            let auth_profile_id: Option<uuid::Uuid> =
-                params.get("auth_profile_id").and_then(|s| s.parse().ok());
-
-            instance
-                .access
-                .input_ssm_instance_id
-                .update(cx, |state, cx| {
-                    state.set_value(instance_id, window, cx);
-                });
-            instance.access.input_ssm_region.update(cx, |state, cx| {
-                state.set_value(region, window, cx);
-            });
-            instance
-                .access
-                .input_ssm_remote_port
-                .update(cx, |state, cx| {
-                    state.set_value(remote_port, window, cx);
-                });
-            instance.access.selected_ssm_auth_profile_id = auth_profile_id;
-            if instance.auth_profile.selected_auth_profile_id.is_none() {
-                instance.auth_profile.selected_auth_profile_id = auth_profile_id;
             }
         }
 
@@ -1506,6 +1410,7 @@ impl ConnectionManagerWindow {
         instance.start_secrets_read(profile, bound_tunnel, window, cx);
 
         instance.load_value_source_selectors(profile, window, cx);
+        instance.clear_broken_value_ref_inputs(profile.id, window, cx);
         instance.sync_access_tab_mode_from_state();
         instance.populate_access_method_dropdown(cx);
 
@@ -1514,6 +1419,16 @@ impl ConnectionManagerWindow {
 
     fn select_driver(&mut self, driver_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let driver = self.app_state.read(cx).drivers().get(driver_id).cloned();
+        self.select_driver_with(driver_id, driver, window, cx);
+    }
+
+    fn select_driver_with(
+        &mut self,
+        driver_id: &str,
+        driver: Option<Arc<dyn DbDriver>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.form.selected_driver_id = Some(driver_id.to_string());
         self.form.selected_driver = driver.clone();
         self.form.form_save_password = true;
@@ -1531,7 +1446,6 @@ impl ConnectionManagerWindow {
         self.test_error = None;
 
         self.auth_profile.selected_auth_profile_id = None;
-        self.access.selected_ssm_auth_profile_id = None;
         self.access.access_kind = None;
         self.access.access_tab_mode = AccessTabMode::Direct;
 
@@ -1719,6 +1633,16 @@ impl ConnectionManagerWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self
+            .app_state
+            .read(cx)
+            .value_ref_diagnostics(profile.id)
+            .is_empty()
+        {
+            self.form.stored_password = StoredPassword::Unreadable;
+            self.form.stored_ssh_secret = StoredPassword::Unreadable;
+            return;
+        }
         self.form.stored_password = StoredPassword::Loading;
         self.inputs_edited_during_read.clear();
         let read_auth_method = self.access.ssh_auth_method;
@@ -1946,6 +1870,17 @@ impl ConnectionManagerWindow {
     /// Placeholder for the password input. An unreadable keyring says so,
     /// because an empty field would otherwise read as "no password saved".
     fn password_placeholder(&self, password_source_is_literal: bool, cx: &Context<Self>) -> String {
+        if password_source_is_literal
+            && self.editing_profile_id.is_some_and(|profile_id| {
+                self.app_state
+                    .read(cx)
+                    .value_ref_diagnostics(profile_id)
+                    .iter()
+                    .any(|diagnostic| diagnostic.field == "password")
+            })
+        {
+            return datatab_i18n::t!("connection_manager.placeholder.password_needs_value");
+        }
         if password_source_is_literal && self.form.stored_password == StoredPassword::Unreadable {
             return datatab_i18n::t!("connection_manager.placeholder.password_unreadable");
         }
@@ -1982,21 +1917,6 @@ impl ConnectionManagerWindow {
             .update(cx, |selector, cx| {
                 let _previous = selector.set_value_ref(None, window, cx);
             });
-        self.access
-            .ssm_instance_id_value_source_selector
-            .update(cx, |selector, cx| {
-                let _previous = selector.set_value_ref(None, window, cx);
-            });
-        self.access
-            .ssm_region_value_source_selector
-            .update(cx, |selector, cx| {
-                let _previous = selector.set_value_ref(None, window, cx);
-            });
-        self.access
-            .ssm_remote_port_value_source_selector
-            .update(cx, |selector, cx| {
-                let _previous = selector.set_value_ref(None, window, cx);
-            });
         self.form
             .database_value_source_selector
             .update(cx, |selector, cx| {
@@ -2020,42 +1940,6 @@ impl ConnectionManagerWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.access
-            .ssm_instance_id_value_source_selector
-            .update(cx, |selector, cx| {
-                let primary =
-                    selector.set_value_ref(profile.value_refs.get("ssm_instance_id"), window, cx);
-                if !primary.is_empty() {
-                    self.access.input_ssm_instance_id.update(cx, |state, cx| {
-                        state.set_value(primary.clone(), window, cx);
-                    });
-                }
-            });
-
-        self.access
-            .ssm_region_value_source_selector
-            .update(cx, |selector, cx| {
-                let primary =
-                    selector.set_value_ref(profile.value_refs.get("ssm_region"), window, cx);
-                if !primary.is_empty() {
-                    self.access.input_ssm_region.update(cx, |state, cx| {
-                        state.set_value(primary.clone(), window, cx);
-                    });
-                }
-            });
-
-        self.access
-            .ssm_remote_port_value_source_selector
-            .update(cx, |selector, cx| {
-                let primary =
-                    selector.set_value_ref(profile.value_refs.get("ssm_remote_port"), window, cx);
-                if !primary.is_empty() {
-                    self.access.input_ssm_remote_port.update(cx, |state, cx| {
-                        state.set_value(primary.clone(), window, cx);
-                    });
-                }
-            });
-
         self.form
             .host_value_source_selector
             .update(cx, |selector, cx| {
@@ -2111,48 +1995,36 @@ impl ConnectionManagerWindow {
         self.sync_fields_to_uri(window, cx);
     }
 
+    fn clear_broken_value_ref_inputs(
+        &mut self,
+        profile_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let fields: Vec<_> = self
+            .app_state
+            .read(cx)
+            .value_ref_diagnostics(profile_id)
+            .iter()
+            .map(|diagnostic| diagnostic.field.clone())
+            .collect();
+        if fields.is_empty() {
+            return;
+        }
+        for field in fields {
+            let input = match field.as_str() {
+                "password" => Some(self.form.input_password.clone()),
+                _ => self.form.driver_inputs.get(&field).cloned(),
+            };
+            if let Some(input) = input {
+                input.update(cx, |input, cx| input.set_value("", window, cx));
+            }
+        }
+        self.sync_fields_to_uri(window, cx);
+    }
+
     pub(super) fn collect_value_refs(&self, cx: &App) -> HashMap<String, ValueRef> {
         let mut refs = HashMap::new();
-
-        let ssm_instance_id = self
-            .access
-            .input_ssm_instance_id
-            .read(cx)
-            .value()
-            .to_string();
-        if let Some(value_ref) = self
-            .access
-            .ssm_instance_id_value_source_selector
-            .read(cx)
-            .value_ref(&ssm_instance_id, cx)
-        {
-            refs.insert("ssm_instance_id".to_string(), value_ref);
-        }
-
-        let ssm_region = self.access.input_ssm_region.read(cx).value().to_string();
-        if let Some(value_ref) = self
-            .access
-            .ssm_region_value_source_selector
-            .read(cx)
-            .value_ref(&ssm_region, cx)
-        {
-            refs.insert("ssm_region".to_string(), value_ref);
-        }
-
-        let ssm_remote_port = self
-            .access
-            .input_ssm_remote_port
-            .read(cx)
-            .value()
-            .to_string();
-        if let Some(value_ref) = self
-            .access
-            .ssm_remote_port_value_source_selector
-            .read(cx)
-            .value_ref(&ssm_remote_port, cx)
-        {
-            refs.insert("ssm_remote_port".to_string(), value_ref);
-        }
 
         let host_value = self
             .form
@@ -2214,21 +2086,6 @@ impl ConnectionManagerWindow {
 
     pub(super) fn has_dynamic_value_ref_for_field(&self, field_id: &str, cx: &App) -> bool {
         match field_id {
-            "ssm_instance_id" => !self
-                .access
-                .ssm_instance_id_value_source_selector
-                .read(cx)
-                .is_literal(cx),
-            "ssm_region" => !self
-                .access
-                .ssm_region_value_source_selector
-                .read(cx)
-                .is_literal(cx),
-            "ssm_remote_port" => !self
-                .access
-                .ssm_remote_port_value_source_selector
-                .read(cx)
-                .is_literal(cx),
             "host" => !self.form.host_value_source_selector.read(cx).is_literal(cx),
             "database" => !self
                 .form
@@ -2358,13 +2215,14 @@ impl ConnectionManagerWindow {
             stops.push(MainExtraStop::SslMode);
 
             if let Some(cert_fields) = &metadata.ssl_cert_fields {
-                let mode = &self.form.selected_ssl_mode;
+                let (show_root_cert, show_client_cert) =
+                    cert_fields.visible_for_mode(&self.form.selected_ssl_mode);
 
-                if datatab_core::ssl_mode_id_requires_root_cert(mode) {
+                if show_root_cert {
                     stops.push(MainExtraStop::SslCert(SslCertSlot::CaCert));
                 }
 
-                if cert_fields.client_cert && datatab_core::ssl_mode_id_is_cert_active(mode) {
+                if show_client_cert {
                     stops.push(MainExtraStop::SslCert(SslCertSlot::ClientCert));
                     stops.push(MainExtraStop::SslCert(SslCertSlot::ClientKey));
                 }
@@ -2501,9 +2359,6 @@ impl ConnectionManagerWindow {
             SshKeyPath => Some("ssh_key_path"),
             SshPassphrase => Some("ssh_passphrase"),
             SshPassword => Some("ssh_password"),
-            SsmInstanceId => Some("ssm_instance_id"),
-            SsmRegion => Some("ssm_region"),
-            SsmRemotePort => Some("ssm_remote_port"),
             _ => None,
         }
     }
@@ -3558,13 +3413,8 @@ impl ConnectionManagerWindow {
             datatab_i18n::t!("connection_manager.placeholder.none"),
             "",
         )];
-        let mut ssm_items = vec![datatab_components::controls::DropdownItem::with_value(
-            datatab_i18n::t!("connection_manager.placeholder.use_connection_auth_profile"),
-            "",
-        )];
 
         self.auth_profile.auth_profile_uuids.clear();
-        self.access.ssm_auth_profile_uuids.clear();
 
         for profile in &profiles {
             if !profile.enabled {
@@ -3591,13 +3441,7 @@ impl ConnectionManagerWindow {
                 label,
                 profile.id.to_string(),
             ));
-            let ssm_label = format!("{} [{}]", profile.name, session_status);
-            ssm_items.push(datatab_components::controls::DropdownItem::with_value(
-                ssm_label,
-                profile.id.to_string(),
-            ));
             self.auth_profile.auth_profile_uuids.push(profile.id);
-            self.access.ssm_auth_profile_uuids.push(profile.id);
         }
 
         auth_items.push(datatab_components::controls::DropdownItem::with_value(
@@ -3605,12 +3449,7 @@ impl ConnectionManagerWindow {
             "__new_auth_profile__",
         ));
 
-        ssm_items.push(datatab_components::controls::DropdownItem::with_value(
-            datatab_i18n::t!("connection_manager.new_auth_profile"),
-            "__new_auth_profile__",
-        ));
-
-        // If the bound auth-profile UUID is not in the current reflected list,
+        // If the bound auth-profile UUID is not in the current stored list,
         // add a "(profile not found)" placeholder entry so the dropdown shows
         // something instead of falling back silently to "None".
         let auth_selected_index = self
@@ -3623,7 +3462,7 @@ impl ConnectionManagerWindow {
                     .iter()
                     .position(|uid| *uid == id);
                 pos.map(|p| p + 1).or_else(|| {
-                    // Bound profile is not reflected — insert a dangling sentinel.
+                    // Bound profile is missing from the list: insert a dangling sentinel.
                     let dangling_label = format!("(profile not found) [{}]", id);
                     auth_items.push(datatab_components::controls::DropdownItem::with_value(
                         dangling_label,
@@ -3640,34 +3479,6 @@ impl ConnectionManagerWindow {
             .update(cx, |dropdown, cx| {
                 dropdown.set_items(auth_items, cx);
                 dropdown.set_selected_index(Some(auth_selected_index), cx);
-            });
-
-        let ssm_selected_index = self
-            .access
-            .selected_ssm_auth_profile_id
-            .and_then(|id| {
-                let pos = self
-                    .access
-                    .ssm_auth_profile_uuids
-                    .iter()
-                    .position(|uid| *uid == id);
-                pos.map(|p| p + 1).or_else(|| {
-                    let dangling_label = format!("(profile not found) [{}]", id);
-                    ssm_items.push(datatab_components::controls::DropdownItem::with_value(
-                        dangling_label,
-                        id.to_string(),
-                    ));
-                    self.access.ssm_auth_profile_uuids.push(id);
-                    Some(self.access.ssm_auth_profile_uuids.len())
-                })
-            })
-            .unwrap_or(0);
-
-        self.access
-            .ssm_auth_profile_dropdown
-            .update(cx, |dropdown, cx| {
-                dropdown.set_items(ssm_items, cx);
-                dropdown.set_selected_index(Some(ssm_selected_index), cx);
             });
     }
 
@@ -3727,105 +3538,8 @@ impl ConnectionManagerWindow {
         self.open_settings_section(crate::settings::SettingsSectionId::AuthProfiles, cx);
     }
 
-    fn open_sso_wizard(&mut self, cx: &mut Context<Self>) {
-        self.auth_profile.pending_wizard_auth_profile_selection = true;
-        self.auth_profile.known_auth_profile_ids = self
-            .app_state
-            .read(cx)
-            .list_auth_profiles()
-            .iter()
-            .map(|profile| profile.id)
-            .collect();
-
-        let app_state = self.app_state.clone();
-        let bounds = Bounds::centered(None, size(px(720.0), px(620.0)), cx);
-
-        let mut options = WindowOptions {
-            app_id: Some(datatab_core::ReleaseChannel::current().app_id().into()),
-            titlebar: Some(TitlebarOptions {
-                title: Some(datatab_i18n::t!("connection_manager.aws_sso_wizard_title").into()),
-                ..Default::default()
-            }),
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            focus: true,
-            ..Default::default()
-        };
-        platform::apply_window_options(&mut options, 600.0, 500.0);
-
-        if let Err(error) = cx.open_window(options, move |window, cx| {
-            datatab_ui_base::ui_automation::install(window, cx);
-
-            let wizard = cx.new(|cx| {
-                let mut wizard = SsoWizard::new(app_state.clone(), window, cx);
-                wizard.open(window, cx);
-                wizard
-            });
-            cx.new(|cx| Root::new(wizard, window, cx))
-        }) {
-            report_error(
-                UserFacingError::new(
-                    ErrorKind::User,
-                    datatab_i18n::t!("connection_manager.aws_sso_open_failed"),
-                )
-                .with_cause(format!("{error}")),
-                cx,
-            );
-        }
-    }
-
     fn handle_app_state_changed(&mut self, cx: &mut Context<Self>) {
         self.sync_secret_providers(cx);
-
-        let current_profiles = self.app_state.read(cx).list_auth_profiles();
-        let current_ids = current_profiles
-            .iter()
-            .map(|profile| profile.id)
-            .collect::<HashSet<_>>();
-
-        if self.auth_profile.pending_wizard_auth_profile_selection {
-            let newest = current_profiles
-                .iter()
-                .rev()
-                .find(|profile| {
-                    !self
-                        .auth_profile
-                        .known_auth_profile_ids
-                        .contains(&profile.id)
-                })
-                .map(|profile| profile.id);
-
-            if let Some(profile_id) = newest {
-                self.auth_profile.selected_auth_profile_id = Some(profile_id);
-
-                if self.access.selected_ssm_auth_profile_id.is_none() {
-                    self.access.selected_ssm_auth_profile_id = Some(profile_id);
-                }
-
-                self.auth_profile.auth_profile_action_message = Some(datatab_i18n::t!(
-                    "connection_manager.auth.profile_created_sso"
-                ));
-            }
-
-            self.auth_profile.pending_wizard_auth_profile_selection = false;
-        }
-
-        self.auth_profile.known_auth_profile_ids = current_ids;
-        self.populate_auth_profile_dropdown(cx);
-        self.refresh_auth_profile_sessions(cx);
-        cx.notify();
-    }
-
-    fn handle_auth_profile_created(&mut self, profile_id: Uuid, cx: &mut Context<Self>) {
-        self.auth_profile.selected_auth_profile_id = Some(profile_id);
-
-        if self.access.selected_ssm_auth_profile_id.is_none() {
-            self.access.selected_ssm_auth_profile_id = Some(profile_id);
-        }
-
-        self.auth_profile.pending_wizard_auth_profile_selection = false;
-        self.auth_profile.auth_profile_action_message = Some(datatab_i18n::t!(
-            "connection_manager.auth.profile_created_wizard"
-        ));
 
         self.populate_auth_profile_dropdown(cx);
         self.refresh_auth_profile_sessions(cx);
@@ -3995,7 +3709,6 @@ impl ConnectionManagerWindow {
     fn apply_pending_auth_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(selection) = self.pending.auth_profile_selection.take() {
             self.auth_profile.selected_auth_profile_id = selection;
-            self.access.selected_ssm_auth_profile_id = selection;
 
             self.sync_driver_fields_from_auth_profile(window, cx);
         }
@@ -4050,49 +3763,6 @@ impl ConnectionManagerWindow {
             input.update(cx, |state, cx| {
                 state.set_value(region, window, cx);
             });
-        }
-    }
-
-    fn handle_ssm_auth_profile_dropdown_selection(
-        &mut self,
-        event: &DropdownSelectionChanged,
-        cx: &mut Context<Self>,
-    ) {
-        if event.index == 0 {
-            self.pending.ssm_auth_profile_selection = Some(None);
-        } else if event.item.value.as_ref() == "__new_auth_profile__" {
-            self.open_sso_wizard(cx);
-
-            let selected_index = self
-                .access
-                .selected_ssm_auth_profile_id
-                .and_then(|id| {
-                    self.access
-                        .ssm_auth_profile_uuids
-                        .iter()
-                        .position(|uid| *uid == id)
-                        .map(|pos| pos + 1)
-                })
-                .unwrap_or(0);
-
-            self.access
-                .ssm_auth_profile_dropdown
-                .update(cx, |dropdown, cx| {
-                    dropdown.set_selected_index(Some(selected_index), cx);
-                });
-        } else {
-            let uuid_index = event.index - 1;
-            if let Some(&id) = self.access.ssm_auth_profile_uuids.get(uuid_index) {
-                self.pending.ssm_auth_profile_selection = Some(Some(id));
-            }
-        }
-
-        cx.notify();
-    }
-
-    fn apply_pending_ssm_auth_profile(&mut self) {
-        if let Some(selection) = self.pending.ssm_auth_profile_selection.take() {
-            self.access.selected_ssm_auth_profile_id = selection;
         }
     }
 
@@ -4321,6 +3991,13 @@ impl ConnectionManagerWindow {
     }
 
     pub(super) fn save_current_ssh_as_tunnel(&mut self, cx: &mut Context<Self>) {
+        if let Some(error) = self.value_ref_notice.clone() {
+            report_error(
+                UserFacingError::new(ErrorKind::Config, error.to_string()),
+                cx,
+            );
+            return;
+        }
         let Some(config) = self.build_ssh_config(cx) else {
             return;
         };
@@ -4383,6 +4060,12 @@ impl ConnectionManagerWindow {
     }
 
     pub(super) fn test_ssh_connection(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(error) = self.value_ref_notice.clone() {
+            self.ssh_test_status = TestStatus::Failed;
+            self.ssh_test_error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
         if !self.access.ssh_enabled {
             return;
         }
@@ -4534,21 +4217,18 @@ impl ConnectionManagerWindow {
     // -----------------------------------------------------------------
 
     fn sync_access_tab_mode_from_state(&mut self) {
-        self.access.access_tab_mode =
-            if matches!(self.access.access_kind, Some(AccessKind::Managed { .. })) {
-                AccessTabMode::ManagedSsm
-            } else if self.access.selected_proxy_id.is_some()
-                || matches!(self.access.access_kind, Some(AccessKind::Proxy { .. }))
-            {
-                AccessTabMode::Proxy
-            } else if self.access.ssh_enabled
-                || self.access.selected_ssh_tunnel_id.is_some()
-                || matches!(self.access.access_kind, Some(AccessKind::Ssh { .. }))
-            {
-                AccessTabMode::Ssh
-            } else {
-                AccessTabMode::Direct
-            };
+        self.access.access_tab_mode = if self.access.selected_proxy_id.is_some()
+            || matches!(self.access.access_kind, Some(AccessKind::Proxy { .. }))
+        {
+            AccessTabMode::Proxy
+        } else if self.access.ssh_enabled
+            || self.access.selected_ssh_tunnel_id.is_some()
+            || matches!(self.access.access_kind, Some(AccessKind::Ssh { .. }))
+        {
+            AccessTabMode::Ssh
+        } else {
+            AccessTabMode::Direct
+        };
     }
 
     /// Populate the access method dropdown with the unified access modes.
@@ -4565,10 +4245,6 @@ impl ConnectionManagerWindow {
             datatab_components::controls::DropdownItem::with_value(
                 datatab_i18n::t!("connection_manager.access_method.proxy"),
                 "proxy",
-            ),
-            datatab_components::controls::DropdownItem::with_value(
-                datatab_i18n::t!("connection_manager.access_method.ssm"),
-                "ssm",
             ),
         ];
 
@@ -4587,7 +4263,6 @@ impl ConnectionManagerWindow {
             AccessTabMode::Direct => 0,
             AccessTabMode::Ssh => 1,
             AccessTabMode::Proxy => 2,
-            AccessTabMode::ManagedSsm => 3,
         }
     }
 
@@ -4599,7 +4274,6 @@ impl ConnectionManagerWindow {
         self.access.access_tab_mode = match event.index {
             1 => AccessTabMode::Ssh,
             2 => AccessTabMode::Proxy,
-            3 => AccessTabMode::ManagedSsm,
             _ => AccessTabMode::Direct,
         };
 
@@ -4620,55 +4294,9 @@ impl ConnectionManagerWindow {
                 self.access.selected_ssh_tunnel_id = None;
                 self.access.access_kind = None;
             }
-            AccessTabMode::ManagedSsm => {
-                self.access.ssh_enabled = false;
-                self.access.selected_ssh_tunnel_id = None;
-                self.access.selected_proxy_id = None;
-                self.access.access_kind = Some(self.collect_managed_access_kind(cx));
-            }
         }
 
         cx.notify();
-    }
-
-    /// Returns true when SSM Tunnel is the currently selected access method.
-    fn is_ssm_selected(&self) -> bool {
-        self.access.access_tab_mode == AccessTabMode::ManagedSsm
-    }
-
-    /// Collect the current managed (aws-ssm) AccessKind from the inline fields.
-    fn collect_managed_access_kind(&self, cx: &Context<Self>) -> AccessKind {
-        let instance_id = self
-            .access
-            .input_ssm_instance_id
-            .read(cx)
-            .value()
-            .to_string();
-        let region = self.access.input_ssm_region.read(cx).value().to_string();
-        let remote_port = self
-            .access
-            .input_ssm_remote_port
-            .read(cx)
-            .value()
-            .to_string();
-
-        let auth_profile_id = self
-            .access
-            .selected_ssm_auth_profile_id
-            .or(self.auth_profile.selected_auth_profile_id);
-
-        let mut params = std::collections::HashMap::new();
-        params.insert("instance_id".to_string(), instance_id);
-        params.insert("region".to_string(), region);
-        params.insert("remote_port".to_string(), remote_port);
-        if let Some(id) = auth_profile_id {
-            params.insert("auth_profile_id".to_string(), id.to_string());
-        }
-
-        AccessKind::Managed {
-            provider: "aws-ssm".to_string(),
-            params,
-        }
     }
 }
 
@@ -5010,10 +4638,7 @@ mod tests {
         "connection_manager.access_method.direct",
         "connection_manager.access_method.ssh_tunnel",
         "connection_manager.access_method.proxy",
-        "connection_manager.access_method.ssm",
         "connection_manager.new_auth_profile",
-        "connection_manager.aws_sso_wizard_title",
-        "connection_manager.aws_sso_open_failed",
         "connection_manager.select_ssh_key_title",
         "connection_manager.select_ca_cert",
         "connection_manager.select_client_cert",
@@ -5056,8 +4681,6 @@ mod tests {
     // --- auth flow i18n ---
 
     const CONNECTION_MANAGER_AUTH_KEYS: &[&str] = &[
-        "connection_manager.auth.profile_created_sso",
-        "connection_manager.auth.profile_created_wizard",
         "connection_manager.auth.refreshing_sessions",
         "connection_manager.auth.select_before_login",
         "connection_manager.auth.provider_unavailable",
@@ -5158,18 +4781,20 @@ mod keyboard_coverage_tests {
     // recursion.
     use super::{AccessTabMode, ActiveTab, ConnectionManagerWindow, View};
     use crate::keyboard_coverage::CONNECTION_MANAGER;
+    use datatab_core::secrecy::SecretString;
+    use datatab_core::{
+        Connection, ConnectionProfile, DbConfig, DbDriver, DbError, DbKind, DriverFormDef,
+        DriverKey, DriverMetadata, FormFieldDef, FormFieldKind, FormSection, FormTab, FormValues,
+        SelectOption, field, field_file_path,
+    };
     use datatab_storage::bootstrap::StorageRuntime;
     use datatab_ui_base::AppStateEntity;
     use datatab_ui_base::keyboard_coverage::{Coverage, FrameCapture};
     use datatab_ui_base::toast::{ToastGlobal, ToastHost};
     use gpui::{AppContext as _, TestAppContext, VisualTestContext};
+    use std::sync::Arc;
 
-    pub(super) fn open_manager(
-        cx: &mut TestAppContext,
-    ) -> (
-        gpui::Entity<ConnectionManagerWindow>,
-        &mut VisualTestContext,
-    ) {
+    fn init_test_app_state(cx: &mut TestAppContext) -> gpui::Entity<AppStateEntity> {
         cx.update(gpui_component::init);
         cx.update(datatab_components::theme::init);
         cx.update(datatab_ui_base::keymap::init_keymap);
@@ -5177,14 +4802,23 @@ mod keyboard_coverage_tests {
             let host = cx.new(|_| ToastHost::new());
             cx.set_global(ToastGlobal { host });
         });
-        let app_state = cx.update(|cx| {
+        cx.update(|cx| {
             cx.new(|_| {
                 AppStateEntity::new_with_storage_runtime(
                     StorageRuntime::in_memory().expect("test storage runtime"),
                 )
                 .expect("test app state")
             })
-        });
+        })
+    }
+
+    pub(super) fn open_manager(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::Entity<ConnectionManagerWindow>,
+        &mut VisualTestContext,
+    ) {
+        let app_state = init_test_app_state(cx);
 
         let (manager, window) =
             cx.add_window_view(|window, cx| ConnectionManagerWindow::new(app_state, window, cx));
@@ -5296,6 +4930,12 @@ mod keyboard_coverage_tests {
                 AccessTabMode::Direct,
                 false,
             ),
+            (
+                "auth-open-settings",
+                ActiveTab::Access,
+                AccessTabMode::Direct,
+                false,
+            ),
             ("ssh-enabled", ActiveTab::Access, AccessTabMode::Ssh, true),
             (
                 "ssh-config-host-picker",
@@ -5323,6 +4963,258 @@ mod keyboard_coverage_tests {
             window.run_until_parked();
             check(window, expected);
         }
+    }
+
+    pub(super) struct FormFieldsTestDriver {
+        inner: Arc<dyn DbDriver>,
+        form: DriverFormDef,
+        settings: Arc<DriverFormDef>,
+    }
+
+    impl FormFieldsTestDriver {
+        pub(super) fn with_auth_profile_ref(inner: Arc<dyn DbDriver>) -> Self {
+            let mut driver = Self::new(inner);
+            driver
+                .form
+                .tabs
+                .first_mut()
+                .expect("main tab")
+                .sections
+                .first_mut()
+                .expect("driver fields")
+                .fields
+                .push(field(
+                    "profile",
+                    "Auth profile",
+                    FormFieldKind::AuthProfileRef { provider_id: None },
+                    "",
+                ));
+            driver
+        }
+
+        fn new(inner: Arc<dyn DbDriver>) -> Self {
+            let form = DriverFormDef {
+                tabs: vec![FormTab {
+                    id: "main".into(),
+                    label: "Main".into(),
+                    sections: vec![FormSection {
+                        title: "Driver Fields".into(),
+                        icon: None,
+                        fields: vec![
+                            field("custom_flag", "Custom flag", FormFieldKind::Checkbox, ""),
+                            field(
+                                "custom_mode",
+                                "Custom mode",
+                                FormFieldKind::Select {
+                                    options: vec![
+                                        SelectOption::new("alpha", "Alpha"),
+                                        SelectOption::new("beta", "Beta"),
+                                    ],
+                                },
+                                "alpha",
+                            ),
+                            field_file_path(),
+                        ],
+                    }],
+                }],
+            };
+            let settings = Arc::new(DriverFormDef {
+                tabs: vec![FormTab {
+                    id: "settings".into(),
+                    label: "Settings".into(),
+                    sections: vec![FormSection {
+                        title: "Custom Settings".into(),
+                        icon: None,
+                        fields: vec![FormFieldDef {
+                            id: "custom_setting".into(),
+                            label: "Custom setting".into(),
+                            kind: FormFieldKind::Checkbox,
+                            placeholder: String::new(),
+                            required: false,
+                            default_value: "false".into(),
+                            enabled_when_checked: None,
+                            enabled_when_unchecked: None,
+                            disabled_when_field_set: None,
+                            enabled_when_field_equals: None,
+                            help: None,
+                        }],
+                    }],
+                }],
+            });
+            Self {
+                inner,
+                form,
+                settings,
+            }
+        }
+    }
+
+    impl DbDriver for FormFieldsTestDriver {
+        fn kind(&self) -> DbKind {
+            self.inner.kind()
+        }
+
+        fn metadata(&self) -> &DriverMetadata {
+            self.inner.metadata()
+        }
+
+        fn form_definition(&self) -> &DriverFormDef {
+            &self.form
+        }
+
+        fn driver_key(&self) -> DriverKey {
+            self.inner.driver_key()
+        }
+
+        fn settings_schema(&self) -> Option<Arc<DriverFormDef>> {
+            Some(self.settings.clone())
+        }
+
+        fn build_config(&self, values: &FormValues) -> Result<DbConfig, DbError> {
+            self.inner.build_config(values)
+        }
+
+        fn extract_values(&self, config: &DbConfig) -> FormValues {
+            self.inner.extract_values(config)
+        }
+
+        fn connect_with_secrets(
+            &self,
+            profile: &ConnectionProfile,
+            password: Option<&SecretString>,
+            ssh_secret: Option<&SecretString>,
+        ) -> Result<Box<dyn Connection>, DbError> {
+            self.inner
+                .connect_with_secrets(profile, password, ssh_secret)
+        }
+
+        fn test_connection(&self, profile: &ConnectionProfile) -> Result<(), DbError> {
+            self.inner.test_connection(profile)
+        }
+    }
+
+    fn select_form_fields_test_driver(
+        manager: &gpui::Entity<ConnectionManagerWindow>,
+        window: &mut VisualTestContext,
+    ) {
+        window.update(|window, cx| {
+            manager.update(cx, |manager, cx| {
+                let postgres = manager
+                    .app_state
+                    .read(cx)
+                    .drivers()
+                    .get("postgres")
+                    .cloned()
+                    .expect("postgres driver registered");
+                let custom: Arc<dyn DbDriver> = Arc::new(FormFieldsTestDriver::new(postgres));
+                manager.select_driver_with("custom", Some(custom), window, cx);
+            });
+        });
+        window.run_until_parked();
+    }
+
+    #[gpui::test]
+    fn driver_form_fields_are_covered(cx: &mut TestAppContext) {
+        let (manager, window) = open_manager(cx);
+        let capture = FrameCapture::observe(window);
+        let check = |window: &mut VisualTestContext, expected: &str| {
+            let checked = Coverage::new(CONNECTION_MANAGER).assert_covered(&capture.frame(window));
+            assert!(
+                checked.iter().any(|id| id.starts_with(expected)),
+                "{expected} in {checked:?}"
+            );
+        };
+
+        for (driver_id, tab, expected) in [
+            ("redis", ActiveTab::Main, "segmented-cm-field-topology-"),
+            ("redis", ActiveTab::Settings, "conn-schema-allow_flush"),
+            ("sqlite", ActiveTab::Main, "browse-file-path"),
+        ] {
+            window.update(|window, cx| {
+                manager.update(cx, |manager, cx| {
+                    manager.select_driver(driver_id, window, cx);
+                    manager.active_tab = tab;
+                    cx.notify();
+                });
+            });
+            window.run_until_parked();
+            check(window, expected);
+        }
+
+        select_form_fields_test_driver(&manager, window);
+        check(window, "cm-field-custom_flag");
+        check(window, "segmented-cm-field-custom_mode-");
+        check(window, "browse-file-path");
+
+        window.update(|_, cx| {
+            manager.update(cx, |manager, cx| {
+                manager.active_tab = ActiveTab::Settings;
+                cx.notify();
+            });
+        });
+        window.run_until_parked();
+        check(window, "conn-schema-custom_setting");
+    }
+
+    #[gpui::test]
+    fn unregistered_driver_field_id_fails_coverage(cx: &mut TestAppContext) {
+        use gpui::{ParentElement as _, Styled as _};
+
+        struct ManagerWithUnregisteredField {
+            manager: gpui::Entity<ConnectionManagerWindow>,
+        }
+
+        impl gpui::Render for ManagerWithUnregisteredField {
+            fn render(
+                &mut self,
+                _window: &mut gpui::Window,
+                _cx: &mut gpui::Context<Self>,
+            ) -> impl gpui::IntoElement {
+                gpui::div()
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(gpui::div().flex_1().min_h_0().child(self.manager.clone()))
+                    .child(
+                        datatab_components::controls::Checkbox::new("unregistered_driver_field")
+                            .label("Unregistered")
+                            .on_click(|_, _, _| {}),
+                    )
+            }
+        }
+
+        let app_state = init_test_app_state(cx);
+        let (wrapper, window) = cx.add_window_view(|window, cx| {
+            let manager = cx.new(|cx| ConnectionManagerWindow::new(app_state, window, cx));
+            ManagerWithUnregisteredField { manager }
+        });
+        let manager = window.update(|_, cx| wrapper.read(cx).manager.clone());
+        select_form_fields_test_driver(&manager, window);
+
+        let capture = FrameCapture::observe(window);
+        let assert_only_unregistered = |window: &mut VisualTestContext| {
+            let problems = Coverage::new(CONNECTION_MANAGER).problems(&capture.frame(window));
+            assert_eq!(
+                problems.len(),
+                1,
+                "expected only the unregistered element to fail coverage, got: {problems:?}"
+            );
+            assert!(
+                problems[0].contains("`unregistered_driver_field`"),
+                "expected unregistered driver field to fail coverage, got: {problems:?}"
+            );
+        };
+
+        assert_only_unregistered(window);
+
+        window.update(|_, cx| {
+            manager.update(cx, |manager, cx| {
+                manager.active_tab = ActiveTab::Settings;
+                cx.notify();
+            });
+        });
+        window.run_until_parked();
+        assert_only_unregistered(window);
     }
 }
 

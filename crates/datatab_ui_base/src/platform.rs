@@ -4,23 +4,28 @@
 /// This module provides helpers to detect the current platform and
 /// adjust window creation accordingly.
 use datatab_components::icons::AppIcon;
-#[cfg(target_os = "linux")]
-use datatab_components::primitives::{Icon, Text};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+use datatab_components::primitives::Icon;
+use datatab_components::primitives::Text;
 #[cfg(target_os = "linux")]
 use datatab_components::tokens::ChromeColors;
+use datatab_components::tokens::ShellMetrics;
 #[cfg(target_os = "linux")]
-use datatab_components::tokens::{Heights, IslandMetrics, Spacing};
+use datatab_components::tokens::{IslandMetrics, Spacing};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use gpui::ClickEvent;
+#[cfg(target_os = "linux")]
+use gpui::Decorations;
+use gpui::InteractiveElement;
 use gpui::{
     App, IntoElement, SharedString, Stateful, Window, WindowDecorations, WindowKind, WindowOptions,
     div, px,
 };
-// Only the CSD title bar uses these, and it is compiled on Linux alone.
-use gpui::InteractiveElement;
-#[cfg(target_os = "linux")]
-use gpui::{ClickEvent, Decorations, ParentElement, StatefulInteractiveElement, Styled};
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows", target_os = "macos"))]
+use gpui::{ParentElement, StatefulInteractiveElement, Styled};
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use gpui_component::ActiveTheme;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use gpui_component::InteractiveElementExt;
 
 /// A single breadcrumb entry for the CSD title bar.
@@ -40,40 +45,10 @@ pub type TitleBarHandler = Box<dyn Fn(&mut Window, &mut App) + 'static>;
 /// Title bar height for Linux CSD mode. Used for layout and client inset reporting.
 pub const TITLE_BAR_HEIGHT: gpui::Pixels = px(32.0);
 
-/// Returns `true` when the current Linux desktop is expected to prefer app-drawn
-/// title bars instead of server-side decorations.
-#[cfg(target_os = "linux")]
-fn prefers_client_side_decorations() -> bool {
-    [
-        "XDG_CURRENT_DESKTOP",
-        "XDG_SESSION_DESKTOP",
-        "DESKTOP_SESSION",
-    ]
-    .into_iter()
-    .filter_map(|key| std::env::var(key).ok())
-    .flat_map(|value| {
-        value
-            .split(':')
-            .map(str::trim)
-            .filter(|segment| !segment.is_empty())
-            .map(|segment| segment.to_ascii_lowercase())
-            .collect::<Vec<_>>()
-    })
-    .any(|desktop| matches!(desktop.as_str(), "gnome" | "ubuntu" | "pop"))
-}
-
-/// Returns the `WindowDecorations` value to request when creating a top-level window.
-///
-/// On Linux, only GNOME-like desktop sessions request `Client` (CSD). Other Linux
-/// environments keep `Server` decorations so the window manager/compositor remains in
-/// control of the title bar.
+/// Request client decorations on every Linux desktop.
 #[cfg(target_os = "linux")]
 pub fn decoration_request() -> Option<WindowDecorations> {
-    Some(if prefers_client_side_decorations() {
-        WindowDecorations::Client
-    } else {
-        WindowDecorations::Server
-    })
+    Some(WindowDecorations::Client)
 }
 
 /// Returns the `WindowDecorations` value to request when creating a top-level window.
@@ -156,7 +131,7 @@ pub fn render_csd_title_bar_with_crumbs(
             .items_center()
             .h(IslandMetrics::WINDOW_TITLE_HEIGHT);
 
-        let mut drag_area = csd_drag_area("linux-csd-drag-area")
+        let mut drag_area = csd_drag_area("linux-csd-drag-area", window, cx)
             .flex()
             .flex_row()
             .items_center()
@@ -199,6 +174,64 @@ pub fn render_csd_title_bar_with_crumbs(
     }
 }
 
+/// The title row for Settings and Connection Manager.
+pub fn render_shell_title_bar(
+    window: &mut Window,
+    cx: &mut App,
+    title: &str,
+) -> Option<Stateful<gpui::Div>> {
+    let client_decorated = prepare_client_decorations(window);
+    if cfg!(target_os = "linux") && !client_decorated {
+        return None;
+    }
+    let draw_controls =
+        (client_decorated || cfg!(target_os = "windows")) && !window.is_fullscreen();
+    let controls = draw_controls.then(|| render_csd_window_controls(window, cx, None));
+    let reserve = if cfg!(target_os = "macos") && !window.is_fullscreen() {
+        ShellMetrics::MAC_TRAFFIC_LIGHT_RESERVE
+    } else {
+        px(0.0)
+    };
+    Some(
+        div()
+            .id("shell-window-title-bar")
+            .debug_selector(|| "shell-window-title-bar".to_string())
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .h(ShellMetrics::TITLE_BAR_HEIGHT)
+            .pl(reserve)
+            .child(
+                csd_drag_area("shell-window-title-drag", window, cx)
+                    .flex()
+                    .items_center()
+                    .flex_1()
+                    .h_full()
+                    .pl(if reserve == px(0.0) {
+                        ShellMetrics::TITLE_BAR_PADDING_X
+                    } else {
+                        px(0.0)
+                    })
+                    .child(Text::body_sm(title.to_string())),
+            )
+            .children(controls),
+    )
+}
+
+/// Configure the caption on windows that render a shell title row.
+pub fn apply_shell_titlebar_options(options: &mut WindowOptions) {
+    if let Some(titlebar) = options.titlebar.as_mut() {
+        titlebar.appears_transparent = cfg!(any(target_os = "windows", target_os = "macos"));
+        if cfg!(target_os = "macos") {
+            titlebar.traffic_light_position = Some(gpui::point(
+                ShellMetrics::MAC_TRAFFIC_LIGHT_POSITION,
+                ShellMetrics::MAC_TRAFFIC_LIGHT_POSITION,
+            ));
+        }
+    }
+    options.app_owns_titlebar_drag = cfg!(target_os = "macos");
+}
+
 /// Reports whether the app draws its own title bar this frame and sets the
 /// client inset to match.
 ///
@@ -217,10 +250,18 @@ pub fn prepare_client_decorations(window: &mut Window) -> bool {
     true
 }
 
-/// The window-management area of a CSD title bar: dragging moves the window,
-/// a double click maximizes or restores it, and a right click opens the
-/// window menu. Elsewhere it is a plain element.
-pub fn csd_drag_area(id: impl Into<gpui::ElementId>) -> Stateful<gpui::Div> {
+/// The window-management area of a title bar. It delegates dragging and
+/// double-click behavior to the platform.
+pub fn csd_drag_area(
+    id: impl Into<gpui::ElementId>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Stateful<gpui::Div> {
+    let id = id.into();
+    #[cfg(not(target_os = "macos"))]
+    let (_window, _cx) = (window, cx);
+    #[cfg(target_os = "macos")]
+    let pressed = window.use_keyed_state(id.clone(), cx, |_, _| false);
     let area = div().id(id);
 
     #[cfg(target_os = "linux")]
@@ -239,74 +280,173 @@ pub fn csd_drag_area(id: impl Into<gpui::ElementId>) -> Stateful<gpui::Div> {
             },
         );
 
+    #[cfg(target_os = "macos")]
+    let area = area
+        .on_mouse_down_out(window.listener_for(&pressed, |pressed, _, _, _| *pressed = false))
+        .on_mouse_down(
+            gpui::MouseButton::Left,
+            window.listener_for(&pressed, |pressed, _, _, _| *pressed = true),
+        )
+        .on_mouse_up(
+            gpui::MouseButton::Left,
+            window.listener_for(&pressed, |pressed, _, _, _| *pressed = false),
+        )
+        .on_mouse_move(window.listener_for(
+            &pressed,
+            |pressed, event: &gpui::MouseMoveEvent, window, _| {
+                if event.pressed_button == Some(gpui::MouseButton::Left) && *pressed {
+                    *pressed = false;
+                    window.start_window_move();
+                }
+            },
+        ))
+        .on_double_click(|_: &ClickEvent, window: &mut Window, _cx: &mut App| {
+            window.titlebar_double_click();
+        });
+
+    #[cfg(target_os = "windows")]
+    let area = area.window_control_area(gpui::WindowControlArea::Drag);
+
     area
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[derive(Clone, Copy)]
+enum WindowControl {
+    Minimize,
+    Maximize,
+    Close,
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+impl WindowControl {
+    fn icon(self) -> AppIcon {
+        match self {
+            Self::Minimize => AppIcon::Minus,
+            Self::Maximize => AppIcon::WindowSquare,
+            Self::Close => AppIcon::X,
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Minimize => "csd-minimize",
+            Self::Maximize => "csd-maximize",
+            Self::Close => "csd-close",
+        }
+    }
+
+    fn label(self) -> String {
+        match self {
+            Self::Minimize => datatab_i18n::t!("workspace.title_bar.minimize"),
+            Self::Maximize => datatab_i18n::t!("workspace.title_bar.maximize"),
+            Self::Close => datatab_i18n::t!("workspace.title_bar.close"),
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+fn window_control_button(control: WindowControl, hover: gpui::Hsla) -> Stateful<gpui::Div> {
+    div()
+        .id(control.id())
+        .debug_selector(|| control.id().to_string())
+        .aria_label(control.label())
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(ShellMetrics::WINDOW_CONTROL_WIDTH)
+        .h_full()
+        .flex_shrink_0()
+        .hover(move |style| style.bg(hover))
+        .child(
+            Icon::new(control.icon())
+                .size(ShellMetrics::WINDOW_CONTROL_ICON)
+                .muted(),
+        )
 }
 
 /// Minimize, maximize and close buttons of a CSD title bar, as the compositor
 /// allows them, each 46 px wide and filling the bar's height.
 ///
-/// `on_close` replaces the close button's action; `None` keeps the default of
-/// removing the window. Returns an empty element off Linux.
+/// On Linux `on_close` replaces the close button's action; `None` removes
+/// the window. On Windows the system handles the marked control areas.
 pub fn render_csd_window_controls(
     window: &mut Window,
     cx: &mut App,
     on_close: Option<TitleBarHandler>,
 ) -> gpui::AnyElement {
-    #[cfg(not(target_os = "linux"))]
-    let _ = (window, cx, on_close);
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+    let (_window, _cx, _on_close) = (window, cx, on_close);
+
+    #[cfg(target_os = "windows")]
+    {
+        let (_window, _on_close) = (window, on_close);
+        let button = |control: WindowControl, area, hover| {
+            window_control_button(control, hover).window_control_area(area)
+        };
+        div()
+            .flex()
+            .h_full()
+            .flex_shrink_0()
+            .child(button(
+                WindowControl::Minimize,
+                gpui::WindowControlArea::Min,
+                cx.theme().secondary_hover,
+            ))
+            .child(button(
+                WindowControl::Maximize,
+                gpui::WindowControlArea::Max,
+                cx.theme().secondary_hover,
+            ))
+            .child(button(
+                WindowControl::Close,
+                gpui::WindowControlArea::Close,
+                cx.theme().danger,
+            ))
+            .into_any_element()
+    }
 
     #[cfg(target_os = "linux")]
     {
         let controls = window.window_controls();
-        let hover = cx.theme().secondary;
-
-        let make_button = |id: &'static str, icon: AppIcon, handler: TitleBarHandler| {
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .justify_center()
-                .w(px(46.0))
-                .h_full()
+        let hover = cx.theme().secondary_hover;
+        let close_hover = cx.theme().danger;
+        let make_button = |control, handler: TitleBarHandler, hover| {
+            window_control_button(control, hover)
                 .cursor_pointer()
-                .hover(move |d| d.bg(hover))
-                .on_click(move |_, window, cx| {
-                    handler(window, cx);
-                })
-                .child(Icon::new(icon).size(Heights::ICON_SM).muted())
+                .on_click(move |_, window, cx| handler(window, cx))
         };
-
         let mut row = div()
             .flex()
             .flex_row()
             .flex_shrink_0()
             .items_center()
             .h_full();
-
         if controls.minimize {
             row = row.child(make_button(
-                "csd-minimize",
-                AppIcon::Minimize2,
+                WindowControl::Minimize,
                 Box::new(|window, _cx| window.minimize_window()),
+                hover,
             ));
         }
-
         if controls.maximize {
             row = row.child(make_button(
-                "csd-maximize",
-                AppIcon::Maximize2,
+                WindowControl::Maximize,
                 Box::new(|window, _cx| window.zoom_window()),
+                hover,
             ));
         }
-
         let close_handler =
             on_close.unwrap_or_else(|| Box::new(|window, _cx| window.remove_window()));
-        row = row.child(make_button("csd-close", AppIcon::X, close_handler));
-
-        row.into_any_element()
+        row.child(make_button(
+            WindowControl::Close,
+            close_handler,
+            close_hover,
+        ))
+        .into_any_element()
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "windows")))]
     {
         div().into_any_element()
     }
@@ -462,6 +602,15 @@ mod window_size_tests {
     };
     use gpui::{Bounds, WindowKind, WindowOptions, point, px, size};
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_requests_client_decorations() {
+        assert_eq!(
+            super::decoration_request(),
+            Some(gpui::WindowDecorations::Client)
+        );
+    }
+
     #[test]
     fn the_screen_margin_is_inset_on_every_side() {
         let area = Bounds::new(point(px(0.0), px(0.0)), size(px(1920.0), px(1080.0)));
@@ -578,3 +727,6 @@ mod window_size_tests {
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests;

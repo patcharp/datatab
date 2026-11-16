@@ -25,6 +25,7 @@ serde_json = { workspace = true }
 urlencoding = "2"
 
 [dev-dependencies]
+datatab_storage.workspace = true
 datatab_test_support.workspace = true
 
 [lints]

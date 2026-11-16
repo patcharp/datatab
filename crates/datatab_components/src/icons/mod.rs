@@ -66,6 +66,7 @@ pub enum AppIcon {
     FingerprintPattern,
     Maximize2,
     Minimize2,
+    WindowSquare,
     PanelBottomClose,
     PanelBottomOpen,
     PanelBottom,
@@ -212,6 +213,7 @@ impl AppIcon {
             Self::FingerprintPattern => "icons/ui/fingerprint-pattern.svg",
             Self::Maximize2 => "icons/ui/maximize-2.svg",
             Self::Minimize2 => "icons/ui/minimize-2.svg",
+            Self::WindowSquare => "icons/ui/window-square.svg",
             Self::PanelBottomClose => "icons/ui/panel-bottom-close.svg",
             Self::PanelBottomOpen => "icons/ui/panel-bottom-open.svg",
             Self::PanelBottom => "icons/ui/panel-bottom.svg",
@@ -302,13 +304,12 @@ impl AppIcon {
             QueryLanguage::MongoQuery => Self::BrandMongodb,
             QueryLanguage::RedisCommands => Self::BrandRedis,
             QueryLanguage::InfluxQuery | QueryLanguage::Flux => Self::BrandInfluxDb,
-            QueryLanguage::Sql
-            | QueryLanguage::CloudWatchLogsInsightsQl
-            | QueryLanguage::OpenSearchPpl
-            | QueryLanguage::OpenSearchSql
-            | QueryLanguage::Cql => Self::Database,
+            QueryLanguage::Sql | QueryLanguage::Cql => Self::Database,
             QueryLanguage::Cypher => Self::Database,
-            QueryLanguage::Custom(_) => Self::FileCode,
+            QueryLanguage::Custom(_)
+            | QueryLanguage::ReservedCloudWatchLogsInsightsQl
+            | QueryLanguage::ReservedOpenSearchPpl
+            | QueryLanguage::ReservedOpenSearchSql => Self::FileCode,
         }
     }
 
@@ -338,15 +339,16 @@ impl AppIcon {
             Icon::Sqlite => Self::BrandSqlite,
             Icon::Mongodb => Self::BrandMongodb,
             Icon::Redis => Self::BrandRedis,
-            Icon::Dynamodb => Self::Braces,
             Icon::Redshift => Self::ChartNoAxesColumn,
-            Icon::S3 => Self::Boxes,
             Icon::Clickhouse => Self::BrandClickhouse,
             Icon::Turso => Self::BrandTurso,
             Icon::Duckdb => Self::BrandDuckdb,
             Icon::Influxdb => Self::BrandInfluxDb,
             Icon::Logs => Self::Logs,
-            Icon::Database => crate::category::category_presentation(category).fallback_icon,
+            // The reserved wire slots are no icon of their own.
+            Icon::Database | Icon::ReservedDynamodb | Icon::ReservedS3 => {
+                crate::category::category_presentation(category).fallback_icon
+            }
         }
     }
 }
@@ -355,7 +357,7 @@ impl AppIcon {
 /// database category, never from a driver id (P1Sidebar, P1DriverPicker):
 /// relational engines read in the info blue, document stores in green,
 /// key-value stores in the danger red, time series in the NULL violet, and
-/// object storage and log streams in amber.
+/// object storage and the generic logs icon in amber.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DriverIconTone {
     Info,
@@ -376,11 +378,13 @@ impl DriverIconTone {
             | Icon::Clickhouse
             | Icon::Turso
             | Icon::Duckdb => Self::Info,
-            Icon::Mongodb | Icon::Dynamodb => Self::Success,
+            Icon::Mongodb => Self::Success,
             Icon::Redis => Self::Danger,
             Icon::Influxdb => Self::Violet,
-            Icon::S3 | Icon::Logs => Self::Warning,
-            Icon::Database => crate::category::category_presentation(category).fallback_tone,
+            Icon::Logs => Self::Warning,
+            Icon::Database | Icon::ReservedDynamodb | Icon::ReservedS3 => {
+                crate::category::category_presentation(category).fallback_tone
+            }
         }
     }
 
@@ -442,7 +446,7 @@ mod tests {
             DriverIconTone::Danger
         );
         assert_eq!(
-            DriverIconTone::for_driver(Icon::S3, DatabaseCategory::ObjectStorage),
+            DriverIconTone::for_driver(Icon::Logs, DatabaseCategory::Relational),
             DriverIconTone::Warning
         );
         assert_eq!(
@@ -467,14 +471,6 @@ mod tests {
             AppIcon::ChartNoAxesColumn
         );
         assert_eq!(
-            AppIcon::for_driver(Icon::Dynamodb, DatabaseCategory::Document),
-            AppIcon::Braces
-        );
-        assert_eq!(
-            AppIcon::for_driver(Icon::S3, DatabaseCategory::ObjectStorage),
-            AppIcon::Boxes
-        );
-        assert_eq!(
             AppIcon::for_driver(Icon::Clickhouse, DatabaseCategory::Relational),
             AppIcon::BrandClickhouse
         );
@@ -492,12 +488,36 @@ mod tests {
             (DatabaseCategory::KeyValue, AppIcon::KeyRound),
             (DatabaseCategory::ObjectStorage, AppIcon::Boxes),
             (DatabaseCategory::TimeSeries, AppIcon::Database),
-            (DatabaseCategory::LogStream, AppIcon::Database),
-            (DatabaseCategory::SecretStore, AppIcon::Lock),
         ];
 
         for (category, expected) in cases {
             assert_eq!(AppIcon::for_driver(Icon::Database, category), expected);
+        }
+    }
+
+    /// A reserved wire slot is no icon of its own: it draws like
+    /// `Icon::Database`, from the category, in the category's tone.
+    #[test]
+    fn reserved_icon_slots_use_the_category_fallback() {
+        for reserved in [Icon::ReservedDynamodb, Icon::ReservedS3] {
+            for category in [
+                DatabaseCategory::Relational,
+                DatabaseCategory::Document,
+                DatabaseCategory::KeyValue,
+                DatabaseCategory::TimeSeries,
+                DatabaseCategory::ObjectStorage,
+            ] {
+                assert_eq!(
+                    AppIcon::for_driver(reserved, category),
+                    AppIcon::for_driver(Icon::Database, category),
+                    "{reserved:?} {category:?}"
+                );
+                assert_eq!(
+                    DriverIconTone::for_driver(reserved, category),
+                    DriverIconTone::for_driver(Icon::Database, category),
+                    "{reserved:?} {category:?}"
+                );
+            }
         }
     }
 

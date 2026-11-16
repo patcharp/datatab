@@ -35,7 +35,8 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 /// `root_cert_path` pins a private certificate authority (added on top of the
 /// system trust store); `client_cert_path` + `client_key_path` supply a PEM
 /// certificate/key pair for mutual TLS. All three are independent paths on
-/// disk, loaded lazily when a TLS-enabled connection is opened.
+/// disk, loaded lazily when a TLS-enabled connection is opened. The root CA
+/// loads only when the mode validates the chain.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct RedshiftTlsCerts {
     pub root_cert_path: Option<String>,
@@ -80,16 +81,17 @@ pub(crate) struct TlsVerification {
 }
 
 impl RedshiftSslMode {
-    /// Parses a libpq `sslmode` value. Unknown values (and the empty string)
-    /// fall back to `prefer`, matching libpq's own default posture.
-    pub(crate) fn parse(value: &str) -> RedshiftSslMode {
-        match value.to_ascii_lowercase().as_str() {
-            "disable" => RedshiftSslMode::Disable,
-            "require" => RedshiftSslMode::Require,
-            "verify-ca" => RedshiftSslMode::VerifyCa,
-            "verify-full" => RedshiftSslMode::VerifyFull,
-            // "allow" | "prefer" and any unrecognized value.
-            _ => RedshiftSslMode::Prefer,
+    /// Parses a libpq `sslmode` value without downgrading unknown values.
+    pub(crate) fn parse(value: &str) -> Result<RedshiftSslMode, DbError> {
+        match value {
+            "disable" => Ok(RedshiftSslMode::Disable),
+            "allow" | "prefer" => Ok(RedshiftSslMode::Prefer),
+            "require" => Ok(RedshiftSslMode::Require),
+            "verify-ca" => Ok(RedshiftSslMode::VerifyCa),
+            "verify-full" => Ok(RedshiftSslMode::VerifyFull),
+            _ => Err(DbError::InvalidProfile(
+                "Unknown Redshift sslmode. Accepted values: disable, allow, prefer, require, verify-ca, verify-full".to_string(),
+            )),
         }
     }
 
@@ -155,10 +157,14 @@ fn build_base_config(params: &RedshiftConnectParams, ssl_mode: RedshiftSslMode) 
 /// Shared by the direct/form path and the URI path so the per-mode certificate
 /// policy lives in exactly one place: `disable` connects without TLS;
 /// `require`/`prefer` accept invalid certificates; `verify-ca` validates the
-/// chain; `verify-full` also validates the hostname; and `prefer` (like libpq)
-/// retries in plaintext when the TLS
-/// attempt fails. `map_err` lets each caller attach its own connection-error
-/// context (host/port for the direct path, sanitized URI for the URI path).
+/// chain; `verify-full` also validates the hostname. Under `prefer`, a failed
+/// TLS handshake still falls back to a new login in clear text. A server's TLS
+/// refusal continues in clear text on the same socket in the wire client.
+/// `prefer` does not resist an active attacker. Use `require` to prevent
+/// clear-text fallback, or `verify-full` to also verify the server's identity.
+///
+/// `map_err` lets each caller attach its own connection-error context
+/// (host/port for the direct path, sanitized URI for the URI path).
 pub(crate) fn connect_with_ssl_mode(
     config: &Config,
     ssl_mode: RedshiftSslMode,
@@ -180,19 +186,35 @@ pub(crate) fn connect_with_ssl_mode(
 
     match config.connect(tls.clone()) {
         Ok(client) => Ok((client, CancelTls::Tls(tls))),
-        Err(_) if ssl_mode == RedshiftSslMode::Prefer => connect_in_clear_text(),
+        Err(error)
+            if error.as_db_error().is_none()
+                && should_retry_without_tls(ssl_mode, std::error::Error::source(&error)) =>
+        {
+            log::info!("[SSL] TLS negotiation failed ({error}), retrying without TLS (prefer)");
+            connect_in_clear_text()
+        }
         Err(e) => Err(map_err(&e)),
     }
+}
+
+// Mirror the PostgreSQL driver's `is_tls_negotiation_failure` to keep retry policy consistent.
+fn should_retry_without_tls(
+    ssl_mode: RedshiftSslMode,
+    source: Option<&(dyn std::error::Error + 'static)>,
+) -> bool {
+    ssl_mode == RedshiftSslMode::Prefer
+        && source.is_some_and(|source| source.is::<native_tls::Error>())
 }
 
 /// Builds the native-tls connector for a TLS-enabled Redshift connection.
 ///
 /// `verification` carries the per-mode validation policy (`require` accepts
-/// any certificate, `verify-ca` skips only the hostname check). On top of it,
-/// a pinned private CA is added when [`RedshiftTlsCerts::root_cert_path`] is set, and a
-/// client identity for mutual TLS is applied when both client cert and key
-/// paths are set. Loading a cert never weakens validation: the root CA is
-/// *added* to the trust store, not substituted for validation.
+/// any certificate, `verify-ca` skips only the hostname check). A pinned private
+/// CA is added when chain validation is enabled and
+/// [`RedshiftTlsCerts::root_cert_path`] is set. A client identity for mutual TLS
+/// is applied when both client cert and key paths are set. Loading a cert never
+/// weakens validation: the root CA is *added* to the trust store, not substituted
+/// for validation.
 fn build_tls_connector(
     verification: TlsVerification,
     tls_certs: &RedshiftTlsCerts,
@@ -202,7 +224,9 @@ fn build_tls_connector(
         .danger_accept_invalid_certs(!verification.chain)
         .danger_accept_invalid_hostnames(!verification.hostname);
 
-    if let Some(path) = tls_certs.root_cert_path.as_deref() {
+    if verification.chain
+        && let Some(path) = tls_certs.root_cert_path.as_deref()
+    {
         builder.add_root_certificate(load_root_certificate(path)?);
     }
 
@@ -287,7 +311,7 @@ pub(crate) fn load_client_identity(
 pub(crate) fn connect_redshift(
     params: &RedshiftConnectParams,
 ) -> Result<(Client, CancelTls), DbError> {
-    let ssl_mode = RedshiftSslMode::parse(params.ssl_mode);
+    let ssl_mode = RedshiftSslMode::parse(params.ssl_mode)?;
     let config = build_base_config(params, ssl_mode);
 
     connect_with_ssl_mode(&config, ssl_mode, params.tls_certs, |e| {
@@ -1125,6 +1149,9 @@ fn redshift_value_to_value(row: &postgres::Row, idx: usize) -> Value {
 
 #[cfg(test)]
 mod tests {
+    mod prefer_retry;
+    mod tls;
+
     use super::{
         RedshiftConnectParams, RedshiftSslMode, RedshiftTlsCerts, TlsVerification,
         build_base_config, ensure_read_only, load_client_identity, load_root_certificate,
@@ -1288,23 +1315,34 @@ mod tests {
 
     #[test]
     fn ssl_mode_parse_maps_every_libpq_value() {
-        assert_eq!(RedshiftSslMode::parse("disable"), RedshiftSslMode::Disable);
-        assert_eq!(RedshiftSslMode::parse("allow"), RedshiftSslMode::Prefer);
-        assert_eq!(RedshiftSslMode::parse("prefer"), RedshiftSslMode::Prefer);
-        assert_eq!(RedshiftSslMode::parse("require"), RedshiftSslMode::Require);
         assert_eq!(
-            RedshiftSslMode::parse("verify-ca"),
+            RedshiftSslMode::parse("disable").expect("known mode"),
+            RedshiftSslMode::Disable
+        );
+        assert_eq!(
+            RedshiftSslMode::parse("allow").expect("known mode"),
+            RedshiftSslMode::Prefer
+        );
+        assert_eq!(
+            RedshiftSslMode::parse("prefer").expect("known mode"),
+            RedshiftSslMode::Prefer
+        );
+        assert_eq!(
+            RedshiftSslMode::parse("require").expect("known mode"),
+            RedshiftSslMode::Require
+        );
+        assert_eq!(
+            RedshiftSslMode::parse("verify-ca").expect("known mode"),
             RedshiftSslMode::VerifyCa
         );
         assert_eq!(
-            RedshiftSslMode::parse("verify-full"),
+            RedshiftSslMode::parse("verify-full").expect("known mode"),
             RedshiftSslMode::VerifyFull
         );
 
-        // Case-insensitive, and unknown/empty fall back to prefer.
-        assert_eq!(RedshiftSslMode::parse("REQUIRE"), RedshiftSslMode::Require);
-        assert_eq!(RedshiftSslMode::parse("bogus"), RedshiftSslMode::Prefer);
-        assert_eq!(RedshiftSslMode::parse(""), RedshiftSslMode::Prefer);
+        assert!(RedshiftSslMode::parse("REQUIRE").is_err());
+        assert!(RedshiftSslMode::parse("bogus").is_err());
+        assert!(RedshiftSslMode::parse("").is_err());
     }
 
     #[test]
@@ -1359,7 +1397,7 @@ mod tests {
             ssl_mode: "verify-full",
             tls_certs: &tls_certs,
         };
-        let ssl_mode = RedshiftSslMode::parse(params.ssl_mode);
+        let ssl_mode = RedshiftSslMode::parse(params.ssl_mode).expect("known mode");
         let config = build_base_config(&params, ssl_mode);
 
         assert_eq!(config.get_password(), Some(password.as_bytes()));
@@ -1384,7 +1422,10 @@ mod tests {
             ssl_mode: "require",
             tls_certs: &tls_certs,
         };
-        let config = build_base_config(&params, RedshiftSslMode::parse(params.ssl_mode));
+        let config = build_base_config(
+            &params,
+            RedshiftSslMode::parse(params.ssl_mode).expect("known mode"),
+        );
 
         assert_eq!(
             config.get_application_name(),
@@ -1404,7 +1445,10 @@ mod tests {
             ssl_mode: "require",
             tls_certs: &tls_certs,
         };
-        let config = build_base_config(&params, RedshiftSslMode::parse(params.ssl_mode));
+        let config = build_base_config(
+            &params,
+            RedshiftSslMode::parse(params.ssl_mode).expect("known mode"),
+        );
 
         assert_eq!(config.get_connect_timeout(), Some(&Duration::from_secs(30)));
     }

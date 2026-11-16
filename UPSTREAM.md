@@ -27,3 +27,5 @@ The upstream [`TRADEMARK.md`](https://github.com/0xErwin1/dbflux/blob/76b46a0037
 ## Taking changes from upstream
 
 DataTab renames the whole repository, so upstream changes cannot be merged. Choose each change, then apply it by hand or with `git cherry-pick`, and record the upstream commit in the commit message.
+
+Drop hunks in AWS crates and removed seams (#311). Map enum changes onto reserved slots; never reuse a reserved index or a retired capability bit.

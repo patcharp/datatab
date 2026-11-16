@@ -39,10 +39,8 @@ DataTab is a native desktop database client for Linux, Windows and macOS, writte
 | Kind | Supported |
 | --- | --- |
 | Relational | PostgreSQL, MySQL and MariaDB, SQLite, Microsoft SQL Server, Amazon Redshift, ClickHouse, TursoDB and libSQL, DuckDB |
-| Document and key-value | MongoDB, Redis, DynamoDB |
-| Time series and logs | InfluxDB v1 and v2, CloudWatch Logs |
-| Object storage | Amazon S3 and S3-compatible endpoints |
-| Secrets | AWS Secrets Manager and Parameter Store |
+| Document and key-value | MongoDB, Redis |
+| Time series | InfluxDB v1 and v2 |
 | Anything else | External drivers over the [Driver RPC Protocol](docs/DRIVER_RPC_PROTOCOL.md) |
 
 [Drivers Overview](docs/DRIVERS.md) has the full capability matrix and each driver's limits.
@@ -71,8 +69,7 @@ DataTab is a native desktop database client for Linux, Windows and macOS, writte
 
 **Connecting**
 
-- SSH tunnels, SOCKS5 and HTTP proxies, and AWS SSM, with reusable profiles
-- AWS SSO, shared and static auth profiles
+- SSH tunnels, SOCKS5 and HTTP proxies, with reusable profiles
 - Hooks before and after connecting, as a command, a script or Lua
 
 **AI through MCP, under your control**
@@ -90,7 +87,7 @@ DataTab is a native desktop database client for Linux, Windows and macOS, writte
 | I want to | Read |
 | --- | --- |
 | Make my first connection | [Getting Started](docs/GETTING_STARTED.md) |
-| Set up tunnels, proxies or AWS | [Connecting](docs/CONNECTIONS.md) |
+| Set up tunnels, proxies or auth profiles | [Connecting](docs/CONNECTIONS.md) |
 | Run queries and work with results | [Usage](docs/USAGE.md) |
 | Learn the keys | [Keyboard](docs/KEYBOARD.md) |
 | Build charts and dashboards | [Charts](docs/CHARTS.md), [Dashboards](docs/DASHBOARDS.md) |

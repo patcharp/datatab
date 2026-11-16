@@ -284,10 +284,6 @@ pub struct PaneHandle {
     /// `None` on the outer `Option` means the document does not support this operation.
     pub set_correlation_filter: Option<Box<dyn Fn(Option<String>, &mut App)>>,
 
-    /// Returns true when this pane matches a given event-stream target.
-    pub matches_event_stream:
-        Option<Box<dyn Fn(uuid::Uuid, &datatab_core::EventStreamTarget, &App) -> bool>>,
-
     /// Reports the cleanup an emptying close leaves behind, without touching the
     /// disk.
     ///
@@ -349,11 +345,6 @@ pub struct PaneHandle {
     /// `take_pending_open_bucket`. Only object-browsing documents populate it.
     pub take_pending_open_object_editor:
         Option<Box<dyn Fn(&mut App) -> Option<ObjectEditorRequest>>>,
-
-    /// Opens `path` of a hierarchical secret store in its existing tab, so a
-    /// path activated in the sidebar navigates the store's one tab. Only
-    /// `SecretStoreDocument` populates it.
-    pub navigate_secret_path: Option<Box<dyn Fn(Option<String>, &mut App)>>,
 
     /// Returns the side panels the document currently shows, drawn by the
     /// workspace as islands beside the document island. `None` for documents
@@ -428,7 +419,7 @@ impl PaneHandle {
     ///
     /// Called by per-document `into_pane` constructors for simple documents
     /// (Chart, KeyValue) that do not need `set_category_filter`,
-    /// `matches_event_stream`, `empty_script_cleanup`, or `session_tab_snapshot`.
+    /// `empty_script_cleanup`, or `session_tab_snapshot`.
     #[allow(clippy::too_many_arguments)]
     pub fn new_chart(
         id: DocumentId,
@@ -471,7 +462,6 @@ impl PaneHandle {
             subscribe,
             set_category_filter: None,
             set_correlation_filter: None,
-            matches_event_stream: None,
             empty_script_cleanup: None,
             session_tab_snapshot: None,
             mark_inspector_closed: None,
@@ -484,7 +474,6 @@ impl PaneHandle {
             tab_tooltip: None,
             take_pending_open_bucket: None,
             take_pending_open_object_editor: None,
-            navigate_secret_path: None,
             side_panels: None,
             pane_actions: None,
             on_close: None,

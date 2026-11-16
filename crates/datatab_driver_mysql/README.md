@@ -16,7 +16,7 @@ Popular open-source relational database.
 - Supports SQL execution, schema discovery, indexes, foreign keys, check constraints, and unique constraints.
 - Displays `DECIMAL` values as the exact decimal MySQL stores.
 - Supports authentication, SSH tunneling, and URI/manual connection modes.
-- TLS with the five native SSL modes (`DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`, `VERIFY_IDENTITY`): `VERIFY_CA` verifies the server chain while skipping hostname validation and `VERIFY_IDENTITY` verifies both. A custom root CA replaces the system trust store for the verifying modes, and a client certificate + key enables mutual TLS. Uses the `rustls`/`aws-lc-rs` backend.
+- TLS with the five native SSL modes (`DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA`, `VERIFY_IDENTITY`): `PREFERRED` and `REQUIRED` do not verify the server certificate. `VERIFY_CA` verifies the server chain while skipping hostname validation and `VERIFY_IDENTITY` verifies both. A custom root CA replaces the system trust store for the verifying modes, and a client certificate + key enables mutual TLS in every mode except `DISABLED`. The form shows root CA pickers only for verifying modes and client certificate/key pickers for every TLS-enabled mode. Uses the `rustls`/`aws-lc-rs` backend.
 - Supports query cancellation through a dedicated cancel path (`KILL QUERY` flow).
 - Includes SQL/code generation for CRUD, indexes, foreign keys, and table DDL operations.
 - Routine discovery: lists stored procedures and user-defined functions from `information_schema.ROUTINES` including parameter types and return type hints (Functions only).
@@ -41,7 +41,7 @@ Exposes a curated set of live server metrics sourced from `SHOW GLOBAL STATUS`:
 - `mysql.innodb_rows_deleted` — rows deleted from InnoDB
 - `mysql.slow_queries` — cumulative slow query count
 - `mysql.table_locks_waited` — table-level lock contention counter
-- `mysql.bytes_sent` — network bytes sent
+- `mysql.bytes_sent` — network bytes sent per second
 
 Each metric is returned as a single `(timestamp_ms, value)` row for live charting.
 
@@ -53,6 +53,8 @@ Exposes tabular snapshots of running server state:
 
 ## Limitations
 
+- Unknown TLS modes are refused.
+
 - Explicit statement timeouts and bounded instance metric/inspector requests are refused before execution; unbounded requests retain compatibility. The retained-row cap does not bound bytes, server work, engine allocation, or elapsed time. Hosted MariaDB was not verified.
 - Batched primary-key row lookup sends at most 100 values per query; a larger request runs as several `IN (...)` statements.
 - SQL-only driver; it does not expose document or key-value APIs.
@@ -60,7 +62,7 @@ Exposes tabular snapshots of running server state:
 - MySQL before 8.0.16 does not store `CHECK` constraints, so table details list none there. MariaDB before 10.2.22 (10.3.10 in the 10.3 series) stores them but has no `information_schema.CHECK_CONSTRAINTS`, so table details list its check constraints without their clause.
 - `DECIMAL` columns are reported as `ColumnKind::Float`, since there is no decimal column kind: charts and other users of the column kind treat them as floating-point numbers, while the values themselves stay exact.
 
-- Instance metrics return a single data point per call (current snapshot from `SHOW GLOBAL STATUS`), not a historical time series. Cumulative counters (e.g. `mysql.bytes_sent`) grow monotonically — interpret them as deltas between samples rather than absolute rates.
+- Instance metrics return a single data point per call (current snapshot from `SHOW GLOBAL STATUS`), not a historical time series. Cumulative counters (for example `mysql.bytes_sent` and the InnoDB buffer-pool read counters) are declared as counters, so the chart shows the change per second between samples; the first sample has no point.
 
 - The `performance_schema` availability probe runs once at catalog construction time. When `performance_schema` is absent, performance-schema-specific metrics are omitted from `list_metrics()`. The static metric set (`SHOW GLOBAL STATUS` based) is always available.
 

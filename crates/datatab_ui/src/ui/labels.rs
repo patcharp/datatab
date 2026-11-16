@@ -124,40 +124,6 @@ pub(crate) fn charts_cannot_open_chart_message(error: impl std::fmt::Display) ->
     datatab_i18n::t!("charts.error.cannot_open_chart", error = error)
 }
 
-/// Formats the error shown when a dashboard import parse/build step fails.
-pub(crate) fn charts_import_failed_message(error: impl std::fmt::Display) -> String {
-    datatab_i18n::t!("charts.error.import_failed", error = error)
-}
-
-/// Formats the error shown when an imported chart fails to persist.
-pub(crate) fn charts_persist_import_chart_failed_message(name: &str) -> String {
-    datatab_i18n::t!("charts.error.persist_import_chart_failed", name = name)
-}
-
-/// Formats the error shown when an imported dashboard fails to persist.
-pub(crate) fn charts_persist_import_dashboard_failed_message(name: &str) -> String {
-    datatab_i18n::t!("charts.error.persist_import_dashboard_failed", name = name)
-}
-
-/// Formats the error shown when a dashboard's charts/panels fail to save.
-pub(crate) fn charts_save_dashboard_failed_message(name: &str, message: &str) -> String {
-    datatab_i18n::t!(
-        "charts.error.save_dashboard_failed",
-        name = name,
-        message = message
-    )
-}
-
-/// Formats the toast shown after a successful dashboard import.
-pub(crate) fn charts_import_success_message(count: usize) -> String {
-    datatab_i18n::t!("charts.toast.import_success", count = count)
-}
-
-/// Formats the error shown when a remote dashboard fails to parse.
-pub(crate) fn charts_remote_parse_failed_message(error: impl std::fmt::Display) -> String {
-    datatab_i18n::t!("charts.error.remote_parse_failed", error = error)
-}
-
 /// Formats the error shown when creating a dashboard fails.
 pub(crate) fn charts_create_dashboard_failed_message(error: impl std::fmt::Display) -> String {
     datatab_i18n::t!("charts.error.create_dashboard_failed", error = error)
@@ -188,21 +154,6 @@ pub(crate) fn charts_duplicate_chart_failed_message(error: impl std::fmt::Displa
     datatab_i18n::t!("charts.error.duplicate_chart_failed", error = error)
 }
 
-/// Formats the error shown when loading metric namespaces fails.
-pub(crate) fn charts_load_namespaces_failed_message(error: impl std::fmt::Display) -> String {
-    datatab_i18n::t!("charts.error.load_namespaces_failed", error = error)
-}
-
-/// Formats the background-task label shown while loading metrics for a namespace.
-pub(crate) fn charts_loading_metrics_label(namespace: &str) -> String {
-    datatab_i18n::t!("charts.status.loading_metrics", namespace = namespace)
-}
-
-/// Formats the error shown when loading metrics for a namespace fails.
-pub(crate) fn charts_load_metrics_failed_message(error: impl std::fmt::Display) -> String {
-    datatab_i18n::t!("charts.error.load_metrics_failed", error = error)
-}
-
 /// Formats the error shown when a query-backed chart fails to persist for a new panel.
 pub(crate) fn charts_persist_chart_for_panel_failed_message(name: &str) -> String {
     datatab_i18n::t!("charts.error.persist_chart_for_panel_failed", name = name)
@@ -211,23 +162,6 @@ pub(crate) fn charts_persist_chart_for_panel_failed_message(name: &str) -> Strin
 /// Formats the error shown when adding a panel to a dashboard fails.
 pub(crate) fn charts_add_panel_failed_message(error: impl std::fmt::Display) -> String {
     datatab_i18n::t!("charts.error.add_panel_failed", error = error)
-}
-
-/// Formats the error shown when a metric-backed chart fails to persist for a new panel.
-pub(crate) fn charts_persist_metric_chart_for_panel_failed_message(name: &str) -> String {
-    datatab_i18n::t!(
-        "charts.error.persist_metric_chart_for_panel_failed",
-        name = name
-    )
-}
-
-/// Formats the toast shown when a panel for the same metric already exists.
-pub(crate) fn charts_panel_already_exists_message(namespace: &str, metric: &str) -> String {
-    datatab_i18n::t!(
-        "charts.toast.panel_already_exists",
-        namespace = namespace,
-        metric = metric
-    )
 }
 
 /// Formats the error shown when adding several panels to a dashboard fails.
@@ -417,12 +351,10 @@ pub(crate) fn audit_persist_mcp_governance_failed_message(error: impl std::fmt::
 pub(crate) enum NoActiveConnectionKind {
     Table,
     Collection,
-    EventSource,
     KeyValueDb,
     ObjectStorageAccount,
     Bucket,
     Object,
-    SecretStore,
 }
 
 /// Formats the "No active connection for this X" toast for the given resource kind.
@@ -433,9 +365,6 @@ pub(crate) fn documents_no_active_connection_message(kind: NoActiveConnectionKin
         }
         NoActiveConnectionKind::Collection => {
             datatab_i18n::t!("documents.toast.no_active_connection_for.collection")
-        }
-        NoActiveConnectionKind::EventSource => {
-            datatab_i18n::t!("documents.toast.no_active_connection_for.event_source")
         }
         NoActiveConnectionKind::KeyValueDb => {
             datatab_i18n::t!("documents.toast.no_active_connection_for.key_value_db")
@@ -448,9 +377,6 @@ pub(crate) fn documents_no_active_connection_message(kind: NoActiveConnectionKin
         }
         NoActiveConnectionKind::Object => {
             datatab_i18n::t!("documents.toast.no_active_connection_for.object")
-        }
-        NoActiveConnectionKind::SecretStore => {
-            datatab_i18n::t!("documents.toast.no_active_connection_for.secret_store")
         }
     }
 }
@@ -532,7 +458,6 @@ mod tests {
         "workspace.hint.open",
         "workspace.hint.new_connection",
         "workspace.mcp_approvals",
-        "workspace.event_streams",
         "workspace.action.delete",
         "workspace.action.drop",
         "workspace.action.delete_folder",
@@ -692,7 +617,6 @@ mod tests {
         "audit.error.persist_mcp_governance_failed",
         "documents.toast.no_active_connection_for.table",
         "documents.toast.no_active_connection_for.collection",
-        "documents.toast.no_active_connection_for.event_source",
         "documents.toast.no_active_connection_for.key_value_db",
         "documents.toast.no_active_connection_for.object_storage_account",
         "documents.toast.no_active_connection_for.bucket",
@@ -750,7 +674,6 @@ mod tests {
         let keys = [
             "connections.toast.export_from_menu",
             "connections.toast.export_from_menu_body",
-            "charts.error.import_unsupported",
         ];
 
         for key in keys {
@@ -808,12 +731,10 @@ mod tests {
         let kinds = [
             NoActiveConnectionKind::Table,
             NoActiveConnectionKind::Collection,
-            NoActiveConnectionKind::EventSource,
             NoActiveConnectionKind::KeyValueDb,
             NoActiveConnectionKind::ObjectStorageAccount,
             NoActiveConnectionKind::Bucket,
             NoActiveConnectionKind::Object,
-            NoActiveConnectionKind::SecretStore,
         ];
 
         let mut messages = Vec::with_capacity(kinds.len());

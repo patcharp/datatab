@@ -20,12 +20,14 @@ impl Workspace {
                                 provider_name,
                                 profile_name,
                                 url,
+                                login,
                             } => {
-                                this.pending_login_modal_open = Some((
-                                    provider_name.clone(),
-                                    profile_name.clone(),
-                                    url.clone(),
-                                ));
+                                this.pending_login_modal_open = Some(PendingSettingsLogin {
+                                    provider_name: provider_name.clone(),
+                                    profile_name: profile_name.clone(),
+                                    url: url.clone(),
+                                    login: login.clone(),
+                                });
                                 cx.notify();
                             }
                         });
@@ -34,6 +36,66 @@ impl Workspace {
                 .detach();
             },
         );
+    }
+
+    /// Shows a login the Settings window started in the login modal, and
+    /// ties the two together: the modal closes when the Settings form stops
+    /// waiting for the login, and the modal's Cancel button cancels the login
+    /// as the form's own Cancel does.
+    pub(in crate::ui::views::workspace) fn show_settings_login(
+        &mut self,
+        pending: PendingSettingsLogin,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let PendingSettingsLogin {
+            provider_name,
+            profile_name,
+            url,
+            login,
+        } = pending;
+
+        // The form may have stopped waiting since it sent the URL.
+        if !login.is_waiting(cx) {
+            return;
+        }
+
+        self.last_settings_login_id = self.last_settings_login_id.wrapping_add(1);
+        let login_id = self.last_settings_login_id;
+
+        let Some(ended) = login.on_ended(cx, move |this, cx| {
+            this.settings_login_ended(login_id, cx);
+        }) else {
+            return;
+        };
+
+        self.settings_login = Some(ShownSettingsLogin {
+            id: login_id,
+            login,
+            _ended: ended,
+        });
+        self.login_modal.update(cx, |modal, cx| {
+            modal.open_for_login(login_id, provider_name, profile_name, url, window, cx);
+        });
+    }
+
+    fn settings_login_ended(&mut self, login_id: u64, cx: &mut Context<Self>) {
+        self.settings_login.take_if(|shown| shown.id == login_id);
+        self.login_modal.update(cx, |modal, cx| {
+            modal.login_ended(login_id, cx);
+        });
+    }
+
+    /// The user pressed Cancel in the login modal while it showed the
+    /// Settings login `login_id`.
+    pub(in crate::ui::views::workspace) fn cancel_settings_login(
+        &mut self,
+        login_id: u64,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(shown) = self.settings_login.take_if(|shown| shown.id == login_id) {
+            shown.login.cancel(cx);
+        }
     }
 
     pub(in crate::ui::views::workspace) fn open_login_modal(
@@ -66,15 +128,5 @@ impl Workspace {
             cx,
             |_settings, _cx| {},
         );
-    }
-
-    pub(in crate::ui::views::workspace) fn open_sso_wizard(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.sso_wizard.update(cx, |wizard, cx| {
-            wizard.open(window, cx);
-        });
     }
 }

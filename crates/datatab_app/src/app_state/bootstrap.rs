@@ -46,12 +46,6 @@ use datatab_driver_mongodb::MongoDriver;
 #[cfg(feature = "redis")]
 use datatab_driver_redis::RedisDriver;
 
-#[cfg(feature = "dynamodb")]
-use datatab_driver_dynamodb::DynamoDriver;
-
-#[cfg(feature = "cloudwatch")]
-use datatab_driver_cloudwatch::CloudWatchDriver;
-
 #[cfg(feature = "influxdb")]
 use datatab_driver_influxdb::InfluxDriver;
 
@@ -67,12 +61,6 @@ use datatab_driver_clickhouse::ClickHouseDriver;
 use datatab_driver_duckdb::DuckDbDriver;
 #[cfg(feature = "turso")]
 use datatab_driver_turso::TursoDriver;
-
-#[cfg(feature = "s3")]
-use datatab_driver_s3::S3Driver;
-
-#[cfg(feature = "aws_secrets")]
-use datatab_driver_aws_secrets::AwsSecretsDriver;
 
 use crate::auth_provider_registry::AuthProviderRegistry;
 use crate::config_loader::{EditableGlobalHook, HookLoadDiagnostic, ProtectedHookRow};
@@ -113,6 +101,7 @@ pub(super) struct BuiltDrivers {
     pub(super) hook_load_diagnostics: Vec<HookLoadDiagnostic>,
     pub(super) protected_hook_rows: Vec<ProtectedHookRow>,
     pub(super) services: Vec<ServiceConfig>,
+    pub(super) value_ref_diagnostics: crate::config_loader::ProfileValueRefDiagnostics,
 }
 
 impl AppState {
@@ -130,6 +119,7 @@ impl AppState {
             built.hook_load_diagnostics,
             built.protected_hook_rows,
             built.services,
+            built.value_ref_diagnostics,
             storage_runtime,
             profiles,
             auth_profiles,
@@ -154,6 +144,7 @@ impl AppState {
             built.hook_load_diagnostics,
             built.protected_hook_rows,
             built.services,
+            built.value_ref_diagnostics,
             storage_runtime,
             profiles,
             auth_profiles,
@@ -173,6 +164,7 @@ impl AppState {
         hook_load_diagnostics: Vec<HookLoadDiagnostic>,
         protected_hook_rows: Vec<ProtectedHookRow>,
         services: Vec<ServiceConfig>,
+        value_ref_diagnostics: crate::config_loader::ProfileValueRefDiagnostics,
         storage_runtime: datatab_storage::bootstrap::StorageRuntime,
         profiles: Vec<ConnectionProfile>,
         auth_profiles: Vec<datatab_core::AuthProfile>,
@@ -248,6 +240,7 @@ impl AppState {
         let mut state = Self {
             facade,
             external_driver_diagnostics,
+            value_ref_diagnostics,
             general_settings,
             update_settings,
             driver_overrides,
@@ -268,8 +261,6 @@ impl AppState {
                 datatab_ssh::SessionPassphraseVault::new(),
             )),
             remembered_connection_passwords: HashMap::new(),
-            metric_catalog_cache: crate::metric_catalog_cache::MetricCatalogCache::new(),
-            remote_dashboard_cache: crate::remote_dashboard_cache::RemoteDashboardCache::new(),
             #[cfg(feature = "mcp")]
             mcp_runtime,
             saved_charts_repo,
@@ -355,23 +346,13 @@ impl AppState {
         (audit_service, audit_degraded, audit_emitter)
     }
 
-    /// Builds the auth-provider registry, registering built-in AWS providers
-    /// (when the `aws` feature is enabled) and any RPC-backed auth providers
+    /// Builds the auth-provider registry from RPC-backed auth providers
     /// declared by `services`.
     fn build_auth_provider_registry(
         services: Vec<ServiceConfig>,
         audit_emitter: Arc<dyn datatab_ipc::ExternalAuditEmitter>,
     ) -> AuthProviderRegistry {
         let mut auth_provider_registry = AuthProviderRegistry::new();
-        #[cfg(feature = "aws")]
-        {
-            auth_provider_registry
-                .register(Arc::new(datatab_aws::AwsSsoSessionAuthProvider::new()));
-            auth_provider_registry.register(Arc::new(datatab_aws::AwsSsoAuthProvider::new()));
-            auth_provider_registry.register(Arc::new(
-                datatab_aws::AwsSharedCredentialsAuthProvider::new(),
-            ));
-        }
 
         if !services.is_empty() {
             Self::launch_rpc_auth_providers(
@@ -385,8 +366,7 @@ impl AppState {
     }
 
     /// Builds the registry of external secret providers declared by `services`.
-    /// Built-in AWS secret providers are registered per connection by their auth
-    /// provider, so they are not part of this registry.
+    /// No built-in secret providers are registered.
     fn build_secret_provider_registry(services: Vec<ServiceConfig>) -> SecretProviderRegistry {
         let mut secret_provider_registry = SecretProviderRegistry::new();
 
@@ -494,17 +474,12 @@ impl AppState {
     }
 
     /// Runs the bootstrap steps that require a fully constructed `AppState`:
-    /// MCP runtime hydration, the one-time AWS config reflect migration,
-    /// audit settings bootstrap, and auth secret hydration/migration.
+    /// MCP runtime hydration, audit settings bootstrap, and auth secret
+    /// hydration/migration.
     fn run_post_construction_bootstraps(state: &mut Self) {
         #[cfg(feature = "mcp")]
         if let Err(e) = state.bootstrap_mcp_runtime_from_persistence() {
             log::warn!("Failed to bootstrap MCP runtime from persistence: {}", e);
-        }
-
-        #[cfg(feature = "aws")]
-        if let Err(e) = state.bootstrap_aws_config_reflect_migration() {
-            log::warn!("aws_config_reflect_migration failed (non-fatal): {}", e);
         }
 
         if let Err(e) = state.bootstrap_audit_settings() {
@@ -829,92 +804,6 @@ impl AppState {
         }
     }
 
-    /// Runs the one-time AWS config reflection migration at startup.
-    ///
-    /// Reads the live AWS config files once, passes the section name sets to the
-    /// migration, and logs any dangling profiles as non-blocking warnings. This
-    /// method is only compiled when the `aws` feature is enabled because it
-    /// depends on `CachedAwsConfig` from `datatab_aws`.
-    ///
-    /// Failure is non-fatal: the caller logs the error and continues startup.
-    #[cfg(feature = "aws")]
-    fn bootstrap_aws_config_reflect_migration(&self) -> Result<(), String> {
-        use std::collections::HashSet;
-
-        use datatab_aws::CachedAwsConfig;
-
-        use crate::aws_config_reflect_migration::run_aws_config_reflect_migration;
-
-        // Obtain section names from the AWS config files.
-        // CachedAwsConfig::new() initializes the cache; errors are non-fatal
-        // (an empty config means zero stored AWS rows match → no rebinds).
-        let mut aws_config = CachedAwsConfig::new();
-
-        // All profile section names from ~/.aws/config (SSO and non-SSO).
-        let config_section_names: HashSet<String> = aws_config
-            .profiles()
-            .iter()
-            .map(|p| p.name.clone())
-            .collect();
-
-        // Section names from ~/.aws/credentials (bare [NAME] headers).
-        let credentials_names: HashSet<String> =
-            aws_config.credentials_names().iter().cloned().collect();
-
-        // Union of both: any name present in either file is a match candidate.
-        let all_config_names: HashSet<String> = config_section_names
-            .union(&credentials_names)
-            .cloned()
-            .collect();
-
-        // We do not have access to the real keyring in this context without
-        // loading a full SecretManager. Use a best-effort probe: the stored
-        // auth profile's `provider_id == "aws-static-credentials"` is a
-        // sufficient signal for the dangling-origin classification. The keyring
-        // predicate is used only to choose between "keyring-only" and
-        // "file-gone" for static profiles; we pass a conservative closure that
-        // returns `true` for all static-credentials profiles so they are
-        // classified as "keyring-only" (the safer choice: preserves the keyring
-        // entry and keeps the stored row).
-        //
-        // The actual keyring secret is never read or deleted by this migration.
-        let static_provider = "aws-static-credentials";
-        let auth_repo = self.storage_runtime.auth_profiles();
-        let static_ids: std::collections::HashSet<String> = auth_repo
-            .all()
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|r| r.provider_id == static_provider)
-            .map(|r| r.id)
-            .collect();
-
-        let summary = run_aws_config_reflect_migration(
-            &self.storage_runtime,
-            &all_config_names,
-            &credentials_names,
-            move |id: &str| static_ids.contains(id),
-        )
-        .map_err(|e| e.to_string())?;
-
-        for dangling in &summary.dangling {
-            if let crate::aws_config_reflect_migration::ProfileMigrationOutcome::Dangling {
-                id,
-                origin,
-            } = dangling
-            {
-                log::warn!(
-                    "AWS config reflect migration: profile {} is dangling \
-                     (origin={}). The connection will fail at connect time until \
-                     the credential source is restored.",
-                    id,
-                    origin.as_str()
-                );
-            }
-        }
-
-        Ok(())
-    }
-
     #[allow(clippy::result_large_err)]
     fn build_default_drivers() -> Result<DefaultDriverBuild, datatab_storage::error::StorageError> {
         #[expect(
@@ -951,6 +840,7 @@ impl AppState {
                 hook_load_diagnostics: loaded.hook_load_diagnostics,
                 protected_hook_rows: loaded.protected_hook_rows,
                 services: loaded.services,
+                value_ref_diagnostics: loaded.value_ref_diagnostics,
             },
             runtime,
             loaded.profiles,
@@ -1287,16 +1177,6 @@ impl AppState {
             drivers.insert("redis".to_string(), Arc::new(RedisDriver::new()));
         }
 
-        #[cfg(feature = "dynamodb")]
-        {
-            drivers.insert("dynamodb".to_string(), Arc::new(DynamoDriver::new()));
-        }
-
-        #[cfg(feature = "cloudwatch")]
-        {
-            drivers.insert("cloudwatch".to_string(), Arc::new(CloudWatchDriver::new()));
-        }
-
         #[cfg(feature = "influxdb")]
         {
             drivers.insert("influxdb".to_string(), Arc::new(InfluxDriver::new()));
@@ -1325,16 +1205,6 @@ impl AppState {
         #[cfg(feature = "duckdb")]
         {
             drivers.insert("duckdb".to_string(), Arc::new(DuckDbDriver::new()));
-        }
-
-        #[cfg(feature = "s3")]
-        {
-            drivers.insert("s3".to_string(), Arc::new(S3Driver::new()));
-        }
-
-        #[cfg(feature = "aws_secrets")]
-        {
-            drivers.insert("aws_secrets".to_string(), Arc::new(AwsSecretsDriver::new()));
         }
 
         drivers

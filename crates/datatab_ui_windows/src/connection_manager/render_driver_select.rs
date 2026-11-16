@@ -12,8 +12,8 @@ use gpui_component::ActiveTheme;
 
 use super::{ConnectionManagerWindow, DismissEvent, DriverInfo};
 
-/// A titled group of cards in the picker. Every category has one section;
-/// time series and log streams share one, since both hold timestamped data.
+/// A titled group of cards in the picker. Every category has one section.
+/// The time-series section keeps its "Time series and logs" title.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum PickerSection {
     Relational,
@@ -21,7 +21,6 @@ pub(super) enum PickerSection {
     KeyValue,
     TimeSeriesAndLogs,
     ObjectStorage,
-    SecretStore,
     /// Categories with no section of their own (the reserved wire slots).
     Other,
 }
@@ -33,7 +32,6 @@ const SECTION_ORDER: &[PickerSection] = &[
     PickerSection::KeyValue,
     PickerSection::TimeSeriesAndLogs,
     PickerSection::ObjectStorage,
-    PickerSection::SecretStore,
     PickerSection::Other,
 ];
 
@@ -43,10 +41,12 @@ impl PickerSection {
             DatabaseCategory::Relational => Self::Relational,
             DatabaseCategory::Document => Self::Document,
             DatabaseCategory::KeyValue => Self::KeyValue,
-            DatabaseCategory::TimeSeries | DatabaseCategory::LogStream => Self::TimeSeriesAndLogs,
+            DatabaseCategory::TimeSeries => Self::TimeSeriesAndLogs,
             DatabaseCategory::ObjectStorage => Self::ObjectStorage,
-            DatabaseCategory::SecretStore => Self::SecretStore,
-            DatabaseCategory::ReservedGraph | DatabaseCategory::ReservedWideColumn => Self::Other,
+            DatabaseCategory::ReservedGraph
+            | DatabaseCategory::ReservedWideColumn
+            | DatabaseCategory::ReservedLogStream
+            | DatabaseCategory::ReservedSecretStore => Self::Other,
         }
     }
 
@@ -57,7 +57,6 @@ impl PickerSection {
             Self::KeyValue => "key_value",
             Self::TimeSeriesAndLogs => "time_series_and_logs",
             Self::ObjectStorage => "object_storage",
-            Self::SecretStore => "secret_store",
             Self::Other => "other",
         };
 
@@ -672,9 +671,9 @@ mod category_order_tests {
             DatabaseCategory::ReservedGraph,
             DatabaseCategory::TimeSeries,
             DatabaseCategory::ReservedWideColumn,
-            DatabaseCategory::LogStream,
+            DatabaseCategory::ReservedLogStream,
             DatabaseCategory::ObjectStorage,
-            DatabaseCategory::SecretStore,
+            DatabaseCategory::ReservedSecretStore,
         ];
 
         let drivers: Vec<DriverInfo> = categories.iter().map(|c| driver_of(*c)).collect();
@@ -727,17 +726,36 @@ mod picker_order_tests {
         );
     }
 
+    /// A driver that declares a reserved category slot is still listed, in
+    /// the last section, after every category with a section of its own.
     #[test]
-    fn time_series_and_log_streams_share_one_section() {
+    fn reserved_category_slots_are_listed_in_the_last_section() {
         let drivers = vec![
-            driver("CloudWatch Logs", DatabaseCategory::LogStream, 1),
-            driver("S3", DatabaseCategory::ObjectStorage, u16::MAX),
+            driver(
+                "Declares a log slot",
+                DatabaseCategory::ReservedLogStream,
+                1,
+            ),
+            driver(
+                "Declares a secret slot",
+                DatabaseCategory::ReservedSecretStore,
+                0,
+            ),
+            driver("Object store", DatabaseCategory::ObjectStorage, u16::MAX),
             driver("InfluxDB", DatabaseCategory::TimeSeries, 0),
         ];
         let visible = visible_drivers(&drivers, "");
 
-        assert_eq!(names(&visible), ["InfluxDB", "CloudWatch Logs", "S3"]);
-        assert_eq!(visible_section_sizes(&visible), vec![2, 1]);
+        assert_eq!(
+            names(&visible),
+            [
+                "InfluxDB",
+                "Object store",
+                "Declares a secret slot",
+                "Declares a log slot"
+            ]
+        );
+        assert_eq!(visible_section_sizes(&visible), vec![1, 1, 2]);
     }
 
     #[test]

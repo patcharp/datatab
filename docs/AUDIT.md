@@ -199,8 +199,6 @@ The [audit viewer](#audit-viewer) above supports:
 - Filtering by actor, tool/action, date range, decision, category
 - Exporting filtered results to CSV or JSON
 
-The same `AuditDocument` UI shell is also reused for driver-backed external event streams when a driver declares them through generic core abstractions (`CollectionPresentation`, `CollectionChildInfo`, `EventStreamTarget`). The UI must not special-case concrete drivers to open or render those streams.
-
 ### Directly via SQLite
 
 The database is a standard SQLite file. Query it directly:
@@ -557,7 +555,7 @@ An emitted `AuditEventEmitDto` must have non-empty `action` and `summary`. Frame
 
 ### Transport mechanism
 
-Emitted frames arrive as `done=false` intermediate frames inside a normal response sequence. The transport layer (`RpcClient` in `datatab_driver_ipc`, `RpcAuthProvider::dispatch_request_loop` in `datatab_ipc`) intercepts them before they reach the caller. The caller only ever sees the terminal frame.
+Emitted frames arrive as `done=false` intermediate frames inside a normal response sequence. The transport layer (`RpcClient` in `datatab_driver_ipc`, `dispatch_request_loop` of the auth-provider client in `datatab_ipc`) intercepts them before they reach the caller. The caller only ever sees the terminal frame.
 
 ### Key files
 

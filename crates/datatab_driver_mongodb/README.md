@@ -16,7 +16,7 @@ MongoDB document driver for DataTab.
 - Document driver classified as `DatabaseCategory::Document` with the `MongoQuery` query language; the editor uses MongoDB shell syntax, not SQL.
 - Connection modes: manual (host/port/credentials/database) and URI mode. URI mode accepts `mongodb://` and `mongodb+srv://` connection strings (SRV records are parsed for replica-set discovery).
 - Multiple logical databases (`MULTIPLE_DATABASES`) with collection browsing and document counting.
-- Authentication (`AUTHENTICATION`) and TLS/SSL with three modes (`off`, `on`, `verify`), supporting a root certificate and optional client certificate.
+- Authentication (`AUTHENTICATION`) and TLS/SSL with three modes: `off` disables TLS, `on` encrypts without verifying the server certificate, and `verify` validates the server certificate. Root CA and client certificate/key pickers appear only for `verify`; switching modes keeps their saved paths.
 - SSH tunnel support for reaching MongoDB through a bastion host.
 - Shell-style query parsing for `db.collection.method(...)` and `db.method(...)` forms, with a JSON-document fallback for backward compatibility. Supported methods: `find`, `findOne`, `aggregate`, `count`/`countDocuments`, `insertOne`, `insertMany`, `updateOne`, `updateMany`, `deleteOne`, `deleteMany`. Parse errors carry byte-offset positions for editor diagnostics.
 - Aggregation pipelines (`AGGREGATION`); query capabilities advertise order-by, group-by, having, limit, and offset.
@@ -64,7 +64,7 @@ Exposes tabular snapshots of running server state:
 - `execute()` enforces `QueryRequest::limit` (`REQUEST_ROW_LIMIT`) on Find, Aggregate and collection listings. Find and Aggregate stop reading the cursor one document past the budget; collection listings are cut after they are read, and script results after the script has run. A script shares one budget across its statements, and a query's own `.limit(n)` still applies. Writes, counts and commands ignore the limit. A statement timeout, and a row limit on instance metric or inspector queries, are still rejected before dispatch.
 - SQL is not supported; queries must use MongoDB shell-style syntax (or the JSON fallback).
 
-- Instance metrics return a single data point per call (current snapshot from `serverStatus`), not a historical time series. Operations counters (e.g. `mongo.opcounters_insert`) grow monotonically — interpret them as deltas between samples rather than absolute rates.
+- Instance metrics return a single data point per call (current snapshot from `serverStatus`), not a historical time series. Operation counters and WiredTiger pages evicted are totals since start, so they are declared as counters and the chart shows the change per second between samples; the first sample has no point.
 
 - `$currentOp` requires the `inprog` privilege or `clusterMonitor` role on Atlas clusters. Without sufficient privileges, `fetch_inspector_snapshot("mongo.current_op")` returns an empty result set.
 - Query cancellation is not supported (`QUERY_CANCELLATION` is not set).

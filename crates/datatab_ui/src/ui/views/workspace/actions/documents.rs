@@ -200,36 +200,14 @@ impl Workspace {
             .connections()
             .contains_key(&profile_id);
 
-        let presentation = self
-            .app_state
-            .read(cx)
-            .connections()
-            .get(&profile_id)
-            .map(|connected| {
-                collection_document_presentation_for_connection(connected, &collection)
-            })
-            .unwrap_or(CollectionDocumentPresentation::DataGrid);
-
         let existing_id = if has_connection {
-            match presentation {
-                CollectionDocumentPresentation::DataGrid => self.tab_manager.read(cx).find_by_key(
-                    &crate::ui::document::DocumentKey::Collection {
-                        profile_id,
-                        collection: collection.clone(),
-                    },
-                    cx,
-                ),
-                CollectionDocumentPresentation::AuditLike => {
-                    use crate::ui::document::DocumentKey;
-                    let target = datatab_core::EventStreamTarget {
-                        collection: collection.clone(),
-                        child_id: None,
-                    };
-                    self.tab_manager
-                        .read(cx)
-                        .find_by_key(&DocumentKey::EventStream { profile_id, target }, cx)
-                }
-            }
+            self.tab_manager.read(cx).find_by_key(
+                &crate::ui::document::DocumentKey::Collection {
+                    profile_id,
+                    collection: collection.clone(),
+                },
+                cx,
+            )
         } else {
             None
         };
@@ -258,111 +236,25 @@ impl Workspace {
             OpenDocumentDecision::OpenNew => {}
         }
 
-        match presentation {
-            CollectionDocumentPresentation::DataGrid => {
-                let doc = cx.new(|cx| {
-                    DataDocument::new_for_collection(
-                        profile_id,
-                        collection.clone(),
-                        self.app_state.clone(),
-                        window,
-                        cx,
-                    )
-                });
-                let pane = DataDocument::into_pane(doc, cx);
-                self.tab_manager.update(cx, |mgr, cx| {
-                    mgr.open(Tab::Pane(Box::new(pane)), cx);
-                });
-            }
-            CollectionDocumentPresentation::AuditLike => {
-                let doc = cx.new(|cx| {
-                    crate::ui::document::AuditDocument::new_for_event_stream(
-                        profile_id,
-                        datatab_core::EventStreamTarget {
-                            collection: collection.clone(),
-                            child_id: None,
-                        },
-                        collection.name.clone(),
-                        self.app_state.clone(),
-                        window,
-                        cx,
-                    )
-                });
-                let pane = crate::ui::document::AuditDocument::into_pane(doc, cx);
-                self.tab_manager.update(cx, |mgr, cx| {
-                    mgr.open(Tab::Pane(Box::new(pane)), cx);
-                });
-            }
-        }
+        let doc = cx.new(|cx| {
+            DataDocument::new_for_collection(
+                profile_id,
+                collection.clone(),
+                self.app_state.clone(),
+                window,
+                cx,
+            )
+        });
+        let pane = DataDocument::into_pane(doc, cx);
+        self.tab_manager.update(cx, |manager, cx| {
+            manager.open(Tab::Pane(Box::new(pane)), cx);
+        });
 
         log::info!(
             "Opened collection document: {}.{}",
             collection.database,
             collection.name
         );
-    }
-
-    pub(in crate::ui::views::workspace) fn open_event_stream_document(
-        &mut self,
-        profile_id: uuid::Uuid,
-        target: datatab_core::EventStreamTarget,
-        title: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let has_connection = self
-            .app_state
-            .read(cx)
-            .connections()
-            .contains_key(&profile_id);
-
-        let existing_id = if has_connection {
-            use crate::ui::document::DocumentKey;
-            self.tab_manager.read(cx).find_by_key(
-                &DocumentKey::EventStream {
-                    profile_id,
-                    target: target.clone(),
-                },
-                cx,
-            )
-        } else {
-            None
-        };
-
-        match decide_open_document(has_connection, existing_id) {
-            OpenDocumentDecision::ErrorNoConnection => {
-                let message =
-                    documents_no_active_connection_message(NoActiveConnectionKind::EventSource);
-                Toast::error(message.clone())
-                    .meta_right(now_hms())
-                    .action(copy_action(message))
-                    .push(cx);
-                return;
-            }
-            OpenDocumentDecision::FocusExisting(id) => {
-                self.tab_manager.update(cx, |mgr, cx| {
-                    mgr.activate(id, cx);
-                });
-                return;
-            }
-            OpenDocumentDecision::OpenNew => {}
-        }
-
-        let doc = cx.new(|cx| {
-            crate::ui::document::AuditDocument::new_for_event_stream(
-                profile_id,
-                target.clone(),
-                title.clone(),
-                self.app_state.clone(),
-                window,
-                cx,
-            )
-        });
-
-        let pane = crate::ui::document::AuditDocument::into_pane(doc, cx);
-        self.tab_manager.update(cx, |mgr, cx| {
-            mgr.open(Tab::Pane(Box::new(pane)), cx);
-        });
     }
 
     pub(in crate::ui::views::workspace) fn open_key_value_document(
@@ -480,78 +372,6 @@ impl Workspace {
             )
         });
         let pane = crate::ui::document::BucketsTableDocument::into_pane(doc, cx);
-
-        self.tab_manager.update(cx, |mgr, cx| {
-            mgr.open(Tab::Pane(Box::new(pane)), cx);
-        });
-
-        self.set_focus(FocusTarget::Document, window, cx);
-    }
-
-    /// Opens the document of one secret store, or focuses the store's
-    /// existing tab. A `path` of a hierarchical store opens at that path, and
-    /// navigates an existing tab to it.
-    pub(in crate::ui::views::workspace) fn open_secret_store_document(
-        &mut self,
-        profile_id: uuid::Uuid,
-        store_id: String,
-        path: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let has_connection = self
-            .app_state
-            .read(cx)
-            .connections()
-            .contains_key(&profile_id);
-
-        let existing_id = if has_connection {
-            self.tab_manager.read(cx).find_by_key(
-                &crate::ui::document::DocumentKey::SecretStore {
-                    profile_id,
-                    store_id: store_id.clone(),
-                },
-                cx,
-            )
-        } else {
-            None
-        };
-
-        match decide_open_document(has_connection, existing_id) {
-            OpenDocumentDecision::ErrorNoConnection => {
-                let message =
-                    documents_no_active_connection_message(NoActiveConnectionKind::SecretStore);
-                Toast::error(message.clone())
-                    .meta_right(now_hms())
-                    .action(copy_action(message))
-                    .push(cx);
-                return;
-            }
-            OpenDocumentDecision::FocusExisting(id) => {
-                self.tab_manager.update(cx, |mgr, cx| {
-                    if path.is_some()
-                        && let Some(tab) = mgr.documents().iter().find(|tab| tab.id() == id)
-                    {
-                        tab.navigate_secret_path(path.clone(), cx);
-                    }
-                    mgr.activate(id, cx);
-                });
-                return;
-            }
-            OpenDocumentDecision::OpenNew => {}
-        }
-
-        let doc = cx.new(|cx| {
-            crate::ui::document::SecretStoreDocument::new(
-                profile_id,
-                store_id,
-                path,
-                self.app_state.clone(),
-                window,
-                cx,
-            )
-        });
-        let pane = crate::ui::document::SecretStoreDocument::into_pane(doc, cx);
 
         self.tab_manager.update(cx, |mgr, cx| {
             mgr.open(Tab::Pane(Box::new(pane)), cx);
@@ -1910,7 +1730,6 @@ mod tests {
                         read_only_reason: None,
                         database_schemas: Default::default(),
                         table_details: Default::default(),
-                        collection_children: Default::default(),
                         schema_types: Default::default(),
                         schema_columns: Default::default(),
                         schema_indexes: Default::default(),

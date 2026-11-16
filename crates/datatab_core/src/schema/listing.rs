@@ -213,7 +213,7 @@ mod tests {
     #[test]
     fn document_folder_objects_keep_the_collections_of_the_database() {
         let mut orders = collection("orders", Some("shop"));
-        orders.presentation = CollectionPresentation::EventStream;
+        orders.presentation = CollectionPresentation::ReservedEventStream;
         orders.indexes = Some(vec![CollectionIndexInfo {
             name: "_id_".to_string(),
             keys: vec![("_id".to_string(), IndexDirection::Ascending)],
@@ -241,7 +241,10 @@ mod tests {
                 .iter()
                 .all(|row| row.schema.as_deref() == Some("shop"))
         );
-        assert_eq!(objects[0].presentation, CollectionPresentation::EventStream);
+        assert_eq!(
+            objects[0].presentation,
+            CollectionPresentation::ReservedEventStream
+        );
         assert!(matches!(
             objects[0].indexes.as_ref(),
             Some(IndexData::Document(indexes)) if indexes.len() == 1

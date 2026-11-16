@@ -65,17 +65,6 @@ pub trait ExportTransformResolver {
 // Typed inputs for the export pipeline
 // ---------------------------------------------------------------------------
 
-/// An AWS-reflected auth profile reference.
-///
-/// Reflected (read-only) profiles are never stored and never exported with
-/// field values. They travel as a `(provider_id, name)` pair that the importer
-/// resolves via `reflect_profiles()` on the target.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AwsRef {
-    pub provider_id: String,
-    pub name: String,
-}
-
 /// A connection together with its driver-extracted form values.
 ///
 /// The app layer calls `driver.extract_values(&profile.config)` for each
@@ -88,15 +77,10 @@ pub struct ConnectionWithValues<'a> {
 }
 
 /// Graph of typed entities to export, assembled by the app layer from `AppState`.
-///
-/// Reflected AWS auth profiles are supplied separately as `AwsRef` values; the
-/// `auth_profiles` list contains only stored (non-reflected) profiles.
 pub struct ExportGraph<'a> {
     pub connections: Vec<ConnectionWithValues<'a>>,
-    /// Stored (non-reflected) auth profiles referenced by any connection.
+    /// Stored auth profiles referenced by any connection.
     pub auth_profiles: Vec<&'a AuthProfile>,
-    /// Reflected (read-only) AWS auth profile references.
-    pub aws_references: Vec<AwsRef>,
     pub ssh_tunnels: Vec<&'a SshTunnelProfile>,
     pub proxies: Vec<&'a ProxyProfile>,
 }
@@ -318,8 +302,6 @@ pub struct RequiredResolution {
 pub enum RequiredResolutionKind {
     /// A secret value (password, token) the exporter omitted.
     Secret,
-    /// An AWS-reflected auth reference that could not be auto-resolved on the target.
-    AwsReference { provider_id: String, name: String },
     /// An auth profile reference that the recipient must create or select.
     AuthProfileRef,
 }
@@ -380,4 +362,13 @@ pub struct ImportActions {
     /// silent topology degradation (e.g. bastion-routed → direct-connect). The app layer
     /// records them in `ImportOutcome::unresolved_refs` (R-INT-3 / M3 / ADR-8).
     pub unresolved_ref_connections: Vec<String>,
+
+    /// Connections skipped because one of their value references could not be read.
+    ///
+    /// Each entry is `(connection_name, field_names)`, with the field names sorted.
+    /// Dropping only the reference would leave the field with the bundle's plain
+    /// text, which connect would then use, so the whole connection is NOT imported.
+    /// The app layer records these in `ImportOutcome::config_failures`. Only field
+    /// names are carried, never the content of a reference.
+    pub value_ref_failures: Vec<(String, Vec<String>)>,
 }

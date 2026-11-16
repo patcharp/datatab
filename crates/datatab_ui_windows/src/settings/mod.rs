@@ -54,6 +54,7 @@ use services_section::ServicesSection;
 use ssh_tunnels_section::SshTunnelsSection;
 use updates_section::UpdatesSection;
 
+pub use self::auth_profiles_section::SettingsLoginHandle;
 pub use self::open_window::open_or_focus_settings;
 pub use self::section_trait::{SettingsSection, SettingsSectionId};
 
@@ -513,11 +514,13 @@ pub enum SettingsEvent {
     },
     /// An auth-provider login flow produced a URL to open in the login modal.
     ///
-    /// Fields: `(provider_name, profile_name, url)`.
+    /// `login` ties the modal to that login: it tells when the login ends,
+    /// and it cancels the login.
     OpenLoginModal {
         provider_name: String,
         profile_name: String,
         url: Option<String>,
+        login: SettingsLoginHandle,
     },
 }
 

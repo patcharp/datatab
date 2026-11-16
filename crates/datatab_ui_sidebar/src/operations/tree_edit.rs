@@ -5,6 +5,7 @@ use datatab_ui_base::user_error::{ErrorKind, UserFacingError, report_error};
 /// Why duplicating a profile stopped before committing the copy.
 #[derive(Debug)]
 enum DuplicateProfileError {
+    BrokenValueRef(String),
     /// The keyring would not hand over the source password.
     PasswordRead(datatab_core::DbError),
     /// The copied password could not be written to the keyring.
@@ -25,6 +26,10 @@ fn duplicate_profile_in_state(
     else {
         return Ok(None);
     };
+
+    if let Some(error) = state.value_ref_load_error(profile_id) {
+        return Err(DuplicateProfileError::BrokenValueRef(error));
+    }
 
     let folder_id = state
         .connection_tree()
@@ -166,6 +171,10 @@ impl Sidebar {
             Ok(None) => return,
             Err(error) => {
                 let (summary, cause) = match error {
+                    DuplicateProfileError::BrokenValueRef(error) => {
+                        report_error(UserFacingError::new(ErrorKind::Config, error), cx);
+                        return;
+                    }
                     DuplicateProfileError::PasswordRead(cause) => (
                         "Unable to read the connection password from the system keyring. Unlock it and try again.",
                         cause,

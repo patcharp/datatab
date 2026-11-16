@@ -6,20 +6,29 @@ use bson::{Bson, Document};
 use datatab_core::{
     ColumnKind, ColumnMeta, DbError, DefaultDashboardPanel, DefaultInstanceDashboard,
     DriverCapabilities, InstanceCatalog, InstanceInspectorDef, InstanceMetricDef,
-    InstanceMetricUnit, QueryResult, QueryResultShape, Row, Value, WritePrivilege,
+    InstanceMetricKind, InstanceMetricUnit, QueryResult, QueryResultShape, Row, Value,
+    WritePrivilege,
 };
 use mongodb::sync::Client;
 
 /// Dotted BSON path within the `serverStatus` document mapped to a chartable metric.
 ///
-/// Each entry: `(dotted_path, metric_id, display_name, group, unit)`.
-pub const SERVER_STATUS_PATHS: &[(&str, &str, &str, &str, InstanceMetricUnit)] = &[
+/// Each entry: `(dotted_path, metric_id, display_name, group, unit, kind)`.
+pub const SERVER_STATUS_PATHS: &[(
+    &str,
+    &str,
+    &str,
+    &str,
+    InstanceMetricUnit,
+    InstanceMetricKind,
+)] = &[
     (
         "opcounters.query",
         "mongo.opcounters.query",
         "Queries / sec",
         "Throughput",
         InstanceMetricUnit::PerSecond,
+        InstanceMetricKind::Counter,
     ),
     (
         "opcounters.insert",
@@ -27,6 +36,7 @@ pub const SERVER_STATUS_PATHS: &[(&str, &str, &str, &str, InstanceMetricUnit)] =
         "Inserts / sec",
         "Throughput",
         InstanceMetricUnit::PerSecond,
+        InstanceMetricKind::Counter,
     ),
     (
         "opcounters.update",
@@ -34,6 +44,7 @@ pub const SERVER_STATUS_PATHS: &[(&str, &str, &str, &str, InstanceMetricUnit)] =
         "Updates / sec",
         "Throughput",
         InstanceMetricUnit::PerSecond,
+        InstanceMetricKind::Counter,
     ),
     (
         "opcounters.delete",
@@ -41,6 +52,7 @@ pub const SERVER_STATUS_PATHS: &[(&str, &str, &str, &str, InstanceMetricUnit)] =
         "Deletes / sec",
         "Throughput",
         InstanceMetricUnit::PerSecond,
+        InstanceMetricKind::Counter,
     ),
     (
         "connections.current",
@@ -48,6 +60,7 @@ pub const SERVER_STATUS_PATHS: &[(&str, &str, &str, &str, InstanceMetricUnit)] =
         "Current connections",
         "Connections",
         InstanceMetricUnit::Count,
+        InstanceMetricKind::Gauge,
     ),
     (
         "connections.available",
@@ -55,6 +68,7 @@ pub const SERVER_STATUS_PATHS: &[(&str, &str, &str, &str, InstanceMetricUnit)] =
         "Available connections",
         "Connections",
         InstanceMetricUnit::Count,
+        InstanceMetricKind::Gauge,
     ),
     (
         "mem.resident",
@@ -62,6 +76,7 @@ pub const SERVER_STATUS_PATHS: &[(&str, &str, &str, &str, InstanceMetricUnit)] =
         "Resident memory (MB)",
         "Memory",
         InstanceMetricUnit::Bytes,
+        InstanceMetricKind::Gauge,
     ),
     (
         "globalLock.currentQueue.total",
@@ -69,6 +84,7 @@ pub const SERVER_STATUS_PATHS: &[(&str, &str, &str, &str, InstanceMetricUnit)] =
         "Global lock queue",
         "Locks",
         InstanceMetricUnit::Count,
+        InstanceMetricKind::Gauge,
     ),
     (
         "wiredTiger.cache.bytes currently in the cache",
@@ -76,13 +92,15 @@ pub const SERVER_STATUS_PATHS: &[(&str, &str, &str, &str, InstanceMetricUnit)] =
         "WiredTiger cache bytes",
         "Cache",
         InstanceMetricUnit::Bytes,
+        InstanceMetricKind::Gauge,
     ),
     (
         "wiredTiger.cache.unmodified pages evicted",
         "mongo.wt.pages_evicted",
-        "WiredTiger pages evicted",
+        "WiredTiger pages evicted / sec",
         "Cache",
-        InstanceMetricUnit::Count,
+        InstanceMetricUnit::PerSecond,
+        InstanceMetricKind::Counter,
     ),
 ];
 
@@ -121,14 +139,17 @@ impl MongoInstanceCatalog {
     pub fn static_metrics() -> Vec<InstanceMetricDef> {
         SERVER_STATUS_PATHS
             .iter()
-            .map(|(_, id, display_name, group, unit)| InstanceMetricDef {
-                id: id.to_string(),
-                display_name: display_name.to_string(),
-                group: group.to_string(),
-                unit: *unit,
-                description: None,
-                default_refresh_secs: 15,
-            })
+            .map(
+                |(_, id, display_name, group, unit, kind)| InstanceMetricDef {
+                    id: id.to_string(),
+                    display_name: display_name.to_string(),
+                    group: group.to_string(),
+                    unit: *unit,
+                    kind: *kind,
+                    description: None,
+                    default_refresh_secs: 15,
+                },
+            )
             .collect()
     }
 
@@ -570,6 +591,13 @@ fn run_server_status(client: &Client) -> Result<Document, DbError> {
 
 #[async_trait]
 impl InstanceCatalog for MongoInstanceCatalog {
+    fn metric_kind(&self, metric_id: &str) -> Option<datatab_core::InstanceMetricKind> {
+        Self::static_metrics()
+            .into_iter()
+            .find(|metric| metric.id == metric_id)
+            .map(|metric| metric.kind)
+    }
+
     async fn list_metrics(&self) -> Result<Vec<InstanceMetricDef>, DbError> {
         Ok(Self::metrics_with_probes(self.cluster_monitor))
     }
@@ -663,10 +691,10 @@ pub(crate) fn dispatch_metric_series(
 ) -> Result<QueryResult, DbError> {
     let entry = SERVER_STATUS_PATHS
         .iter()
-        .find(|(_, id, _, _, _)| *id == metric_id);
+        .find(|(_, id, _, _, _, _)| *id == metric_id);
 
     match entry {
-        Some((path, metric_id_str, display_name, _, _)) => {
+        Some((path, metric_id_str, display_name, _, _, _)) => {
             let status = run_server_status(client)?;
             let value = MongoInstanceCatalog::extract_path(&status, path).ok_or_else(|| {
                 DbError::QueryFailed(
@@ -851,6 +879,35 @@ pub fn mongo_advertises_instance_capabilities() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counter_metric_kinds() {
+        let counters: Vec<_> = MongoInstanceCatalog::static_metrics()
+            .into_iter()
+            .filter(|metric| metric.kind == datatab_core::InstanceMetricKind::Counter)
+            .collect();
+
+        let actual: Vec<&str> = counters.iter().map(|metric| metric.id.as_str()).collect();
+        assert_eq!(
+            actual,
+            vec![
+                "mongo.opcounters.query",
+                "mongo.opcounters.insert",
+                "mongo.opcounters.update",
+                "mongo.opcounters.delete",
+                "mongo.wt.pages_evicted"
+            ]
+        );
+
+        for metric in counters {
+            assert_eq!(
+                metric.unit,
+                InstanceMetricUnit::PerSecond,
+                "counter {:?} must be charted per second",
+                metric.id
+            );
+        }
+    }
 
     #[test]
     fn server_status_paths_list_is_non_empty() {

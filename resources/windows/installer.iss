@@ -20,7 +20,7 @@
 #define MyAppVersion GetEnv("DATATAB_APP_VERSION")
 #if MyAppVersion == ""
 #undef MyAppVersion
-#define MyAppVersion "0.1.2"
+#define MyAppVersion "0.1.3"
 #endif
 #endif
 #define MyAppPublisher "PCPLab"

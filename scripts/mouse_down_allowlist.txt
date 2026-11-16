@@ -43,6 +43,7 @@ crates/datatab_ui/src/ui/views/workspace/render.rs:render: focus on press
 crates/datatab_ui/src/ui/views/workspace/render.rs:render: focus on press
 crates/datatab_ui/src/ui/views/workspace/render.rs:render_tasks_panel: focus on press
 crates/datatab_ui_base/src/platform.rs:csd_drag_area: drag start
+crates/datatab_ui_base/src/platform.rs:csd_drag_area: macOS drag start
 crates/datatab_ui_sidebar/src/render_overlays.rs:render_add_menu: outside-press dismiss
 crates/datatab_ui_sidebar/src/render_tree.rs:render_tree_item: selection start
 crates/datatab_ui_sidebar/src/render_tree.rs:render_tree_item: propagation guard
@@ -57,12 +58,6 @@ crates/datatab_ui_windows/src/connection_manager/access_tab.rs:render_access_tab
 crates/datatab_ui_windows/src/connection_manager/access_tab.rs:render_ssh_auth_inputs: cursor sync
 crates/datatab_ui_windows/src/connection_manager/access_tab.rs:render_ssh_auth_inputs: cursor sync
 crates/datatab_ui_windows/src/connection_manager/access_tab.rs:render_ssh_auth_inputs: cursor sync
-crates/datatab_ui_windows/src/connection_manager/access_tab.rs:render_ssm_access_section: cursor sync
-crates/datatab_ui_windows/src/connection_manager/access_tab.rs:render_ssm_access_section: cursor sync
-crates/datatab_ui_windows/src/connection_manager/access_tab.rs:render_ssm_access_section: cursor sync
-crates/datatab_ui_windows/src/connection_manager/access_tab.rs:render_ssm_access_section: cursor sync
-crates/datatab_ui_windows/src/connection_manager/access_tab.rs:render_ssm_value_field: cursor sync
-crates/datatab_ui_windows/src/connection_manager/access_tab.rs:render_ssm_value_field: cursor sync
 crates/datatab_ui_windows/src/connection_manager/hooks_tab.rs:render_hook_extra_row: cursor sync
 crates/datatab_ui_windows/src/connection_manager/render.rs:cm_control_frame: cursor sync
 crates/datatab_ui_windows/src/connection_manager/render.rs:render: focus on press

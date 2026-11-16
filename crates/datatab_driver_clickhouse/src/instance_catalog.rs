@@ -50,9 +50,19 @@ impl MetricSource {
 
 /// Curated list of ClickHouse system-table metrics mapped to chartable instance metrics.
 ///
-/// Each entry: `(raw_name, metric_id, display_name, group, unit, source)`.
+/// Each entry: `(raw_name, metric_id, display_name, group, unit, source, kind)`.
 /// `raw_name` matches the `metric`/`event` column value in the source system table.
-pub const METRIC_DEFS: &[(&str, &str, &str, &str, InstanceMetricUnit, MetricSource)] = &[
+/// `system.events` reports a total since server start, so its metrics are
+/// counters charted per second.
+pub const METRIC_DEFS: &[(
+    &str,
+    &str,
+    &str,
+    &str,
+    InstanceMetricUnit,
+    MetricSource,
+    datatab_core::InstanceMetricKind,
+)] = &[
     (
         "Query",
         "clickhouse.query",
@@ -60,6 +70,7 @@ pub const METRIC_DEFS: &[(&str, &str, &str, &str, InstanceMetricUnit, MetricSour
         "Activity",
         InstanceMetricUnit::Count,
         MetricSource::Metrics,
+        datatab_core::InstanceMetricKind::Gauge,
     ),
     (
         "MemoryTracking",
@@ -68,6 +79,7 @@ pub const METRIC_DEFS: &[(&str, &str, &str, &str, InstanceMetricUnit, MetricSour
         "Memory",
         InstanceMetricUnit::Bytes,
         MetricSource::Metrics,
+        datatab_core::InstanceMetricKind::Gauge,
     ),
     (
         "TCPConnection",
@@ -76,6 +88,7 @@ pub const METRIC_DEFS: &[(&str, &str, &str, &str, InstanceMetricUnit, MetricSour
         "Connections",
         InstanceMetricUnit::Count,
         MetricSource::Metrics,
+        datatab_core::InstanceMetricKind::Gauge,
     ),
     (
         "HTTPConnection",
@@ -84,22 +97,25 @@ pub const METRIC_DEFS: &[(&str, &str, &str, &str, InstanceMetricUnit, MetricSour
         "Connections",
         InstanceMetricUnit::Count,
         MetricSource::Metrics,
+        datatab_core::InstanceMetricKind::Gauge,
     ),
     (
         "SelectedRows",
         "clickhouse.selected_rows",
-        "Selected rows",
+        "Selected rows / sec",
         "Throughput",
-        InstanceMetricUnit::Count,
+        InstanceMetricUnit::PerSecond,
         MetricSource::Events,
+        datatab_core::InstanceMetricKind::Counter,
     ),
     (
         "InsertedRows",
         "clickhouse.inserted_rows",
-        "Inserted rows",
+        "Inserted rows / sec",
         "Throughput",
-        InstanceMetricUnit::Count,
+        InstanceMetricUnit::PerSecond,
         MetricSource::Events,
+        datatab_core::InstanceMetricKind::Counter,
     ),
     (
         "OSMemoryAvailable",
@@ -108,6 +124,7 @@ pub const METRIC_DEFS: &[(&str, &str, &str, &str, InstanceMetricUnit, MetricSour
         "Memory",
         InstanceMetricUnit::Bytes,
         MetricSource::AsynchronousMetrics,
+        datatab_core::InstanceMetricKind::Gauge,
     ),
 ];
 
@@ -162,14 +179,17 @@ impl ClickHouseInstanceCatalog {
     pub fn static_metrics() -> Vec<InstanceMetricDef> {
         METRIC_DEFS
             .iter()
-            .map(|(_, id, display_name, group, unit, _)| InstanceMetricDef {
-                id: id.to_string(),
-                display_name: display_name.to_string(),
-                group: group.to_string(),
-                unit: *unit,
-                description: None,
-                default_refresh_secs: 15,
-            })
+            .map(
+                |(_, id, display_name, group, unit, _, kind)| InstanceMetricDef {
+                    id: id.to_string(),
+                    display_name: display_name.to_string(),
+                    group: group.to_string(),
+                    unit: *unit,
+                    kind: *kind,
+                    description: None,
+                    default_refresh_secs: 15,
+                },
+            )
             .collect()
     }
 
@@ -365,6 +385,13 @@ fn validate_query_id(raw: &str) -> Result<&str, DbError> {
 
 #[async_trait]
 impl InstanceCatalog for ClickHouseInstanceCatalog {
+    fn metric_kind(&self, metric_id: &str) -> Option<datatab_core::InstanceMetricKind> {
+        Self::static_metrics()
+            .into_iter()
+            .find(|metric| metric.id == metric_id)
+            .map(|metric| metric.kind)
+    }
+
     async fn list_metrics(&self) -> Result<Vec<InstanceMetricDef>, DbError> {
         Ok(Self::static_metrics())
     }
@@ -436,7 +463,7 @@ pub(crate) fn dispatch_metric_series(
     let entry = METRIC_DEFS.iter().find(|(_, id, ..)| *id == metric_id);
 
     match entry {
-        Some((raw_name, _, display_name, _, _, source)) => {
+        Some((raw_name, _, display_name, _, _, source, _)) => {
             let result = run_instance_query(client, &source.select_sql(raw_name))?;
             let value = result
                 .rows
@@ -488,6 +515,54 @@ pub fn clickhouse_advertises_instance_capabilities() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counter_metric_kinds() {
+        let counters: Vec<_> = ClickHouseInstanceCatalog::static_metrics()
+            .into_iter()
+            .filter(|metric| metric.kind == datatab_core::InstanceMetricKind::Counter)
+            .collect();
+
+        let actual: Vec<&str> = counters.iter().map(|metric| metric.id.as_str()).collect();
+        assert_eq!(
+            actual,
+            vec!["clickhouse.selected_rows", "clickhouse.inserted_rows"]
+        );
+
+        for metric in counters {
+            assert_eq!(
+                metric.unit,
+                InstanceMetricUnit::PerSecond,
+                "counter {:?} must be charted per second",
+                metric.id
+            );
+        }
+    }
+
+    /// `system.metrics` and `system.asynchronous_metrics` report a current
+    /// value, so those metrics stay gauges.
+    #[test]
+    fn system_table_metrics_stay_gauges() {
+        let metrics = ClickHouseInstanceCatalog::static_metrics();
+
+        for id in [
+            "clickhouse.query",
+            "clickhouse.memory_tracking",
+            "clickhouse.tcp_connection",
+            "clickhouse.http_connection",
+            "clickhouse.os_memory_available",
+        ] {
+            let metric = metrics
+                .iter()
+                .find(|metric| metric.id == id)
+                .expect("every curated metric id must produce a static metric");
+            assert_eq!(
+                metric.kind,
+                datatab_core::InstanceMetricKind::Gauge,
+                "{id} reads a current value from a system table, not a cumulative total"
+            );
+        }
+    }
 
     #[test]
     fn metric_defs_list_is_non_empty_with_distinct_ids() {

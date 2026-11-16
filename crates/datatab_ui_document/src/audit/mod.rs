@@ -6,14 +6,12 @@ mod filters;
 pub(crate) mod pane;
 mod render;
 mod source_adapter;
-pub(crate) mod view;
 
 pub(crate) use chart_view::{AuditChartState, AuditTimeline, AuditViewMode, TimelineBucket};
 pub(crate) use filters::{AuditFilters, TimeRange, TimestampDisplayMode};
 pub(crate) use source_adapter::AuditSourceAdapter;
-pub(crate) use view::LogStreamView;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use datatab_app::keymap::{Command, ContextId};
 use datatab_components::common::time_range::view::{TimeRangeChanged, TimeRangePanel};
@@ -25,7 +23,7 @@ use datatab_components::controls::{
 use datatab_components::controls::{GpuiInput as Input, InputEvent, InputState};
 use datatab_components::icons::AppIcon;
 use datatab_core::{
-    CollectionRef, EventQuery, EventRecord, EventStreamTarget, Pagination, RefreshPolicy,
+    Pagination, RefreshPolicy,
     observability::{EventCategory, EventOutcome, EventSeverity},
 };
 use datatab_storage::repositories::audit::{AuditEventDto, AuditQueryFilter, AuditRepository};
@@ -38,10 +36,6 @@ use gpui::*;
 use gpui_component::ActiveTheme;
 use gpui_component::calendar::Date;
 use gpui_component::date_picker::DatePickerState;
-use gpui_component::input::{EditorState as GpuiEditorState, TextareaState};
-use uuid::Uuid;
-
-use datatab_components::vim::{VimBinding, VimHost};
 
 use super::handle::DocumentEvent;
 use super::types::{DocumentIcon, DocumentId, DocumentKind, DocumentState};
@@ -101,17 +95,7 @@ impl AuditMenuItem {
 }
 
 const DEFAULT_PAGE_SIZE: u32 = 100;
-
-#[derive(Clone)]
-enum AuditDocumentSource {
-    Internal {
-        adapter: AuditSourceAdapter,
-    },
-    ExternalEventStream {
-        profile_id: Uuid,
-        target: EventStreamTarget,
-    },
-}
+const LAST_24_HOURS_PRESET_INDEX: usize = 3;
 
 #[derive(Clone, Copy)]
 enum ToolbarSlot {
@@ -137,15 +121,11 @@ struct LoadedEventPage {
 /// Audit event viewer document.
 pub struct AuditDocument {
     app_state: Entity<AppStateEntity>,
-    source: AuditDocumentSource,
+    source: AuditSourceAdapter,
     filters: AuditFilters,
     events: Vec<AuditEventDto>,
     total_events: u64,
     expanded_event_ids: HashSet<i64>,
-    external_message_inputs: HashMap<i64, Entity<TextareaState>>,
-    external_details_inputs: HashMap<i64, Entity<GpuiEditorState>>,
-    /// Vim motions in the external details editors, by input.
-    external_details_vims: HashMap<EntityId, VimBinding>,
     pagination: Pagination,
     status_message: Option<String>,
     is_loading: bool,
@@ -229,9 +209,7 @@ impl AuditDocument {
     ) -> Self {
         Self::new_with_source(
             app_state,
-            AuditDocumentSource::Internal {
-                adapter: AuditSourceAdapter::new(audit_repo),
-            },
+            AuditSourceAdapter::new(audit_repo),
             datatab_i18n::t!("document.audit.title"),
             datatab_i18n::t!("document.audit.filter.placeholder.search_events"),
             window,
@@ -239,27 +217,9 @@ impl AuditDocument {
         )
     }
 
-    pub fn new_for_event_stream(
-        profile_id: Uuid,
-        target: EventStreamTarget,
-        title: String,
-        app_state: Entity<AppStateEntity>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
-        Self::new_with_source(
-            app_state,
-            AuditDocumentSource::ExternalEventStream { profile_id, target },
-            title,
-            datatab_i18n::t!("document.audit.filter.placeholder.filter_events"),
-            window,
-            cx,
-        )
-    }
-
     fn new_with_source(
         app_state: Entity<AppStateEntity>,
-        source: AuditDocumentSource,
+        source: AuditSourceAdapter,
         title: String,
         search_placeholder: String,
         window: &mut Window,
@@ -269,13 +229,9 @@ impl AuditDocument {
 
         let search_input = cx.new(|cx| InputState::new(window, cx).placeholder(search_placeholder));
 
-        let initial_time_range = Self::initial_time_range(&source);
+        let initial_time_range = Some(LAST_24_HOURS_PRESET_INDEX);
         let time_range_placeholder =
-            if matches!(source, AuditDocumentSource::ExternalEventStream { .. }) {
-                datatab_i18n::t!("document.audit.filter.placeholder.all_time")
-            } else {
-                datatab_i18n::t!("document.audit.filter.placeholder.last_12_hours")
-            };
+            datatab_i18n::t!("document.audit.filter.placeholder.last_12_hours");
 
         // Construct the reusable time-range panel.  Sub-entities are extracted
         // below so rendering and FilterBarItem wiring can reference them
@@ -504,7 +460,6 @@ impl AuditDocument {
 
         let selected_time_range = initial_time_range.and_then(Self::time_range_for_index);
         let filter_bar = FilterBarState::new(Self::toolbar_items_for_state(
-            &source,
             selected_time_range,
             &search_input,
             &dropdown_timestamp_mode,
@@ -516,7 +471,7 @@ impl AuditDocument {
             &refresh_dropdown,
         ));
 
-        let filters = Self::default_filters_for_source(&source);
+        let filters = Self::default_filters();
 
         // Chart group-by dropdown — visible only when in Chart mode.
         let dropdown_chart_group_by = cx.new(|_cx| {
@@ -557,9 +512,6 @@ impl AuditDocument {
             events: Vec::new(),
             total_events: 0,
             expanded_event_ids: HashSet::new(),
-            external_message_inputs: HashMap::new(),
-            external_details_inputs: HashMap::new(),
-            external_details_vims: HashMap::new(),
             pagination: Pagination::Offset {
                 limit: DEFAULT_PAGE_SIZE,
                 offset: 0,
@@ -615,30 +567,8 @@ impl AuditDocument {
         }
     }
 
-    pub fn matches_event_stream(&self, profile_id: Uuid, target: &EventStreamTarget) -> bool {
-        match &self.source {
-            AuditDocumentSource::ExternalEventStream {
-                profile_id: doc_profile_id,
-                target: doc_target,
-            } => *doc_profile_id == profile_id && doc_target == target,
-            AuditDocumentSource::Internal { .. } => false,
-        }
-    }
-
-    fn is_external_event_stream(&self) -> bool {
-        matches!(self.source, AuditDocumentSource::ExternalEventStream { .. })
-    }
-
-    /// Returns `true` when this document is backed by the built-in audit
-    /// store (as opposed to an external event stream). Used for deduplication:
-    /// only one internal audit viewer may be open at a time.
-    pub fn is_internal(&self) -> bool {
-        matches!(self.source, AuditDocumentSource::Internal { .. })
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn toolbar_items_for_state(
-        source: &AuditDocumentSource,
         selected_time_range: Option<TimeRange>,
         search_input: &Entity<InputState>,
         dropdown_timestamp_mode: &Entity<Dropdown>,
@@ -687,13 +617,11 @@ impl AuditDocument {
             ]);
         }
 
-        if matches!(source, AuditDocumentSource::Internal { .. }) {
-            toolbar_items.extend([
-                FilterBarItem::button(datatab_i18n::t!("document.audit.detail.level")),
-                FilterBarItem::button(datatab_i18n::t!("document.audit.detail.category")),
-                FilterBarItem::button(datatab_i18n::t!("document.audit.detail.outcome")),
-            ]);
-        }
+        toolbar_items.extend([
+            FilterBarItem::button(datatab_i18n::t!("document.audit.detail.level")),
+            FilterBarItem::button(datatab_i18n::t!("document.audit.detail.category")),
+            FilterBarItem::button(datatab_i18n::t!("document.audit.detail.outcome")),
+        ]);
 
         toolbar_items.extend([
             FilterBarItem::button_with_icon(
@@ -712,7 +640,6 @@ impl AuditDocument {
 
     fn refresh_filter_bar_items(&mut self) {
         self.filter_bar.set_items(Self::toolbar_items_for_state(
-            &self.source,
             self.selected_time_range,
             &self.search_input,
             &self.dropdown_timestamp_mode,
@@ -732,32 +659,19 @@ impl AuditDocument {
             0
         };
 
-        match (&self.source, slot) {
-            (_, ToolbarSlot::Search) => Some(0),
-            (_, ToolbarSlot::Time) => Some(1),
-            (_, ToolbarSlot::Timezone) => Some(2),
-            (_, ToolbarSlot::CustomStart) if custom_offset > 0 => Some(3),
-            (_, ToolbarSlot::CustomEnd) if custom_offset > 0 => Some(6),
-            (_, ToolbarSlot::CustomApply) if custom_offset > 0 => Some(8),
-            (AuditDocumentSource::Internal { .. }, ToolbarSlot::Level) => Some(3 + custom_offset),
-            (AuditDocumentSource::Internal { .. }, ToolbarSlot::Category) => {
-                Some(4 + custom_offset)
-            }
-            (AuditDocumentSource::Internal { .. }, ToolbarSlot::Outcome) => Some(5 + custom_offset),
-            (AuditDocumentSource::Internal { .. }, ToolbarSlot::Refresh) => Some(6 + custom_offset),
-            (AuditDocumentSource::Internal { .. }, ToolbarSlot::RefreshPolicy) => {
-                Some(7 + custom_offset)
-            }
-            (AuditDocumentSource::Internal { .. }, ToolbarSlot::Clear) => Some(8 + custom_offset),
-            (AuditDocumentSource::ExternalEventStream { .. }, ToolbarSlot::Refresh) => {
-                Some(3 + custom_offset)
-            }
-            (AuditDocumentSource::ExternalEventStream { .. }, ToolbarSlot::RefreshPolicy) => {
-                Some(4 + custom_offset)
-            }
-            (AuditDocumentSource::ExternalEventStream { .. }, ToolbarSlot::Clear) => {
-                Some(5 + custom_offset)
-            }
+        match slot {
+            ToolbarSlot::Search => Some(0),
+            ToolbarSlot::Time => Some(1),
+            ToolbarSlot::Timezone => Some(2),
+            ToolbarSlot::CustomStart if custom_offset > 0 => Some(3),
+            ToolbarSlot::CustomEnd if custom_offset > 0 => Some(6),
+            ToolbarSlot::CustomApply if custom_offset > 0 => Some(8),
+            ToolbarSlot::Level => Some(3 + custom_offset),
+            ToolbarSlot::Category => Some(4 + custom_offset),
+            ToolbarSlot::Outcome => Some(5 + custom_offset),
+            ToolbarSlot::Refresh => Some(6 + custom_offset),
+            ToolbarSlot::RefreshPolicy => Some(7 + custom_offset),
+            ToolbarSlot::Clear => Some(8 + custom_offset),
             _ => None,
         }
     }
@@ -852,105 +766,29 @@ impl AuditDocument {
         }));
     }
 
-    fn initial_time_range(source: &AuditDocumentSource) -> Option<usize> {
-        match source {
-            AuditDocumentSource::ExternalEventStream { .. } => None,
-            // Index 3 = Last24Hours in the new preset mapping.
-            AuditDocumentSource::Internal { .. } => Some(3),
+    fn default_filters() -> AuditFilters {
+        let (start_ms, end_ms) = TimeRange::Last24Hours.to_filter_values();
+        AuditFilters {
+            start_ms,
+            end_ms,
+            ..AuditFilters::default()
         }
-    }
-
-    fn default_filters_for_source(source: &AuditDocumentSource) -> AuditFilters {
-        let mut filters = AuditFilters::default();
-
-        if !matches!(source, AuditDocumentSource::ExternalEventStream { .. }) {
-            let (start_ms, end_ms) = TimeRange::Last24Hours.to_filter_values();
-            filters.start_ms = start_ms;
-            filters.end_ms = end_ms;
-        }
-
-        filters
     }
 
     fn source_loading_label(&self) -> String {
-        if self.is_external_event_stream() {
-            datatab_i18n::t!("document.audit.source.loading.external")
-        } else {
-            datatab_i18n::t!("document.audit.source.loading.internal")
-        }
+        datatab_i18n::t!("document.audit.source.loading.internal")
     }
 
     fn source_error_heading(&self) -> String {
-        if self.is_external_event_stream() {
-            datatab_i18n::t!("document.audit.source.error_heading.external")
-        } else {
-            datatab_i18n::t!("document.audit.source.error_heading.internal")
-        }
+        datatab_i18n::t!("document.audit.source.error_heading.internal")
     }
 
     fn source_empty_label(&self) -> String {
-        if self.is_external_event_stream() {
-            datatab_i18n::t!("document.audit.source.empty.external")
-        } else {
-            datatab_i18n::t!("document.audit.source.empty.internal")
-        }
+        datatab_i18n::t!("document.audit.source.empty.internal")
     }
 
     fn source_row_label(&self) -> String {
-        if self.is_external_event_stream() {
-            datatab_i18n::t!("document.audit.row.unit.events")
-        } else {
-            datatab_i18n::t!("document.audit.row.unit.rows")
-        }
-    }
-
-    fn external_page_to_loaded(page: datatab_core::EventPage) -> LoadedEventPage {
-        let events = page
-            .events
-            .into_iter()
-            .map(Self::audit_event_from_record)
-            .collect::<Vec<_>>();
-        let total_events = page
-            .total
-            .map(|value| value as u64)
-            .unwrap_or_else(|| page.offset as u64 + events.len() as u64 + u64::from(page.has_more));
-
-        LoadedEventPage {
-            events,
-            total_events,
-        }
-    }
-
-    fn audit_event_from_record(record: EventRecord) -> AuditEventDto {
-        AuditEventDto {
-            id: record.id.unwrap_or_default(),
-            actor_id: record.actor_id.unwrap_or_default(),
-            tool_id: record.action.clone(),
-            decision: String::new(),
-            reason: None,
-            profile_id: None,
-            classification: None,
-            duration_ms: record.duration_ms,
-            created_at: record.ts_ms.to_string(),
-            created_at_epoch_ms: record.ts_ms,
-            level: Some(record.level.as_str().to_string()),
-            category: Some(record.category.as_str().to_string()),
-            action: Some(record.action),
-            outcome: Some(record.outcome.as_str().to_string()),
-            actor_type: Some(record.actor_type.as_str().to_string()),
-            source_id: Some(record.source_id.as_str().to_string()),
-            summary: Some(record.summary),
-            connection_id: record.connection_id,
-            database_name: record.database_name,
-            driver_id: record.driver_id,
-            object_type: record.object_type,
-            object_id: record.object_id,
-            details_json: record.details_json,
-            error_code: record.error_code,
-            error_message: record.error_message,
-            session_id: record.session_id,
-            correlation_id: record.correlation_id,
-        }
+        datatab_i18n::t!("document.audit.row.unit.rows")
     }
 
     fn active_filter(&self, limit: Option<usize>, offset: Option<usize>) -> AuditQueryFilter {
@@ -1078,87 +916,21 @@ impl AuditDocument {
         );
         let count_filter = self.active_filter(None, None);
 
-        let (task_id, task) = match &self.source {
-            AuditDocumentSource::Internal { adapter } => {
-                let adapter = adapter.clone();
+        let adapter = self.source.clone();
+        let task = cx.background_executor().spawn(async move {
+            let events = adapter.query_filter(&page_filter)?;
+            let total = adapter.count_filter(&count_filter)?;
 
-                let task = cx.background_executor().spawn(async move {
-                    let events = adapter.query_filter(&page_filter)?;
-                    let total = adapter.count_filter(&count_filter)?;
+            Ok::<_, String>(LoadedEventPage {
+                events,
+                total_events: total,
+            })
+        });
 
-                    Ok::<_, String>(LoadedEventPage {
-                        events,
-                        total_events: total,
-                    })
-                });
-
-                (None, task)
-            }
-            AuditDocumentSource::ExternalEventStream { profile_id, target } => {
-                // Resolve the connection before registering the background
-                // task, so a missing connection never leaves a task running.
-                let Some(connection) = self
-                    .app_state
-                    .read(cx)
-                    .connections()
-                    .get(profile_id)
-                    .map(|connected| connected.connection.clone())
-                else {
-                    self.events.clear();
-                    self.total_events = 0;
-                    self.expanded_event_ids.clear();
-                    self.is_loading = false;
-                    self.status_message =
-                        Some(crate::labels::audit_event_source_connection_not_found());
-                    cx.notify();
-                    return;
-                };
-
-                let task_id = self.app_state.update(cx, |state, _| {
-                    let (task_id, _) = state.start_task_for_profile(
-                        datatab_core::TaskKind::Query,
-                        crate::labels::audit_loading_event_stream_task_label(&self.title),
-                        Some(*profile_id),
-                    );
-                    state.tasks_mut().mark_uncancellable(task_id);
-                    task_id
-                });
-
-                let target = target.clone();
-                let query = EventQuery {
-                    from_ts_ms: self.filters.start_ms,
-                    to_ts_ms: self.filters.end_ms,
-                    free_text: self.filters.free_text.clone(),
-                    limit: Some(self.pagination_limit()),
-                    offset: Some(self.pagination_offset()),
-                    ..EventQuery::default()
-                };
-
-                let task = cx.background_executor().spawn(async move {
-                    let page = connection
-                        .browse_event_stream(&target, &query)
-                        .map_err(|error| format!("external event stream browse failed: {error}"))?;
-
-                    Ok::<_, String>(Self::external_page_to_loaded(page))
-                });
-
-                (Some(task_id), task)
-            }
-        };
-
-        // The background task ends with its own load, even when a newer load
-        // has superseded it (a repeated refresh); only the page it returns is
-        // dropped in that case.
         cx.spawn(async move |this, cx| match task.await {
             Ok(page) => {
                 cx.update(|cx| {
                     this.update(cx, |doc, cx| {
-                        if let Some(task_id) = task_id {
-                            doc.app_state.update(cx, |state, _| {
-                                state.complete_task(task_id);
-                            });
-                        }
-
                         if doc.load_request_id != request_id {
                             return;
                         }
@@ -1172,7 +944,6 @@ impl AuditDocument {
                         doc.status_message = None;
                         doc.expanded_event_ids
                             .retain(|event_id| visible_ids.contains(event_id));
-                        doc.retain_external_inline_inputs(&visible_ids);
 
                         cx.notify();
                     })
@@ -1182,13 +953,6 @@ impl AuditDocument {
             Err(error) => {
                 cx.update(|cx| {
                     this.update(cx, |doc, cx| {
-                        if let Some(task_id) = task_id {
-                            let details = crate::labels::audit_events_load_failed(&error);
-                            doc.app_state.update(cx, |state, _| {
-                                state.fail_task_with_details(task_id, error.clone(), details);
-                            });
-                        }
-
                         if doc.load_request_id != request_id {
                             return;
                         }
@@ -1196,7 +960,6 @@ impl AuditDocument {
                         doc.events.clear();
                         doc.total_events = 0;
                         doc.expanded_event_ids.clear();
-                        doc.clear_external_inline_inputs();
                         doc.is_loading = false;
                         doc.status_message = Some(crate::labels::audit_events_load_failed(&error));
 
@@ -1407,12 +1170,12 @@ impl AuditDocument {
     }
 
     pub fn clear_filters(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.filters = Self::default_filters_for_source(&self.source);
+        self.filters = Self::default_filters();
         self.reset_pagination();
         self.export_menu_open = false;
 
         self.suppress_load = true;
-        let selected_time_range = Self::initial_time_range(&self.source);
+        let selected_time_range = Some(LAST_24_HOURS_PRESET_INDEX);
         let selected_range_variant = selected_time_range.and_then(Self::time_range_for_index);
         self.selected_time_range = selected_range_variant;
         self.time_range_panel.update(cx, |panel, _cx| {
@@ -1452,34 +1215,6 @@ impl AuditDocument {
         }
 
         cx.notify();
-    }
-
-    fn retain_external_inline_inputs(&mut self, visible_ids: &HashSet<i64>) {
-        Self::retain_event_input_cache(&mut self.external_message_inputs, visible_ids);
-        Self::retain_event_input_cache(&mut self.external_details_inputs, visible_ids);
-        self.retain_external_details_vims();
-    }
-
-    /// Drops the Vim bindings of details editors no longer cached.
-    fn retain_external_details_vims(&mut self) {
-        let live: HashSet<EntityId> = self
-            .external_details_inputs
-            .values()
-            .map(|input| input.entity_id())
-            .collect();
-
-        self.external_details_vims
-            .retain(|input, _| live.contains(input));
-    }
-
-    fn retain_event_input_cache<T>(cache: &mut HashMap<i64, T>, visible_ids: &HashSet<i64>) {
-        cache.retain(|event_id, _| visible_ids.contains(event_id));
-    }
-
-    fn clear_external_inline_inputs(&mut self) {
-        self.external_message_inputs.clear();
-        self.external_details_inputs.clear();
-        self.external_details_vims.clear();
     }
 
     fn go_to_prev_page(&mut self, cx: &mut Context<Self>) {
@@ -1584,10 +1319,6 @@ impl AuditDocument {
                 datatab_i18n::t!("document.audit.category.object_storage"),
                 "object_storage",
             ),
-            DropdownItem::with_value(
-                datatab_i18n::t!("document.audit.category.secret_store"),
-                "secret_store",
-            ),
         ]
     }
 
@@ -1603,7 +1334,6 @@ impl AuditDocument {
             Some(EventCategory::Mcp) => 7,
             Some(EventCategory::Governance) => 8,
             Some(EventCategory::ObjectStorage) => 9,
-            Some(EventCategory::SecretStore) => 10,
             None => 0,
         }
     }
@@ -1620,7 +1350,6 @@ impl AuditDocument {
             7 => Some(EventCategory::Mcp),
             8 => Some(EventCategory::Governance),
             9 => Some(EventCategory::ObjectStorage),
-            10 => Some(EventCategory::SecretStore),
             _ => None,
         }
     }
@@ -1745,16 +1474,7 @@ impl AuditDocument {
     /// Cancelling the dialog is a no-op. Failures to fetch or write the export
     /// are reported through `report_error_async` as storage errors.
     fn do_export(&mut self, format: String, cx: &mut Context<Self>) {
-        let AuditDocumentSource::Internal { adapter } = &self.source else {
-            self.pending_toast = Some(PendingToast {
-                message: crate::labels::audit_export_unsupported_source_toast(),
-                is_error: true,
-            });
-            cx.notify();
-            return;
-        };
-
-        let adapter = adapter.clone();
+        let adapter = self.source.clone();
         let filter = self.active_filter(None, None);
 
         let extension = audit_export_extension(&format);
@@ -1889,22 +1609,6 @@ fn write_export_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()
 
 impl EventEmitter<DocumentEvent> for AuditDocument {}
 
-/// An external event's details are shown read-only: Vim moves, selects and
-/// yanks in them.
-impl VimHost for AuditDocument {
-    fn vim(&self, input: EntityId) -> Option<&VimBinding> {
-        self.external_details_vims.get(&input)
-    }
-
-    fn vim_mut(&mut self, input: EntityId) -> Option<&mut VimBinding> {
-        self.external_details_vims.get_mut(&input)
-    }
-
-    fn vim_read_only(&self, _input: EntityId, _cx: &App) -> bool {
-        true
-    }
-}
-
 impl Render for AuditDocument {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.pending_initial_load {
@@ -1974,10 +1678,9 @@ impl Render for AuditDocument {
             .when(self.selected_time_range == Some(TimeRange::Custom), |d| {
                 d.child(self.render_custom_range_row(cx))
             })
-            .when(
-                self.view_mode == AuditViewMode::Table && self.is_internal(),
-                |d| d.child(self.render_timeline(cx)),
-            )
+            .when(self.view_mode == AuditViewMode::Table, |d| {
+                d.child(self.render_timeline(cx))
+            })
             .child(content_area)
             .when(self.view_mode == AuditViewMode::Table, |d| {
                 d.child(self.render_status_bar(cx))
@@ -1988,11 +1691,8 @@ impl Render for AuditDocument {
 #[cfg(test)]
 mod tests {
     use super::AuditDocument;
-    use std::collections::{HashMap, HashSet};
 
-    use datatab_core::{
-        EventActorType, EventCategory, EventOutcome, EventRecord, EventSeverity, EventSourceId,
-    };
+    use datatab_core::EventCategory;
 
     #[test]
     fn category_index_maps_none_to_all() {
@@ -2002,40 +1702,6 @@ mod tests {
     #[test]
     fn category_index_maps_mcp_to_mcp_dropdown_entry() {
         assert_eq!(AuditDocument::category_index(Some(EventCategory::Mcp)), 7);
-    }
-
-    #[test]
-    fn audit_event_from_record_preserves_event_stream_fields() {
-        let event = AuditDocument::audit_event_from_record(EventRecord {
-            id: Some(7),
-            ts_ms: 1000,
-            level: EventSeverity::Info,
-            category: EventCategory::System,
-            action: "partition-a".to_string(),
-            outcome: EventOutcome::Success,
-            actor_type: EventActorType::System,
-            actor_id: None,
-            source_id: EventSourceId::System,
-            connection_id: Some("source-a".to_string()),
-            database_name: Some("logs".to_string()),
-            driver_id: Some("cloudwatch".to_string()),
-            object_type: Some("event_stream".to_string()),
-            object_id: Some("event-123".to_string()),
-            summary: "hello".to_string(),
-            details_json: Some("{\"message\":\"hello\"}".to_string()),
-            error_code: None,
-            error_message: Some("2000".to_string()),
-            duration_ms: None,
-            session_id: None,
-            correlation_id: None,
-        });
-
-        assert_eq!(event.id, 7);
-        assert_eq!(event.created_at_epoch_ms, 1000);
-        assert_eq!(event.action.as_deref(), Some("partition-a"));
-        assert_eq!(event.summary.as_deref(), Some("hello"));
-        assert_eq!(event.object_id.as_deref(), Some("event-123"));
-        assert_eq!(event.connection_id.as_deref(), Some("source-a"));
     }
 
     fn fixed_time(
@@ -2115,30 +1781,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn retain_event_input_cache_drops_non_visible_entries() {
-        let mut cache = HashMap::from([(1_i64, "message"), (2_i64, "details"), (3_i64, "extra")]);
-        let visible_ids = HashSet::from([2_i64, 3_i64]);
-
-        AuditDocument::retain_event_input_cache(&mut cache, &visible_ids);
-
-        assert_eq!(cache, HashMap::from([(2_i64, "details"), (3_i64, "extra")]));
-    }
-
-    #[test]
-    fn event_text_rows_adds_wrap_height_for_long_lines() {
-        let long_line = "x".repeat(161);
-
-        assert_eq!(AuditDocument::event_text_rows(&long_line, 2), 3);
-    }
-
-    #[test]
-    fn event_code_rows_is_more_conservative_for_pretty_json_blocks() {
-        let line = "a\nb\nc";
-
-        assert_eq!(AuditDocument::event_code_rows(line, 2), 3);
-    }
-
     #[cfg(unix)]
     #[test]
     fn write_export_file_sets_mode_0o600() {
@@ -2177,12 +1819,8 @@ mod tests {
             level_items[1].label.as_ref(),
             datatab_i18n::t!("document.audit.level.warn")
         );
+        assert_eq!(category_items.len(), 9);
         assert_eq!(category_items[8].value.as_ref(), "object_storage");
-        assert_eq!(category_items[9].value.as_ref(), "secret_store");
-        assert_eq!(
-            category_items[9].label.as_ref(),
-            datatab_i18n::t!("document.audit.category.secret_store")
-        );
         assert_eq!(
             category_items[8].label.as_ref(),
             datatab_i18n::t!("document.audit.category.object_storage")
@@ -2248,13 +1886,9 @@ mod tests {
     }
 
     const SOURCE_AND_ROW_KEYS: &[&str] = &[
-        "document.audit.row.unit.events",
         "document.audit.row.unit.rows",
-        "document.audit.source.empty.external",
         "document.audit.source.empty.internal",
-        "document.audit.source.error_heading.external",
         "document.audit.source.error_heading.internal",
-        "document.audit.source.loading.external",
         "document.audit.source.loading.internal",
     ];
 
@@ -2285,7 +1919,6 @@ mod tests {
 
     fn new_audit_document(
         cx: &mut gpui::TestAppContext,
-        event_stream_profile: Option<uuid::Uuid>,
     ) -> (
         gpui::Entity<AuditDocument>,
         gpui::Entity<datatab_ui_base::AppStateEntity>,
@@ -2311,68 +1944,18 @@ mod tests {
 
         let (document, window) = cx.add_window_view({
             let app_state = app_state.clone();
-            move |window, cx| match event_stream_profile {
-                Some(profile_id) => AuditDocument::new_for_event_stream(
-                    profile_id,
-                    datatab_core::EventStreamTarget {
-                        collection: datatab_core::CollectionRef::new("logs", "stream"),
-                        child_id: None,
-                    },
-                    "Events".to_string(),
-                    app_state,
-                    window,
-                    cx,
-                ),
-                None => {
-                    let audit_repo = app_state
-                        .read(cx)
-                        .storage_runtime()
-                        .audit()
-                        .expect("audit repo should open in test");
-                    AuditDocument::new(audit_repo, app_state, window, cx)
-                }
+            move |window, cx| {
+                let audit_repo = app_state
+                    .read(cx)
+                    .storage_runtime()
+                    .audit()
+                    .expect("audit repo should open in test");
+                AuditDocument::new(audit_repo, app_state, window, cx)
             }
         });
         window.run_until_parked();
 
         (document, app_state, window)
-    }
-
-    /// An external event's details editor gets a Vim binding that follows
-    /// the setting, and loses it when the editor leaves the cache.
-    #[gpui::test]
-    fn external_details_editors_follow_the_vim_setting(cx: &mut gpui::TestAppContext) {
-        use datatab_components::vim::VimMode;
-
-        let (document, _app_state, window) = new_audit_document(cx, None);
-        window.update(|_, cx| datatab_components::vim::set_vim_enabled(cx, true));
-
-        let input = window.update(|window, cx| {
-            document.update(cx, |document, cx| {
-                document.ensure_external_details_input(7, "{}", window, cx)
-            })
-        });
-        let mode = |window: &mut gpui::VisualTestContext| {
-            window.update(|_, cx| {
-                document
-                    .read(cx)
-                    .external_details_vims
-                    .get(&input.entity_id())
-                    .and_then(|vim| vim.mode())
-            })
-        };
-        assert_eq!(mode(window), Some(VimMode::Normal));
-
-        window.update(|_, cx| datatab_components::vim::set_vim_enabled(cx, false));
-        window.run_until_parked();
-        assert_eq!(mode(window), None);
-
-        window.update(|_, cx| {
-            document.update(cx, |document, _| {
-                document.retain_external_inline_inputs(&HashSet::new())
-            })
-        });
-        assert!(window.update(|_, cx| document.read(cx).external_details_vims.is_empty()));
     }
 
     /// With the toolbar ring on the time presets, Right and Left move the
@@ -2543,7 +2126,7 @@ mod tests {
     fn refresh_key_reloads_the_audit_list(cx: &mut gpui::TestAppContext) {
         use datatab_app::keymap::{Command, KeyChord};
 
-        let (document, _app_state, window) = new_audit_document(cx, None);
+        let (document, _app_state, window) = new_audit_document(cx);
 
         let context = window.update(|_, cx| document.read(cx).active_context());
         let chord = KeyChord::parse("r").expect("plain letter chord");
@@ -2566,35 +2149,6 @@ mod tests {
             let document = document.read(cx);
             assert_eq!(document.load_request_id, request_before + 1);
             assert!(!document.is_loading);
-        });
-    }
-
-    /// Refreshing an event stream whose connection is gone reports that in
-    /// the status line and registers no background task, instead of leaving
-    /// a "loading" task running forever.
-    #[gpui::test]
-    fn refresh_without_event_stream_connection_starts_no_task(cx: &mut gpui::TestAppContext) {
-        use datatab_app::keymap::Command;
-
-        let (document, app_state, window) = new_audit_document(cx, Some(uuid::Uuid::new_v4()));
-
-        let handled = window.update(|window, cx| {
-            document.update(cx, |document, cx| {
-                document.dispatch_command(Command::RefreshSchema, window, cx)
-            })
-        });
-        window.run_until_parked();
-
-        assert!(handled);
-        window.update(|_, cx| {
-            assert!(app_state.read(cx).running_tasks().is_empty());
-
-            let document = document.read(cx);
-            assert!(!document.is_loading);
-            assert_eq!(
-                document.status_message,
-                Some(crate::labels::audit_event_source_connection_not_found())
-            );
         });
     }
 
@@ -2646,7 +2200,7 @@ mod tests {
     /// reported.
     #[gpui::test]
     fn two_expanded_rows_render_distinct_accessibility_nodes(cx: &mut gpui::TestAppContext) {
-        let (document, _app_state, window) = new_audit_document(cx, None);
+        let (document, _app_state, window) = new_audit_document(cx);
 
         let capture = std::sync::Arc::new(FrameCapture::default());
         window.update(|window, cx| {
@@ -2684,7 +2238,7 @@ mod tests {
         use datatab_ui_base::keyboard_coverage::{Coverage, FrameCapture};
 
         cx.update(datatab_ui_base::keymap::init_keymap);
-        let (document, _app_state, window) = new_audit_document(cx, None);
+        let (document, _app_state, window) = new_audit_document(cx);
         window.update(|_, cx| {
             document.update(cx, |document, cx| {
                 document.events = vec![detailed_event(1), detailed_event(2)];

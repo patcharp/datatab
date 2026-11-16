@@ -26,32 +26,6 @@ impl Workspace {
                 Some(true)
             }
 
-            Command::ImportDashboard => {
-                // Only available when the active connection has DASHBOARD_IMPORT.
-                let has_capability = self
-                    .app_state
-                    .read(cx)
-                    .active_connection()
-                    .map(|conn| {
-                        conn.connection
-                            .metadata()
-                            .capabilities
-                            .contains(datatab_core::DriverCapabilities::DASHBOARD_IMPORT)
-                    })
-                    .unwrap_or(false);
-
-                if has_capability {
-                    self.modal_import_dashboard.update(cx, |modal, cx| {
-                        modal.open(window, cx);
-                    });
-                } else {
-                    Toast::warning(datatab_i18n::t!("charts.error.import_unsupported"))
-                        .meta_right(now_hms())
-                        .push(cx);
-                }
-                Some(true)
-            }
-
             Command::NewDashboard => {
                 self.create_dashboard_from_palette(window, cx);
                 Some(true)

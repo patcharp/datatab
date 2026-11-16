@@ -7,7 +7,7 @@ Standalone MCP (Model Context Protocol) server for AI-driven database operations
 `datatab_mcp_server` provides a JSON-RPC interface over stdin/stdout for AI clients (Claude Desktop, OpenAI GPT, etc.) to interact with databases through DataTab's governance layer.
 
 **Key features:**
-- **Unified database interface** — Query PostgreSQL, MySQL, SQLite, MongoDB, Redis, and DynamoDB with the same tools
+- **Unified database interface** — Query PostgreSQL, MySQL, SQLite, MongoDB, and Redis with the same tools
 - **Governance layer** — Policy engine, approval workflows, and audit logging
 - **DDL safety system** — Preview, classify, and control schema changes
 - **Driver-agnostic queries** — JSON WHERE clause syntax works across all drivers
@@ -84,7 +84,7 @@ Claude: I can see the following MCP tools available: connect, list_connections, 
 ┌─────────────────────────────────────────────────────────────┐
 │                    Driver Layer (datatab_core)                │
 │  • PostgreSQL    • MongoDB    • Redis                        │
-│  • MySQL         • DynamoDB                                  │
+│  • MySQL                                                     │
 │  • SQLite                                                    │
 └─────────────────────────────────────────────────────────────┘
                             │
@@ -579,7 +579,6 @@ See driver READMEs:
 | Driver | WHERE Clause | DDL | Notes |
 |--------|--------------|-----|-------|
 | Redis | ⚠️ Pattern only | ❌ No | SCAN pattern matching on keys; no WHERE clause support |
-| DynamoDB | ⚠️ FilterExpression | ⚠️ Limited | FilterExpression runs after scan (not indexed) |
 
 ## ColumnRef Pattern
 
@@ -827,7 +826,6 @@ RUST_LOG=datatab_mcp=trace ./target/debug/datatab mcp --client-id test
 - **MySQL:** DDL not transactional (cannot rollback)
 - **MongoDB:** No SQL LIKE (use `$regex`)
 - **Redis:** No WHERE clause support (key pattern only)
-- **DynamoDB:** FilterExpression not indexed (runs after scan)
 
 ## Contributing
 

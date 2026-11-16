@@ -60,8 +60,6 @@ fn system_records_for_all_prefix_map_modules_pass_validate() {
         "datatab_app::access_manager::auth",
         "datatab_ssh::tunnel",
         "datatab_proxy::http",
-        "datatab_aws::client",
-        "datatab_ssm::params",
         "datatab_driver_ipc::host",
         "datatab_app::config::profiles",
         "datatab_app::aws_config::reflect",

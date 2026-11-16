@@ -162,6 +162,35 @@ enum ConnectStop {
 
 impl Sidebar {
     pub fn connect_to_profile(&mut self, profile_id: Uuid, cx: &mut Context<Self>) {
+        let refusal = {
+            let state = self.app_state.read(cx);
+            state
+                .validate_connect_profile(profile_id)
+                .err()
+                .map(|error| {
+                    let diagnostic = error
+                        .socket_id()
+                        .and_then(|socket_id| state.external_driver_diagnostic(socket_id));
+                    (
+                        connect_prepare_error_toast(&error, diagnostic),
+                        !state.value_ref_diagnostics(profile_id).is_empty(),
+                    )
+                })
+        };
+        if let Some((toast, broken_value_ref)) = refusal {
+            self.app_state.update(cx, |state, _cx| {
+                state.record_connect_failure(profile_id, toast.message.clone());
+            });
+            if broken_value_ref {
+                report_error(UserFacingError::new(ErrorKind::Config, toast.message), cx);
+            } else {
+                self.pending_toast = Some(toast);
+            }
+            self.refresh_tree(cx);
+            cx.notify();
+            return;
+        }
+
         let (prompt, remembered_password) = {
             let state = self.app_state.read(cx);
             let idle = !state.connections().contains_key(&profile_id)
@@ -1014,16 +1043,7 @@ impl Sidebar {
                     cx.notify();
                     teardown
                 });
-                // Cancel in-flight metric catalog fetches for this profile so
-                // that stale data from a previous account cannot land in the
-                // cache after invalidation (e.g. if the user reconnects the
-                // same profile_id to a different AWS account). Dropping the
-                // Task handle abandons the foreground awaiter, which is where
-                // the cache write now lives (see spawn_fetch_* refactor).
-                // Also evict the cached catalog entries so the next folder
-                // expand re-runs privilege probes against the new session.
                 sidebar.update(cx, |sidebar, _cx| {
-                    sidebar.drop_pending_metric_fetches(profile_id);
                     sidebar.clear_instance_catalog_cache(profile_id);
                 });
                 teardown
@@ -1143,10 +1163,6 @@ impl Sidebar {
     }
 
     pub(crate) fn refresh_connection(&mut self, profile_id: Uuid, cx: &mut Context<Self>) {
-        // Cancel pending metric catalog fetches and evict the stale cache
-        // before disconnect invalidates the connection. Mirrors what
-        // disconnect_profile does so reconnect always re-fetches fresh data.
-        self.drop_pending_metric_fetches(profile_id);
         self.clear_instance_catalog_cache(profile_id);
         self.app_state.update(cx, |state, cx| {
             state.cancel_detached_hook_tasks(profile_id);
@@ -1161,11 +1177,6 @@ impl Sidebar {
     }
 
     pub(crate) fn delete_profile(&mut self, profile_id: Uuid, cx: &mut Context<Self>) {
-        // Defensive eviction: even though delete_profile does not call
-        // disconnect directly, removing the profile orphans any in-flight
-        // metric fetches. Drop their foreground tasks so the cache-write
-        // closures never run.
-        self.drop_pending_metric_fetches(profile_id);
         self.app_state.update(cx, |state, cx| {
             if let Some(idx) = state.profiles().iter().position(|p| p.id == profile_id)
                 && let Some(removed) = state.remove_profile(idx)
@@ -1174,23 +1185,6 @@ impl Sidebar {
             }
             cx.emit(datatab_ui_base::AppStateChanged);
         });
-    }
-
-    /// Drop foreground tasks for every in-flight metric catalog fetch
-    /// targeting `profile_id`.
-    ///
-    /// Dropping the `Task` handle abandons the `cx.spawn` awaiter where the
-    /// cache-write closure now lives (see `spawn_fetch_metric_namespaces` /
-    /// `spawn_fetch_metrics`). This guarantees that any data fetched in the
-    /// background before the teardown can no longer be written to the
-    /// session-scoped `MetricCatalogCache`.
-    ///
-    /// Called from every code path that invalidates the cache or removes a
-    /// profile: `disconnect_profile`, `refresh_connection`, `delete_profile`.
-    fn drop_pending_metric_fetches(&mut self, profile_id: Uuid) {
-        self.pending_metric_namespace_fetches.remove(&profile_id);
-        self.pending_metric_fetches
-            .retain(|(pid, _ns), _task| *pid != profile_id);
     }
 
     pub(crate) fn edit_profile(&mut self, profile_id: Uuid, cx: &mut Context<Self>) {
@@ -1216,6 +1210,7 @@ impl Sidebar {
 
 #[cfg(test)]
 mod tests {
+    mod refusal;
     use super::wait_for_connection_teardown;
     use datatab_core::CancelToken;
     use gpui::TestAppContext;
@@ -1433,9 +1428,23 @@ mod tests {
     struct PasswordRecordingDriver {
         metadata: datatab_core::DriverMetadata,
         passwords: RecordedPasswords,
+        refuses_profile: bool,
     }
 
     impl datatab_core::DbDriver for PasswordRecordingDriver {
+        fn validate_profile(
+            &self,
+            _: &datatab_core::ConnectionProfile,
+        ) -> Result<(), datatab_core::DbError> {
+            if self.refuses_profile {
+                Err(datatab_core::DbError::InvalidProfile(
+                    "fixture refusal".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
         fn kind(&self) -> datatab_core::DbKind {
             datatab_core::DbKind::Postgres
         }
@@ -1502,6 +1511,14 @@ mod tests {
         save_password: bool,
         cx: &mut TestAppContext,
     ) -> (PasswordFixture, &mut VisualTestContext) {
+        password_fixture_with_refusal(save_password, false, cx)
+    }
+
+    fn password_fixture_with_refusal(
+        save_password: bool,
+        refuses_profile: bool,
+        cx: &mut TestAppContext,
+    ) -> (PasswordFixture, &mut VisualTestContext) {
         let state = test_app_state(cx);
         let passwords: RecordedPasswords = Arc::new(Mutex::new(Vec::new()));
         let metadata = datatab_core::DriverMetadataBuilder::new(
@@ -1526,6 +1543,7 @@ mod tests {
                 Arc::new(PasswordRecordingDriver {
                     metadata,
                     passwords: passwords.clone(),
+                    refuses_profile,
                 }),
             );
             state.profiles_mut().push(profile);

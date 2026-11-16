@@ -66,9 +66,6 @@ pub enum PaletteItem {
         /// collection charts from query charts.
         is_collection_source: bool,
     },
-    /// "Import Dashboard from JSON" action (shown only when the active connection
-    /// has the `DASHBOARD_IMPORT` capability).
-    ImportDashboard,
 }
 
 /// Schema resource variants surfaced by connected profiles.
@@ -208,12 +205,6 @@ impl PaletteItem {
                     relative_path
                 )
             }
-            Self::ImportDashboard => {
-                format!(
-                    "Charts {}",
-                    datatab_i18n::t!("palette.import_dashboard.name")
-                )
-            }
         }
     }
 
@@ -255,10 +246,6 @@ impl PaletteItem {
                 }
             },
             Self::Script { name, .. } => (datatab_i18n::t!("palette.kind.script"), name.clone()),
-            Self::ImportDashboard => (
-                datatab_i18n::t!("palette.section.charts"),
-                datatab_i18n::t!("palette.import_dashboard.name"),
-            ),
         }
     }
 
@@ -268,7 +255,6 @@ impl PaletteItem {
             Self::Action { .. } => 0,
             Self::Connection { .. } => 1,
             Self::SavedChart { .. } => 2,
-            Self::ImportDashboard => 2,
             Self::Resource(_) => 3,
             Self::Script { .. } => 4,
         }
@@ -320,7 +306,6 @@ impl PaletteItem {
                     None
                 }
             }
-            _ => None,
         }
     }
 
@@ -338,7 +323,6 @@ impl PaletteItem {
             Self::Resource(ResourceItem::KeyValueDb { .. }) => (AppIcon::KeyRound, None),
             Self::Script { .. } => (AppIcon::FileCode, None),
             Self::SavedChart { .. } => (AppIcon::ChartSpline, None),
-            Self::ImportDashboard => (AppIcon::Download, None),
         }
     }
 
@@ -375,7 +359,7 @@ fn command_icon(id: &str) -> AppIcon {
         "increase_interface_size" => AppIcon::ZoomIn,
         "decrease_interface_size" => AppIcon::ZoomOut,
         "open_settings" => AppIcon::Settings,
-        "open_login_modal" | "open_sso_wizard" => AppIcon::KeyRound,
+        "open_login_modal" => AppIcon::KeyRound,
         "open_mcp_approvals" | "refresh_mcp_governance" => AppIcon::Bot,
         "open_audit_viewer" => AppIcon::FingerprintPattern,
         "open_saved_chart" => AppIcon::ChartSpline,
@@ -463,8 +447,6 @@ pub enum PaletteSelection {
     OpenSavedChart {
         chart_id: Uuid,
     },
-    /// The user selected the "Import Dashboard from JSON" entry.
-    ImportDashboard,
 }
 
 /// The section a [`PaletteItem`] groups under.
@@ -472,7 +454,7 @@ fn item_section(item: &PaletteItem) -> PaletteSection {
     match item {
         PaletteItem::Connection { .. } => PaletteSection::Connections,
         PaletteItem::Action { .. } => PaletteSection::Commands,
-        PaletteItem::SavedChart { .. } | PaletteItem::ImportDashboard => PaletteSection::Charts,
+        PaletteItem::SavedChart { .. } => PaletteSection::Charts,
         PaletteItem::Resource(_) => PaletteSection::Tables,
         PaletteItem::Script { .. } => PaletteSection::Scripts,
     }
@@ -585,7 +567,6 @@ impl PaletteEntry for PaletteItem {
             PaletteItem::SavedChart { id, .. } => {
                 PaletteSelection::OpenSavedChart { chart_id: *id }
             }
-            PaletteItem::ImportDashboard => PaletteSelection::ImportDashboard,
         }
     }
 }
@@ -759,10 +740,6 @@ mod tests {
             .section(),
             PaletteSection::Charts
         );
-        assert_eq!(
-            PaletteItem::ImportDashboard.section(),
-            PaletteSection::Charts
-        );
     }
 
     /// The selection mapping moved with the engine's confirm: a resource
@@ -794,28 +771,6 @@ mod tests {
         );
         assert_eq!(connection("cache-redis", false).qualifier(), None);
         assert_eq!(action("export_results", "Export results").qualifier(), None);
-    }
-
-    // R.1 — Import label cleanup
-
-    #[test]
-    fn command_palette_import_label_contains_no_cloudwatch() {
-        let (_category, label) = PaletteItem::ImportDashboard.display_label();
-        assert!(
-            !label.contains("CloudWatch"),
-            "ImportDashboard display label must not reference CloudWatch; got: {label:?}"
-        );
-        let search = PaletteItem::ImportDashboard.search_text();
-        assert!(
-            !search.contains("CloudWatch"),
-            "ImportDashboard search_text must not reference CloudWatch; got: {search:?}"
-        );
-    }
-
-    #[test]
-    fn command_palette_import_label_is_exactly_correct() {
-        let (_category, label) = PaletteItem::ImportDashboard.display_label();
-        assert_eq!(label, "Import dashboard from JSON…");
     }
 
     // R.2 — New palette entries
@@ -890,27 +845,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn command_palette_does_not_include_import_dashboard_in_commands() {
-        // ImportDashboard is a PaletteItem::ImportDashboard, not a PaletteCommand.
-        // It should never appear in default_commands().
-        use crate::ui::views::workspace::Workspace;
-
-        let commands = Workspace::palette_commands_for_test();
-        let import_in_commands = commands
-            .iter()
-            .any(|c| c.name.contains("Import") && c.name.contains("Dashboard"));
-        assert!(
-            !import_in_commands,
-            "ImportDashboard must not appear in default_commands(); found: {:?}",
-            commands
-                .iter()
-                .filter(|c| c.name.contains("Import"))
-                .map(|c| c.name.clone())
-                .collect::<Vec<_>>()
-        );
-    }
-
     // i18n — command palette foundation
     //
     // These assert through `datatab_i18n` directly: the seam resolves the
@@ -932,7 +866,6 @@ mod tests {
         "palette.kind.keyspace",
         "palette.kind.script",
         "palette.chart.browse_suffix",
-        "palette.import_dashboard.name",
         "palette.footer.navigate",
         "palette.footer.run",
         "palette.footer.open_in_new_tab",

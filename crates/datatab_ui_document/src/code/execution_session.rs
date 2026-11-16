@@ -615,7 +615,6 @@ mod tests {
                         read_only_reason: None,
                         database_schemas: Default::default(),
                         table_details: Default::default(),
-                        collection_children: Default::default(),
                         schema_types: Default::default(),
                         schema_columns: Default::default(),
                         schema_indexes: Default::default(),
@@ -1864,6 +1863,8 @@ mod tests {
                 3,
                 "{route:?}"
             );
+            drop(sessions);
+            window.update(|window, _| window.remove_window());
         }
     }
 

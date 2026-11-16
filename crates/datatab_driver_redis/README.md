@@ -23,7 +23,7 @@ Redis key-value driver for DataTab, built on the [`redis`](https://crates.io/cra
 - TLS/SSL with three modes (`off`, `on`, `verify`):
   - `off` — plain `redis://` connection.
   - `on` — `rediss://`, encrypted, with no check of the certificate chain or name, so it does not protect against a man in the middle. Refused with the Sentinel topology (see Limitations).
-  - `verify` — `rediss://` with a supplied root certificate and optional client certificate/key, built through `Client::build_with_tls`. Refused with the Sentinel topology (see Limitations).
+  - `verify` — `rediss://` with a supplied root certificate and optional client certificate/key, built through `Client::build_with_tls`. Certificate pickers appear only in this mode; switching modes keeps their saved paths. Refused with the Sentinel topology (see Limitations).
 - SSH tunnel support for reaching Redis through a bastion host (manual mode only; see Limitations).
 - Deployment topology can be detected automatically or set explicitly (`standalone`, `cluster`, `sentinel`):
   - Automatic detection probes `ROLE` and `INFO cluster` at connect time and routes to standalone or Cluster handling.
@@ -61,11 +61,11 @@ Exposes a curated set of live server metrics sourced from the `INFO` command out
 - `redis.blocked_clients` — clients waiting on a blocking command
 - `redis.used_memory` — bytes allocated by Redis allocator
 - `redis.used_memory_rss` — bytes allocated by the OS (resident set size)
-- `redis.total_commands_processed` — cumulative commands processed
+- `redis.total_commands_processed` — commands processed per second
 - `redis.total_connections_received` — cumulative connections accepted
 - `redis.instantaneous_ops_per_sec` — commands processed per second (server-side rate)
-- `redis.keyspace_hits` — cache hits against key lookups
-- `redis.keyspace_misses` — cache misses against key lookups
+- `redis.keyspace_hits` — cache hits per second on key lookups
+- `redis.keyspace_misses` — cache misses per second on key lookups
 - `redis.evicted_keys` — keys evicted due to `maxmemory` policy
 - `redis.expired_keys` — keys expired by TTL
 - `redis.rdb_changes_since_last_save` — changes since last RDB snapshot
@@ -88,7 +88,7 @@ Sensitive fields (`addr`, `laddr`, `name`) are redacted to `[redacted]` to avoid
 
 - SQL is not supported; queries must be written as Redis commands.
 
-- Instance metrics return a single data point per call (current snapshot from `INFO`), not a historical time series. Cumulative counters (e.g. `redis.total_commands_processed`) grow monotonically — interpret them as deltas between samples rather than absolute rates.
+- Instance metrics return a single data point per call (current snapshot from `INFO`), not a historical time series. Cumulative counters (for example `total_commands_processed`, `keyspace_hits` and `keyspace_misses`) are declared as counters, so the chart shows the change per second between samples; the first sample has no point. The `instantaneous_*` fields are already rates the server computed, so they stay gauges.
 
 - The `CLIENT LIST` inspector redacts the `addr`, `laddr`, and `name` fields in every row to avoid exposing client IP addresses and user-supplied names to the UI.
 
@@ -103,6 +103,6 @@ Sensitive fields (`addr`, `laddr`, `name`) are redacted to `[redacted]` to avoid
 - The type filter needs Redis 6.0 or later (`SCAN ... TYPE`). Paging a stream past its first page needs Redis 6.2 or later (exclusive range bounds); consumer groups need Redis 5.0 or later.
 - Key sizes come from `MEMORY USAGE`, which some managed providers disable; the size column then stays empty while the expiry column still fills in.
 - Bulk delete counts matches with a full `SCAN` of the database before anything is deleted, which reads the whole keyspace once.
-- Sentinel does not support TLS. DataTab cannot reach the resolved Sentinel master over TLS yet, so TLS modes `on` and `verify` and every `rediss://` URI are refused with the Sentinel topology, before any network access. The check reads the address as the `redis` crate parses it, so a trailing space or an upper-case scheme does not get past it. Use TLS mode `off` or a `redis://` URI with Sentinel; the password then travels unencrypted to the Sentinel master.
+- Sentinel does not support TLS. DataTab cannot reach the resolved Sentinel master over TLS yet. In manual mode, TLS modes `on` and `verify`, unknown modes, and legacy `tls: true` without `ssl_mode` are refused. In URI mode, every `rediss://` URI is refused. Refusal comes before any network access, including PreConnect hooks, authentication, SSH and proxies. The check reads the address as the `redis` crate parses it, so a trailing space or an upper-case scheme does not get past it. Use TLS mode `off` or a `redis://` URI with Sentinel; the password then travels unencrypted to the Sentinel master.
 - Cluster additional seed nodes are always contacted over plain `redis://`; per-node TLS configuration for those extra nodes is not supported.
 - Sentinel authentication applies only to the resolved master connection (via the configured username/password); the Sentinel nodes themselves are contacted without authentication.

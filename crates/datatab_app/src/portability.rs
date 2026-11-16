@@ -39,8 +39,8 @@ use datatab_core::{
     ProxyProfile, SecretStore, SshTunnelProfile,
 };
 use datatab_portability::{
-    AwsRef, ConnectionWithValues, DestSnapshot, ExportGraph, ExportTransformResolver,
-    FieldHintResolver, ImportActions, ImportPlan, ParsedBundle, ResolutionChoices, SecretReader,
+    ConnectionWithValues, DestSnapshot, ExportGraph, ExportTransformResolver, FieldHintResolver,
+    ImportActions, ImportPlan, ParsedBundle, ResolutionChoices, SecretReader,
 };
 
 // ---------------------------------------------------------------------------
@@ -163,10 +163,8 @@ impl SecretReader for AppSecretReader {
 pub struct ExportInputs {
     /// Selected connection profiles with their driver-extracted form values.
     pub connections_with_values: Vec<(ConnectionProfile, FormValues)>,
-    /// Stored (non-reflected) auth profiles referenced by any selected connection.
+    /// Stored auth profiles referenced by any selected connection.
     pub auth_profiles: Vec<AuthProfile>,
-    /// Read-only AWS reflected auth references (cannot be stored, travel as metadata).
-    pub aws_references: Vec<AwsRef>,
     /// SSH tunnel profiles referenced by any selected connection.
     pub ssh_tunnels: Vec<SshTunnelProfile>,
     /// Proxy profiles referenced by any selected connection.
@@ -191,7 +189,6 @@ pub fn build_export_graph(inputs: &ExportInputs) -> ExportGraph<'_> {
     ExportGraph {
         connections,
         auth_profiles: inputs.auth_profiles.iter().collect(),
-        aws_references: inputs.aws_references.clone(),
         ssh_tunnels: inputs.ssh_tunnels.iter().collect(),
         proxies: inputs.proxies.iter().collect(),
     }
@@ -350,7 +347,7 @@ pub fn persist_import_actions(
 ) -> ImportOutcome {
     let mut outcome = ImportOutcome::default();
 
-    // Record kind and dangling-ref failures reported by the pure apply() step.
+    // Record kind, dangling-ref and value-ref failures reported by the pure apply() step.
     for (name, driver_id) in actions.kind_failures {
         outcome.config_failures.push((
             name,
@@ -359,6 +356,12 @@ pub fn persist_import_actions(
     }
     for name in actions.unresolved_ref_connections {
         outcome.unresolved_refs.push(name);
+    }
+    for (name, fields) in actions.value_ref_failures {
+        outcome.config_failures.push((
+            name,
+            format!("unreadable value reference for: {}", fields.join(", ")),
+        ));
     }
 
     // Collect (new_auth_id, field_name) -> secret pairs for in-session hydration.
@@ -655,7 +658,7 @@ mod tests {
         AuthProfile, Connection, ConnectionProfile, DbConfig, DbError, DbKind, DriverFormDef,
         DriverMetadata, ExportFieldHint, FormValues, ProxyProfile, SecretStore, SshTunnelProfile,
     };
-    use datatab_portability::{AwsRef, FieldHintResolver, SecretReader};
+    use datatab_portability::{FieldHintResolver, SecretReader};
     use uuid::Uuid;
 
     // -----------------------------------------------------------------------
@@ -817,8 +820,6 @@ mod tests {
             fields: HashMap::new(),
             secret_fields: HashMap::new(),
             enabled: true,
-            read_only: false,
-            dangling_origin: None,
         }
     }
 
@@ -990,10 +991,6 @@ mod tests {
         let inputs = ExportInputs {
             connections_with_values: vec![(profile, FormValues::default())],
             auth_profiles: vec![make_auth_profile(auth_id)],
-            aws_references: vec![AwsRef {
-                provider_id: "aws-sso".to_string(),
-                name: "dev-account".to_string(),
-            }],
             ssh_tunnels: vec![make_ssh_tunnel(ssh_id)],
             proxies: vec![make_proxy(proxy_id)],
         };
@@ -1005,9 +1002,6 @@ mod tests {
 
         assert_eq!(graph.auth_profiles.len(), 1);
         assert_eq!(graph.auth_profiles[0].id, auth_id);
-
-        assert_eq!(graph.aws_references.len(), 1);
-        assert_eq!(graph.aws_references[0].name, "dev-account");
 
         assert_eq!(graph.ssh_tunnels.len(), 1);
         assert_eq!(graph.ssh_tunnels[0].id, ssh_id);
@@ -1025,7 +1019,6 @@ mod tests {
         let inputs = ExportInputs {
             connections_with_values: vec![(profile, FormValues::default())],
             auth_profiles: vec![],
-            aws_references: vec![],
             ssh_tunnels: vec![],
             proxies: vec![],
         };
@@ -1034,7 +1027,6 @@ mod tests {
 
         assert_eq!(graph.connections.len(), 1);
         assert_eq!(graph.auth_profiles.len(), 0);
-        assert_eq!(graph.aws_references.len(), 0);
         assert_eq!(graph.ssh_tunnels.len(), 0);
         assert_eq!(graph.proxies.len(), 0);
     }
@@ -1044,7 +1036,6 @@ mod tests {
         let inputs = ExportInputs {
             connections_with_values: vec![],
             auth_profiles: vec![],
-            aws_references: vec![],
             ssh_tunnels: vec![],
             proxies: vec![],
         };
@@ -1053,7 +1044,6 @@ mod tests {
 
         assert_eq!(graph.connections.len(), 0);
         assert_eq!(graph.auth_profiles.len(), 0);
-        assert_eq!(graph.aws_references.len(), 0);
         assert_eq!(graph.ssh_tunnels.len(), 0);
         assert_eq!(graph.proxies.len(), 0);
     }
@@ -1073,7 +1063,6 @@ mod tests {
         let inputs = ExportInputs {
             connections_with_values: vec![(profile, FormValues::default())],
             auth_profiles: vec![make_auth_profile(included_auth)],
-            aws_references: vec![],
             ssh_tunnels: vec![],
             proxies: vec![],
         };
@@ -1187,6 +1176,7 @@ mod tests {
             secret_writes: vec![],
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
+            value_ref_failures: vec![],
         }
     }
 
@@ -1223,8 +1213,6 @@ mod tests {
             fields: HashMap::new(),
             secret_fields: HashMap::new(),
             enabled: true,
-            read_only: false,
-            dangling_origin: None,
         };
         let ssh = SshTunnelProfile::new(
             "TestSSH",
@@ -1257,6 +1245,7 @@ mod tests {
             secret_writes: vec![],
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
+            value_ref_failures: vec![],
         };
 
         let outcome = persist_import_actions(actions, &mut deps);
@@ -1283,6 +1272,7 @@ mod tests {
             secret_writes: vec![],
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
+            value_ref_failures: vec![],
         };
 
         let outcome = persist_import_actions(actions, &mut deps);
@@ -1307,6 +1297,7 @@ mod tests {
             secret_writes: vec![],
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
+            value_ref_failures: vec![],
         };
 
         let outcome = persist_import_actions(actions, &mut deps);
@@ -1332,6 +1323,7 @@ mod tests {
             )],
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
+            value_ref_failures: vec![],
         };
 
         let outcome = persist_import_actions(actions, &mut deps);
@@ -1358,11 +1350,36 @@ mod tests {
             )],
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
+            value_ref_failures: vec![],
         };
 
         let outcome = persist_import_actions(actions, &mut deps);
 
         assert!(outcome.secret_failures.is_empty());
+    }
+
+    #[test]
+    fn persist_reports_unreadable_value_refs_as_config_failures_naming_the_fields() {
+        let mut deps = FakePersistence::all_drivers();
+        let mut actions = make_import_actions_empty();
+        actions
+            .connections
+            .push(make_conn_profile("ProdPG", "postgres"));
+        actions.value_ref_failures.push((
+            "Removed source".to_string(),
+            vec!["host".to_string(), "password".to_string()],
+        ));
+
+        let outcome = persist_import_actions(actions, &mut deps);
+
+        assert_eq!(
+            outcome.config_failures,
+            [(
+                "Removed source".to_string(),
+                "unreadable value reference for: host, password".to_string()
+            )]
+        );
+        assert_eq!(outcome.succeeded, ["ProdPG"]);
     }
 
     #[test]
@@ -1380,6 +1397,7 @@ mod tests {
             secret_writes: vec![],
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
+            value_ref_failures: vec![],
         };
 
         let outcome = persist_import_actions(actions, &mut deps);
@@ -1457,6 +1475,7 @@ mod tests {
             secret_writes: vec![],
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
+            value_ref_failures: vec![],
         };
 
         persist_import_actions(actions, &mut recorder);
@@ -1528,6 +1547,7 @@ mod tests {
             secret_writes: vec![],
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
+            value_ref_failures: vec![],
         };
 
         let outcome = persist_import_actions(actions, &mut deps);
@@ -1627,6 +1647,7 @@ mod tests {
             ],
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
+            value_ref_failures: vec![],
         };
 
         let outcome = persist_import_actions(actions, &mut deps);
@@ -1759,7 +1780,6 @@ mod tests {
                     fields: Default::default(),
                     local_path_fields: Default::default(),
                     required_refs: vec![],
-                    auth_ref: None,
                     auth_profile_local_id: None,
                     access: None,
                     value_refs: Default::default(),
@@ -1777,7 +1797,6 @@ mod tests {
                     fields: Default::default(),
                     local_path_fields: Default::default(),
                     required_refs: vec![],
-                    auth_ref: None,
                     auth_profile_local_id: None,
                     access: None,
                     value_refs: Default::default(),
@@ -1880,8 +1899,6 @@ mod tests {
             fields: HashMap::new(),
             secret_fields: HashMap::new(),
             enabled: true,
-            read_only: false,
-            dangling_origin: None,
         };
 
         let actions = ImportActions {
@@ -1895,6 +1912,7 @@ mod tests {
             )],
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
+            value_ref_failures: vec![],
         };
 
         let mut tracker = HydrationTracker {

@@ -11,6 +11,10 @@ use crate::driver::form::FormValues;
 use crate::values::ValueRef;
 
 /// Supported database types.
+///
+/// The driver RPC wire encodes a kind by its position (postcard), so a
+/// variant is never removed or moved: a retired kind keeps its position as a
+/// `Reserved*` slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum DbKind {
     Postgres,
@@ -19,16 +23,29 @@ pub enum DbKind {
     MariaDB,
     MongoDB,
     Redis,
-    DynamoDB,
-    CloudWatchLogs,
+    /// Holds postcard wire index 6 (formerly DynamoDB, removed in #311) so the
+    /// kinds after it keep their indices in the frames driver RPC peers
+    /// send. No driver may declare it, and no profile is saved with it.
+    #[doc(hidden)]
+    ReservedDynamoDb,
+    /// Holds postcard wire index 7 (formerly CloudWatch Logs), like
+    /// [`Self::ReservedDynamoDb`].
+    #[doc(hidden)]
+    ReservedCloudWatchLogs,
     InfluxDB,
     SqlServer,
     Redshift,
-    S3,
+    /// Holds postcard wire index 11 (formerly Amazon S3), like
+    /// [`Self::ReservedDynamoDb`].
+    #[doc(hidden)]
+    ReservedS3,
     ClickHouse,
     Turso,
     DuckDB,
-    AwsSecrets,
+    /// Holds postcard wire index 15 (formerly AWS Secrets), like
+    /// [`Self::ReservedDynamoDb`].
+    #[doc(hidden)]
+    ReservedAwsSecrets,
 }
 
 impl DbKind {
@@ -40,17 +57,30 @@ impl DbKind {
             DbKind::MariaDB => "MariaDB",
             DbKind::MongoDB => "MongoDB",
             DbKind::Redis => "Redis",
-            DbKind::DynamoDB => "DynamoDB",
-            DbKind::CloudWatchLogs => "CloudWatch Logs",
             DbKind::InfluxDB => "InfluxDB",
             DbKind::SqlServer => "SQL Server",
             DbKind::Redshift => "Amazon Redshift",
-            DbKind::S3 => "Amazon S3",
             DbKind::ClickHouse => "ClickHouse",
             DbKind::Turso => "TursoDB",
             DbKind::DuckDB => "DuckDB",
-            DbKind::AwsSecrets => "AWS Secrets",
+            DbKind::ReservedDynamoDb
+            | DbKind::ReservedCloudWatchLogs
+            | DbKind::ReservedS3
+            | DbKind::ReservedAwsSecrets => "Unknown",
         }
+    }
+
+    /// Whether this kind only holds a driver-wire slot of a removed driver.
+    /// Such a kind has no stored name: a profile carrying it is refused at
+    /// save and at bundle import, because it could not be loaded again.
+    pub fn is_reserved(&self) -> bool {
+        matches!(
+            self,
+            DbKind::ReservedDynamoDb
+                | DbKind::ReservedCloudWatchLogs
+                | DbKind::ReservedS3
+                | DbKind::ReservedAwsSecrets
+        )
     }
 }
 
@@ -461,22 +491,6 @@ pub enum DbConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         additional_nodes: Option<String>,
     },
-    DynamoDB {
-        region: String,
-        #[serde(default)]
-        profile: Option<String>,
-        #[serde(default)]
-        endpoint: Option<String>,
-        #[serde(default)]
-        table: Option<String>,
-    },
-    CloudWatchLogs {
-        region: String,
-        #[serde(default)]
-        profile: Option<String>,
-        #[serde(default)]
-        endpoint: Option<String>,
-    },
     /// InfluxDB connection parameters.
     ///
     /// Supports both v1 (InfluxQL, user/password) and v2 (Flux/InfluxQL, token-based).
@@ -579,36 +593,6 @@ pub enum DbConfig {
         #[serde(default)]
         ssh_tunnel_profile_id: Option<Uuid>,
     },
-    /// AWS S3 or an S3-compatible object-storage endpoint (Cloudflare R2, MinIO).
-    ///
-    /// Auth is either an AWS profile/SSO `AuthProfileRef` (`profile`) or static
-    /// credentials (`access_key_id` + the connection's existing keyring-backed
-    /// secret, resolved the same way a Postgres/MySQL password is — no new
-    /// secret-storage mechanism). When both are set, `profile` takes
-    /// precedence, mirroring the AWS SDK's own credential-provider ordering.
-    S3 {
-        /// AWS region, required by the SDK even against S3-compatible
-        /// endpoints that otherwise ignore it.
-        region: String,
-        /// Profile/SSO auth-profile reference (a profile UUID as a string),
-        /// bound to the `profile` `DRIVER_FORM` field declared as
-        /// `FormFieldKind::AuthProfileRef`.
-        #[serde(default)]
-        profile: Option<String>,
-        /// Static AWS access key id. Not sensitive on its own — stored in
-        /// cleartext like `user` on other drivers.
-        #[serde(default)]
-        access_key_id: Option<String>,
-        /// Custom endpoint URL for S3-compatible services. `None` uses the
-        /// AWS SDK's default S3 endpoint resolution.
-        #[serde(default)]
-        endpoint: Option<String>,
-        /// Force path-style addressing (`endpoint/bucket/key`) instead of
-        /// virtual-hosted-style (`bucket.endpoint/key`). Required by most
-        /// S3-compatible endpoints (MinIO) and some Cloudflare R2 setups.
-        #[serde(default)]
-        path_style: bool,
-    },
     ClickHouse {
         url: String,
         user: String,
@@ -638,29 +622,6 @@ pub enum DbConfig {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         init_sql: Option<String>,
     },
-    /// AWS Secrets Manager and Systems Manager Parameter Store, browsed as
-    /// two secret stores of one connection.
-    ///
-    /// Auth follows `S3`: an AWS profile/SSO `AuthProfileRef` (`profile`) or
-    /// static credentials (`access_key_id` plus the connection's
-    /// keyring-backed secret). When both are set, `profile` takes precedence.
-    AwsSecrets {
-        /// AWS region both services are reached in.
-        region: String,
-        /// Profile/SSO auth-profile reference (a profile UUID as a string),
-        /// bound to the `profile` `DRIVER_FORM` field declared as
-        /// `FormFieldKind::AuthProfileRef`.
-        #[serde(default)]
-        profile: Option<String>,
-        /// Static AWS access key id, stored in cleartext like `user` on
-        /// other drivers.
-        #[serde(default)]
-        access_key_id: Option<String>,
-        /// Custom endpoint URL (for example a LocalStack instance). `None`
-        /// uses the AWS SDK's default endpoint resolution.
-        #[serde(default)]
-        endpoint: Option<String>,
-    },
     /// Generic config for external RPC drivers.
     External {
         kind: DbKind,
@@ -681,16 +642,12 @@ impl DbConfig {
             DbConfig::MySQL { .. } => DbKind::MySQL,
             DbConfig::MongoDB { .. } => DbKind::MongoDB,
             DbConfig::Redis { .. } => DbKind::Redis,
-            DbConfig::DynamoDB { .. } => DbKind::DynamoDB,
-            DbConfig::CloudWatchLogs { .. } => DbKind::CloudWatchLogs,
             DbConfig::InfluxDB { .. } => DbKind::InfluxDB,
             DbConfig::SqlServer { .. } => DbKind::SqlServer,
             DbConfig::Redshift { .. } => DbKind::Redshift,
-            DbConfig::S3 { .. } => DbKind::S3,
             DbConfig::ClickHouse { .. } => DbKind::ClickHouse,
             DbConfig::Turso { .. } => DbKind::Turso,
             DbConfig::DuckDB { .. } => DbKind::DuckDB,
-            DbConfig::AwsSecrets { .. } => DbKind::AwsSecrets,
             DbConfig::External { kind, .. } => *kind,
         }
     }
@@ -775,15 +732,6 @@ impl DbConfig {
         }
     }
 
-    pub fn default_dynamodb() -> Self {
-        DbConfig::DynamoDB {
-            region: "us-east-1".to_string(),
-            profile: None,
-            endpoint: None,
-            table: None,
-        }
-    }
-
     pub fn default_influxdb() -> Self {
         DbConfig::InfluxDB {
             version: InfluxVersion::V2,
@@ -793,14 +741,6 @@ impl DbConfig {
             retention_policy: None,
             user: None,
             request_timeout_seconds: None,
-        }
-    }
-
-    pub fn default_cloudwatch_logs() -> Self {
-        DbConfig::CloudWatchLogs {
-            region: "us-east-1".to_string(),
-            profile: None,
-            endpoint: None,
         }
     }
 
@@ -838,25 +778,6 @@ impl DbConfig {
         }
     }
 
-    pub fn default_s3() -> Self {
-        DbConfig::S3 {
-            region: "us-east-1".to_string(),
-            profile: None,
-            access_key_id: None,
-            endpoint: None,
-            path_style: false,
-        }
-    }
-
-    pub fn default_aws_secrets() -> Self {
-        DbConfig::AwsSecrets {
-            region: "us-east-1".to_string(),
-            profile: None,
-            access_key_id: None,
-            endpoint: None,
-        }
-    }
-
     pub fn default_turso() -> Self {
         DbConfig::Turso { url: String::new() }
     }
@@ -889,11 +810,7 @@ impl DbConfig {
             | DbConfig::SqlServer { ssh_tunnel, .. }
             | DbConfig::Redshift { ssh_tunnel, .. } => ssh_tunnel.as_ref(),
             DbConfig::SQLite { .. }
-            | DbConfig::DynamoDB { .. }
-            | DbConfig::CloudWatchLogs { .. }
             | DbConfig::InfluxDB { .. }
-            | DbConfig::S3 { .. }
-            | DbConfig::AwsSecrets { .. }
             | DbConfig::ClickHouse { .. }
             | DbConfig::Turso { .. }
             | DbConfig::DuckDB { .. }
@@ -929,11 +846,7 @@ impl DbConfig {
                 ..
             } => *ssh_tunnel_profile_id,
             DbConfig::SQLite { .. }
-            | DbConfig::DynamoDB { .. }
-            | DbConfig::CloudWatchLogs { .. }
             | DbConfig::InfluxDB { .. }
-            | DbConfig::S3 { .. }
-            | DbConfig::AwsSecrets { .. }
             | DbConfig::ClickHouse { .. }
             | DbConfig::Turso { .. }
             | DbConfig::DuckDB { .. }
@@ -982,11 +895,7 @@ impl DbConfig {
                 *profile_id = ssh_tunnel_profile_id;
             }
             DbConfig::SQLite { .. }
-            | DbConfig::DynamoDB { .. }
-            | DbConfig::CloudWatchLogs { .. }
             | DbConfig::InfluxDB { .. }
-            | DbConfig::S3 { .. }
-            | DbConfig::AwsSecrets { .. }
             | DbConfig::ClickHouse { .. }
             | DbConfig::Turso { .. }
             | DbConfig::DuckDB { .. }
@@ -1028,11 +937,7 @@ impl DbConfig {
                 ..
             } => ssh_tunnel.is_some() || ssh_tunnel_profile_id.is_some(),
             DbConfig::SQLite { .. }
-            | DbConfig::DynamoDB { .. }
-            | DbConfig::CloudWatchLogs { .. }
             | DbConfig::InfluxDB { .. }
-            | DbConfig::S3 { .. }
-            | DbConfig::AwsSecrets { .. }
             | DbConfig::ClickHouse { .. }
             | DbConfig::Turso { .. }
             | DbConfig::DuckDB { .. }
@@ -1050,11 +955,7 @@ impl DbConfig {
             | DbConfig::SqlServer { host, port, .. }
             | DbConfig::Redshift { host, port, .. } => Some((host, *port)),
             DbConfig::SQLite { .. }
-            | DbConfig::DynamoDB { .. }
-            | DbConfig::CloudWatchLogs { .. }
             | DbConfig::InfluxDB { .. }
-            | DbConfig::S3 { .. }
-            | DbConfig::AwsSecrets { .. }
             | DbConfig::ClickHouse { .. }
             | DbConfig::Turso { .. }
             | DbConfig::DuckDB { .. }
@@ -1106,11 +1007,7 @@ impl DbConfig {
                 *use_uri = false;
             }
             DbConfig::SQLite { .. }
-            | DbConfig::DynamoDB { .. }
-            | DbConfig::CloudWatchLogs { .. }
             | DbConfig::InfluxDB { .. }
-            | DbConfig::S3 { .. }
-            | DbConfig::AwsSecrets { .. }
             | DbConfig::ClickHouse { .. }
             | DbConfig::Turso { .. }
             | DbConfig::DuckDB { .. }
@@ -1142,11 +1039,7 @@ impl DbConfig {
             | DbConfig::SqlServer { use_uri, uri, .. }
             | DbConfig::Redshift { use_uri, uri, .. } => (use_uri, uri),
             DbConfig::SQLite { .. }
-            | DbConfig::DynamoDB { .. }
-            | DbConfig::CloudWatchLogs { .. }
             | DbConfig::InfluxDB { .. }
-            | DbConfig::S3 { .. }
-            | DbConfig::AwsSecrets { .. }
             | DbConfig::ClickHouse { .. }
             | DbConfig::Turso { .. }
             | DbConfig::DuckDB { .. }
@@ -1171,7 +1064,7 @@ impl DbConfig {
     }
 
     /// Returns the database name for configs that support it.
-    /// Returns `None` for SQLite, DynamoDB, and External configs.
+    /// Returns `None` for configs without a database name, such as External.
     pub fn database(&self) -> Option<String> {
         match self {
             DbConfig::Postgres { database, .. } => Some(database.clone()),
@@ -1181,25 +1074,11 @@ impl DbConfig {
             DbConfig::SqlServer { database, .. } => database.clone(),
             DbConfig::Redshift { database, .. } => Some(database.clone()),
             DbConfig::SQLite { .. } => Some("main".to_string()),
-            DbConfig::DuckDB { .. } | DbConfig::AwsSecrets { .. } => None,
-            DbConfig::DynamoDB { .. } | DbConfig::CloudWatchLogs { .. } => None,
+            DbConfig::DuckDB { .. } => None,
             DbConfig::InfluxDB { default_bucket, .. } => default_bucket.clone(),
             DbConfig::ClickHouse { database, .. } => Some(database.clone()),
-            DbConfig::S3 { .. } | DbConfig::Turso { .. } => None,
+            DbConfig::Turso { .. } => None,
             DbConfig::External { .. } => None,
-        }
-    }
-
-    /// Returns the cloud region this connection is configured against, for the
-    /// configs that carry one. Generic UI code uses it to pre-fill
-    /// region-scoped forms without knowing which driver it is talking to.
-    pub fn region(&self) -> Option<&str> {
-        match self {
-            DbConfig::DynamoDB { region, .. }
-            | DbConfig::CloudWatchLogs { region, .. }
-            | DbConfig::S3 { region, .. }
-            | DbConfig::AwsSecrets { region, .. } => Some(region.as_str()),
-            _ => None,
         }
     }
 
@@ -1820,16 +1699,18 @@ impl ConnectionProfile {
             DbKind::MariaDB => "mariadb",
             DbKind::MongoDB => "mongodb",
             DbKind::Redis => "redis",
-            DbKind::DynamoDB => "dynamodb",
-            DbKind::CloudWatchLogs => "cloudwatch",
             DbKind::InfluxDB => "influxdb",
             DbKind::SqlServer => "mssql",
             DbKind::Redshift => "redshift",
-            DbKind::S3 => "s3",
             DbKind::ClickHouse => "clickhouse",
             DbKind::Turso => "turso",
             DbKind::DuckDB => "duckdb",
-            DbKind::AwsSecrets => "aws_secrets",
+            // No driver registers under these ids (built-in ids are fixed
+            // names and external ids start with `rpc:`), so a reserved kind is refused as an unregistered driver.
+            DbKind::ReservedDynamoDb => "reserved:dynamodb",
+            DbKind::ReservedCloudWatchLogs => "reserved:cloudwatch-logs",
+            DbKind::ReservedS3 => "reserved:s3",
+            DbKind::ReservedAwsSecrets => "reserved:aws-secrets",
         }
     }
 
@@ -1853,24 +1734,6 @@ impl ConnectionProfile {
     /// (has auth profile, value refs, or unified access method).
     pub fn uses_pipeline(&self) -> bool {
         self.auth_profile_id.is_some() || !self.value_refs.is_empty() || self.access_kind.is_some()
-    }
-
-    /// Returns an external auth profile name embedded in the driver config.
-    ///
-    /// This lets app-layer connection orchestration route profiles through the
-    /// generic auth pipeline without matching on concrete driver names.
-    pub fn external_auth_profile_name(&self) -> Option<&str> {
-        match &self.config {
-            DbConfig::CloudWatchLogs {
-                profile: Some(profile),
-                ..
-            }
-            | DbConfig::DynamoDB {
-                profile: Some(profile),
-                ..
-            } => Some(profile.as_str()),
-            _ => None,
-        }
     }
 
     /// Derives an AccessKind from legacy fields (proxy_profile_id, ssh_tunnel_profile_id)
@@ -1981,6 +1844,31 @@ mod tests {
     use crate::config::app::GlobalOverrides;
     use crate::driver::form::FormValues;
     use crate::values::ValueRef;
+
+    #[test]
+    fn reserved_kinds_get_distinct_ids_no_driver_registers() {
+        let reserved = [
+            DbKind::ReservedDynamoDb,
+            DbKind::ReservedCloudWatchLogs,
+            DbKind::ReservedS3,
+            DbKind::ReservedAwsSecrets,
+        ];
+        let ids: std::collections::HashSet<&str> = reserved
+            .iter()
+            .map(|kind| ConnectionProfile::builtin_driver_id_for_kind(*kind))
+            .collect();
+        assert_eq!(
+            ids.len(),
+            reserved.len(),
+            "each reserved kind has its own id"
+        );
+        for id in ids {
+            assert!(id.starts_with("reserved:"), "{id}");
+            for kept in [DbKind::Postgres, DbKind::SQLite, DbKind::Redis] {
+                assert_ne!(id, ConnectionProfile::builtin_driver_id_for_kind(kept));
+            }
+        }
+    }
 
     fn sqlite_profile() -> ConnectionProfile {
         ConnectionProfile::new("test-sqlite", DbConfig::default_sqlite())
@@ -2099,10 +1987,7 @@ mod tests {
         let tunnel_profile_id = Uuid::from_u128(1);
         let mut configs = [
             DbConfig::default_sqlite(),
-            DbConfig::default_dynamodb(),
-            DbConfig::default_cloudwatch_logs(),
             DbConfig::default_influxdb(),
-            DbConfig::default_s3(),
             DbConfig::default_clickhouse(),
             DbConfig::default_turso(),
             DbConfig::External {
@@ -2317,25 +2202,6 @@ mod tests {
     }
 
     #[test]
-    fn dynamodb_config_kind_and_driver_id_fallback_work() {
-        let json = r#"{
-            "id": "00000000-0000-0000-0000-000000000099",
-            "name": "legacy-dynamodb",
-            "config": {
-                "DynamoDB": {
-                    "region": "us-east-1"
-                }
-            }
-        }"#;
-
-        let profile: ConnectionProfile =
-            serde_json::from_str(json).expect("dynamodb profile should deserialize");
-
-        assert_eq!(profile.kind(), DbKind::DynamoDB);
-        assert_eq!(profile.driver_id(), "dynamodb");
-    }
-
-    #[test]
     fn clickhouse_profile_without_insecure_http_flag_loads_as_off() {
         let json = r#"{
             "id": "00000000-0000-0000-0000-000000000182",
@@ -2385,86 +2251,6 @@ mod tests {
                 ..
             } if database == "logs"
         ));
-    }
-
-    #[test]
-    fn dynamodb_profile_serde_roundtrip_preserves_optional_fields() {
-        let profile = ConnectionProfile::new(
-            "dynamo",
-            DbConfig::DynamoDB {
-                region: "us-west-2".to_string(),
-                profile: Some("dev".to_string()),
-                endpoint: Some("http://localhost:8000".to_string()),
-                table: Some("users".to_string()),
-            },
-        );
-
-        let json = serde_json::to_string(&profile).expect("serialize should succeed");
-        let restored: ConnectionProfile =
-            serde_json::from_str(&json).expect("deserialize should succeed");
-
-        match restored.config {
-            DbConfig::DynamoDB {
-                region,
-                profile,
-                endpoint,
-                table,
-            } => {
-                assert_eq!(region, "us-west-2");
-                assert_eq!(profile.as_deref(), Some("dev"));
-                assert_eq!(endpoint.as_deref(), Some("http://localhost:8000"));
-                assert_eq!(table.as_deref(), Some("users"));
-            }
-            _ => panic!("expected DynamoDB config variant"),
-        }
-    }
-
-    #[test]
-    fn cloudwatch_config_kind_and_driver_id_fallback_work() {
-        let json = r#"{
-            "id": "00000000-0000-0000-0000-000000000100",
-            "name": "legacy-cloudwatch",
-            "config": {
-                "CloudWatchLogs": {
-                    "region": "us-east-1"
-                }
-            }
-        }"#;
-
-        let profile: ConnectionProfile =
-            serde_json::from_str(json).expect("cloudwatch profile should deserialize");
-
-        assert_eq!(profile.kind(), DbKind::CloudWatchLogs);
-        assert_eq!(profile.driver_id(), "cloudwatch");
-    }
-
-    #[test]
-    fn cloudwatch_profile_serde_roundtrip_preserves_optional_fields() {
-        let profile = ConnectionProfile::new(
-            "cloudwatch",
-            DbConfig::CloudWatchLogs {
-                region: "us-west-2".to_string(),
-                profile: Some("dev".to_string()),
-                endpoint: Some("http://localhost:4566".to_string()),
-            },
-        );
-
-        let json = serde_json::to_string(&profile).expect("serialize should succeed");
-        let restored: ConnectionProfile =
-            serde_json::from_str(&json).expect("deserialize should succeed");
-
-        match restored.config {
-            DbConfig::CloudWatchLogs {
-                region,
-                profile,
-                endpoint,
-            } => {
-                assert_eq!(region, "us-west-2");
-                assert_eq!(profile.as_deref(), Some("dev"));
-                assert_eq!(endpoint.as_deref(), Some("http://localhost:4566"));
-            }
-            _ => panic!("expected CloudWatch Logs config variant"),
-        }
     }
 
     #[test]
@@ -2684,7 +2470,6 @@ mod tests {
         let sources = [
             ValueRef::env("DB_PASS"),
             ValueRef::secret("aws-secrets-manager", "db/creds", None),
-            ValueRef::parameter_with_key("aws-ssm", "/db/pass", None),
             ValueRef::auth("password"),
             ValueRef::literal("stored"),
         ];

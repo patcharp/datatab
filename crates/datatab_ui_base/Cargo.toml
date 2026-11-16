@@ -20,7 +20,6 @@ datatab_components.workspace = true
 datatab_core.workspace = true
 datatab_i18n.workspace = true
 datatab_mcp = { workspace = true, optional = true }
-datatab_aws = { workspace = true, optional = true }
 gpui-mcp = { workspace = true, optional = true }
 tracing.workspace = true
 uuid.workspace = true
@@ -45,7 +44,6 @@ default = []
 test-support = ["gpui/test-support", "bolt/test-support"]
 mcp = ["datatab_mcp", "datatab_app/mcp"]
 lua = ["datatab_app/lua"]
-aws = ["datatab_aws", "datatab_app/aws"]
 # Installs the gpui-mcp automation bridge in every window. Development only: the
 # bridge exposes rendered UI text to local processes of the same user.
 ui-automation = ["dep:gpui-mcp"]

@@ -18,7 +18,9 @@ use datatab_storage::repositories::connection_profile_governance_bindings::Conne
 use datatab_storage::repositories::connection_profile_hook_bindings::ConnectionProfileHookBindingDto;
 use datatab_storage::repositories::connection_profile_hooks::ConnectionProfileHookDto;
 use datatab_storage::repositories::connection_profile_settings::ConnectionProfileSettingDto;
-use datatab_storage::repositories::connection_profile_value_refs::ConnectionProfileValueRefDto;
+use datatab_storage::repositories::connection_profile_value_refs::{
+    ConnectionProfileValueRefDto, ValueRefLoadDiagnostic,
+};
 use datatab_storage::repositories::connection_profiles::ConnectionProfileDto;
 use datatab_storage::repositories::driver_overrides::DriverOverridesDto;
 use datatab_storage::repositories::driver_setting_values::DriverSettingValueDto;
@@ -28,6 +30,8 @@ use datatab_storage::repositories::general_settings::{
 use datatab_storage::repositories::hook_definitions::{
     HookDefinitionDto, HookDefinitionReplacement,
 };
+
+pub type ProfileValueRefDiagnostics = HashMap<uuid::Uuid, Vec<ValueRefLoadDiagnostic>>;
 
 pub fn save_general_settings(
     runtime: &StorageRuntime,
@@ -367,9 +371,38 @@ pub fn save_profiles(
     runtime: &StorageRuntime,
     profiles: &[ConnectionProfile],
 ) -> Result<(), datatab_storage::error::StorageError> {
+    save_profiles_preserving_value_refs(runtime, profiles, &HashMap::new())
+}
+
+/// Why `profile` cannot be saved, when its kind or its config's kind is a
+/// reserved driver-wire slot (`DbKind::is_reserved`). Such a kind has no
+/// stored name, so the saved profile would be gone at the next start.
+pub(crate) fn reserved_kind_refusal(profile: &ConnectionProfile) -> Option<String> {
+    (profile.kind().is_reserved() || profile.config.kind().is_reserved()).then(|| {
+        format!(
+            "Connection profile '{}' cannot be saved: its driver declares a reserved database kind",
+            profile.id
+        )
+    })
+}
+
+/// Saves `profiles`. A profile with a reserved kind is refused: no row is
+/// written for it, the other profiles are still saved, and the returned
+/// error names each refused profile and the reason.
+pub(crate) fn save_profiles_preserving_value_refs(
+    runtime: &StorageRuntime,
+    profiles: &[ConnectionProfile],
+    diagnostics: &ProfileValueRefDiagnostics,
+) -> Result<(), datatab_storage::error::StorageError> {
     let repo = runtime.connection_profiles();
+    let mut refused = Vec::new();
 
     for profile in profiles {
+        if let Some(reason) = reserved_kind_refusal(profile) {
+            refused.push(reason);
+            continue;
+        }
+
         let (access_kind_str, access_provider_str, ssh_tunnel_profile_id_str) =
             access_kind_columns(&profile.access_kind);
 
@@ -452,11 +485,14 @@ pub fn save_profiles(
         }
 
         // value_refs → connection_profile_value_refs
-        let value_refs_repo = repo.value_refs();
-        value_refs_repo.delete_for_profile(profile_id)?;
-        for (key, value_ref) in &profile.value_refs {
-            let dto = value_ref_to_dto(profile_id, key, value_ref);
-            value_refs_repo.insert(&dto)?;
+        // An unrelated save must not erase rows dropped during load.
+        if !diagnostics.contains_key(&profile.id) {
+            let value_refs_repo = repo.value_refs();
+            value_refs_repo.delete_for_profile(profile_id)?;
+            for (key, value_ref) in &profile.value_refs {
+                let dto = value_ref_to_dto(profile_id, key, value_ref);
+                value_refs_repo.insert(&dto)?;
+            }
         }
 
         // access_kind params → connection_profile_access_params
@@ -507,6 +543,12 @@ pub fn save_profiles(
         }
     }
 
+    if !refused.is_empty() {
+        return Err(datatab_storage::error::StorageError::Data(
+            refused.join("; "),
+        ));
+    }
+
     Ok(())
 }
 
@@ -518,16 +560,18 @@ fn db_kind_to_str(kind: DbKind) -> String {
         DbKind::MariaDB => "MariaDB",
         DbKind::MongoDB => "MongoDB",
         DbKind::Redis => "Redis",
-        DbKind::DynamoDB => "DynamoDB",
-        DbKind::CloudWatchLogs => "CloudWatchLogs",
         DbKind::InfluxDB => "InfluxDB",
         DbKind::SqlServer => "SqlServer",
         DbKind::Redshift => "Redshift",
-        DbKind::S3 => "S3",
         DbKind::ClickHouse => "ClickHouse",
         DbKind::Turso => "Turso",
         DbKind::DuckDB => "DuckDB",
-        DbKind::AwsSecrets => "AwsSecrets",
+        // A reserved wire slot has no stored name. `str_to_db_kind` does not
+        // parse this one, and `save_profiles` refuses such a profile.
+        DbKind::ReservedDynamoDb
+        | DbKind::ReservedCloudWatchLogs
+        | DbKind::ReservedS3
+        | DbKind::ReservedAwsSecrets => "Reserved",
     }
     .to_string()
 }
@@ -540,38 +584,40 @@ fn str_to_db_kind(s: &str) -> Option<DbKind> {
         "MariaDB" => Some(DbKind::MariaDB),
         "MongoDB" => Some(DbKind::MongoDB),
         "Redis" => Some(DbKind::Redis),
-        "DynamoDB" => Some(DbKind::DynamoDB),
-        "CloudWatchLogs" => Some(DbKind::CloudWatchLogs),
         "InfluxDB" => Some(DbKind::InfluxDB),
         "SqlServer" => Some(DbKind::SqlServer),
         "Redshift" => Some(DbKind::Redshift),
-        "S3" => Some(DbKind::S3),
         "ClickHouse" => Some(DbKind::ClickHouse),
         "Turso" => Some(DbKind::Turso),
         "DuckDB" => Some(DbKind::DuckDB),
-        "AwsSecrets" => Some(DbKind::AwsSecrets),
+        // The names of the removed AWS drivers ("DynamoDB", "CloudWatchLogs",
+        // "S3", "AwsSecrets") are unknown like any other string.
         _ => None,
     }
 }
 
-fn default_db_config_for_kind(kind: DbKind) -> datatab_core::DbConfig {
-    match kind {
+/// The config a profile row gets when it has no driver-config row. `None` for
+/// a reserved wire slot, which has no config.
+fn default_db_config_for_kind(kind: DbKind) -> Option<datatab_core::DbConfig> {
+    let config = match kind {
         DbKind::Postgres => datatab_core::DbConfig::default_postgres(),
         DbKind::SQLite => datatab_core::DbConfig::default_sqlite(),
         DbKind::MySQL | DbKind::MariaDB => datatab_core::DbConfig::default_mysql(),
         DbKind::MongoDB => datatab_core::DbConfig::default_mongodb(),
         DbKind::Redis => datatab_core::DbConfig::default_redis(),
-        DbKind::DynamoDB => datatab_core::DbConfig::default_dynamodb(),
-        DbKind::CloudWatchLogs => datatab_core::DbConfig::default_cloudwatch_logs(),
         DbKind::InfluxDB => datatab_core::DbConfig::default_influxdb(),
         DbKind::SqlServer => datatab_core::DbConfig::default_sqlserver(),
         DbKind::Redshift => datatab_core::DbConfig::default_redshift(),
-        DbKind::S3 => datatab_core::DbConfig::default_s3(),
         DbKind::ClickHouse => datatab_core::DbConfig::default_clickhouse(),
         DbKind::Turso => datatab_core::DbConfig::default_turso(),
         DbKind::DuckDB => datatab_core::DbConfig::default_duckdb(),
-        DbKind::AwsSecrets => datatab_core::DbConfig::default_aws_secrets(),
-    }
+        DbKind::ReservedDynamoDb
+        | DbKind::ReservedCloudWatchLogs
+        | DbKind::ReservedS3
+        | DbKind::ReservedAwsSecrets => return None,
+    };
+
+    Some(config)
 }
 
 fn access_kind_columns(
@@ -847,17 +893,6 @@ fn value_ref_to_dto(
             locator.clone(),
             json_key.clone(),
         ),
-        ValueRef::Parameter {
-            provider,
-            name,
-            json_key,
-        } => ConnectionProfileValueRefDto::new_param(
-            profile_id.to_string(),
-            key.to_string(),
-            provider.clone(),
-            name.clone(),
-            json_key.clone(),
-        ),
         ValueRef::Auth { field } => ConnectionProfileValueRefDto::new_auth(
             profile_id.to_string(),
             key.to_string(),
@@ -1057,6 +1092,7 @@ pub struct LoadedConfig {
     pub protected_hook_rows: Vec<ProtectedHookRow>,
     pub services: Vec<ServiceConfig>,
     pub profiles: Vec<ConnectionProfile>,
+    pub value_ref_diagnostics: ProfileValueRefDiagnostics,
     pub auth_profiles: Vec<datatab_core::AuthProfile>,
     pub proxy_profiles: Vec<ProxyProfile>,
     pub ssh_tunnels: Vec<SshTunnelProfile>,
@@ -1083,7 +1119,7 @@ pub fn load_config(
     let (hook_definitions, hook_load_diagnostics, protected_hook_rows) =
         load_hook_definitions(&hooks_repo)?;
     let services = datatab_storage::load_service_configs(runtime);
-    let profiles = load_profiles(&profiles_repo);
+    let (profiles, value_ref_diagnostics) = load_profiles(&profiles_repo);
     let auth_profiles = load_auth_profiles(&auth_repo);
     let proxy_profiles = load_proxy_profiles(&proxy_repo, &proxy_repo.auth_repo());
     let ssh_tunnels = load_ssh_tunnels(&ssh_repo);
@@ -1097,6 +1133,7 @@ pub fn load_config(
         protected_hook_rows,
         services,
         profiles,
+        value_ref_diagnostics,
         auth_profiles,
         proxy_profiles,
         ssh_tunnels,
@@ -1642,23 +1679,22 @@ fn load_hook_bindings_from_dtos(
     result
 }
 
-/// `load_profiles` has no error channel, so a stored value reference that cannot be
-/// rebuilt is skipped while the rest of the profile still loads. The warning keeps that
-/// skip visible; it names the field but never a stored value.
-fn warn_dropped_value_ref(profile_id: &str, ref_key: &str, kind: &str, missing: &str) {
+fn warn_dropped_value_ref(profile_id: &str, diagnostic: &ValueRefLoadDiagnostic) {
     log::warn!(
-        "Skipping {kind} value reference for field '{ref_key}' of connection profile {profile_id}: the stored row has no {missing}"
+        "Skipping value reference of connection profile {profile_id}: {}",
+        diagnostic.message()
     );
 }
 
 fn load_profiles(
     repo: &datatab_storage::repositories::connection_profiles::ConnectionProfileRepository,
-) -> Vec<ConnectionProfile> {
+) -> (Vec<ConnectionProfile>, ProfileValueRefDiagnostics) {
     let Ok(dtos) = repo.all() else {
-        return Vec::new();
+        return (Vec::new(), HashMap::new());
     };
+    let mut diagnostics = HashMap::new();
 
-    dtos
+    let profiles = dtos
         .into_iter()
         .filter_map(|dto| {
             let profile_id = &dto.id;
@@ -1667,15 +1703,21 @@ fn load_profiles(
             // Load DbConfig from connection_driver_configs (native columns)
             let driver_configs_repo = repo.driver_configs();
             let driver_dto = driver_configs_repo.get_for_profile(profile_id).ok().flatten();
-            let config = driver_dto
+            let Some(config) = driver_dto
                 .and_then(|d| d.to_db_config())
                 .or_else(|| {
                     // Fallback: construct default config based on kind if driver config is missing
                     dto.kind.as_ref().and_then(|kind_str| {
                         let kind = str_to_db_kind(kind_str)?;
-                        Some(default_db_config_for_kind(kind))
+                        default_db_config_for_kind(kind)
                     })
-                })?;
+                })
+            else {
+                log::warn!(
+                    "Dropping stored connection profile {profile_id}: its kind has no supported driver"
+                );
+                return None;
+            };
 
             // Load settings overrides and connection settings from connection_profile_settings
             let settings_repo = repo.settings();
@@ -1688,7 +1730,14 @@ fn load_profiles(
             let value_refs_map = value_refs
                 .into_iter()
                 .filter_map(|vr| {
-                    let kind = datatab_storage::repositories::connection_profile_value_refs::RefKind::try_parse(&vr.ref_kind)?;
+                    let kind = match vr.load_kind() {
+                        Ok(kind) => kind,
+                        Err(diagnostic) => {
+                            warn_dropped_value_ref(profile_id, &diagnostic);
+                            diagnostics.entry(id).or_insert_with(Vec::new).push(diagnostic);
+                            return None;
+                        }
+                    };
                     let value_ref = match kind {
                         datatab_storage::repositories::connection_profile_value_refs::RefKind::Literal => {
                             ValueRef::Literal {
@@ -1701,10 +1750,7 @@ fn load_profiles(
                             }
                         }
                         datatab_storage::repositories::connection_profile_value_refs::RefKind::Dotenv => {
-                            let Some(key) = vr.env_key else {
-                                warn_dropped_value_ref(profile_id, &vr.ref_key, "dotenv", "key");
-                                return None;
-                            };
+                            let key = vr.env_key?;
                             ValueRef::Dotenv {
                                 path: vr.ref_value,
                                 key,
@@ -1717,23 +1763,9 @@ fn load_profiles(
                             }
                         }
                         datatab_storage::repositories::connection_profile_value_refs::RefKind::Secret => {
-                            let Some(provider) = vr.ref_provider else {
-                                warn_dropped_value_ref(profile_id, &vr.ref_key, "secret", "provider");
-                                return None;
-                            };
+                            let provider = vr.ref_provider?;
                             ValueRef::Secret {
                                 locator: vr.secret_locator.unwrap_or(vr.ref_value),
-                                provider,
-                                json_key: vr.ref_json_key,
-                            }
-                        }
-                        datatab_storage::repositories::connection_profile_value_refs::RefKind::Param => {
-                            let Some(provider) = vr.ref_provider else {
-                                warn_dropped_value_ref(profile_id, &vr.ref_key, "parameter", "provider");
-                                return None;
-                            };
-                            ValueRef::Parameter {
-                                name: vr.param_name.unwrap_or(vr.ref_value),
                                 provider,
                                 json_key: vr.ref_json_key,
                             }
@@ -1871,7 +1903,8 @@ fn load_profiles(
                 show_all_databases: dto.show_all_databases,
             })
         })
-        .collect()
+        .collect();
+    (profiles, diagnostics)
 }
 
 // ---------------------------------------------------------------------------
@@ -1897,8 +1930,6 @@ fn load_auth_profiles(
                     // fields are secret-kind.
                     secret_fields: std::collections::HashMap::new(),
                     enabled: dto.enabled,
-                    read_only: false,
-                    dangling_origin: dto.dangling_origin,
                 })
             })
             .collect()
@@ -2745,11 +2776,11 @@ mod tests {
     fn default_db_config_for_kind_maps_mariadb_to_mysql_config() {
         assert!(matches!(
             default_db_config_for_kind(DbKind::MariaDB),
-            DbConfig::MySQL { .. }
+            Some(DbConfig::MySQL { .. })
         ));
         assert!(matches!(
             default_db_config_for_kind(DbKind::MySQL),
-            DbConfig::MySQL { .. }
+            Some(DbConfig::MySQL { .. })
         ));
     }
 
@@ -2757,7 +2788,7 @@ mod tests {
     fn default_db_config_for_kind_maps_influxdb_to_influx_config() {
         assert!(matches!(
             default_db_config_for_kind(DbKind::InfluxDB),
-            DbConfig::InfluxDB { .. }
+            Some(DbConfig::InfluxDB { .. })
         ));
     }
 
@@ -2767,13 +2798,13 @@ mod tests {
         assert_eq!(str_to_db_kind("ClickHouse"), Some(DbKind::ClickHouse));
         assert!(matches!(
             default_db_config_for_kind(DbKind::ClickHouse),
-            DbConfig::ClickHouse {
+            Some(DbConfig::ClickHouse {
                 ref url,
                 ref user,
                 ref database,
                 request_timeout_seconds: None,
                 allow_insecure_http_password: false,
-            } if url == "http://localhost:8123" && user == "default" && database == "default"
+            }) if url == "http://localhost:8123" && user == "default" && database == "default"
         ));
     }
 
@@ -3633,7 +3664,7 @@ mod tests {
         assert_eq!(str_to_db_kind("Turso"), Some(DbKind::Turso));
         assert!(matches!(
             default_db_config_for_kind(DbKind::Turso),
-            DbConfig::Turso { ref url } if url.is_empty()
+            Some(DbConfig::Turso { ref url }) if url.is_empty()
         ));
     }
 }

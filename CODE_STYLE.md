@@ -77,7 +77,7 @@
 - Do call `cx.notify()` after state changes that should re-render (crates/datatab_ui/src/ui/views/workspace/mod.rs).
 - Do use `background_executor().spawn()` for DB operations to avoid blocking UI.
 - Do propagate or log errors; do not silently discard fallible results.
-- Do refactor and modularize functions that grow beyond ~100 lines; treat this as a design smell.
+- Do refactor and modularize logic functions that grow beyond ~100 lines (render functions that only build an element tree: ~200 lines); treat this as a design smell. See `CONTRIBUTING.md` § Pull Requests.
 - Do use abstractions (`DatabaseCategory`, `QueryLanguage`, `DriverCapabilities`) to adapt UI behavior instead of driver-specific conditionals.
 - Do use `QueryGenerator` for copied queries and textual read/DML previews; do not duplicate mutation or read template formatting in the UI.
 - Do keep each `crates/datatab_driver_*/README.md` updated with current **Features** and **Limitations**.

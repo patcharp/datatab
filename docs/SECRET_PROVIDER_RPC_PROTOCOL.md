@@ -45,8 +45,8 @@ the manifest's `provider_id`:
 { "source": "secret", "provider": "<provider_id>", "locator": "prod/db/password", "json_key": "password" }
 ```
 
-`json_key` is optional and omitted when unset. The built-in AWS providers use the same shape
-with the reserved ids `aws-secrets-manager` and `aws-ssm`, and keep working unchanged.
+`json_key` is optional and omitted when unset. DataTab ships no built-in secret provider, so every
+provider id comes from an RPC service and none is reserved.
 
 ## Transport
 
@@ -126,7 +126,7 @@ If the provider answers `Hello` with `Error`, the probe fails and the provider i
 | Field | Type | Rule |
 |---|---|---|
 | `manifest_version` | `u16` | Must be `1` |
-| `provider_id` | string | 1 to 64 characters, only `a-z`, `0-9`, `.`, `_`, `-`; must not be a reserved id (`aws-secrets-manager`, `aws-ssm`) or an id another provider already registered |
+| `provider_id` | string | 1 to 64 characters, only `a-z`, `0-9`, `.`, `_`, `-`; must not be an id another provider already registered |
 | `display_name` | string | Must not be empty after trimming; shown in the value-source selector |
 | `capabilities.get_secret` | bool | Must be `true` |
 | `capabilities.json_key` | bool | Whether the provider extracts `json_key` itself; defaults to `false` |

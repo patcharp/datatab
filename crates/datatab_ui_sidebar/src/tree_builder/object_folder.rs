@@ -9,10 +9,7 @@ use std::borrow::Cow;
 pub(super) struct FolderSources<'a> {
     pub(super) profile_id: Uuid,
     pub(super) connected: &'a ConnectedProfile,
-    pub(super) capabilities: DriverCapabilities,
     pub(super) connection_category: DatabaseCategory,
-    pub(super) metric_cache: Option<&'a datatab_app::MetricCatalogCache>,
-    pub(super) metric_fetch_errors: &'a HashMap<String, String>,
 }
 
 /// Where the objects of one database stand in the caches.
@@ -96,9 +93,8 @@ fn folder_objects<'a>(
     FolderObjects::Unloaded
 }
 
-/// The rows under a database whose objects are known: the object folder,
-/// the metric catalog when the driver offers one, and the indexes of every
-/// object when the folder lists object details.
+/// The rows under a database whose objects are known: the object folder
+/// and the indexes of every object when the folder lists object details.
 pub(super) fn folder_content(
     sources: &FolderSources<'_>,
     folder: ObjectFolder,
@@ -109,18 +105,6 @@ pub(super) fn folder_content(
 
     if let Some(objects_folder) = objects_folder(sources, folder, database, objects) {
         content.push(objects_folder);
-    }
-
-    if sources
-        .capabilities
-        .contains(DriverCapabilities::METRIC_CATALOG)
-    {
-        content.push(build_metrics_folder(
-            sources.profile_id,
-            database,
-            sources.metric_cache,
-            sources.metric_fetch_errors,
-        ));
     }
 
     if folder.lists_object_details()
@@ -158,7 +142,6 @@ fn objects_folder(
                     database,
                     object,
                     &sources.connected.table_details,
-                    &sources.connected.collection_children,
                 )
             } else {
                 object_leaf(sources.profile_id, database, &object.name)
@@ -175,7 +158,7 @@ fn objects_folder(
             .to_string(),
             crate::labels::container_folder_label(category, objects.len()),
         )
-        .expanded(category.default_expand_container())
+        .expanded(true)
         .children(object_items),
     )
 }
@@ -201,30 +184,6 @@ fn database_loading_item(profile_id: Uuid, database: &str) -> TreeItem {
         .to_string(),
         datatab_i18n::t!("sidebar.tree.status.loading"),
     )
-}
-
-fn build_metrics_folder(
-    profile_id: Uuid,
-    database_name: &str,
-    metric_catalog_cache: Option<&datatab_app::MetricCatalogCache>,
-    metric_fetch_errors: &HashMap<String, String>,
-) -> TreeItem {
-    let parent_id = SchemaNodeId::MetricsFolder {
-        profile_id,
-        database: database_name.to_string(),
-    }
-    .to_string();
-
-    let children = if let Some(err_msg) = metric_fetch_errors.get(&parent_id) {
-        let retry_id = format!("metrics-retry|{}|{}", profile_id, database_name);
-        vec![Sidebar::error_retry_placeholder(&retry_id, err_msg)]
-    } else {
-        Sidebar::build_metric_namespace_children(profile_id, database_name, metric_catalog_cache)
-    };
-
-    TreeItem::new(parent_id, crate::labels::metrics_folder_label())
-        .expanded(false)
-        .children(children)
 }
 
 fn build_db_collection_indexes_folder(

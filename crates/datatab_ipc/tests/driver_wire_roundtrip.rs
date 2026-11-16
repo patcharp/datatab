@@ -1645,9 +1645,9 @@ fn database_category_variants_keep_their_postcard_indices() {
         (DatabaseCategory::ReservedGraph, 3),
         (DatabaseCategory::TimeSeries, 4),
         (DatabaseCategory::ReservedWideColumn, 5),
-        (DatabaseCategory::LogStream, 6),
+        (DatabaseCategory::ReservedLogStream, 6),
         (DatabaseCategory::ObjectStorage, 7),
-        (DatabaseCategory::SecretStore, 8),
+        (DatabaseCategory::ReservedSecretStore, 8),
     ];
 
     for (category, expected_index) in cases {
@@ -1657,4 +1657,182 @@ fn database_category_variants_keep_their_postcard_indices() {
         let decoded: DatabaseCategory = postcard::from_bytes(&bytes).expect("decode category");
         assert_eq!(decoded, category);
     }
+}
+
+#[test]
+fn db_kind_variants_keep_their_postcard_indices() {
+    use datatab_core::DbKind;
+
+    let cases = [
+        (DbKind::Postgres, 0u8),
+        (DbKind::SQLite, 1),
+        (DbKind::MySQL, 2),
+        (DbKind::MariaDB, 3),
+        (DbKind::MongoDB, 4),
+        (DbKind::Redis, 5),
+        (DbKind::ReservedDynamoDb, 6),
+        (DbKind::ReservedCloudWatchLogs, 7),
+        (DbKind::InfluxDB, 8),
+        (DbKind::SqlServer, 9),
+        (DbKind::Redshift, 10),
+        (DbKind::ReservedS3, 11),
+        (DbKind::ClickHouse, 12),
+        (DbKind::Turso, 13),
+        (DbKind::DuckDB, 14),
+        (DbKind::ReservedAwsSecrets, 15),
+    ];
+
+    for (kind, expected_index) in cases {
+        let bytes = postcard::to_allocvec(&kind).expect("encode db kind");
+        assert_eq!(bytes, vec![expected_index], "{kind:?}");
+
+        let decoded: DbKind = postcard::from_bytes(&bytes).expect("decode db kind");
+        assert_eq!(decoded, kind);
+    }
+}
+
+#[test]
+fn icon_variants_keep_their_postcard_indices() {
+    use datatab_core::Icon;
+
+    let cases = [
+        (Icon::Postgres, 0u8),
+        (Icon::Mysql, 1),
+        (Icon::Mariadb, 2),
+        (Icon::Sqlite, 3),
+        (Icon::Mongodb, 4),
+        (Icon::Redis, 5),
+        (Icon::ReservedDynamodb, 6),
+        (Icon::Redshift, 7),
+        (Icon::ReservedS3, 8),
+        (Icon::Clickhouse, 9),
+        (Icon::Turso, 10),
+        (Icon::Duckdb, 11),
+        (Icon::Influxdb, 12),
+        (Icon::Logs, 13),
+        (Icon::Database, 14),
+    ];
+
+    for (icon, expected_index) in cases {
+        let bytes = postcard::to_allocvec(&icon).expect("encode icon");
+        assert_eq!(bytes, vec![expected_index], "{icon:?}");
+
+        let decoded: Icon = postcard::from_bytes(&bytes).expect("decode icon");
+        assert_eq!(decoded, icon);
+    }
+}
+
+#[test]
+fn query_language_variants_keep_their_postcard_indices() {
+    use datatab_core::QueryLanguage;
+
+    let cases = [
+        (QueryLanguage::Sql, 0u8),
+        (QueryLanguage::ReservedCloudWatchLogsInsightsQl, 1),
+        (QueryLanguage::ReservedOpenSearchPpl, 2),
+        (QueryLanguage::ReservedOpenSearchSql, 3),
+        (QueryLanguage::MongoQuery, 4),
+        (QueryLanguage::RedisCommands, 5),
+        (QueryLanguage::Cypher, 6),
+        (QueryLanguage::InfluxQuery, 7),
+        (QueryLanguage::Flux, 8),
+        (QueryLanguage::Cql, 9),
+        (QueryLanguage::Lua, 10),
+        (QueryLanguage::Python, 11),
+        (QueryLanguage::Bash, 12),
+        (QueryLanguage::Custom("custom".to_string()), 13),
+    ];
+
+    for (language, expected_index) in cases {
+        let bytes = postcard::to_allocvec(&language).expect("encode query language");
+        assert_eq!(bytes.first(), Some(&expected_index), "{language:?}");
+
+        let decoded: QueryLanguage = postcard::from_bytes(&bytes).expect("decode query language");
+        assert_eq!(decoded, language);
+        let reencoded = postcard::to_allocvec(&decoded).expect("re-encode query language");
+        assert_eq!(reencoded, bytes, "{language:?}");
+    }
+}
+
+#[test]
+fn execution_source_context_variants_keep_their_postcard_indices() {
+    use datatab_core::ExecutionSourceContext;
+
+    let cases = [
+        (
+            ExecutionSourceContext::CollectionWindow {
+                targets: vec!["stream-a".to_string()],
+                start_ms: 1_000,
+                end_ms: 2_000,
+                query_mode: None,
+            },
+            0u8,
+        ),
+        (ExecutionSourceContext::ReservedMetricQuery, 1),
+        (
+            ExecutionSourceContext::InstanceMetricQuery {
+                metric_id: "active_connections".to_string(),
+                start_ms: 1_000,
+                end_ms: 2_000,
+            },
+            2,
+        ),
+        (
+            ExecutionSourceContext::InstanceInspectorQuery {
+                metric_id: "processes".to_string(),
+            },
+            3,
+        ),
+    ];
+
+    for (source, expected_index) in cases {
+        let bytes = postcard::to_allocvec(&source).expect("encode execution source context");
+        assert_eq!(bytes.first(), Some(&expected_index), "{source:?}");
+
+        let decoded: ExecutionSourceContext =
+            postcard::from_bytes(&bytes).expect("decode execution source context");
+        assert_eq!(decoded, source);
+        let reencoded =
+            postcard::to_allocvec(&decoded).expect("re-encode execution source context");
+        assert_eq!(reencoded, bytes, "{source:?}");
+    }
+}
+
+#[test]
+fn collection_presentation_variants_keep_their_postcard_indices() {
+    use datatab_core::CollectionPresentation;
+
+    let cases = [
+        (CollectionPresentation::DataGrid, 0u8),
+        (CollectionPresentation::ReservedEventStream, 1),
+        (CollectionPresentation::ObjectBrowser, 2),
+    ];
+
+    for (presentation, expected_index) in cases {
+        let bytes = postcard::to_allocvec(&presentation).expect("encode collection presentation");
+        assert_eq!(bytes, vec![expected_index], "{presentation:?}");
+
+        let decoded: CollectionPresentation =
+            postcard::from_bytes(&bytes).expect("decode collection presentation");
+        assert_eq!(decoded, presentation);
+    }
+}
+
+#[test]
+fn driver_capabilities_round_trip_keeps_all_defined_bits() {
+    use datatab_core::DriverCapabilities;
+
+    let all_defined_bits: u128 = (1u128 << 67) - 1;
+    assert_eq!(
+        DriverCapabilities::all().bits() & all_defined_bits,
+        all_defined_bits,
+        "every bit 0..=66 must remain defined in DriverCapabilities"
+    );
+
+    let bytes = postcard::to_allocvec(&all_defined_bits).expect("encode capability bits");
+    let decoded: DriverCapabilities = postcard::from_bytes(&bytes).expect("decode capabilities");
+    assert_eq!(decoded.bits(), all_defined_bits);
+
+    let reencoded = postcard::to_allocvec(&decoded).expect("re-encode capabilities");
+    assert_eq!(reencoded, bytes);
 }

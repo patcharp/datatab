@@ -8,7 +8,8 @@
 #
 # Needs: rustup (cargo and rustc), mold, cmake, pkg-config and the development
 # libraries listed in docs/BUILDING.md. For --deb it also needs readelf,
-# envsubst and either nfpm or Docker; build on x86_64 Ubuntu 24.04.
+# envsubst and Docker for the pinned nfpm container by default. A local nfpm
+# is used only with DATATAB_NFPM_LOCAL=1; build on x86_64 Ubuntu 24.04.
 # The package is amd64 only.
 # Set CARGO_TARGET_DIR to build outside ./target.
 # Writes <target>/linux-package/ and leaves the tracked tree clean.
@@ -64,8 +65,12 @@ if [ "$make_deb" = yes ]; then
         fail "readelf not found; install it with: sudo apt-get install -y binutils"
     command -v envsubst >/dev/null 2>&1 ||
         fail "envsubst not found; install it with: sudo apt-get install -y gettext-base"
-    if ! command -v nfpm >/dev/null 2>&1 && ! command -v docker >/dev/null 2>&1; then
-        fail "--deb needs nfpm or Docker on PATH; install one of them"
+    if [ "${DATATAB_NFPM_LOCAL:-}" = 1 ]; then
+        command -v nfpm >/dev/null 2>&1 ||
+            fail "--deb: DATATAB_NFPM_LOCAL=1 but nfpm is not on PATH; install nfpm or unset DATATAB_NFPM_LOCAL to use the pinned container"
+    else
+        command -v docker >/dev/null 2>&1 ||
+            fail "--deb needs Docker on PATH for the pinned nfpm container; install Docker or set DATATAB_NFPM_LOCAL=1 to use a local nfpm"
     fi
 fi
 

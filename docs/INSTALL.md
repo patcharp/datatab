@@ -22,11 +22,16 @@ Use the file name of the package you received. The package is unsigned.
 
 ## macOS
 
-The release has a `DataTab.app` for Intel and one for Apple Silicon. Both are unsigned and need macOS 11 or later. Drag the app to `/Applications`. A downloaded app needs its quarantine flag cleared before its first start:
+The release has a `DataTab.app` for Intel and one for Apple Silicon. Both need macOS 11 or later. Open the `.dmg` for your architecture and drag DataTab to Applications. The `.zip` also works: unzip it and drag DataTab to Applications.
+
+From 0.1.3 onward, releases carry a stable signature from the self-signed PCPLab project certificate. They are not notarized, so Gatekeeper still warns on first start. Clear the downloaded app's quarantine flag, then open it:
 
 ```bash
 xattr -dr com.apple.quarantine /Applications/DataTab.app
+open /Applications/DataTab.app
 ```
+
+Keychain may ask for access to saved passwords after an upgrade. Choose **Always Allow** if you want to grant access. Whether macOS keeps that grant across updates is not verified yet: Apple's securityd gives non-Apple certificates a per-build `cdhash:` partition. The owner checks two consecutive builds after the 0.1.3 release. This is a post-release check, not a release gate.
 
 ## Build from source
 

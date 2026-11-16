@@ -4,6 +4,8 @@ use datatab_ipc::{
     protocol::{AppControlRequest, AppControlResponse, IpcMessage, IpcResponse},
 };
 use gpui::*;
+#[cfg(unix)]
+use interprocess::local_socket::traits::Stream as _;
 use interprocess::local_socket::{
     Listener as IpcListener, Stream as IpcStream, traits::Listener as _,
 };
@@ -12,6 +14,8 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::Duration;
+
+const SERVER_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct IpcServer;
 
@@ -45,8 +49,10 @@ fn accept_loop(listener: IpcListener, cmd_tx: Sender<IpcCommand>, auth_token: St
     loop {
         match listener.accept() {
             Ok(stream) => {
-                if let Err(e) = handle_connection(stream, &cmd_tx, &auth_token) {
-                    log::warn!("IPC connection error: {}", e);
+                if let Err(error) =
+                    spawn_connection(stream, cmd_tx.clone(), auth_token.clone(), SERVER_TIMEOUT)
+                {
+                    log::warn!("IPC connection thread failed: {}", error);
                 }
             }
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -60,11 +66,33 @@ fn accept_loop(listener: IpcListener, cmd_tx: Sender<IpcCommand>, auth_token: St
     }
 }
 
+fn spawn_connection(
+    stream: IpcStream,
+    cmd_tx: Sender<IpcCommand>,
+    auth_token: String,
+    timeout: Duration,
+) -> io::Result<thread::JoinHandle<io::Result<()>>> {
+    thread::Builder::new()
+        .name("app-control-server".into())
+        .spawn(move || {
+            let result = handle_connection(stream, &cmd_tx, &auth_token, timeout);
+            if let Err(error) = &result {
+                log::warn!("IPC connection error: {:?}", error.kind());
+            }
+            result
+        })
+}
+
 fn handle_connection(
     mut stream: IpcStream,
     cmd_tx: &Sender<IpcCommand>,
     expected_auth_token: &str,
+    timeout: Duration,
 ) -> io::Result<()> {
+    #[cfg(unix)]
+    stream.set_recv_timeout(Some(timeout))?;
+    #[cfg(not(unix))]
+    let _timeout = timeout;
     let request: AppControlRequest = framing::recv_msg(&mut stream)?;
     let request_id = request.request_id;
 
@@ -99,6 +127,7 @@ fn handle_connection(
         },
         IpcMessage::OpenScript { path } => {
             let path = path.canonicalize().unwrap_or(path);
+            let path = datatab_ui_document::simplify_path(&path);
             if cmd_tx.send(IpcCommand::OpenScript { path }).is_ok() {
                 IpcResponse::Ok
             } else {
@@ -159,3 +188,6 @@ async fn process_commands(
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

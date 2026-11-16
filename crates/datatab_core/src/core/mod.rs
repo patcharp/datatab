@@ -22,11 +22,11 @@ pub use task::{
 pub use traits::{
     BucketCreateOptions, BucketCreateOutcome, BucketDetails, BucketEncryption, BucketInfo,
     BucketSizeEstimate, CodeGenScope, CodeGeneratorInfo, Connection, ConnectionExt,
-    ConnectionOverrides, DbDriver, DeletePrefixOutcome, DocumentConnection, EventStreamTarget,
-    ExecutionSession, ExecutionSessionFactory, KeyValueApi, KeyValueConnection, NoopCancelHandle,
-    ObjectListingPage, ObjectMetadata, ObjectStoreConnection, ObjectSummary, ObjectVersionSummary,
-    PresignMethod, PublicAccessStatus, QueryCancelHandle, RelationalConnection, SchemaDropTarget,
-    SchemaFeatures, SchemaLoadingStrategy, SchemaObjectKind, SchemaSnapshotAuthority,
-    SourceContextSpec, SourceQueryMode, VersioningStatus,
+    ConnectionOverrides, DbDriver, DeletePrefixOutcome, DocumentConnection, ExecutionSession,
+    ExecutionSessionFactory, KeyValueApi, KeyValueConnection, NoopCancelHandle, ObjectListingPage,
+    ObjectMetadata, ObjectStoreConnection, ObjectSummary, ObjectVersionSummary, PresignMethod,
+    PublicAccessStatus, QueryCancelHandle, RelationalConnection, SchemaDropTarget, SchemaFeatures,
+    SchemaLoadingStrategy, SchemaObjectKind, SchemaSnapshotAuthority, SourceContextSpec,
+    SourceQueryMode, VersioningStatus,
 };
 pub use value::Value;

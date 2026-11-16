@@ -90,8 +90,11 @@ pub struct AuthProviderHelloResponseV1_3 {
 /// Request to fetch the available options for a `DynamicSelect` field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FetchFieldOptionsRequest {
-    /// JSON-serialized `AuthProfile` (with secret fields stripped by the host
-    /// unless `secret_dependency_opt_in` is `true` for the relevant fields).
+    /// JSON-serialized `AuthProfile`. Its `fields` hold only the fields the
+    /// provider's form declares. The host leaves out the value of every
+    /// `Password` and `WriteOnly` field, unless the provider set
+    /// `secret_dependency_opt_in` and the target field lists that field in
+    /// its `depends_on`.
     pub profile_json: String,
     /// ID of the `DynamicSelect` field whose options are being requested.
     pub field_id: String,
@@ -523,7 +526,6 @@ mod tests {
                     supported: true,
                     verification_url_progress: true,
                 },
-                edit: None,
             },
         };
 
@@ -613,18 +615,29 @@ mod tests {
         );
     }
 
-    /// S-CAP-1: `AuthProviderCapabilities` JSON without an `edit` key
-    /// deserializes with `edit == None`. This validates the backward-compat
-    /// `#[serde(default)]` annotation on the `edit` field (older providers
-    /// that do not advertise edit capabilities must not fail deserialization).
     #[test]
-    fn capabilities_without_edit_key_deserializes_edit_as_none() {
-        let json = r#"{"login":{"supported":true,"verification_url_progress":false}}"#;
-        let caps: AuthProviderCapabilities =
-            serde_json::from_str(json).expect("must deserialize without edit key");
-        assert!(
-            caps.edit.is_none(),
-            "edit must be None when the key is absent from the JSON payload"
+    fn older_capabilities_edit_object_keeps_login_capabilities() {
+        let caps: AuthProviderCapabilities = serde_json::from_value(serde_json::json!({
+            "login": {"supported": true, "verification_url_progress": true},
+            "edit": {"mirror_label": "Legacy", "success_written": "Saved",
+                     "name_field_hint": "Name", "dangling_messages": {}}
+        }))
+        .expect("older capabilities");
+        assert!(caps.login.supported);
+        assert!(caps.login.verification_url_progress);
+    }
+
+    #[test]
+    fn older_auth_profile_read_only_field_is_accepted() {
+        let profile: datatab_core::AuthProfile = serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::nil(), "name": "RPC", "provider_id": "rpc-auth",
+            "fields": {"tenant": "example"}, "read_only": true
+        }))
+        .expect("older auth profile");
+        assert_eq!(profile.provider_id, "rpc-auth");
+        assert_eq!(
+            profile.fields.get("tenant").map(String::as_str),
+            Some("example")
         );
     }
 }

@@ -1,3 +1,10 @@
+mod app_control_client;
+#[cfg(feature = "test-support")]
+pub use app_control_client::send_test_request;
+pub use app_control_client::{
+    APP_CONTROL_TIMEOUT, AppControlError, send_app_control_request,
+    send_app_control_request_checked, send_app_control_request_with_timeout, send_focus_request,
+};
 pub mod audit;
 pub mod auth;
 pub mod auth_provider_client;

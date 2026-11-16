@@ -130,7 +130,7 @@ fn bson_path_extraction_from_real_server_status() {
 
         // All SERVER_STATUS_PATHS should produce a valid (non-error) metric
         let paths = datatab_driver_mongodb::instance_catalog::SERVER_STATUS_PATHS;
-        for (_, metric_id, _, _, _) in paths {
+        for (_, metric_id, _, _, _, _) in paths {
             let result = conn.execute(&metric_req(metric_id));
             assert!(
                 result.is_ok(),

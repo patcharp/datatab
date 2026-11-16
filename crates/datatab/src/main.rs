@@ -1,12 +1,12 @@
 #![windows_subsystem = "windows"]
 #![recursion_limit = "256"]
 
-mod cli;
 #[cfg(unix)]
 mod shell_path;
 
 use datatab_app::mcp_command::run_mcp_command;
 use datatab_audit::AuditService;
+use datatab_cli::{Dispatch, parse};
 use datatab_core::ShutdownPhase;
 use datatab_core::observability::actions::{SYSTEM_SHUTDOWN, SYSTEM_STARTUP};
 use datatab_core::observability::tracing_bridge::{
@@ -15,9 +15,7 @@ use datatab_core::observability::tracing_bridge::{
 use datatab_core::observability::{EventCategory, EventOutcome, EventRecord, EventSeverity};
 use datatab_driver_ipc::shutdown_managed_hosts;
 use datatab_ipc::{
-    APP_CONTROL_VERSION, framing, init_process_auth_tokens,
-    protocol::{AppControlRequest, AppControlResponse, IpcMessage, IpcResponse},
-    read_app_control_token, shutdown_managed_auth_provider_hosts,
+    init_process_auth_tokens, send_focus_request, shutdown_managed_auth_provider_hosts,
     shutdown_managed_secret_provider_hosts, socket_name,
 };
 use datatab_ui::AppStateEntity;
@@ -34,11 +32,10 @@ use datatab_ui_base::window_state::{self, WindowGeometry};
 use gpui::*;
 use gpui_component::Root;
 use interprocess::local_socket::{
-    Listener as IpcListener, ListenerNonblockingMode, ListenerOptions, Stream as IpcStream,
-    prelude::*,
+    Listener as IpcListener, ListenerNonblockingMode, ListenerOptions,
 };
 use log::info;
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -245,10 +242,10 @@ fn emit_system_shutdown(audit_service: &AuditService) {
 /// Installs a process-wide rustls crypto provider.
 ///
 /// rustls 0.23 only auto-selects a provider when exactly one backend is
-/// compiled in. Several are linked here (the AWS SDK enables `ring`, reqwest
-/// and the TLS drivers enable `aws-lc-rs`), so any consumer that builds a
-/// rustls client via the auto path — notably the `mysql` driver — would panic
-/// with "Could not automatically determine the process-level CryptoProvider".
+/// compiled in. Both `ring` and `aws-lc-rs` are linked here, so any consumer
+/// that builds a rustls client via the auto path — notably the `mysql` driver —
+/// would panic with "Could not automatically determine the process-level
+/// CryptoProvider".
 /// Installing one explicitly, before any handshake, resolves that for every
 /// consumer that relies on the process default.
 fn install_default_crypto_provider() {
@@ -261,50 +258,54 @@ fn install_default_crypto_provider() {
 }
 
 fn main() {
+    let cli = match parse(std::env::args_os()) {
+        Ok(cli) => cli,
+        Err(error) => {
+            attach_parent_console();
+            error.exit();
+        }
+    };
     install_panic_hook();
     install_default_crypto_provider();
-
-    let args: Vec<String> = std::env::args().collect();
-
-    if args.get(1).map(|s| s.as_str()) == Some("mcp") {
-        #[expect(
-            clippy::indexing_slicing,
-            reason = "the guard above requires `args[1]` to exist, so \
-                      `args.len() >= 2` and the `[2..]` slice is in range"
-        )]
-        let exit_code = run_mcp_command(&args[2..]);
-        std::process::exit(exit_code);
+    match cli.run() {
+        Dispatch::Exit(code) => std::process::exit(code),
+        Dispatch::RunGui => run_gui(),
+        Dispatch::Mcp {
+            client_id,
+            config_dir,
+        } => std::process::exit(run_mcp_command(client_id, config_dir)),
     }
+}
 
-    if args.get(1).map(|s| s.as_str()) == Some("--gui") {
-        run_gui();
-        return;
+#[cfg(windows)]
+#[expect(unsafe_code, reason = "AttachConsole requires a Win32 call")]
+fn attach_parent_console() {
+    unsafe {
+        windows_sys::Win32::System::Console::AttachConsole(
+            windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS,
+        );
     }
+}
 
-    if args.len() == 1 {
-        if let Ok(name) = socket_name()
-            && let Ok(mut stream) = IpcStream::connect(name)
-            && send_focus_request(&mut stream, 1).is_ok()
-        {
-            return;
-        }
+#[cfg(not(windows))]
+fn attach_parent_console() {}
 
-        run_gui();
-        return;
+fn focus_answered(result: std::io::Result<()>) -> std::io::Result<bool> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => Err(error),
+        Err(_) => Ok(false),
     }
-
-    std::process::exit(cli::run(&args));
 }
 
 fn bind_ipc_socket() -> Result<IpcListener, ()> {
-    let connect_name = socket_name().map_err(|e| {
-        eprintln!("Failed to create socket name: {}", e);
-    })?;
-
-    if let Ok(mut stream) = IpcStream::connect(connect_name)
-        && send_focus_request(&mut stream, 1).is_ok()
-    {
-        std::process::exit(0);
+    match focus_answered(send_focus_request()) {
+        Ok(true) => std::process::exit(0),
+        Ok(false) => {}
+        Err(error) => {
+            log::error!("IPC focus failed: {}", error);
+            return Err(());
+        }
     }
 
     let bind_name = socket_name().map_err(|e| {
@@ -319,32 +320,6 @@ fn bind_ipc_socket() -> Result<IpcListener, ()> {
         .map_err(|e| {
             eprintln!("Failed to bind IPC socket: {}", e);
         })
-}
-
-fn send_focus_request<S: Read + Write>(stream: &mut S, request_id: u64) -> io::Result<()> {
-    let auth_token = read_app_control_token()?;
-    let request = AppControlRequest::new(request_id, Some(auth_token), IpcMessage::Focus);
-    framing::send_msg(&mut *stream, &request)?;
-
-    let response: AppControlResponse = framing::recv_msg(&mut *stream)?;
-
-    if !response
-        .protocol_version
-        .is_compatible_with(APP_CONTROL_VERSION)
-    {
-        return Err(io::Error::other(
-            "incompatible app-control protocol version",
-        ));
-    }
-
-    if response.request_id != request_id {
-        return Err(io::Error::other("mismatched app-control response id"));
-    }
-
-    match response.body {
-        IpcResponse::Error { message } => Err(io::Error::other(message)),
-        _ => Ok(()),
-    }
 }
 
 /// Runs the GPUI application: tracing, IPC listener, main window, shutdown
@@ -493,6 +468,7 @@ fn run_gui() {
         // The main window stays a normal window: a floating one is an
         // `NSPanel` above everything else on macOS, which takes it out of
         // AeroSpace, Spaces and Stage Manager.
+        platform::apply_shell_titlebar_options(&mut main_window_options);
         platform::apply_main_window_options(&mut main_window_options, 800.0, 600.0);
 
         let window_result = cx.open_window(main_window_options, |window, cx| {
@@ -967,3 +943,7 @@ fn shutdown_all_managed_hosts() {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "main/tests.rs"]
+mod tests;

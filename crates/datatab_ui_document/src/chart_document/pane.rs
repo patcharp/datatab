@@ -102,11 +102,6 @@ impl ChartDocument {
                             d.connection_id().is_some()
                                 && d.saved_chart_id() == Some(*saved_chart_id)
                         }
-                        DocumentKey::MetricChart {
-                            profile_id,
-                            namespace,
-                            metric_name,
-                        } => d.matches_metric_source(*profile_id, namespace, metric_name),
                         DocumentKey::InstanceMetric {
                             profile_id,
                             metric_id,

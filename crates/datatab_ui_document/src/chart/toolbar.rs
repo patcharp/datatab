@@ -16,7 +16,7 @@
 use super::shell::{ChartRailTab, ChartShell};
 use crate::chrome::time_preset_control;
 use crate::labels::configure_chart_kind_label;
-use datatab_components::chart::{ChartKind, format_x_value};
+use datatab_components::chart::{ChartKind, format_x_value_in};
 use datatab_components::common::time_range::TimeRangePanel;
 use datatab_components::composites::refresh_split_button;
 use datatab_components::controls::{Button, ButtonVariant, Dropdown};
@@ -150,8 +150,8 @@ pub fn chart_window_label(
     match bounds {
         Some((start, end)) => format!(
             "{} \u{2192} {} UTC \u{00b7} {}",
-            format_x_value(start, true),
-            format_x_value(end, true),
+            format_x_value_in(&datatab_core::chrono::Utc, start, true),
+            format_x_value_in(&datatab_core::chrono::Utc, end, true),
             points
         ),
         None => points,
@@ -429,6 +429,18 @@ mod tests {
         assert!(
             !source_supports_save,
             "save button must be gated by source_supports_save"
+        );
+    }
+
+    #[gpui::test]
+    fn chart_window_label_keeps_explicit_utc(cx: &mut gpui::TestAppContext) {
+        let shell = cx.new(ChartShell::new_standalone);
+        let label = cx.read_entity(&shell, |_, app| {
+            super::chart_window_label(&shell, Some((0, 3_600_000)), 5, app)
+        });
+        assert!(
+            label.starts_with("1970-01-01 00:00:00 \u{2192} 1970-01-01 01:00:00 UTC \u{00b7} "),
+            "expected explicit UTC window label, got: {label}"
         );
     }
 

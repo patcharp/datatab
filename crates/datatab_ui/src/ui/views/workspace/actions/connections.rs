@@ -25,6 +25,7 @@ impl Workspace {
             datatab_ui_windows::connection_manager::WINDOW_MIN_WIDTH,
             datatab_ui_windows::connection_manager::WINDOW_MIN_HEIGHT,
         );
+        platform::apply_shell_titlebar_options(&mut options);
 
         match cx.open_window(options, |window, cx| {
             datatab_ui_base::ui_automation::install(window, cx);
@@ -85,6 +86,7 @@ impl Workspace {
             datatab_ui_windows::connection_manager::WINDOW_MIN_WIDTH,
             datatab_ui_windows::connection_manager::WINDOW_MIN_HEIGHT,
         );
+        platform::apply_shell_titlebar_options(&mut options);
 
         if let Err(error) = cx.open_window(options, |window, cx| {
             datatab_ui_base::ui_automation::install(window, cx);
@@ -120,6 +122,7 @@ impl Workspace {
             datatab_ui_windows::connection_manager::WINDOW_MIN_WIDTH,
             datatab_ui_windows::connection_manager::WINDOW_MIN_HEIGHT,
         );
+        platform::apply_shell_titlebar_options(&mut options);
 
         if let Err(error) = cx.open_window(options, |window, cx| {
             datatab_ui_base::ui_automation::install(window, cx);

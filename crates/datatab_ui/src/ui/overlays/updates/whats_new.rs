@@ -384,8 +384,8 @@ mod tests {
 
         assert_eq!(content, WhatsNewContent::RunningRelease);
         assert_eq!(releases.len(), 1);
-        assert_eq!(release_label(releases[0]), "0.1.2");
-        assert_eq!(releases[0].date.as_deref(), Some("2026-11-13"));
+        assert_eq!(release_label(releases[0]), "0.1.3");
+        assert_eq!(releases[0].date.as_deref(), Some("2026-11-16"));
     }
 
     #[test]

@@ -237,12 +237,22 @@ fn manifest_rejects_provider_id_outside_allowed_characters() {
 }
 
 #[test]
-fn manifest_rejects_built_in_provider_ids() {
-    for reserved in BUILT_IN_SECRET_PROVIDER_IDS {
+fn manifest_accepts_former_builtin_provider_id() {
+    let mut candidate = manifest();
+    candidate.provider_id = "aws-secrets-manager".into();
+    let validated = validate_manifest(&candidate, &BUILT_IN_SECRET_PROVIDER_IDS)
+        .expect("former built-in provider id is available");
+    assert_eq!(validated.provider_id, "aws-secrets-manager");
+}
+
+#[test]
+fn manifest_rejects_reserved_provider_ids() {
+    let reserved_ids = &["reserved-id"];
+    for reserved in reserved_ids {
         let mut candidate = manifest();
         candidate.provider_id = reserved.to_string();
         assert_eq!(
-            validate_manifest(&candidate, &BUILT_IN_SECRET_PROVIDER_IDS),
+            validate_manifest(&candidate, reserved_ids),
             Err(ManifestError::ReservedProviderId(reserved.to_string()))
         );
     }
@@ -272,8 +282,11 @@ fn manifest_rejects_missing_get_secret_capability() {
 
 #[test]
 fn manifest_errors_render_readable_messages() {
-    let message = ManifestError::ReservedProviderId("aws-ssm".to_string()).to_string();
-    assert_eq!(message, "secret-provider id 'aws-ssm' is already in use");
+    let message = ManifestError::ReservedProviderId("reserved-id".to_string()).to_string();
+    assert_eq!(
+        message,
+        "secret-provider id 'reserved-id' is already in use"
+    );
 }
 
 #[test]
@@ -764,12 +777,25 @@ fn probe_rejects_invalid_manifest() {
 }
 
 #[test]
+fn probe_accepts_former_builtin_provider_id() {
+    let mut candidate = manifest();
+    candidate.provider_id = "aws-secrets-manager".to_string();
+    let server = FakeServer::start(candidate, SECRET_PROVIDER_RPC_V1_0, answer_with_secret());
+
+    let _provider = server
+        .probe()
+        .expect("former built-in provider id is available");
+}
+
+#[test]
 fn probe_rejects_reserved_provider_id() {
     let mut reserved = manifest();
-    reserved.provider_id = "aws-secrets-manager".to_string();
+    reserved.provider_id = "reserved-id".to_string();
     let server = FakeServer::start(reserved, SECRET_PROVIDER_RPC_V1_0, answer_with_secret());
 
-    let error = server.probe().err().expect("must reject");
+    let error = RpcSecretProvider::probe(&server.socket_id, None, &["reserved-id"])
+        .err()
+        .expect("must reject");
 
     assert!(error.to_string().contains("is already in use"), "{error}");
 }

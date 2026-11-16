@@ -1,7 +1,6 @@
 pub mod active_query;
 pub mod delete_connection;
 pub mod drop_table;
-pub mod import_dashboard;
 pub mod schema_drift;
 pub mod tunnel_auth;
 pub mod unsaved_changes;
@@ -13,9 +12,6 @@ pub use delete_connection::{
     DeleteConnectionOutcome, DeleteConnectionRequest, ModalDeleteConnection,
 };
 pub use drop_table::{DropTableOutcome, DropTableRequest, ModalDropTable};
-pub use import_dashboard::{
-    ImportDashboardCancelled, ImportDashboardConfirmed, ModalImportDashboard,
-};
 pub use schema_drift::ModalSchemaDrift;
 pub use tunnel_auth::{
     ConnectionPasswordRequest, ModalTunnelAuth, TunnelAuthOutcome, TunnelAuthRequest,

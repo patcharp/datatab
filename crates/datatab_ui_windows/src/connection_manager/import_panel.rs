@@ -81,13 +81,13 @@ enum Step {
 ///
 /// Identical wiring to the previous wizard's persistence adapter; the import
 /// backend itself is unchanged.
-struct AppStatePersistence<'a> {
+pub(super) struct AppStatePersistence<'a> {
     state: &'a mut datatab_app::AppState,
     registered_drivers: std::collections::HashSet<String>,
 }
 
 impl<'a> AppStatePersistence<'a> {
-    fn new(state: &'a mut datatab_app::AppState) -> Self {
+    pub(super) fn new(state: &'a mut datatab_app::AppState) -> Self {
         let registered_drivers = state.drivers().keys().cloned().collect();
         Self {
             state,
@@ -129,6 +129,12 @@ impl ImportPersistence for AppStatePersistence<'_> {
                 Ok(config) => {
                     let mut rebuilt = profile;
                     rebuilt.config = config;
+                    // The registered driver may declare a reserved kind;
+                    // such a profile could not be loaded again.
+                    if let Err(error) = datatab_app::AppState::check_profile_can_be_saved(&rebuilt)
+                    {
+                        return ConnectionInsertResult::ConfigFailed(error.to_string());
+                    }
                     self.state.add_profile_in_folder(rebuilt, None);
                     ConnectionInsertResult::Ok
                 }
@@ -227,7 +233,7 @@ pub struct ImportConnectionsPanel {
     secret_inputs: HashMap<(String, String), Entity<InputState>>,
     secret_values: HashMap<(String, String), String>,
     pending_provision_secrets: bool,
-    // Auth-profile picks for AwsReference / AuthProfileRef resolutions.
+    // Auth-profile picks for required auth-profile resolutions.
     auth_profile_choices: HashMap<(String, String), Uuid>,
 
     // Apply.
@@ -1730,28 +1736,6 @@ impl ImportConnectionsPanel {
                 }
             }
 
-            RequiredResolutionKind::AwsReference { provider_id, name } => {
-                let matching: Vec<(Uuid, String)> = self
-                    .dest_auth_profiles
-                    .iter()
-                    .filter(|p| &p.provider_id == provider_id)
-                    .map(|p| (p.id, p.name.clone()))
-                    .collect();
-
-                row = row.child(
-                    div()
-                        .text_size(FontSizes::SM)
-                        .text_color(theme.foreground)
-                        .child(crate::labels::import_required_aws_reference_label(
-                            name,
-                            provider_id,
-                            &resolution.owner_name,
-                        )),
-                );
-
-                row = row.child(self.auth_choice_block(&key, &matching, cx));
-            }
-
             RequiredResolutionKind::AuthProfileRef => {
                 let all_dest: Vec<(Uuid, String)> = self
                     .dest_auth_profiles
@@ -2195,7 +2179,6 @@ mod tests {
         "connection_manager.import.conflicts.row_label",
         "connection_manager.import.required.intro",
         "connection_manager.import.required.secret_label",
-        "connection_manager.import.required.aws_reference_label",
         "connection_manager.import.required.auth_profile_ref_label",
         "connection_manager.import.required.no_matching_auth_profile",
         "connection_manager.import.status.complete",

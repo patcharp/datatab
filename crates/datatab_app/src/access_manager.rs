@@ -1,6 +1,4 @@
 use std::collections::HashMap;
-#[cfg(feature = "aws")]
-use std::sync::Arc;
 
 use datatab_core::DbError;
 use datatab_core::ResolvedProxy;
@@ -22,25 +20,9 @@ pub struct ResolvedSshTunnel {
 pub struct AppAccessManager {
     ssh_tunnels: HashMap<Uuid, ResolvedSshTunnel>,
     proxy_tunnels: HashMap<Uuid, ResolvedProxy>,
-    #[cfg(feature = "aws")]
-    ssm_factory: Option<Arc<datatab_ssm::SsmTunnelFactory>>,
 }
 
 impl AppAccessManager {
-    #[cfg(feature = "aws")]
-    pub fn new(
-        ssh_tunnels: HashMap<Uuid, ResolvedSshTunnel>,
-        proxy_tunnels: HashMap<Uuid, ResolvedProxy>,
-        ssm_factory: Option<Arc<datatab_ssm::SsmTunnelFactory>>,
-    ) -> Self {
-        Self {
-            ssh_tunnels,
-            proxy_tunnels,
-            ssm_factory,
-        }
-    }
-
-    #[cfg(not(feature = "aws"))]
     pub fn new(
         ssh_tunnels: HashMap<Uuid, ResolvedSshTunnel>,
         proxy_tunnels: HashMap<Uuid, ResolvedProxy>,
@@ -154,27 +136,9 @@ impl AppAccessManager {
         _params: &std::collections::HashMap<String, String>,
         _remote_host: &str,
     ) -> Result<AccessHandle, DbError> {
-        match provider {
-            #[cfg(feature = "aws")]
-            "aws-ssm" => {
-                let ssm = datatab_core::SsmAccessParams::from_params(_params)?;
-
-                let factory = self.ssm_factory.as_ref().ok_or_else(|| {
-                    DbError::connection_failed("SSM tunnel factory not available")
-                })?;
-
-                let tunnel =
-                    factory.start(&ssm.instance_id, &ssm.region, _remote_host, ssm.remote_port)?;
-                let local_port = tunnel.local_port();
-
-                Ok(AccessHandle::tunnel(local_port, Box::new(tunnel)))
-            }
-
-            other => Err(DbError::connection_failed(format!(
-                "Unknown managed access provider: '{}'. No handler registered.",
-                other
-            ))),
-        }
+        Err(DbError::connection_failed(format!(
+            "Unknown managed access provider: '{provider}'. No handler registered."
+        )))
     }
 }
 
@@ -192,12 +156,6 @@ mod tests {
 
     use super::AppAccessManager;
 
-    #[cfg(feature = "aws")]
-    fn test_manager() -> AppAccessManager {
-        AppAccessManager::new(HashMap::new(), HashMap::new(), None)
-    }
-
-    #[cfg(not(feature = "aws"))]
     fn test_manager() -> AppAccessManager {
         AppAccessManager::new(HashMap::new(), HashMap::new())
     }
@@ -331,9 +289,6 @@ mod tests {
         let mut proxy_tunnels = HashMap::new();
         proxy_tunnels.insert(profile_id, resolved);
 
-        #[cfg(feature = "aws")]
-        let manager = AppAccessManager::new(HashMap::new(), proxy_tunnels, None);
-        #[cfg(not(feature = "aws"))]
         let manager = AppAccessManager::new(HashMap::new(), proxy_tunnels);
 
         let handle = run_ready_future(manager.open(
@@ -370,9 +325,6 @@ mod tests {
         let mut proxy_tunnels = HashMap::new();
         proxy_tunnels.insert(profile_id, resolved);
 
-        #[cfg(feature = "aws")]
-        let manager = AppAccessManager::new(HashMap::new(), proxy_tunnels, None);
-        #[cfg(not(feature = "aws"))]
         let manager = AppAccessManager::new(HashMap::new(), proxy_tunnels);
 
         let handle = run_ready_future(manager.open(
@@ -409,9 +361,6 @@ mod tests {
         let mut proxy_tunnels = HashMap::new();
         proxy_tunnels.insert(profile_id, resolved);
 
-        #[cfg(feature = "aws")]
-        let manager = AppAccessManager::new(HashMap::new(), proxy_tunnels, None);
-        #[cfg(not(feature = "aws"))]
         let manager = AppAccessManager::new(HashMap::new(), proxy_tunnels);
 
         let result = run_ready_future(manager.open(
@@ -441,28 +390,30 @@ mod tests {
 
     #[test]
     fn unknown_managed_provider_returns_structured_failure() {
-        let manager = test_manager();
-        let result = run_ready_future(manager.open(
-            &AccessKind::Managed {
-                provider: "custom-provider".to_string(),
-                params: std::collections::HashMap::new(),
-            },
-            "localhost",
-            5432,
-        ));
+        for provider in ["custom-provider", "aws-ssm"] {
+            let manager = test_manager();
+            let result = run_ready_future(manager.open(
+                &AccessKind::Managed {
+                    provider: provider.to_string(),
+                    params: std::collections::HashMap::new(),
+                },
+                "localhost",
+                5432,
+            ));
 
-        let error = match result {
-            Ok(_) => panic!("unknown managed providers should fail explicitly"),
-            Err(error) => error,
-        };
+            let error = match result {
+                Ok(_) => panic!("unknown managed providers should fail explicitly"),
+                Err(error) => error,
+            };
 
-        let DbError::ConnectionFailed(error) = error else {
-            panic!("managed mode should return a connection error");
-        };
+            let DbError::ConnectionFailed(error) = error else {
+                panic!("managed mode should return a connection error");
+            };
 
-        assert_eq!(
-            error.message,
-            "Unknown managed access provider: 'custom-provider'. No handler registered."
-        );
+            assert_eq!(
+                error.message,
+                format!("Unknown managed access provider: '{provider}'. No handler registered.")
+            );
+        }
     }
 }

@@ -210,23 +210,33 @@ impl SettingsCoordinator {
 
                 // Forward login-URL events from the auth profiles section up to
                 // the workspace, which owns the login modal.
-                let login_sub =
-                    cx.subscribe(&section, |this, _, event: &AuthProfilesSectionEvent, cx| {
+                let login_sub = cx.subscribe(
+                    &section,
+                    |this, section, event: &AuthProfilesSectionEvent, cx| {
                         match event {
                             AuthProfilesSectionEvent::OpenLoginModal {
                                 provider_name,
                                 profile_name,
                                 url,
+                                generation,
                             } => {
                                 cx.emit(SettingsEvent::OpenLoginModal {
                                     provider_name: provider_name.clone(),
                                     profile_name: profile_name.clone(),
                                     url: url.clone(),
+                                    login: SettingsLoginHandle::new(
+                                        section.downgrade(),
+                                        *generation,
+                                    ),
                                 });
                                 let _ = this;
                             }
+                            // The holder of the `SettingsLoginHandle` hears
+                            // this from the section itself.
+                            AuthProfilesSectionEvent::LoginEnded { .. } => {}
                         }
-                    });
+                    },
+                );
 
                 let portability_sub = Self::subscribe_portability(&section, cx);
                 (

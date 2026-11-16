@@ -70,6 +70,7 @@ embedded_icons! {
     FingerprintPattern => "icons/ui/fingerprint-pattern.svg",
     Maximize2 => "icons/ui/maximize-2.svg",
     Minimize2 => "icons/ui/minimize-2.svg",
+    WindowSquare => "icons/ui/window-square.svg",
     PanelBottomClose => "icons/ui/panel-bottom-close.svg",
     PanelBottomOpen => "icons/ui/panel-bottom-open.svg",
     PanelBottom => "icons/ui/panel-bottom.svg",
@@ -168,6 +169,7 @@ mod tests {
             AppIcon::ZoomOut,
             AppIcon::Grid3x3,
             AppIcon::Minus,
+            AppIcon::WindowSquare,
             AppIcon::Snowflake,
             AppIcon::DatabaseZap,
         ] {

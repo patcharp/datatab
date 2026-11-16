@@ -225,14 +225,14 @@ fn secret_adapter_reports_probe_failure_as_diagnostic() {
 }
 
 #[test]
-fn secret_adapter_passes_built_in_ids_as_reserved() {
+fn secret_adapter_passes_empty_reserved_ids() {
     let adaptation = adapt_secret_provider_service_with(
         descriptor(service(RpcServiceKind::SecretProvider, true)),
         |_| false,
         |socket_id, launch, reserved_ids| {
             assert_eq!(socket_id, "secret-socket");
             assert!(launch.is_some());
-            assert_eq!(reserved_ids, ["aws-secrets-manager", "aws-ssm"]);
+            assert!(reserved_ids.is_empty());
             Ok(fake_provider("vault"))
         },
     );

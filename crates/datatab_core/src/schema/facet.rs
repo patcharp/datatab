@@ -128,9 +128,7 @@ mod tests {
         for category in [
             DatabaseCategory::Relational,
             DatabaseCategory::KeyValue,
-            DatabaseCategory::LogStream,
             DatabaseCategory::ObjectStorage,
-            DatabaseCategory::SecretStore,
         ] {
             assert_eq!(
                 category_collection_facets(category),

@@ -535,7 +535,7 @@ The binary crate, `crates/datatab/Cargo.toml`, has no direct `datatab_lua` depen
 ```toml
 [features]
 lua = ["datatab_app/lua", "datatab_ui/lua"]
-default = ["sqlite", "postgres", "mysql", "mongodb", "redis", "dynamodb", "cloudwatch", "influxdb", "mssql", "lua", "aws", "mcp"]
+default = ["sqlite", "postgres", "mysql", "mongodb", "redis", "influxdb", "mssql", "redshift", "clickhouse", "turso", "duckdb", "lua", "mcp"]
 ```
 
 The `lua` feature is in the default set, so it's always enabled in normal builds. It can be disabled for builds that don't need Lua (reduces binary size by ~200KB).

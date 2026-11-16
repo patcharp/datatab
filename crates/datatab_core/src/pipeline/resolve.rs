@@ -33,48 +33,10 @@ pub async fn resolve_profile_values(
             continue;
         }
 
-        if patch_access_kind_field(&mut patched, field, value) {
-            continue;
-        }
-
         patch_config_field(&mut patched.config, field, value);
     }
 
     Ok((patched, password))
-}
-
-/// Patches a single field in `ConnectionProfile::access_kind`.
-///
-/// Returns `true` when the field was handled by access-kind patching.
-fn patch_access_kind_field(
-    profile: &mut ConnectionProfile,
-    field: &str,
-    value: &ResolvedValue,
-) -> bool {
-    let Some(access_kind) = profile.access_kind.as_mut() else {
-        return false;
-    };
-
-    let val = value.expose_secret();
-
-    match access_kind {
-        crate::access::AccessKind::Managed { params, .. } => match field {
-            "ssm_instance_id" => {
-                params.insert("instance_id".to_string(), val.to_string());
-                true
-            }
-            "ssm_region" => {
-                params.insert("region".to_string(), val.to_string());
-                true
-            }
-            "ssm_remote_port" => {
-                params.insert("remote_port".to_string(), val.to_string());
-                true
-            }
-            _ => false,
-        },
-        _ => false,
-    }
 }
 
 /// Patches a single field in the `DbConfig` variant with a resolved value.
@@ -170,30 +132,6 @@ fn patch_config_field(config: &mut DbConfig, field: &str, value: &ResolvedValue)
             _ => {}
         },
 
-        DbConfig::DynamoDB {
-            region,
-            profile,
-            endpoint,
-            table,
-        } => match field {
-            "region" => *region = val.to_string(),
-            "profile" => *profile = Some(val.to_string()),
-            "endpoint" => *endpoint = Some(val.to_string()),
-            "table" => *table = Some(val.to_string()),
-            _ => {}
-        },
-
-        DbConfig::CloudWatchLogs {
-            region,
-            profile,
-            endpoint,
-        } => match field {
-            "region" => *region = val.to_string(),
-            "profile" => *profile = Some(val.to_string()),
-            "endpoint" => *endpoint = Some(val.to_string()),
-            _ => {}
-        },
-
         DbConfig::InfluxDB {
             url,
             org,
@@ -266,34 +204,6 @@ fn patch_config_field(config: &mut DbConfig, field: &str, value: &ResolvedValue)
             }
             "user" => *user = val.to_string(),
             "database" => *database = val.to_string(),
-            _ => {}
-        },
-
-        DbConfig::S3 {
-            region,
-            profile,
-            access_key_id,
-            endpoint,
-            path_style,
-        } => match field {
-            "region" => *region = val.to_string(),
-            "profile" => *profile = Some(val.to_string()),
-            "access_key_id" => *access_key_id = Some(val.to_string()),
-            "endpoint" => *endpoint = Some(val.to_string()),
-            "path_style" => *path_style = val == "true",
-            _ => {}
-        },
-
-        DbConfig::AwsSecrets {
-            region,
-            profile,
-            access_key_id,
-            endpoint,
-        } => match field {
-            "region" => *region = val.to_string(),
-            "profile" => *profile = Some(val.to_string()),
-            "access_key_id" => *access_key_id = Some(val.to_string()),
-            "endpoint" => *endpoint = Some(val.to_string()),
             _ => {}
         },
 
@@ -468,37 +378,31 @@ mod tests {
         );
     }
 
+    /// The `ssm_*` fields were removed with the SSM access mode. A reference
+    /// left on a stored profile under one of those names changes nothing.
     #[tokio::test]
-    async fn resolve_ssm_access_fields() {
+    async fn leftover_ssm_field_refs_leave_managed_params_untouched() {
         let mut refs = HashMap::new();
         refs.insert("ssm_instance_id".to_string(), ValueRef::literal("i-abc123"));
-        refs.insert("ssm_region".to_string(), ValueRef::literal("us-east-1"));
         refs.insert("ssm_remote_port".to_string(), ValueRef::literal("15432"));
 
-        let mut params = HashMap::new();
-        params.insert("instance_id".to_string(), "i-old".to_string());
-        params.insert("region".to_string(), "eu-west-1".to_string());
-        params.insert("remote_port".to_string(), "5432".to_string());
+        let stored = HashMap::from([("instance_id".to_string(), "i-old".to_string())]);
 
         let mut profile = test_profile_with_refs(refs);
         profile.access_kind = Some(crate::access::AccessKind::Managed {
-            provider: "aws-ssm".to_string(),
-            params,
+            provider: "custom-provider".to_string(),
+            params: stored.clone(),
         });
 
-        let resolver = test_resolver();
-        let ctx = ResolveContext::default();
-
-        let (patched, _) = resolve_profile_values(&profile, &resolver, &ctx)
-            .await
-            .unwrap();
+        let (patched, _) =
+            resolve_profile_values(&profile, &test_resolver(), &ResolveContext::default())
+                .await
+                .unwrap();
 
         match patched.access_kind {
             Some(crate::access::AccessKind::Managed { provider, params }) => {
-                assert_eq!(provider, "aws-ssm");
-                assert_eq!(params["instance_id"], "i-abc123");
-                assert_eq!(params["region"], "us-east-1");
-                assert_eq!(params["remote_port"], "15432");
+                assert_eq!(provider, "custom-provider");
+                assert_eq!(params, stored);
             }
             other => panic!("expected AccessKind::Managed, got {:?}", other),
         }

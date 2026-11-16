@@ -5,14 +5,15 @@ use async_trait::async_trait;
 use datatab_core::{
     ColumnKind, ColumnMeta, DbError, DefaultDashboardPanel, DefaultInstanceDashboard,
     DriverCapabilities, InstanceCatalog, InstanceInspectorDef, InstanceMetricDef,
-    InstanceMetricUnit, QueryResult, QueryResultShape, Row, Value, WritePrivilege,
+    InstanceMetricKind, InstanceMetricUnit, QueryResult, QueryResultShape, Row, Value,
+    WritePrivilege,
 };
 
 use crate::driver::MssqlConnectionInner;
 
 /// Curated list of `sys.dm_os_performance_counters` entries that map to chartable metrics.
 ///
-/// Each entry: `(counter_name, instance_name, metric_id, display_name, group, unit)`.
+/// Each entry: `(counter_name, instance_name, metric_id, display_name, group, unit, kind)`.
 /// `instance_name` is often `""` (empty) for instance-wide counters or a database name.
 /// Counter names in `PERFORMANCE_COUNTERS` that are ratio types in
 /// `sys.dm_os_performance_counters`. For these, SQL Server stores the numerator
@@ -20,7 +21,15 @@ use crate::driver::MssqlConnectionInner;
 /// charted value must be `(numerator / denominator) * 100.0`.
 pub const RATIO_COUNTER_NAMES: &[&str] = &["Buffer cache hit ratio"];
 
-pub const PERFORMANCE_COUNTERS: &[(&str, &str, &str, &str, &str, InstanceMetricUnit)] = &[
+pub const PERFORMANCE_COUNTERS: &[(
+    &str,
+    &str,
+    &str,
+    &str,
+    &str,
+    InstanceMetricUnit,
+    InstanceMetricKind,
+)] = &[
     (
         "Batch Requests/sec",
         "",
@@ -28,6 +37,7 @@ pub const PERFORMANCE_COUNTERS: &[(&str, &str, &str, &str, &str, InstanceMetricU
         "Batch requests / sec",
         "Throughput",
         InstanceMetricUnit::PerSecond,
+        InstanceMetricKind::Counter,
     ),
     (
         "SQL Compilations/sec",
@@ -36,6 +46,7 @@ pub const PERFORMANCE_COUNTERS: &[(&str, &str, &str, &str, &str, InstanceMetricU
         "SQL compilations / sec",
         "Throughput",
         InstanceMetricUnit::PerSecond,
+        InstanceMetricKind::Counter,
     ),
     (
         "SQL Re-Compilations/sec",
@@ -44,6 +55,7 @@ pub const PERFORMANCE_COUNTERS: &[(&str, &str, &str, &str, &str, InstanceMetricU
         "SQL re-compilations / sec",
         "Throughput",
         InstanceMetricUnit::PerSecond,
+        InstanceMetricKind::Counter,
     ),
     (
         "User Connections",
@@ -52,6 +64,7 @@ pub const PERFORMANCE_COUNTERS: &[(&str, &str, &str, &str, &str, InstanceMetricU
         "User connections",
         "Connections",
         InstanceMetricUnit::Count,
+        InstanceMetricKind::Gauge,
     ),
     (
         "Lock Waits/sec",
@@ -60,6 +73,7 @@ pub const PERFORMANCE_COUNTERS: &[(&str, &str, &str, &str, &str, InstanceMetricU
         "Lock waits / sec",
         "Locks",
         InstanceMetricUnit::PerSecond,
+        InstanceMetricKind::Counter,
     ),
     (
         "Page reads/sec",
@@ -68,6 +82,7 @@ pub const PERFORMANCE_COUNTERS: &[(&str, &str, &str, &str, &str, InstanceMetricU
         "Page reads / sec",
         "I/O",
         InstanceMetricUnit::PerSecond,
+        InstanceMetricKind::Counter,
     ),
     (
         "Page writes/sec",
@@ -76,6 +91,7 @@ pub const PERFORMANCE_COUNTERS: &[(&str, &str, &str, &str, &str, InstanceMetricU
         "Page writes / sec",
         "I/O",
         InstanceMetricUnit::PerSecond,
+        InstanceMetricKind::Counter,
     ),
     (
         "Buffer cache hit ratio",
@@ -84,6 +100,7 @@ pub const PERFORMANCE_COUNTERS: &[(&str, &str, &str, &str, &str, InstanceMetricU
         "Buffer cache hit ratio",
         "Cache",
         InstanceMetricUnit::Percent,
+        InstanceMetricKind::Gauge,
     ),
     (
         "Total Server Memory (KB)",
@@ -92,6 +109,7 @@ pub const PERFORMANCE_COUNTERS: &[(&str, &str, &str, &str, &str, InstanceMetricU
         "Total server memory (KB)",
         "Memory",
         InstanceMetricUnit::Bytes,
+        InstanceMetricKind::Gauge,
     ),
 ];
 
@@ -114,14 +132,17 @@ impl MssqlInstanceCatalog {
     pub fn static_metrics() -> Vec<InstanceMetricDef> {
         PERFORMANCE_COUNTERS
             .iter()
-            .map(|(_, _, id, display_name, group, unit)| InstanceMetricDef {
-                id: id.to_string(),
-                display_name: display_name.to_string(),
-                group: group.to_string(),
-                unit: *unit,
-                description: None,
-                default_refresh_secs: 15,
-            })
+            .map(
+                |(_, _, id, display_name, group, unit, kind)| InstanceMetricDef {
+                    id: id.to_string(),
+                    display_name: display_name.to_string(),
+                    group: group.to_string(),
+                    unit: *unit,
+                    kind: *kind,
+                    description: None,
+                    default_refresh_secs: 15,
+                },
+            )
             .collect()
     }
 
@@ -396,6 +417,13 @@ fn kill_session(inner: &mut MssqlConnectionInner, sql: &str) -> Result<(), DbErr
 
 #[async_trait]
 impl InstanceCatalog for MssqlInstanceCatalog {
+    fn metric_kind(&self, metric_id: &str) -> Option<datatab_core::InstanceMetricKind> {
+        Self::static_metrics()
+            .into_iter()
+            .find(|metric| metric.id == metric_id)
+            .map(|metric| metric.kind)
+    }
+
     async fn list_metrics(&self) -> Result<Vec<InstanceMetricDef>, DbError> {
         if !self.view_server_state_available {
             log::warn!("[MSSQL] VIEW SERVER STATE permission absent; instance metrics unavailable");
@@ -505,10 +533,10 @@ pub(crate) fn dispatch_metric_series(
 ) -> Result<QueryResult, DbError> {
     let entry = PERFORMANCE_COUNTERS
         .iter()
-        .find(|(_, _, id, _, _, _)| *id == metric_id);
+        .find(|(_, _, id, _, _, _, _)| *id == metric_id);
 
     match entry {
-        Some((counter_name, instance_name, _, display_name, _, _)) => {
+        Some((counter_name, instance_name, _, display_name, _, _, _)) => {
             fetch_performance_counter(inner, counter_name, instance_name, display_name)
         }
         None => Err(DbError::NotSupported(format!(
@@ -543,7 +571,7 @@ fn fetch_performance_counter(
     debug_assert!(
         PERFORMANCE_COUNTERS
             .iter()
-            .any(|(cn, inst, _, _, _, _)| *cn == counter_name && *inst == instance_name),
+            .any(|(cn, inst, _, _, _, _, _)| *cn == counter_name && *inst == instance_name),
         "fetch_performance_counter called with values not in PERFORMANCE_COUNTERS — \
          ensure callers are not passing external input"
     );
@@ -800,6 +828,26 @@ pub fn mssql_advertises_instance_capabilities() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counter_metric_kinds() {
+        let actual: Vec<_> = MssqlInstanceCatalog::static_metrics()
+            .into_iter()
+            .filter(|metric| metric.kind == datatab_core::InstanceMetricKind::Counter)
+            .map(|metric| metric.id)
+            .collect();
+        assert_eq!(
+            actual,
+            vec![
+                "mssql.batch_requests_per_sec",
+                "mssql.compilations_per_sec",
+                "mssql.recompilations_per_sec",
+                "mssql.lock_waits_per_sec",
+                "mssql.page_reads_per_sec",
+                "mssql.page_writes_per_sec"
+            ]
+        );
+    }
 
     /// K2: single-quote characters must be doubled to prevent SQL injection via
     /// interpolation into Tiberius `simple_query` literals.

@@ -11,8 +11,8 @@ use crate::data_view::DataViewMode;
 use crate::result_view::ResultViewMode;
 use datatab_components::chart::legend::legend_element;
 use datatab_components::chart::{
-    ChartDetection, ManualChartSelection, SeriesSpec, SeriesStats, count_columns_for_why,
-    format_resolution, format_span, format_x_value, format_y_value,
+    ChartDetection, ChartView, ManualChartSelection, SeriesSpec, SeriesStats,
+    count_columns_for_why, format_resolution, format_span, format_x_value_in, format_y_value,
 };
 use datatab_components::chart::{SourceRowRef, point_inspector_element};
 use datatab_components::common::time_range::view::TimeRangePanel;
@@ -2246,13 +2246,7 @@ impl DataGridPanel {
                 let shell = s.read(cx);
                 let chart_entity = shell.chart_view()?.clone();
                 let chart = chart_entity.read(cx);
-                let point = chart.hovered_point()?;
-
-                Some((
-                    chart.series_label(point.series_idx).to_string(),
-                    datatab_components::chart::format_x_value(point.x, chart.x_is_time()),
-                    datatab_components::chart::format_y_value(point.y),
-                ))
+                format_point_inspector_readout_in(&datatab_core::chrono::Local, chart)
             })
             .unwrap_or_default();
 
@@ -3320,8 +3314,8 @@ impl DataGridPanel {
         };
 
         let span_ms = x_max - x_min;
-        let start_label = format_x_value(x_min, x_is_time);
-        let end_label = format_x_value(x_max, x_is_time);
+        let (start_label, end_label) =
+            format_stats_window_bounds_in(&datatab_core::chrono::Local, x_min, x_max, x_is_time);
         let span_label = format_span(span_ms);
         let points_count = self.result.rows.len();
 
@@ -4111,6 +4105,33 @@ fn format_hex_dump(data: &[u8]) -> String {
     } else {
         lines.join("\n")
     }
+}
+
+/// Format the hovered point's series label, X value and Y value in `tz` for
+/// the point inspector dock.
+pub(super) fn format_point_inspector_readout_in<Z: datatab_core::chrono::TimeZone>(
+    tz: &Z,
+    chart: &ChartView,
+) -> Option<(String, String, String)> {
+    let point = chart.hovered_point()?;
+    Some((
+        chart.series_label(point.series_idx).to_string(),
+        format_x_value_in(tz, point.x, chart.x_is_time()),
+        format_y_value(point.y),
+    ))
+}
+
+/// Format the stats rail's window start and end labels in `tz`.
+pub(super) fn format_stats_window_bounds_in<Z: datatab_core::chrono::TimeZone>(
+    tz: &Z,
+    x_min: f64,
+    x_max: f64,
+    x_is_time: bool,
+) -> (String, String) {
+    (
+        format_x_value_in(tz, x_min, x_is_time),
+        format_x_value_in(tz, x_max, x_is_time),
+    )
 }
 
 #[cfg(test)]

@@ -22,7 +22,7 @@ use datatab_ui_base::modals::{
     AddPanelOutcome, AddPanelRequest, CreateDashboardOutcome, CreateDashboardRequest,
     DeleteConfirmOutcome, DeleteConfirmRequest, DeleteTarget, ModalAddPanelPicker,
     ModalCreateDashboard, ModalDeleteConfirm, ModalRenameItem, RenameItemOutcome,
-    RenameItemRequest, RenameTarget, RequestMetricsForNamespace,
+    RenameItemRequest, RenameTarget,
 };
 use datatab_ui_base::{
     AppStateGlobal, OpenAuditRequested, UserErrorReported, drain_hook_load_diagnostics,
@@ -45,7 +45,6 @@ use crate::ui::overlays::command_palette::{
 use crate::ui::overlays::login_modal::{LoginModal, LoginModalEvent};
 use crate::ui::overlays::shutdown_overlay::ShutdownOverlay;
 use crate::ui::overlays::sql_preview_modal::SqlPreviewModal;
-use crate::ui::overlays::sso_wizard::{SsoWizard, SsoWizardEvent};
 #[cfg(feature = "mcp")]
 use crate::ui::views::status_bar::OpenApprovalsRequested;
 use crate::ui::views::status_bar::{StatusBar, ToggleTasksPanel};
@@ -222,7 +221,6 @@ pub(super) fn map_item_to_selection(item: &PaletteItem) -> Option<PaletteSelecti
         PaletteItem::SavedChart { id, .. } => {
             Some(PaletteSelection::OpenSavedChart { chart_id: *id })
         }
-        PaletteItem::ImportDashboard => Some(PaletteSelection::ImportDashboard),
     }
 }
 
@@ -327,7 +325,6 @@ pub struct Workspace {
     command_palette: Entity<CommandPalette>,
     sql_preview_modal: Entity<SqlPreviewModal>,
     login_modal: Entity<LoginModal>,
-    sso_wizard: Entity<SsoWizard>,
     shutdown_overlay: Entity<ShutdownOverlay>,
     whats_new_dialog: Entity<crate::ui::overlays::updates::WhatsNewDialog>,
     welcome_dialog: Entity<crate::ui::overlays::updates::WelcomeDialog>,
@@ -356,8 +353,6 @@ pub struct Workspace {
     pending_drop_table_item_id: Option<String>,
     /// SSH tunnel passphrase modal.
     modal_tunnel_auth: Entity<crate::ui::overlays::modals::ModalTunnelAuth>,
-    /// Import Dashboard from JSON modal.
-    modal_import_dashboard: Entity<crate::ui::overlays::modals::ModalImportDashboard>,
 
     /// Dashboard / saved-chart management modals.
     modal_create_dashboard: Entity<ModalCreateDashboard>,
@@ -408,10 +403,32 @@ pub struct Workspace {
     _background_purge_task: Option<Task<()>>,
 
     /// Pending login modal open request from a settings window auth-profile
-    /// login flow. Consumed in render() to call `login_modal.open_manual`.
-    ///
-    /// Fields: `(provider_name, profile_name, url)`.
-    pending_login_modal_open: Option<(String, String, Option<String>)>,
+    /// login flow. Consumed in render() by `show_settings_login`.
+    pending_login_modal_open: Option<PendingSettingsLogin>,
+
+    /// The Settings login the login modal shows, while the two are tied.
+    settings_login: Option<ShownSettingsLogin>,
+
+    /// The id `show_settings_login` gave the last Settings login it showed.
+    last_settings_login_id: u64,
+}
+
+/// A Settings login whose verification URL arrived, waiting for the next
+/// render to show it in the login modal.
+struct PendingSettingsLogin {
+    provider_name: String,
+    profile_name: String,
+    url: Option<String>,
+    login: datatab_ui_windows::settings::SettingsLoginHandle,
+}
+
+/// The tie between the login modal and the Settings login it shows.
+struct ShownSettingsLogin {
+    /// The id the login modal knows this login by.
+    id: u64,
+    login: datatab_ui_windows::settings::SettingsLoginHandle,
+    /// Closes the modal when the Settings form stops waiting for the login.
+    _ended: Subscription,
 }
 
 /// The operation the active-query prompt interrupted.
@@ -508,7 +525,6 @@ impl Workspace {
 
         let sql_preview_modal = cx.new(|cx| SqlPreviewModal::new(app_state.clone(), window, cx));
         let login_modal = cx.new(|cx| LoginModal::new(window, cx));
-        let sso_wizard = cx.new(|cx| SsoWizard::new(app_state.clone(), window, cx));
         let shutdown_overlay = cx.new(|cx| ShutdownOverlay::new(app_state.clone(), window, cx));
         let whats_new_dialog =
             cx.new(|cx| crate::ui::overlays::updates::WhatsNewDialog::new(app_state.clone(), cx));
@@ -531,9 +547,6 @@ impl Workspace {
             cx.new(|cx| crate::ui::overlays::modals::ModalDropTable::new(window, cx));
         let modal_tunnel_auth =
             cx.new(|cx| crate::ui::overlays::modals::ModalTunnelAuth::new(window, cx));
-        let modal_import_dashboard =
-            cx.new(|cx| crate::ui::overlays::modals::ModalImportDashboard::new(window, cx));
-
         let modal_create_dashboard = cx.new(|cx| ModalCreateDashboard::new(window, cx));
         let modal_rename_item = cx.new(|cx| ModalRenameItem::new(window, cx));
         let modal_delete_dashboard = cx.new(ModalDeleteConfirm::new);
@@ -854,11 +867,6 @@ impl Workspace {
                 PaletteSelection::OpenSavedChart { chart_id } => {
                     this.open_saved_chart(*chart_id, window, cx);
                 }
-                PaletteSelection::ImportDashboard => {
-                    this.modal_import_dashboard.update(cx, |modal, cx| {
-                        modal.open(window, cx);
-                    });
-                }
             },
         )
         .detach();
@@ -867,16 +875,6 @@ impl Workspace {
             this.needs_focus_restore = true;
             cx.notify();
         })
-        .detach();
-
-        // Subscribe: ModalImportDashboard — on Confirmed, run the dashboard import flow.
-        cx.subscribe_in(
-            &modal_import_dashboard,
-            window,
-            |this, _, event: &crate::ui::overlays::modals::ImportDashboardConfirmed, window, cx| {
-                this.run_dashboard_import(event.json.clone(), event.name.clone(), window, cx);
-            },
-        )
         .detach();
 
         // Subscribe: ModalCreateDashboard — on Confirmed, create the dashboard and open it.
@@ -931,7 +929,7 @@ impl Workspace {
         )
         .detach();
 
-        // Subscribe: ModalAddPanelPicker — handle all three submission paths.
+        // Subscribe: ModalAddPanelPicker — handle chart selection and query creation.
         cx.subscribe_in(
             &modal_add_panel,
             window,
@@ -959,40 +957,7 @@ impl Workspace {
                         cx,
                     );
                 }
-                AddPanelOutcome::CreateFromMetric {
-                    dashboard_id,
-                    profile_id,
-                    name,
-                    namespace,
-                    metric_name,
-                    dimensions,
-                    period_seconds,
-                    statistic,
-                } => {
-                    this.on_create_panel_from_metric(
-                        dashboard_id,
-                        profile_id,
-                        name,
-                        namespace,
-                        metric_name,
-                        dimensions,
-                        period_seconds,
-                        statistic,
-                        window,
-                        cx,
-                    );
-                }
                 AddPanelOutcome::Cancelled => {}
-            },
-        )
-        .detach();
-
-        // Subscribe: ModalAddPanelPicker — fetch metrics for a namespace on demand.
-        cx.subscribe_in(
-            &modal_add_panel,
-            window,
-            |this, modal, ev: &RequestMetricsForNamespace, _window, cx| {
-                this.on_request_metrics_for_namespace(modal.clone(), ev.clone(), cx);
             },
         )
         .detach();
@@ -1005,31 +970,8 @@ impl Workspace {
                     let _ = window;
                     this.open_auth_profiles_settings(cx);
                 }
-            },
-        )
-        .detach();
-
-        cx.subscribe_in(
-            &sso_wizard,
-            window,
-            |this, _, event: &SsoWizardEvent, _window, cx| match event {
-                SsoWizardEvent::ProfileCreated { profile_id } => {
-                    this.app_state.update(cx, |_state, cx| {
-                        cx.emit(AppStateChanged);
-                    });
-
-                    if this.pipeline_progress.is_some() {
-                        this.login_modal.update(cx, |modal, cx| {
-                            modal.close(cx);
-                        });
-
-                        this.pipeline_progress = None;
-                        this._pipeline_subscription = None;
-
-                        this.sidebar.update(cx, |sidebar, cx| {
-                            sidebar.connect_to_profile(*profile_id, cx);
-                        });
-                    }
+                LoginModalEvent::LoginCancelled { login_id } => {
+                    this.cancel_settings_login(*login_id, cx);
                 }
             },
         )
@@ -1069,19 +1011,6 @@ impl Workspace {
                         *profile_id,
                         collection.clone(),
                         TabPlacement::ReuseExisting,
-                        window,
-                        cx,
-                    );
-                }
-                SidebarEvent::OpenCollectionChild {
-                    profile_id,
-                    target,
-                    title,
-                } => {
-                    this.open_event_stream_document(
-                        *profile_id,
-                        target.clone(),
-                        title.clone(),
                         window,
                         cx,
                     );
@@ -1152,19 +1081,6 @@ impl Workspace {
                     ..
                 } => {
                     this.refresh_root_section_document(*profile_id, *presentation, window, cx);
-                }
-                SidebarEvent::OpenSecretStore {
-                    profile_id,
-                    store_id,
-                    path,
-                } => {
-                    this.open_secret_store_document(
-                        *profile_id,
-                        store_id.clone(),
-                        path.clone(),
-                        window,
-                        cx,
-                    );
                 }
                 SidebarEvent::RequestSqlPreview {
                     profile_id,
@@ -1301,24 +1217,8 @@ impl Workspace {
                         cx,
                     );
                 }
-                SidebarEvent::OpenMetricChart {
-                    profile_id,
-                    namespace,
-                    metric_name,
-                } => {
-                    this.open_metric_chart_from_sidebar(
-                        *profile_id,
-                        namespace.clone(),
-                        metric_name.clone(),
-                        window,
-                        cx,
-                    );
-                }
                 SidebarEvent::OpenDashboard { dashboard_id } => {
                     this.open_dashboard(*dashboard_id, window, cx);
-                }
-                SidebarEvent::OpenRemoteDashboard { profile_id, name } => {
-                    this.open_remote_dashboard(*profile_id, name.clone(), window, cx);
                 }
                 SidebarEvent::OpenSavedChart { chart_id } => {
                     this.open_saved_chart(*chart_id, window, cx);
@@ -1328,9 +1228,6 @@ impl Workspace {
                 }
                 SidebarEvent::RequestCreateDashboard { profile_id } => {
                     this.create_dashboard_from_sidebar(*profile_id, window, cx);
-                }
-                SidebarEvent::RequestImportDashboard { profile_id } => {
-                    this.import_dashboard_for_profile(*profile_id, window, cx);
                 }
                 SidebarEvent::RequestRenameDashboard { dashboard_id } => {
                     this.rename_dashboard(*dashboard_id, window, cx);
@@ -1737,7 +1634,6 @@ impl Workspace {
             command_palette,
             sql_preview_modal,
             login_modal,
-            sso_wizard,
             shutdown_overlay,
             whats_new_dialog,
             welcome_dialog,
@@ -1753,7 +1649,6 @@ impl Workspace {
             modal_drop_table,
             pending_drop_table_item_id: None,
             modal_tunnel_auth,
-            modal_import_dashboard,
             modal_create_dashboard,
             modal_rename_item,
             modal_delete_dashboard,
@@ -1780,6 +1675,8 @@ impl Workspace {
             last_user_error: None,
             _background_purge_task: None,
             pending_login_modal_open: None,
+            settings_login: None,
+            last_settings_login_id: 0,
         };
 
         {
@@ -2127,11 +2024,6 @@ impl Workspace {
                 datatab_i18n::t!("palette.command.open_login_modal.name"),
                 datatab_i18n::t!("palette.category.view"),
             ),
-            PaletteCommand::new(
-                "open_sso_wizard",
-                datatab_i18n::t!("palette.command.open_sso_wizard.name"),
-                datatab_i18n::t!("palette.category.view"),
-            ),
             #[cfg(feature = "mcp")]
             PaletteCommand::new(
                 "open_mcp_approvals",
@@ -2261,15 +2153,6 @@ impl Workspace {
             return Some(ContextId::CommandPalette);
         }
 
-        if self.sidebar.read(cx).has_child_picker_open() {
-            // When the filter input inside the picker is focused, defer to the
-            // text-input keymap so typing does not trigger list navigation.
-            if self.sidebar.read(cx).child_picker_filter_is_focused() {
-                return Some(ContextId::TextInput);
-            }
-            return Some(ContextId::EventStreamsPicker);
-        }
-
         if self.sql_preview_modal.read(cx).is_visible() {
             return Some(ContextId::SqlPreviewModal);
         }
@@ -2279,8 +2162,7 @@ impl Workspace {
         // command shortcuts. `TextInput` has no parent in the keymap fallback
         // chain, and as an overlay it keeps no global chords either, so only
         // input-level bindings fire.
-        if self.modal_import_dashboard.read(cx).is_visible()
-            || self.modal_create_dashboard.read(cx).is_visible()
+        if self.modal_create_dashboard.read(cx).is_visible()
             || self.modal_rename_item.read(cx).is_visible()
             || self.modal_add_panel.read(cx).is_visible()
             || self.modal_drop_table.read(cx).is_visible()
@@ -2446,17 +2328,6 @@ impl Workspace {
                     &mut items,
                 );
             }
-        }
-
-        // Add the "Import Dashboard from JSON" entry only when the active
-        // connection advertises the DASHBOARD_IMPORT capability.
-        if app_state.active_connection().is_some_and(|a| {
-            a.connection
-                .metadata()
-                .capabilities
-                .contains(datatab_core::DriverCapabilities::DASHBOARD_IMPORT)
-        }) {
-            items.push(PaletteItem::ImportDashboard);
         }
 
         // "Analyze database dump…" only appears when at least one registered

@@ -17,6 +17,7 @@ gpui.workspace = true
 gpui-component.workspace = true
 gpui-pre-platform.workspace = true
 datatab_app.workspace = true
+datatab_cli.workspace = true
 datatab_ui = { workspace = true }
 datatab_core = { workspace = true, features = ["tracing-bridge"] }
 datatab_i18n.workspace = true
@@ -28,13 +29,16 @@ tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 log.workspace = true
 interprocess.workspace = true
 # rustls 0.23 refuses to auto-select a crypto provider when more than one
-# backend is linked. This workspace links several (the AWS SDK pulls `ring`,
-# reqwest and the TLS drivers pull `aws-lc-rs`), so the binary installs a
-# process-wide default in `main`. Declared here to reach `rustls::crypto`.
+# backend is linked. This workspace links both `ring` and `aws-lc-rs`, so the
+# binary installs a process-wide default in `main`. Declared here to reach
+# `rustls::crypto`.
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
 
 # The build script embeds the icon and VERSIONINFO into datatab.exe. gpui already
 # builds with embed-resource on Windows, so this widens an existing dependency
@@ -53,7 +57,7 @@ workspace = true
 optional = true
 
 [features]
-default = ["sqlite", "postgres", "mysql", "mongodb", "redis", "dynamodb", "cloudwatch", "influxdb", "mssql", "redshift", "clickhouse", "turso", "duckdb", "s3", "aws_secrets", "lua", "aws", "mcp"]
+default = ["sqlite", "postgres", "mysql", "mongodb", "redis", "influxdb", "mssql", "redshift", "clickhouse", "turso", "duckdb", "lua", "mcp"]
 # datatab_ui is driver-agnostic, so driver features only drive datatab_app (which
 # registers the drivers and relays to the MCP server). The binary does not need
 # to declare driver/runtime crates as direct optional deps — `datatab_app/<feat>`
@@ -63,18 +67,13 @@ postgres = ["datatab_app/postgres"]
 mysql = ["datatab_app/mysql"]
 mongodb = ["datatab_app/mongodb"]
 redis = ["datatab_app/redis"]
-dynamodb = ["datatab_app/dynamodb"]
-cloudwatch = ["datatab_app/cloudwatch"]
 influxdb = ["datatab_app/influxdb"]
 mssql = ["datatab_app/mssql"]
 redshift = ["datatab_app/redshift"]
 clickhouse = ["datatab_app/clickhouse"]
 turso = ["datatab_app/turso"]
 duckdb = ["datatab_app/duckdb"]
-s3 = ["datatab_app/s3"]
-aws_secrets = ["datatab_app/aws_secrets"]
 lua = ["datatab_app/lua", "datatab_ui/lua"]
-aws = ["datatab_app/aws", "datatab_ui/aws"]
 mcp = ["datatab_app/mcp", "datatab_ui/mcp"]
 # Development-only UI automation bridge (gpui-mcp). Never part of `default`.
 ui-automation = ["datatab_ui/ui-automation"]

@@ -4,11 +4,10 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    CodeGenCapabilities, CodeGenerator, CollectionBrowseRequest, CollectionChildrenPage,
-    CollectionChildrenRequest, CollectionCountRequest, CollectionRef, ConnectionProfile,
-    CrudResult, CustomTypeInfo, DatabaseInfo, DbConfig, DbError, DbKind, DbSchemaInfo,
-    DescribeRequest, DocumentDelete, DocumentInsert, DocumentUpdate, DriverCapabilities,
-    DriverFormDef, DriverMetadata, EventPage, EventQuery, ExplainRequest, ExportFieldHint,
+    CodeGenCapabilities, CodeGenerator, CollectionBrowseRequest, CollectionCountRequest,
+    ConnectionProfile, CrudResult, CustomTypeInfo, DatabaseInfo, DbConfig, DbError, DbKind,
+    DbSchemaInfo, DescribeRequest, DocumentDelete, DocumentInsert, DocumentUpdate,
+    DriverCapabilities, DriverFormDef, DriverMetadata, ExplainRequest, ExportFieldHint,
     FormFieldKind, FormValues, LanguageService, NoOpCodeGenerator, QueryHandle, QueryLanguage,
     QueryRequest, QueryResult, RelationRef, RoutineInfo, RowDelete, RowInsert, RowPatch,
     SchemaColumnInfo, SchemaForeignKeyInfo, SchemaIndexInfo, SchemaSnapshot, SemanticPlan,
@@ -121,13 +120,6 @@ pub struct SourceContextSpec {
     pub default_query_mode: Option<String>,
 }
 
-/// A driver-owned event stream target that can be opened in the audit document.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EventStreamTarget {
-    pub collection: CollectionRef,
-    pub child_id: Option<String>,
-}
-
 impl SchemaObjectKind {
     /// Returns the SQL keyword for the DROP statement header.
     pub fn drop_keyword(&self) -> &'static str {
@@ -212,7 +204,7 @@ use std::sync::Arc;
 /// Passed to `DbDriver::connect_with_overrides()` so drivers receive
 /// pipeline-resolved credentials without storing them in the profile.
 pub struct ConnectionOverrides {
-    /// Password resolved from a ValueRef (secret manager, SSM, SSO credentials).
+    /// Password resolved from a ValueRef (secret provider, environment variable, auth session credentials).
     pub password: Option<SecretString>,
 }
 
@@ -287,7 +279,7 @@ pub trait DbDriver: Send + Sync {
     }
 
     /// Short monospace hint shown under the driver's name in the connection
-    /// manager's driver picker, such as `:5432`, `file` or `AWS`.
+    /// manager's driver picker, such as `:5432`, `file` or `cloud`.
     ///
     /// Default implementation shows the default port (`:<port>`) and falls
     /// back to `description()` for drivers without one. Drivers without a
@@ -344,6 +336,16 @@ pub trait DbDriver: Send + Sync {
         None
     }
 
+    /// Refuse a profile before PreConnect hooks, authentication, value resolution
+    /// or access setup.
+    ///
+    /// This check must be pure: no I/O and no secret resolution. Inspect only
+    /// static profile settings, allowing values that will be resolved later.
+    /// The default accepts every profile, including external RPC profiles.
+    fn validate_profile(&self, _profile: &ConnectionProfile) -> Result<(), DbError> {
+        Ok(())
+    }
+
     /// Build a DbConfig from form values collected by the UI.
     ///
     /// The `values` map contains field IDs as keys and user input as values.
@@ -363,7 +365,7 @@ pub trait DbDriver: Send + Sync {
     ///
     /// Drivers override this only for fields whose export semantics cannot be
     /// inferred from the kind alone — for example, a `Text` or `AuthProfileRef`
-    /// field that names an environment-local resource such as an AWS profile must
+    /// field that names an environment-local resource such as a cloud profile name must
     /// be marked `RequiredOnImport` explicitly.
     ///
     /// The `values` parameter carries the current form state and is available for
@@ -417,17 +419,6 @@ pub trait DbDriver: Send + Sync {
         None
     }
 
-    /// Build a config targeting a specific cloud region, when supported.
-    ///
-    /// Drivers whose connections reach one region can override this to return
-    /// an updated config, which is what lets the user move a live connection to
-    /// another region without editing the profile. Drivers without a region
-    /// should return `None`, so a region switch is refused instead of silently
-    /// connecting to the same place.
-    fn with_region(&self, _config: &DbConfig, _region: &str) -> Option<DbConfig> {
-        None
-    }
-
     /// Whether this database type requires authentication.
     ///
     /// Default implementation checks for the AUTHENTICATION capability.
@@ -478,8 +469,8 @@ pub trait DbDriver: Send + Sync {
     /// Create a connection using pipeline-resolved overrides.
     ///
     /// Called by the connect pipeline after value resolution. The overrides
-    /// contain the resolved password (from SSO credentials, secret manager,
-    /// or parameter store) that should be used instead of the keyring password.
+    /// contain the resolved password (from auth session credentials or a
+    /// secret provider) that should be used instead of the keyring password.
     ///
     /// The default implementation delegates to `connect_with_secrets`.
     fn connect_with_overrides(
@@ -1358,29 +1349,6 @@ pub trait Connection: Send + Sync {
         None
     }
 
-    /// Returns the cloud region this connection reaches, if it reaches one.
-    ///
-    /// Drivers that advertise `DriverCapabilities::REGION_SWITCH` report the
-    /// region they connected with, which is also the value a region switch
-    /// starts from. Drivers without a region keep the `None` default.
-    fn current_region(&self) -> Option<String> {
-        None
-    }
-
-    /// Lists the cloud regions this connection can be moved to.
-    ///
-    /// Drivers that advertise `DriverCapabilities::REGION_SWITCH` ask the
-    /// provider for its regions with this connection's credentials, so a
-    /// caller sees exactly the regions this connection can reach. A driver
-    /// without a region inherits the default and reports `NotSupported` rather
-    /// than an empty list, because an empty list reads as "there is nowhere to
-    /// go" while the truth is "this connection has no regions".
-    fn available_regions(&self) -> Result<Vec<String>, DbError> {
-        Err(DbError::NotSupported(
-            "region listing not supported".to_string(),
-        ))
-    }
-
     /// Returns the database kind for this connection.
     fn kind(&self) -> DbKind;
 
@@ -1674,16 +1642,6 @@ pub trait Connection: Send + Sync {
         ))
     }
 
-    /// List driver-owned child sources under a collection/container.
-    fn collection_children(
-        &self,
-        _request: &CollectionChildrenRequest,
-    ) -> Result<CollectionChildrenPage, DbError> {
-        Err(DbError::NotSupported(
-            "Collection child listing not supported by this driver".to_string(),
-        ))
-    }
-
     /// Count documents in a collection with an optional filter.
     ///
     /// The default implementation returns `NotSupported`.
@@ -1810,47 +1768,11 @@ pub trait Connection: Send + Sync {
         ))
     }
 
-    /// Browse a driver-owned event stream source as canonical observability records.
-    fn browse_event_stream(
-        &self,
-        _target: &EventStreamTarget,
-        _query: &EventQuery,
-    ) -> Result<EventPage, DbError> {
-        Err(DbError::NotSupported(
-            "Event stream browsing not supported by this driver".to_string(),
-        ))
-    }
-
     /// Optional source-context controls exposed by this driver in query documents.
     fn source_context_spec(&self) -> Option<SourceContextSpec> {
         None
     }
 
-    /// Return a reference to this connection's metric catalog, if supported.
-    ///
-    /// Drivers that implement `MetricCatalog` override this and return `Some(&self.catalog)`.
-    /// Drivers that do not support catalog browsing inherit this default and return `None`.
-    /// These drivers MUST NOT advertise `DriverCapabilities::METRIC_CATALOG`.
-    fn metric_catalog(&self) -> Option<&dyn crate::connection::metric_catalog::MetricCatalog> {
-        None
-    }
-
-    /// Return a reference to this connection's dashboard importer, if supported.
-    ///
-    /// Drivers that implement `DashboardImporter` override this and return `Some(&self.importer)`.
-    /// Drivers without dashboard import support inherit this default and return `None`.
-    /// These drivers MUST NOT advertise `DriverCapabilities::DASHBOARD_IMPORT`.
-    fn dashboard_importer(
-        &self,
-    ) -> Option<&dyn crate::connection::dashboard_import::DashboardImporter> {
-        None
-    }
-
-    /// Return a reference to this connection's dashboard sync source, if supported.
-    ///
-    /// Drivers that implement `DashboardSource` override this and return `Some(&self.source)`.
-    /// Drivers without dashboard sync support inherit this default and return `None`.
-    /// These drivers MUST NOT advertise `DriverCapabilities::DASHBOARD_SYNC`.
     /// Return a boxed `InstanceCatalog` for this connection, if supported.
     ///
     /// Drivers that implement `InstanceCatalog` override this and return `Some(catalog)`.
@@ -1860,12 +1782,6 @@ pub trait Connection: Send + Sync {
     fn instance_catalog(
         &self,
     ) -> Option<Box<dyn crate::connection::instance_catalog::InstanceCatalog>> {
-        None
-    }
-
-    fn dashboard_source(
-        &self,
-    ) -> Option<&dyn crate::connection::dashboard_source::DashboardSource> {
         None
     }
 
@@ -2025,25 +1941,6 @@ pub trait Connection: Send + Sync {
         &self,
     ) -> Option<&dyn crate::connection::root_section::RootSectionSource> {
         None
-    }
-
-    /// Returns the secret stores this connection exposes, in display order.
-    ///
-    /// Drivers that implement `SecretStoreSource` override this. Drivers without
-    /// secret stores inherit the empty default and MUST NOT advertise
-    /// `DriverCapabilities::SECRET_STORE`.
-    fn secret_stores(&self) -> Vec<&dyn crate::connection::secret_store::SecretStoreSource> {
-        Vec::new()
-    }
-
-    /// Returns the store whose descriptor id is `store_id`.
-    fn secret_store(
-        &self,
-        store_id: &str,
-    ) -> Option<&dyn crate::connection::secret_store::SecretStoreSource> {
-        self.secret_stores()
-            .into_iter()
-            .find(|store| store.descriptor().id == store_id)
     }
 
     /// Returns the language service for this connection.
@@ -2697,27 +2594,6 @@ mod tests {
     fn table_alter_planner_defaults_to_none_for_legacy_connections() {
         let conn = StubConnection;
         assert!(conn.table_alter_planner().is_none());
-    }
-
-    #[test]
-    fn test_connection_default_dashboard_importer_is_none() {
-        // The default `Connection::dashboard_importer()` must return None.
-        // StubConnection does not override the method, so it exercises the default.
-        let conn = StubConnection;
-        assert!(
-            conn.dashboard_importer().is_none(),
-            "default dashboard_importer() must return None"
-        );
-    }
-
-    #[test]
-    fn test_connection_default_dashboard_source_is_none() {
-        // The default `Connection::dashboard_source()` must return None.
-        let conn = StubConnection;
-        assert!(
-            conn.dashboard_source().is_none(),
-            "default dashboard_source() must return None"
-        );
     }
 
     struct StubKeyValue;

@@ -11,6 +11,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD_NO_PAD;
@@ -345,14 +346,14 @@ pub fn establish_session(
     config: &SshTunnelConfig,
     secret: Option<&str>,
 ) -> Result<Session, DbError> {
-    let total_start = std::time::Instant::now();
+    establish_session_with(
+        config,
+        |resolved| connect_ssh_tcp(resolved).map(Some),
+        |session, resolved| handshake_and_authenticate(session, resolved, secret),
+    )
+}
 
-    // Resolve the SSH config alias first: every dial below —
-    // TCP connect, handshake, TOFU host-key step (keyed on the resolved
-    // host and port, A1) and authentication — uses the resolved target.
-    let resolved = resolve_for_dial(config)?;
-    let config = &resolved;
-
+fn connect_ssh_tcp(config: &SshTunnelConfig) -> Result<TcpStream, DbError> {
     log::info!(
         "[SSH] Phase 1/3: TCP connect to {}:{}",
         config.host,
@@ -378,20 +379,21 @@ pub fn establish_session(
         phase_start.elapsed().as_secs_f64() * 1000.0
     );
 
-    log::info!("[SSH] Phase 2/3: Creating SSH session and handshake");
+    Ok(tcp)
+}
+
+fn handshake_and_authenticate(
+    session: &mut Session,
+    config: &SshTunnelConfig,
+    secret: Option<&str>,
+) -> Result<(), DbError> {
     let phase_start = std::time::Instant::now();
-
-    let mut session = Session::new()
-        .map_err(|e| DbError::connection_failed(format!("Failed to create SSH session: {}", e)))?;
-
-    session.set_tcp_stream(tcp);
-    session.set_timeout(30000);
 
     session
         .handshake()
         .map_err(|e| DbError::connection_failed(format!("SSH handshake failed: {}", e)))?;
 
-    verify_or_store_host_key(&session, &config.host, config.port)?;
+    verify_or_store_host_key(session, &config.host, config.port)?;
 
     log::info!(
         "[SSH] Phase 2/3: Handshake completed in {:.2}ms",
@@ -403,7 +405,7 @@ pub fn establish_session(
 
     match &config.auth_method {
         SshAuthMethod::PrivateKey { key_path } => {
-            authenticate_with_key(&session, &config.user, key_path.as_deref(), secret)?;
+            authenticate_with_key(session, &config.user, key_path.as_deref(), secret)?;
         }
         SshAuthMethod::Password => {
             let password = secret.ok_or_else(|| {
@@ -427,6 +429,45 @@ pub fn establish_session(
         "[SSH] Phase 3/3: Authentication completed in {:.2}ms",
         phase_start.elapsed().as_secs_f64() * 1000.0
     );
+
+    Ok(())
+}
+
+fn establish_session_with<Connect, HandshakeAndAuth>(
+    config: &SshTunnelConfig,
+    connect_stream: Connect,
+    handshake_and_auth: HandshakeAndAuth,
+) -> Result<Session, DbError>
+where
+    Connect: FnOnce(&SshTunnelConfig) -> Result<Option<TcpStream>, DbError>,
+    HandshakeAndAuth: FnOnce(&mut Session, &SshTunnelConfig) -> Result<(), DbError>,
+{
+    let total_start = std::time::Instant::now();
+
+    // Resolve the SSH config alias first: every dial below —
+    // TCP connect, handshake, TOFU host-key step (keyed on the resolved
+    // host and port, A1) and authentication — uses the resolved target.
+    let resolved = resolve_for_dial(config)?;
+    let config = &resolved;
+
+    let maybe_tcp = connect_stream(config)?;
+
+    log::info!("[SSH] Phase 2/3: Creating SSH session and handshake");
+
+    let mut session = Session::new()
+        .map_err(|e| DbError::connection_failed(format!("Failed to create SSH session: {}", e)))?;
+
+    if let Some(tcp) = maybe_tcp {
+        session.set_tcp_stream(tcp);
+    }
+    session.set_timeout(30000);
+    // Keepalive must NOT be configured before handshake and authentication:
+    // libssh2 starts `keepalive_last_sent` at 0, so a blocking handshake that
+    // hits EAGAIN calls `_libssh2_wait_socket` -> `libssh2_keepalive_send`
+    // mid-handshake. Keepalive is configured once authenticated, at
+    // tunnel-loop entry.
+
+    handshake_and_auth(&mut session, config)?;
 
     log::info!(
         "[SSH] Session established, total time: {:.2}ms",
@@ -827,6 +868,53 @@ fn authenticate_with_key_file(
 // SSH tunnel loop
 // ---------------------------------------------------------------------------
 
+/// Interval between SSH-level keepalive messages (`keepalive@libssh2.org`)
+/// on an idle tunnel session. Matches the 60 s idle window used on direct
+/// driver sockets so NAT gateways and firewalls keep the flow open.
+const SSH_KEEPALIVE_INTERVAL_SECS: u32 = 60;
+
+const SSH_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(SSH_KEEPALIVE_INTERVAL_SECS as u64);
+
+/// Enable SSH-level keepalives (`SSH_MSG_GLOBAL_REQUEST`,
+/// `"keepalive@libssh2.org"`) on `session` every 60 seconds of idle time.
+///
+/// Uses `want_reply = false`: `libssh2` (`keepalive.c`) only sends the request
+/// and never drains `SSH_MSG_REQUEST_FAILURE` replies, which `packet.c`
+/// otherwise appends to `session->packets` indefinitely.
+fn configure_ssh_keepalive(session: &Session) {
+    session.set_keepalive(false, SSH_KEEPALIVE_INTERVAL_SECS);
+}
+
+#[derive(Debug)]
+enum KeepaliveOutcome {
+    NotDue,
+    Sent,
+    Failed(ssh2::Error),
+}
+
+/// Sends an SSH keepalive if `now` has reached `*next_keepalive`.
+///
+/// `libssh2` only calls `libssh2_keepalive_send` automatically inside blocking
+/// waits, so the non-blocking tunnel loop must poll it explicitly.
+fn poll_keepalive(
+    session: &Session,
+    next_keepalive: &mut Instant,
+    now: Instant,
+) -> KeepaliveOutcome {
+    if now < *next_keepalive {
+        return KeepaliveOutcome::NotDue;
+    }
+
+    match session.keepalive_send() {
+        Ok(seconds_to_next) => {
+            let delay_secs = u64::from(seconds_to_next.max(1));
+            *next_keepalive = now + Duration::from_secs(delay_secs);
+            KeepaliveOutcome::Sent
+        }
+        Err(error) => KeepaliveOutcome::Failed(error),
+    }
+}
+
 /// Single-threaded tunnel loop that multiplexes all SSH connections.
 fn run_ssh_tunnel_loop(
     listener: TcpListener,
@@ -835,9 +923,29 @@ fn run_ssh_tunnel_loop(
     remote_port: u16,
     shutdown: Arc<AtomicBool>,
 ) {
+    run_ssh_tunnel_loop_with_keepalive_delay(
+        listener,
+        session,
+        remote_host,
+        remote_port,
+        shutdown,
+        SSH_KEEPALIVE_INTERVAL,
+    );
+}
+
+fn run_ssh_tunnel_loop_with_keepalive_delay(
+    listener: TcpListener,
+    session: Session,
+    remote_host: String,
+    remote_port: u16,
+    shutdown: Arc<AtomicBool>,
+    first_keepalive_delay: Duration,
+) {
     session.set_blocking(false);
+    configure_ssh_keepalive(&session);
 
     let mut connections: Vec<ForwardingConnection<ssh2::Channel>> = Vec::new();
+    let mut next_keepalive = Instant::now() + first_keepalive_delay;
 
     while !shutdown.load(Ordering::SeqCst) {
         let mut activity = false;
@@ -891,6 +999,16 @@ fn run_ssh_tunnel_loop(
                 before - connections.len(),
                 connections.len()
             );
+        }
+
+        let now = Instant::now();
+        if activity {
+            next_keepalive = now + SSH_KEEPALIVE_INTERVAL;
+        } else if let KeepaliveOutcome::Failed(error) =
+            poll_keepalive(&session, &mut next_keepalive, now)
+        {
+            log::warn!("[SSH] Keepalive send failed, closing tunnel: {}", error);
+            break;
         }
 
         adaptive_sleep(activity, !connections.is_empty());
@@ -1226,6 +1344,175 @@ mod resolve_for_dial_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configure_ssh_keepalive_arms_libssh2_keepalive() {
+        let session = Session::new().expect("create SSH session");
+        assert_eq!(
+            session.keepalive_send().expect("unconfigured keepalive"),
+            0,
+            "a fresh session must start with keepalive disabled"
+        );
+
+        configure_ssh_keepalive(&session);
+
+        // Once keepalive is armed (interval > 0, last_sent == 0), keepalive_send
+        // attempts to write an SSH_MSG_GLOBAL_REQUEST packet, which fails on an
+        // unconnected Session without a socket.
+        assert!(
+            session.keepalive_send().is_err(),
+            "configured session must attempt to send a keepalive packet"
+        );
+    }
+
+    #[test]
+    fn tunnel_loop_exits_when_keepalive_send_fails() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local listener");
+        listener
+            .set_nonblocking(true)
+            .expect("set listener non-blocking");
+        let session = Session::new().expect("create SSH session");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        let thread = std::thread::spawn({
+            let shutdown = shutdown.clone();
+            move || {
+                run_ssh_tunnel_loop_with_keepalive_delay(
+                    listener,
+                    session,
+                    "127.0.0.1".to_string(),
+                    5432,
+                    shutdown,
+                    std::time::Duration::ZERO,
+                );
+                done_tx
+                    .send(())
+                    .expect("receiver stays alive until after thread.join()");
+            }
+        });
+
+        let result = done_rx.recv_timeout(std::time::Duration::from_millis(500));
+        shutdown.store(true, Ordering::SeqCst);
+        thread.join().expect("join tunnel loop thread");
+        drop(done_rx);
+
+        assert!(
+            result.is_ok(),
+            "tunnel loop must exit when SSH keepalive send fails"
+        );
+    }
+
+    #[test]
+    fn poll_keepalive_skips_before_deadline_and_probes_when_due() {
+        let session = Session::new().expect("create SSH session");
+        let base = Instant::now();
+        let initial_deadline = base + SSH_KEEPALIVE_INTERVAL;
+        let mut next_keepalive = initial_deadline;
+
+        // Before the deadline, even an armed unconnected session is not probed.
+        configure_ssh_keepalive(&session);
+        assert!(matches!(
+            poll_keepalive(
+                &session,
+                &mut next_keepalive,
+                base + Duration::from_secs(59)
+            ),
+            KeepaliveOutcome::NotDue
+        ));
+        assert_eq!(next_keepalive, initial_deadline);
+
+        // At the deadline, an armed unconnected session attempts to send and fails.
+        assert!(matches!(
+            poll_keepalive(&session, &mut next_keepalive, initial_deadline),
+            KeepaliveOutcome::Failed(_)
+        ));
+
+        // When keepalive is disabled (interval = 0), keepalive_send returns Ok(0)
+        // and poll_keepalive clamps the next deadline to at least 1 second.
+        session.set_keepalive(false, 0);
+        assert!(matches!(
+            poll_keepalive(&session, &mut next_keepalive, initial_deadline),
+            KeepaliveOutcome::Sent
+        ));
+        assert_eq!(next_keepalive, initial_deadline + Duration::from_secs(1));
+    }
+
+    #[test]
+    fn keepalive_is_not_configured_before_authentication_and_is_configured_at_loop_entry() {
+        let config = SshTunnelConfig {
+            host: "ssh.example.invalid".to_string(),
+            port: 22,
+            user: "tester".to_string(),
+            auth_method: SshAuthMethod::Password,
+            ssh_config_host: None,
+        };
+
+        let mut keepalive_before_handshake = None;
+        let session = establish_session_with(
+            &config,
+            |_| Ok(None),
+            |session, _| {
+                keepalive_before_handshake = Some(session.keepalive_send());
+                Ok(())
+            },
+        )
+        .expect("establish session without connecting");
+
+        assert_eq!(
+            keepalive_before_handshake
+                .expect("handshake callback ran")
+                .expect("keepalive must stay disabled before handshake/auth"),
+            0,
+            "keepalive must not be configured before handshake and authentication"
+        );
+        assert_eq!(
+            session
+                .keepalive_send()
+                .expect("keepalive must stay disabled immediately after session establishment"),
+            0,
+            "establish_session must return a session with keepalive still disabled"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind local listener");
+        listener
+            .set_nonblocking(true)
+            .expect("set listener non-blocking");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let session_observer = session.clone();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+
+        let thread = std::thread::spawn({
+            let shutdown = shutdown.clone();
+            move || {
+                run_ssh_tunnel_loop_with_keepalive_delay(
+                    listener,
+                    session,
+                    "127.0.0.1".to_string(),
+                    5432,
+                    shutdown,
+                    Duration::ZERO,
+                );
+                done_tx
+                    .send(())
+                    .expect("receiver stays alive until after thread.join()");
+            }
+        });
+
+        let result = done_rx.recv_timeout(Duration::from_millis(500));
+        shutdown.store(true, Ordering::SeqCst);
+        thread.join().expect("join tunnel loop thread");
+        drop(done_rx);
+
+        assert!(
+            result.is_ok(),
+            "tunnel loop must run and exit when keepalive send fails on unconnected session"
+        );
+        assert!(
+            session_observer.keepalive_send().is_err(),
+            "keepalive must be configured on the session at tunnel-loop entry"
+        );
+    }
 
     #[test]
     fn open_tunnel_reports_an_unreachable_ssh_server() {

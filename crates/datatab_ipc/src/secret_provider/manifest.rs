@@ -3,8 +3,8 @@ use std::time::Duration;
 
 use super::protocol::{AuthProfileDependency, SecretProviderCapabilities, SecretProviderManifest};
 
-/// Provider ids owned by the built-in secret providers; external providers may not claim them.
-pub const BUILT_IN_SECRET_PROVIDER_IDS: [&str; 2] = ["aws-secrets-manager", "aws-ssm"];
+/// Provider ids reserved for built-in secret providers. No id is reserved today.
+pub const BUILT_IN_SECRET_PROVIDER_IDS: [&str; 0] = [];
 
 pub const SUPPORTED_MANIFEST_VERSION: u16 = 1;
 pub const MAX_PROVIDER_ID_LENGTH: usize = 64;

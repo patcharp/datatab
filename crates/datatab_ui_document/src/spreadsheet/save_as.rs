@@ -22,6 +22,7 @@ use datatab_ui_base::{SaveTargetOutcome, SaveTargetProvider, SaveTargetRequest};
 use gpui::*;
 
 use super::document::{SheetSource, SpreadsheetDocument, spreadsheet_error_to_user_facing};
+use crate::code::display_path::display_path;
 use crate::dedup::FileDocumentKey;
 
 const XLSX_EXTENSION: &str = "xlsx";
@@ -42,7 +43,7 @@ impl SaveAsPrompt {
 
 /// Why Save as .xlsx wrote no new file.
 #[derive(Debug)]
-enum SaveAsError {
+pub(super) enum SaveAsError {
     /// The original workbook could not be opened again.
     Open(SpreadsheetError),
 
@@ -194,7 +195,7 @@ impl SpreadsheetDocument {
                         let name = target
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| target.display().to_string());
+                            .unwrap_or_else(|| display_path(&target));
 
                         Toast::success(crate::labels::spreadsheet_save_as_saved_message(&name))
                             .push(cx);
@@ -394,7 +395,7 @@ fn write_staged(
 /// The user-facing error of a Save as .xlsx that wrote no file. A value or
 /// sheet name the xlsx format refuses is the user's to change; everything
 /// else is a file that could not be read or written.
-fn save_as_error_to_user_facing(error: &SaveAsError, title: &str) -> UserFacingError {
+pub(super) fn save_as_error_to_user_facing(error: &SaveAsError, title: &str) -> UserFacingError {
     let summary = crate::labels::spreadsheet_save_as_failed_message(title);
 
     match error {
@@ -425,7 +426,7 @@ fn save_as_error_to_user_facing(error: &SaveAsError, title: &str) -> UserFacingE
         SaveAsError::Local { path, source } => UserFacingError::new(ErrorKind::Storage, summary)
             .with_cause(datatab_i18n::t!(
                 "document.file.error.storage.local_io",
-                path = path.display().to_string(),
+                path = display_path(path),
                 cause = source
             )),
     }

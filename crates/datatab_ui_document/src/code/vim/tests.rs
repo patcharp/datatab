@@ -83,14 +83,23 @@ fn init_runtime(cx: &mut TestAppContext) {
 
 type FixtureSlot = Rc<RefCell<Option<(Entity<CodeDocument>, Entity<Harness>)>>>;
 
-struct Fixture<'a> {
+struct Fixture {
     app_state: Entity<AppStateEntity>,
     document: Entity<CodeDocument>,
     harness: Entity<Harness>,
-    window: &'a mut VisualTestContext,
+    window: VisualTestContext,
 }
 
-impl Fixture<'_> {
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // Close between tests; during unwinding the window may already be unavailable.
+        if !std::thread::panicking() {
+            self.window.update(|window, _| window.remove_window());
+        }
+    }
+}
+
+impl Fixture {
     /// Whether the key context the workspace reports carries the Vim mode.
     fn reports_vim_mode(&mut self) -> bool {
         let document = self.document.clone();
@@ -388,12 +397,10 @@ impl Fixture<'_> {
 
     fn keys(&mut self, keystrokes: &str) {
         self.window.simulate_keystrokes(keystrokes);
-        self.window.run_until_parked();
     }
 
     fn type_text(&mut self, input: &str) {
         self.window.simulate_input(input);
-        self.window.run_until_parked();
     }
 
     /// Delivers text the way an IME does: a marked composition, then a commit,
@@ -1289,7 +1296,7 @@ fn pending_g_escape_exits_visual_and_resets_prefix(cx: &mut TestAppContext) {
     }
 }
 
-fn open_editor<'a>(cx: &'a mut TestAppContext, content: &str, vim_enabled: bool) -> Fixture<'a> {
+fn open_editor(cx: &mut TestAppContext, content: &str, vim_enabled: bool) -> Fixture {
     open_editor_with(
         cx,
         EditorSetup {
@@ -1308,7 +1315,7 @@ struct EditorSetup<'a> {
     read_only: bool,
 }
 
-fn open_editor_with<'a>(cx: &'a mut TestAppContext, setup: EditorSetup<'_>) -> Fixture<'a> {
+fn open_editor_with(cx: &mut TestAppContext, setup: EditorSetup<'_>) -> Fixture {
     init_runtime(cx);
 
     let app_state = cx.update(|cx| {
@@ -1373,7 +1380,7 @@ fn open_editor_with<'a>(cx: &'a mut TestAppContext, setup: EditorSetup<'_>) -> F
         app_state,
         document,
         harness,
-        window,
+        window: window.clone(),
     }
 }
 
@@ -3023,7 +3030,7 @@ fn action_and_focus_boundaries_discard_pending_count(cx: &mut TestAppContext) {
 #[gpui::test]
 fn pending_display_clears_on_focus_and_tab_action(cx: &mut TestAppContext) {
     let mut editor = open_editor(cx, "abcdef", true);
-    let pending = |editor: &mut Fixture<'_>| {
+    let pending = |editor: &mut Fixture| {
         let document = editor.document.clone();
         editor
             .window
@@ -3176,7 +3183,7 @@ fn insert_mode_accepts_text_like_a_plain_editor(
     cx: &mut TestAppContext,
     plain_cx: &mut TestAppContext,
 ) {
-    fn drive(editor: &mut Fixture<'_>) -> String {
+    fn drive(editor: &mut Fixture) -> String {
         editor.type_text("hé中🎉");
         editor.keys("enter");
         editor.type_text("x");
@@ -3381,7 +3388,7 @@ impl gpui::FrameObserver for MenuWidths {
 
 #[gpui::test]
 fn completion_menu_fits_long_labels_and_caps_its_width(cx: &mut TestAppContext) {
-    let editor = open_editor(cx, "select * from ", false);
+    let mut editor = open_editor(cx, "select * from ", false);
     let document = editor.document.clone();
     let menu_width = std::sync::Arc::new(MenuWidths::default());
     editor
@@ -3460,7 +3467,7 @@ fn escape_with_an_open_completion_menu_closes_it_and_stays_in_insert(cx: &mut Te
     });
     editor.window.run_until_parked();
 
-    let menu_open = |editor: &mut Fixture<'_>| {
+    let menu_open = |editor: &mut Fixture| {
         let document = editor.document.clone();
         editor.window.update(|_, cx| {
             document
@@ -4096,15 +4103,15 @@ fn another_window_is_unaffected_by_a_normal_mode_editor(cx: &mut TestAppContext)
     let input = slot.borrow().clone().expect("plain input");
 
     other_window
-        .update(&mut **editor.window, |_, window, cx| {
+        .update(&mut *editor.window, |_, window, cx| {
             input.update(cx, |state, cx| state.focus(window, cx));
         })
         .expect("focus the other window's input");
 
-    TestAppContext::simulate_input(editor.window, other_window.into(), "hjklxu");
+    TestAppContext::simulate_input(&mut editor.window, other_window.into(), "hjklxu");
 
     let value = other_window
-        .read_with(&**editor.window, |_, cx| input.read(cx).value().to_string())
+        .read_with(&*editor.window, |_, cx| input.read(cx).value().to_string())
         .expect("read the other window's input");
     assert_eq!(value, "hjklxu");
     assert_eq!(editor.text(), "abc");
@@ -4137,7 +4144,7 @@ fn the_editor_undo_and_redo_shortcuts_keep_working_in_normal_mode(cx: &mut TestA
 #[gpui::test]
 fn pending_command_tracks_raw_keys_and_clears_on_completion(cx: &mut TestAppContext) {
     let mut editor = open_editor(cx, "alpha\nbeta\ngamma", true);
-    let pending = |editor: &mut Fixture<'_>| {
+    let pending = |editor: &mut Fixture| {
         let document = editor.document.clone();
         editor
             .window
@@ -4278,7 +4285,7 @@ fn the_leader_alone_times_out_without_typing(cx: &mut TestAppContext) {
     assert!(editor.commands().is_empty());
 }
 
-fn read_only_editor<'a>(cx: &'a mut TestAppContext, content: &str) -> Fixture<'a> {
+fn read_only_editor(cx: &mut TestAppContext, content: &str) -> Fixture {
     open_editor_with(
         cx,
         EditorSetup {
@@ -5082,7 +5089,7 @@ fn line_shortcuts_do_nothing_in_a_read_only_editor(cx: &mut TestAppContext) {
     assert_eq!(editor.mode(), Some(VimMode::Normal));
 }
 
-fn set_clipboard(editor: &mut Fixture<'_>, text: &str) {
+fn set_clipboard(editor: &mut Fixture, text: &str) {
     editor
         .window
         .write_to_clipboard(ClipboardItem::new_string(text.to_string()));

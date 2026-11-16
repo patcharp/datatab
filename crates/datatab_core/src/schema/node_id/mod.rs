@@ -102,27 +102,6 @@ pub enum SchemaNodeId {
         database: String,
     },
 
-    /// Root folder for the metric catalog under a CloudWatch connection.
-    /// Rendered as a sibling of "Collections" when `METRIC_CATALOG` capability is set.
-    MetricsFolder {
-        profile_id: Uuid,
-        database: String,
-    },
-    /// Expandable folder for a single CloudWatch namespace (e.g. `AWS/EC2`).
-    MetricNamespaceFolder {
-        profile_id: Uuid,
-        database: String,
-        namespace: String,
-    },
-    /// Clickable leaf for a single CloudWatch metric.
-    /// Clicking opens a ChartDocument pre-populated with this metric's defaults.
-    MetricLeaf {
-        profile_id: Uuid,
-        database: String,
-        namespace: String,
-        metric_name: String,
-    },
-
     /// Root folder for dashboards under a connection profile.
     /// Always visible, regardless of driver capabilities.
     DashboardsFolder {
@@ -132,18 +111,6 @@ pub enum SchemaNodeId {
     DashboardItem {
         profile_id: Uuid,
         dashboard_id: Uuid,
-    },
-    /// Root folder listing dashboards fetched live from an upstream source
-    /// (e.g. CloudWatch). Children load lazily via `DashboardSource` and are
-    /// never persisted. Shown when the connection advertises `DASHBOARD_SYNC`.
-    RemoteDashboardsFolder {
-        profile_id: Uuid,
-    },
-    /// Clickable item for a single upstream dashboard, identified by its source
-    /// name. Opens read-only; nothing is persisted.
-    RemoteDashboardItem {
-        profile_id: Uuid,
-        name: String,
     },
     /// Root folder for saved charts under a connection profile.
     /// Always visible, regardless of driver capabilities.
@@ -173,18 +140,6 @@ pub enum SchemaNodeId {
         profile_id: Uuid,
         database: String,
         name: String,
-    },
-    CollectionChild {
-        profile_id: Uuid,
-        database: String,
-        collection: String,
-        child_id: String,
-        name: String,
-    },
-    CollectionChildrenMore {
-        profile_id: Uuid,
-        database: String,
-        collection: String,
     },
     CustomType {
         profile_id: Uuid,
@@ -395,23 +350,6 @@ pub enum SchemaNodeId {
         profile_id: Uuid,
         section_id: String,
     },
-
-    /// One store of a secret-store connection (`DatabaseCategory::SecretStore`),
-    /// keyed by its `SecretStoreDescriptor::id`. Activating it opens the
-    /// store's document.
-    SecretStore {
-        profile_id: Uuid,
-        store_id: String,
-    },
-
-    /// A path level of a hierarchical secret store, such as `/app/prod/`.
-    /// Expanding it lists its sub-paths; activating it opens the store's
-    /// document at that path.
-    SecretPath {
-        profile_id: Uuid,
-        store_id: String,
-        path: String,
-    },
 }
 
 /// Simple kind enum for cheap matching without data.
@@ -435,20 +373,13 @@ pub enum SchemaNodeKind {
     RoutinesFolder,
     RoutinesLoadingFolder,
     CollectionsFolder,
-    MetricsFolder,
-    MetricNamespaceFolder,
-    MetricLeaf,
     DashboardsFolder,
     DashboardItem,
-    RemoteDashboardsFolder,
-    RemoteDashboardItem,
     SavedChartsFolder,
     SavedChartItem,
     Table,
     View,
     Collection,
-    CollectionChild,
-    CollectionChildrenMore,
     CustomType,
     ColumnsFolder,
     IndexesFolder,
@@ -485,8 +416,6 @@ pub enum SchemaNodeKind {
     RootSection,
     RootSectionItem,
     RootSectionLoadMore,
-    SecretStore,
-    SecretPath,
 }
 
 impl SchemaNodeId {
@@ -512,20 +441,13 @@ impl SchemaNodeId {
             Self::RoutinesFolder { .. } => SchemaNodeKind::RoutinesFolder,
             Self::RoutinesLoadingFolder { .. } => SchemaNodeKind::RoutinesLoadingFolder,
             Self::CollectionsFolder { .. } => SchemaNodeKind::CollectionsFolder,
-            Self::MetricsFolder { .. } => SchemaNodeKind::MetricsFolder,
-            Self::MetricNamespaceFolder { .. } => SchemaNodeKind::MetricNamespaceFolder,
-            Self::MetricLeaf { .. } => SchemaNodeKind::MetricLeaf,
             Self::DashboardsFolder { .. } => SchemaNodeKind::DashboardsFolder,
             Self::DashboardItem { .. } => SchemaNodeKind::DashboardItem,
-            Self::RemoteDashboardsFolder { .. } => SchemaNodeKind::RemoteDashboardsFolder,
-            Self::RemoteDashboardItem { .. } => SchemaNodeKind::RemoteDashboardItem,
             Self::SavedChartsFolder { .. } => SchemaNodeKind::SavedChartsFolder,
             Self::SavedChartItem { .. } => SchemaNodeKind::SavedChartItem,
             Self::Table { .. } => SchemaNodeKind::Table,
             Self::View { .. } => SchemaNodeKind::View,
             Self::Collection { .. } => SchemaNodeKind::Collection,
-            Self::CollectionChild { .. } => SchemaNodeKind::CollectionChild,
-            Self::CollectionChildrenMore { .. } => SchemaNodeKind::CollectionChildrenMore,
             Self::CustomType { .. } => SchemaNodeKind::CustomType,
             Self::ColumnsFolder { .. } => SchemaNodeKind::ColumnsFolder,
             Self::IndexesFolder { .. } => SchemaNodeKind::IndexesFolder,
@@ -562,8 +484,6 @@ impl SchemaNodeId {
             Self::RootSection { .. } => SchemaNodeKind::RootSection,
             Self::RootSectionItem { .. } => SchemaNodeKind::RootSectionItem,
             Self::RootSectionLoadMore { .. } => SchemaNodeKind::RootSectionLoadMore,
-            Self::SecretStore { .. } => SchemaNodeKind::SecretStore,
-            Self::SecretPath { .. } => SchemaNodeKind::SecretPath,
         }
     }
 
@@ -590,14 +510,9 @@ impl SchemaNodeId {
             | Self::RoutinesFolder { profile_id, .. }
             | Self::RoutinesLoadingFolder { profile_id, .. }
             | Self::CollectionsFolder { profile_id, .. }
-            | Self::MetricsFolder { profile_id, .. }
-            | Self::MetricNamespaceFolder { profile_id, .. }
-            | Self::MetricLeaf { profile_id, .. }
             | Self::Table { profile_id, .. }
             | Self::View { profile_id, .. }
             | Self::Collection { profile_id, .. }
-            | Self::CollectionChild { profile_id, .. }
-            | Self::CollectionChildrenMore { profile_id, .. }
             | Self::CustomType { profile_id, .. }
             | Self::ColumnsFolder { profile_id, .. }
             | Self::IndexesFolder { profile_id, .. }
@@ -624,8 +539,6 @@ impl SchemaNodeId {
             | Self::DependentItem { profile_id, .. }
             | Self::DashboardsFolder { profile_id, .. }
             | Self::DashboardItem { profile_id, .. }
-            | Self::RemoteDashboardsFolder { profile_id, .. }
-            | Self::RemoteDashboardItem { profile_id, .. }
             | Self::SavedChartsFolder { profile_id, .. }
             | Self::SavedChartItem { profile_id, .. }
             | Self::InstanceMetricsFolder { profile_id, .. }
@@ -636,9 +549,7 @@ impl SchemaNodeId {
             | Self::InstanceFolder { profile_id, .. }
             | Self::RootSection { profile_id, .. }
             | Self::RootSectionItem { profile_id, .. }
-            | Self::RootSectionLoadMore { profile_id, .. }
-            | Self::SecretStore { profile_id, .. }
-            | Self::SecretPath { profile_id, .. } => Some(*profile_id),
+            | Self::RootSectionLoadMore { profile_id, .. } => Some(*profile_id),
         }
     }
 }
@@ -664,8 +575,6 @@ const P_COLLECTIONS_FOLDER: &str = "CF2";
 const P_TABLE: &str = "T";
 const P_VIEW: &str = "V";
 const P_COLLECTION: &str = "C";
-const P_COLLECTION_CHILD: &str = "CCH";
-const P_COLLECTION_CHILDREN_MORE: &str = "CCM";
 const P_CUSTOM_TYPE: &str = "Y";
 const P_COLUMNS_FOLDER: &str = "CLF";
 const P_INDEXES_FOLDER: &str = "IXF";
@@ -695,10 +604,6 @@ const P_DEPENDENT_ITEM: &str = "DEP";
 const P_ROUTINES_FOLDER: &str = "RTF";
 const P_ROUTINES_LOADING: &str = "RTL";
 const P_ROUTINE: &str = "RT";
-// Metric catalog node prefixes (CloudWatch sidebar tree)
-const P_METRICS_FOLDER: &str = "MF";
-const P_METRIC_NS_FOLDER: &str = "MNF";
-const P_METRIC_LEAF: &str = "ML";
 // Instance metrics and inspector sidebar node prefixes.
 const P_INST_METRICS_FOLDER: &str = "IMF";
 const P_INST_METRIC_LEAF: &str = "IML";
@@ -711,15 +616,10 @@ const P_INST_FOLDER: &str = "INSF";
 const P_ROOT_SECTION: &str = "RSC";
 const P_ROOT_SECTION_ITEM: &str = "RSCI";
 const P_ROOT_SECTION_MORE: &str = "RSCM";
-// Secret-store store and path nodes.
-const P_SECRET_STORE: &str = "SST";
-const P_SECRET_PATH: &str = "SSP";
 // Dashboard and saved-chart sidebar node prefixes.
 // Note: P_SCRIPTS_FOLDER already uses "SCF", so we use distinct tags here.
 const P_DASHBOARDS_FOLDER: &str = "DBF";
 const P_DASHBOARD_ITEM: &str = "DBI";
-const P_REMOTE_DASHBOARDS_FOLDER: &str = "RDBF";
-const P_REMOTE_DASHBOARD_ITEM: &str = "RDBI";
 const P_SAVED_CHARTS_FOLDER: &str = "SCRF";
 const P_SAVED_CHART_ITEM: &str = "SCRI";
 
@@ -842,18 +742,6 @@ mod tests {
             profile_id: uuid,
             database: "mydb".into(),
             name: "orders".into(),
-        });
-        roundtrip(SchemaNodeId::CollectionChild {
-            profile_id: uuid,
-            database: "logs".into(),
-            collection: "/aws/lambda/app".into(),
-            child_id: "stream-2026-04-25".into(),
-            name: "2026/04/25/[$LATEST]abc".into(),
-        });
-        roundtrip(SchemaNodeId::CollectionChildrenMore {
-            profile_id: uuid,
-            database: "logs".into(),
-            collection: "/aws/lambda/app".into(),
         });
         roundtrip(SchemaNodeId::CustomType {
             profile_id: uuid,
@@ -984,27 +872,6 @@ mod tests {
             profile_id: uuid,
             schema: "public".into(),
             specific_name: "add(integer, integer)".into(),
-        });
-    }
-
-    #[test]
-    fn metric_nodes_round_trip_via_display_and_from_str() {
-        let uuid = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
-
-        roundtrip(SchemaNodeId::MetricsFolder {
-            profile_id: uuid,
-            database: "default".into(),
-        });
-        roundtrip(SchemaNodeId::MetricNamespaceFolder {
-            profile_id: uuid,
-            database: "default".into(),
-            namespace: "AWS/EC2".into(),
-        });
-        roundtrip(SchemaNodeId::MetricLeaf {
-            profile_id: uuid,
-            database: "default".into(),
-            namespace: "AWS/EC2".into(),
-            metric_name: "CPUUtilization".into(),
         });
     }
 
@@ -1230,39 +1097,6 @@ mod tests {
     }
 
     #[test]
-    fn test_node_id_remote_dashboards_folder_roundtrip() {
-        let uuid = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
-        roundtrip(SchemaNodeId::RemoteDashboardsFolder { profile_id: uuid });
-    }
-
-    #[test]
-    fn test_node_id_remote_dashboard_item_roundtrip() {
-        let profile_id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
-        roundtrip(SchemaNodeId::RemoteDashboardItem {
-            profile_id,
-            name: "prod-overview".to_string(),
-        });
-    }
-
-    #[test]
-    fn test_node_id_remote_dashboard_item_name_with_special_chars() {
-        // Dashboard names with hyphens/dots/underscores must survive the
-        // pipe-delimited encoding (splitn absorbs any trailing content).
-        let profile_id = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
-        roundtrip(SchemaNodeId::RemoteDashboardItem {
-            profile_id,
-            name: "My_Dashboard.v2-final".to_string(),
-        });
-    }
-
-    #[test]
-    fn test_remote_dashboard_item_shows_pointer_and_needs_click() {
-        assert!(SchemaNodeKind::RemoteDashboardItem.shows_pointer_cursor());
-        assert!(SchemaNodeKind::RemoteDashboardItem.needs_click_handler());
-        assert!(SchemaNodeKind::RemoteDashboardsFolder.is_expandable_folder());
-    }
-
-    #[test]
     fn test_node_id_saved_charts_folder_roundtrip() {
         let uuid = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
         roundtrip(SchemaNodeId::SavedChartsFolder { profile_id: uuid });
@@ -1419,28 +1253,6 @@ mod tests {
         let id = "RSCI|12345678-1234-1234-1234-123456789abc|buckets";
 
         assert!(id.parse::<SchemaNodeId>().is_err());
-    }
-
-    /// Secret-store nodes round-trip, including a path that itself contains
-    /// the `|` separator.
-    #[test]
-    fn secret_store_nodes_round_trip_via_display_and_from_str() {
-        let uuid = Uuid::parse_str("12345678-1234-1234-1234-123456789abc").unwrap();
-
-        roundtrip(SchemaNodeId::SecretStore {
-            profile_id: uuid,
-            store_id: "parameter-store".into(),
-        });
-        roundtrip(SchemaNodeId::SecretPath {
-            profile_id: uuid,
-            store_id: "parameter-store".into(),
-            path: "/app/prod/".into(),
-        });
-        roundtrip(SchemaNodeId::SecretPath {
-            profile_id: uuid,
-            store_id: "parameter-store".into(),
-            path: "/odd|name/".into(),
-        });
     }
 
     #[test]

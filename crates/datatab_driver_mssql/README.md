@@ -27,8 +27,8 @@ Microsoft SQL Server driver for DataTab, built on the
   `EncryptionLevel`. The form exposes a single **SSL Mode** dropdown;
   the `TrustServerCertificate` flag is derived automatically:
   - `off` — no encryption (login packet still encrypted by TDS).
-  - `on` — encrypted, accepts self-signed certs. Best for local/dev
-    SQL Server with its auto-generated cert.
+  - `on` — encrypted, server certificate not verified. This skips both
+    the certificate chain and hostname checks.
   - `required` — encrypted, validates the cert chain. Use against
     servers with a real CA-signed cert (Azure SQL, etc.). Selecting
     `required` reveals the **CA certificate** path; when set, the chain
@@ -137,12 +137,33 @@ Requires the `VIEW SERVER STATE` permission.
   connections keeps the session open. The probes go only to the configured
   server.
 - Through an SSH tunnel, the session socket connects to the local end of the
-  tunnel (`127.0.0.1`). Its probes then stay on this machine and do not keep
-  the remote network path open. A tunneled session that sits idle can still
-  be dropped.
-- A session that is dropped anyway (for example by a server restart or a
-  very short firewall timeout) is not recovered. The next action fails with
-  an I/O error, and the connection needs a reconnect.
+  tunnel (`127.0.0.1`). Its TCP keepalive probes then stay on this machine and
+  do not cross the tunnel. The SSH tunnel itself sends an SSH-level keepalive
+  (`keepalive@libssh2.org`) after 60 seconds idle so NAT gateways and firewalls
+  on the path to the SSH server keep the tunnel open; the hop from the SSH
+  server to SQL Server still carries no keepalive.
+- When the server or the network drops the session anyway (for example by
+  a server restart or a very short firewall timeout), the next call fails
+  with an I/O error (`BrokenPipe`, `ConnectionReset`, `ConnectionAborted`,
+  `NotConnected`, `UnexpectedEof`, or `TimedOut`). The driver drops the dead
+  client and marks the connection poisoned for reconnection, the same way it
+  does after a cancel.
+- Metadata reads (databases, tables, views, table and view details, schema
+  types, indexes, foreign keys, and routines) recover first, restore the
+  active database, and retry once when the transport was lost during the
+  read and the user did not cancel, so opening a table after an idle period
+  works without reconnecting by hand.
+- Row edits (`insert`, `update`, `delete`), browsing, counting, `ping`,
+  `table_creation_metadata`, `set_active_database`, and row/dependency
+  lookups open a new session before they run once a previous call has
+  detected the drop. If nothing detected it yet, the first operation fails
+  and is not replayed; a failed write is never replayed. Recovery is
+  serialized so concurrent callers share one new session instead of each
+  replacing the other's. A server error that reports a killed session
+  (`596`, `233`, `6005`) is treated the same way as a dropped socket.
+- A query batch (`execute`) is never retried, because the server may already
+  have run it. Its error is shown, and the next query or ping opens a new
+  session.
 
 ### Schema discovery
 
@@ -272,6 +293,8 @@ Requires the `VIEW SERVER STATE` permission.
   `NOT VALID` + `VALIDATE CONSTRAINT`.
 
 ## Limitations
+
+- Unknown TLS modes are refused.
 
 - The `required` mode's CA certificate replaces the system trust store
   rather than extending it, must hold exactly one certificate, and must
@@ -406,4 +429,10 @@ Requires the `VIEW SERVER STATE` permission.
   Server disables FK checking per-table via `ALTER TABLE ... NOCHECK
   CONSTRAINT`, which does not fit the engine's single global toggle; a
   per-table variant is a possible future addition.
+- Long-running recovery/cancel trade-off: when a session is dropped by the
+  server or network, any open transaction, temp table, or `SET` option of
+  the dropped session is lost on reconnect (just as after cancellation).
+  The first `execute` batch or write on an undetected dropped socket fails
+  without retry; only metadata reads retry once, and only subsequent calls
+  recover onto a fresh session.
 - No database-enforced read-only mode: requests that require one are refused, so MCP `execute_script` governs scripts classified `Read` or `Metadata` as writes, and editor auto-refresh is unavailable on SQL Server connections.

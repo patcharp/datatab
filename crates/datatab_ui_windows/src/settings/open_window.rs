@@ -65,6 +65,7 @@ pub fn open_or_focus_settings<S>(
         ..Default::default()
     };
     platform::apply_window_options(&mut options, WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT);
+    platform::apply_shell_titlebar_options(&mut options);
 
     let app_state_for_new = app_state.clone();
 

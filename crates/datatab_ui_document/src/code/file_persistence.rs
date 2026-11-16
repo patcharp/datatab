@@ -10,6 +10,8 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
+use super::display_path::display_path;
+
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
@@ -193,6 +195,15 @@ fn write_physical_bytes(path: &Path, content: &str) -> std::io::Result<()> {
     std::fs::write(path, content)
 }
 
+/// The refusal of a save whose destination carries the read-only permission
+/// bit, naming the destination as the user should read it.
+fn read_only_destination_error(destination: &Path) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("{} is read-only", display_path(destination)),
+    )
+}
+
 /// Replaces the destination's contents without ever leaving a truncated
 /// original behind.
 ///
@@ -215,10 +226,7 @@ fn replace_file_contents(destination: &Path, content: &str) -> std::io::Result<(
         .as_ref()
         .is_some_and(|metadata| metadata.permissions().readonly())
     {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("{} is read-only", destination.display()),
-        ));
+        return Err(read_only_destination_error(&destination));
     }
 
     let staged_path = stage_path(directory);
@@ -1261,6 +1269,17 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&directory).ok();
+    }
+
+    /// The refusal of a save over a read-only file names the file as the user
+    /// should read it, never in the extended-length form Windows
+    /// canonicalisation returns.
+    #[test]
+    fn a_read_only_refusal_hides_the_windows_verbatim_prefix() {
+        let error = read_only_destination_error(Path::new(r"\\?\C:\Users\ana\script.sql"));
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), r"C:\Users\ana\script.sql is read-only");
     }
 
     /// A write that fails partway through must not damage the bytes already on

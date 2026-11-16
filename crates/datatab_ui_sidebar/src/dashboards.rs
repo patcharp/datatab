@@ -7,7 +7,7 @@
 //! dashboard row reuses the `DashboardItem` node id of the connections tree,
 //! so opening it and its Open / Rename / Duplicate / Delete menu go through
 //! the same events; a profile group heading reuses that profile's
-//! `DashboardsFolder` id, whose menu creates or imports a dashboard for it.
+//! `DashboardsFolder` id, whose menu creates a dashboard for it.
 //! The rows are flat: a heading and its dashboards are siblings, so nothing
 //! here writes the expansion state the connections tree keeps for its own
 //! Dashboards folders.

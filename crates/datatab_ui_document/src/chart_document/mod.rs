@@ -14,11 +14,10 @@ mod render;
 use super::chart::keyboard::{
     ChartKeyOutcome, chart_shell_pane_actions, step_time_range, time_range_pane_actions,
 };
-use super::chart::shell::ChartShellEvent;
 use super::chart::{ChartHost, ChartShell, HostAdapter};
 use super::handle::DocumentEvent;
 use super::pane::PaneAction;
-use super::task_runner::DocumentTaskRunner;
+use super::task_runner::{DocumentTaskRunner, PrimaryCompletion};
 use super::types::{DocumentId, DocumentState};
 use datatab_app::keymap::{Command, ContextId};
 use datatab_components::chart::{
@@ -58,7 +57,7 @@ enum ChartDocFocus {
 /// A pending query result that arrived from the task runner background task.
 struct PendingResult {
     task_id: datatab_core::TaskId,
-    result: Result<QueryResult, datatab_core::DbError>,
+    result: Result<(QueryResult, datatab_core::InstanceMetricKind), datatab_core::DbError>,
 }
 
 /// Internal execution state.
@@ -109,7 +108,7 @@ pub struct ChartDocument {
 
     // Toolbar controls
     time_range_panel: Option<Entity<TimeRangePanel>>,
-    _time_range_sub: Option<Subscription>,
+    _time_range_subscriptions: Option<(Subscription, Subscription)>,
     /// Mirrors `TimeRangePanel::selected_time_range` so the render path can
     /// decide whether to show the custom date/time picker row without calling
     /// `panel.read(cx)` on every frame.
@@ -140,16 +139,6 @@ pub struct ChartDocument {
     /// sharing its own range panel). The child's own first-render preset seed
     /// must not overwrite externally staged absolute bounds.
     external_window_staged: bool,
-
-    // Pending data source swap from MetricPickerApplied event.
-    // Consumed by the render loop so the swap happens on the UI thread.
-    pending_data_source: Option<Box<dyn ChartDataSource>>,
-
-    // The `(namespace, metric_name)` triple this document was opened with,
-    // when the source was a `MetricSource`. Used by `matches_metric_source`
-    // for sidebar dedup so the identity remains stable after the user
-    // refines dimensions/period/statistic via the Apply button.
-    initial_metric_identity: Option<(String, String)>,
 
     /// Stable identity for instance metric charts opened from the
     /// `InstanceMetricsFolder` sidebar node. Used by `matches_instance_metric_chart`
@@ -184,8 +173,6 @@ pub struct ChartDocument {
     /// surrounding chrome instead.
     pub(super) embedded: bool,
 
-    _subscriptions: Vec<Subscription>,
-
     /// Sample accumulation buffer for `InstanceMetric` sources.
     ///
     /// Populated on first successful fetch when `data_source.is_accumulating()`
@@ -193,6 +180,7 @@ pub struct ChartDocument {
     /// receives the full accumulated series rather than the single-point result.
     /// Cleared when the data source changes or the document closes.
     instance_metric_buffer: Option<InstantSeriesBuffer>,
+    instance_metric_kind: Option<datatab_core::InstanceMetricKind>,
 }
 
 impl ChartDocument {
@@ -220,31 +208,6 @@ impl ChartDocument {
             // drives set_result directly without going through HostAdapter.
             ChartShell::new_standalone(cx)
         });
-
-        // Bridge the metric picker's Apply emission into this document.
-        // Without this subscription `pending_data_source` is never written and
-        // the Apply button (and Cmd/Ctrl+Enter shortcut) become dead UI.
-        let metric_apply_sub = cx.subscribe(
-            &chart_shell,
-            |this: &mut Self, _shell, event: &ChartShellEvent, cx| match event {
-                ChartShellEvent::MetricPickerApplied(src) => {
-                    this.pending_data_source = Some(src.clone_box());
-                    cx.notify();
-                }
-            },
-        );
-
-        // Cancel any pending metric-picker dimensions fetch when the chart's
-        // connection drops. Without this, the in-flight fetch completes,
-        // enters its foreground cx.update closure, and writes a now-stale
-        // entry into MetricCatalogCache (which the disconnect already
-        // invalidated). Dropping the task short-circuits the await.
-        let app_state_disconnect_sub = cx.subscribe(
-            &app_state,
-            |this: &mut Self, _state, _event: &datatab_ui_base::AppStateChanged, cx| {
-                this.cancel_metric_fetches_if_disconnected(cx);
-            },
-        );
 
         let default_refresh = RefreshPolicy::default();
         let refresh_dropdown = cx.new(|_cx| {
@@ -296,7 +259,7 @@ impl ChartDocument {
             pending_run_on_first_render: pending_run,
             chart_shell,
             time_range_panel: None,
-            _time_range_sub: None,
+            _time_range_subscriptions: None,
             selected_time_range: None,
             refresh_dropdown,
             refresh_policy: default_refresh,
@@ -307,8 +270,6 @@ impl ChartDocument {
             pending_chart_reexecute: false,
             applied_display_window: None,
             external_window_staged: false,
-            pending_data_source: None,
-            initial_metric_identity: None,
             initial_instance_metric_id: None,
             initial_time_range_index: 3,
             saved_chart_id: None,
@@ -318,14 +279,14 @@ impl ChartDocument {
             focus_mode: ChartDocFocus::default(),
             result_panel: None,
             embedded: false,
-            _subscriptions: vec![metric_apply_sub, app_state_disconnect_sub],
             instance_metric_buffer: None,
+            instance_metric_kind: None,
         }
     }
 
     /// Create a `ChartDocument` from a previously saved chart record.
     ///
-    /// Only `SavedChartSource::Query` sources are supported. Callers must
+    /// Query and instance-metric sources are supported. Callers must
     /// route `Collection` sources to a `DataDocument` instead — passing a
     /// `Collection`-source chart here will produce a document with an empty
     /// query and no data.
@@ -335,7 +296,7 @@ impl ChartDocument {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<Self, String> {
-        use datatab_components::chart::{InstanceMetricSource, MetricSource};
+        use datatab_components::chart::InstanceMetricSource;
 
         match &saved.source {
             // Collection sources are not routed through ChartDocument in W0.
@@ -346,26 +307,7 @@ impl ChartDocument {
                 ));
             }
 
-            // Metric sources bypass the query path and construct a MetricSource
-            // directly, matching the same path used by `open_metric_chart_from_sidebar`.
-            SavedChartSource::Metric { series } => {
-                let source = MetricSource {
-                    series: series.clone(),
-                };
-
-                let mut doc = Self::new_with_source(
-                    Some(saved.profile_id),
-                    saved.name.clone(),
-                    Box::new(source),
-                    app_state,
-                    window,
-                    cx,
-                );
-                doc.saved_chart_id = Some(saved.id);
-                return Ok(doc);
-            }
-
-            // Instance metric sources follow the same self-executing pattern as Metric.
+            // Instance metrics execute through the instance catalog.
             SavedChartSource::InstanceMetric { metric_id } => {
                 let source = InstanceMetricSource {
                     metric_id: metric_id.clone(),
@@ -430,7 +372,7 @@ impl ChartDocument {
     /// Create a `ChartDocument` with an explicitly supplied `ChartDataSource`.
     ///
     /// Used when the caller already holds a fully-constructed source (e.g.
-    /// `MetricSource`) and does not want to go through `resolve_source`. The
+    /// `InstanceMetricSource`) and does not want to go through `resolve_source`. The
     /// document title defaults to `"Untitled chart"` and can be overridden by
     /// the caller after construction.
     ///
@@ -446,29 +388,6 @@ impl ChartDocument {
         cx: &mut Context<Self>,
     ) -> Self {
         let chart_shell = cx.new(ChartShell::new_standalone);
-
-        // Bridge the metric picker's Apply emission into this document.
-        // Without this subscription `pending_data_source` is never written and
-        // the Apply button (and Cmd/Ctrl+Enter shortcut) become dead UI.
-        let metric_apply_sub = cx.subscribe(
-            &chart_shell,
-            |this: &mut Self, _shell, event: &ChartShellEvent, cx| match event {
-                ChartShellEvent::MetricPickerApplied(src) => {
-                    this.pending_data_source = Some(src.clone_box());
-                    cx.notify();
-                }
-            },
-        );
-
-        // See `new()` for the rationale: drop the metric-picker dimensions
-        // task on disconnect so its foreground cache-write closure never runs
-        // against the invalidated MetricCatalogCache.
-        let app_state_disconnect_sub = cx.subscribe(
-            &app_state,
-            |this: &mut Self, _state, _event: &datatab_ui_base::AppStateChanged, cx| {
-                this.cancel_metric_fetches_if_disconnected(cx);
-            },
-        );
 
         let default_refresh = RefreshPolicy::default();
         let refresh_dropdown = cx.new(|_cx| {
@@ -496,19 +415,6 @@ impl ChartDocument {
             runner.set_profile_id(pid);
         }
 
-        // Capture the initial (namespace, metric_name) identity when the
-        // source is a MetricSource so sidebar dedup stays correct even after
-        // Apply rewrites dimensions/period/statistic.
-        let initial_metric_identity = data_source
-            .as_any()
-            .and_then(|a| a.downcast_ref::<datatab_components::chart::MetricSource>())
-            .map(|src| {
-                (
-                    src.primary_namespace().to_string(),
-                    src.primary_metric_name().to_string(),
-                )
-            });
-
         Self {
             id: DocumentId::new(),
             title,
@@ -524,7 +430,7 @@ impl ChartDocument {
             pending_run_on_first_render: true,
             chart_shell,
             time_range_panel: None,
-            _time_range_sub: None,
+            _time_range_subscriptions: None,
             selected_time_range: None,
             refresh_dropdown,
             refresh_policy: default_refresh,
@@ -535,8 +441,6 @@ impl ChartDocument {
             pending_chart_reexecute: false,
             applied_display_window: None,
             external_window_staged: false,
-            pending_data_source: None,
-            initial_metric_identity,
             initial_instance_metric_id: None,
             initial_time_range_index: 3,
             saved_chart_id: None,
@@ -546,46 +450,18 @@ impl ChartDocument {
             embedded: false,
             focus_handle: cx.focus_handle(),
             focus_mode: ChartDocFocus::default(),
-            _subscriptions: vec![metric_apply_sub, app_state_disconnect_sub],
             instance_metric_buffer: None,
+            instance_metric_kind: None,
         }
-    }
-
-    /// If the document's profile is no longer connected, drop the metric
-    /// picker's in-flight dimensions fetch so its foreground cache-write
-    /// closure never runs against the now-invalidated cache.
-    ///
-    /// No-op when there is no profile, no picker, or no in-flight task.
-    fn cancel_metric_fetches_if_disconnected(&mut self, cx: &mut Context<Self>) {
-        let Some(profile_id) = self.profile_id else {
-            return;
-        };
-        let still_connected = self
-            .app_state
-            .read(cx)
-            .connections()
-            .contains_key(&profile_id);
-        if still_connected {
-            return;
-        }
-        self.chart_shell.update(cx, |shell, _cx| {
-            if let Some(picker) = shell.metric_picker.as_mut()
-                && picker.dimensions_task.is_some()
-            {
-                picker.dimensions_task = None;
-            }
-        });
     }
 
     /// Check whether a `SavedChart` source is compatible with `ChartDocument`.
     ///
-    /// Returns `Ok(())` for `Query` sources and `Err` for `Collection` sources.
+    /// Accepts query and instance-metric sources; rejects collection sources.
     /// Call this before allocating an entity to avoid panicking inside `cx.new`.
     pub fn validate_saved_source(saved: &SavedChart) -> Result<(), String> {
         match &saved.source {
-            SavedChartSource::Query { .. }
-            | SavedChartSource::Metric { .. }
-            | SavedChartSource::InstanceMetric { .. } => Ok(()),
+            SavedChartSource::Query { .. } | SavedChartSource::InstanceMetric { .. } => Ok(()),
             SavedChartSource::Collection { .. } => Err(datatab_i18n::t!(
                 "document.chart.error.collection_source_unsupported"
             )),
@@ -616,28 +492,6 @@ impl ChartDocument {
 
     pub fn saved_chart_id(&self) -> Option<Uuid> {
         self.saved_chart_id
-    }
-
-    /// Check whether this document was opened for the given metric identity.
-    ///
-    /// Used by the `DocumentKey::MetricChart` dedup path in `into_pane`. Compares
-    /// against the initial `(namespace, metric_name)` captured at construction —
-    /// NOT the current `data_source` — so the identity remains stable after the
-    /// Apply button rewrites dimensions/period/statistic (which keeps the
-    /// `MetricSource` type but produces a new value via `set_data_source`).
-    pub fn matches_metric_source(
-        &self,
-        profile_id: Uuid,
-        namespace: &str,
-        metric_name: &str,
-    ) -> bool {
-        if self.profile_id != Some(profile_id) {
-            return false;
-        }
-
-        self.initial_metric_identity
-            .as_ref()
-            .is_some_and(|(ns, mn)| ns == namespace && mn == metric_name)
     }
 
     /// Set the stable instance-metric identity for this document.
@@ -750,7 +604,7 @@ impl ChartDocument {
 
     /// The chart's toolbar and pointer-only controls, for the pane-actions
     /// menu: refresh and its interval, the time range, the chart kind, the
-    /// axis pickers, the stats and metric rails, and save.
+    /// axis pickers, the stats rail, and save.
     pub(crate) fn pane_actions(&self, entity: &Entity<Self>, cx: &App) -> Vec<PaneAction> {
         let context = ContextId::Chart;
         let mut actions = vec![
@@ -793,7 +647,6 @@ impl ChartDocument {
             &self.chart_shell,
             &columns,
             context,
-            cx,
         ));
 
         actions.push(
@@ -844,7 +697,7 @@ impl ChartDocument {
     /// auto-refresh interval (the one its toolbar shows), the chart type and
     /// the stats. Its axis pickers live in the panel's Configure popover and
     /// its time range, refresh and save in the dashboard.
-    pub(crate) fn embedded_pane_actions(&self, cx: &App) -> Vec<PaneAction> {
+    pub(crate) fn embedded_pane_actions(&self) -> Vec<PaneAction> {
         let refresh_dropdown = self.refresh_dropdown.clone();
         let mut actions = vec![
             PaneAction::callback(
@@ -861,7 +714,6 @@ impl ChartDocument {
             &self.chart_shell,
             &[],
             ContextId::Chart,
-            cx,
         ));
         actions
     }
@@ -939,43 +791,6 @@ impl ChartDocument {
         !settings.auto_refresh_only_if_visible || self.is_active_tab
     }
 
-    /// Open the Metric rail and initialize the picker with a pre-populated
-    /// `(namespace, metric_name)`.
-    ///
-    /// Called after construction when the chart is opened from the sidebar tree
-    /// (user clicked a metric leaf). The picker shows dimensions, period, and
-    /// statistic for refinement; namespace/metric are pinned.
-    pub fn setup_metric_picker(
-        &mut self,
-        namespace: String,
-        metric_name: String,
-        cx: &mut Context<Self>,
-    ) {
-        use super::chart::ChartRailTab;
-        use super::chart::metric_picker::MetricPickerState;
-
-        let profile_id = match self.profile_id {
-            Some(id) => id,
-            None => return,
-        };
-
-        // Record the metric identity so the sidebar's MetricChart dedup
-        // remains stable across subsequent Apply rewrites.
-        self.initial_metric_identity = Some((namespace.clone(), metric_name.clone()));
-
-        let app_state_clone = self.app_state.clone();
-        self.chart_shell.update(cx, |shell, cx| {
-            shell.set_initial_rail(ChartRailTab::Metric, true);
-            shell.metric_picker = Some(MetricPickerState::new_pre_populated(
-                profile_id,
-                app_state_clone,
-                namespace,
-                metric_name,
-                cx,
-            ));
-        });
-    }
-
     pub fn change_summary(&self, _cx: &App) -> Option<String> {
         None
     }
@@ -996,6 +811,7 @@ impl ChartDocument {
         cx: &mut Context<Self>,
     ) {
         self.runner.cancel_primary(cx);
+        self.pending_result = None;
 
         // Update the title if the new source describes itself.
         if let Some(title) = source.describe().display_title() {
@@ -1008,6 +824,7 @@ impl ChartDocument {
         // Drop the accumulation buffer when the source changes so stale
         // samples from the previous metric do not bleed into the new series.
         self.instance_metric_buffer = None;
+        self.instance_metric_kind = None;
 
         cx.emit(DocumentEvent::DataSourceChanged);
         cx.emit(DocumentEvent::MetaChanged);
@@ -1022,36 +839,8 @@ impl ChartDocument {
     /// thread, and delivers the result back to the entity via `pending_result`.
     /// The render loop picks up `pending_result` and applies it.
     pub fn request_reexecute(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        // Build the execution request through the data source seam.
-        // EmptyQuery → silent early return (preserves the old inline empty-query guard).
-        // Other errors → show a toast and return.
-        let window = self.pending_time_window.map(|(s, e)| TimeWindow {
-            start_ms: s,
-            end_ms: e,
-        });
-
-        // Build the execution plan through the data source seam, then extract the
-        // Driver request. Query/Collection sources always yield ChartDataPlan::Driver;
-        // the non-Driver arm is a defensive guard for any future source kind that
-        // somehow reaches ChartDocument (which should not happen by design).
-        let request = match self.data_source.build_plan(window) {
-            Ok(datatab_components::chart::ChartDataPlan::Driver(r)) => r,
-            Ok(_non_driver) => {
-                // Non-Driver plans are not executable by ChartDocument; this path
-                // is unreachable with Query/Collection sources but is handled
-                // defensively to avoid a silent no-op.
-                log::warn!("[chart-doc] build_plan returned a non-Driver plan; ignoring");
-                return;
-            }
-            Err(ChartSourceError::EmptyQuery) => return,
-            Err(e) => {
-                self.pending_toast = Some(PendingToast {
-                    message: datatab_i18n::t!("document.chart.error.source", error = e),
-                    is_error: true,
-                });
-                cx.notify();
-                return;
-            }
+        let Some(request) = self.build_execution_request(cx) else {
+            return;
         };
 
         let Some(profile_id) = self.profile_id else {
@@ -1115,9 +904,11 @@ impl ChartDocument {
 
         let conn_cleanup = conn.clone();
 
-        let task = cx
-            .background_executor()
-            .spawn(async move { conn.execute(&request) });
+        let cached_kind = self.instance_metric_kind;
+        let task = cx.background_executor().spawn(async move {
+            let kind = Self::resolve_instance_metric_kind(conn.as_ref(), &request, cached_kind);
+            conn.execute(&request).map(|result| (result, kind))
+        });
 
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -1140,6 +931,67 @@ impl ChartDocument {
         .detach();
     }
 
+    fn build_execution_request(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<datatab_core::QueryRequest> {
+        let window = self.pending_time_window.map(|(s, e)| TimeWindow {
+            start_ms: s,
+            end_ms: e,
+        });
+
+        // Build the execution plan through the data source seam, then extract the
+        // Driver request. Query/Collection sources always yield ChartDataPlan::Driver;
+        // the non-Driver arm is a defensive guard for any future source kind that
+        // somehow reaches ChartDocument (which should not happen by design).
+        match self.data_source.build_plan(window) {
+            Ok(datatab_components::chart::ChartDataPlan::Driver(request)) => Some(request),
+            Ok(_non_driver) => {
+                // Non-Driver plans are not executable by ChartDocument; this path
+                // is unreachable with Query/Collection sources but is handled
+                // defensively to avoid a silent no-op.
+                log::warn!("[chart-doc] build_plan returned a non-Driver plan; ignoring");
+                None
+            }
+            Err(ChartSourceError::EmptyQuery) => None,
+            Err(e) => {
+                self.pending_toast = Some(PendingToast {
+                    message: datatab_i18n::t!("document.chart.error.source", error = e),
+                    is_error: true,
+                });
+                cx.notify();
+                None
+            }
+        }
+    }
+
+    fn resolve_instance_metric_kind(
+        connection: &dyn datatab_core::Connection,
+        request: &datatab_core::QueryRequest,
+        cached_kind: Option<datatab_core::InstanceMetricKind>,
+    ) -> datatab_core::InstanceMetricKind {
+        let metric_id =
+            request
+                .execution_context
+                .as_ref()
+                .and_then(|context| match context.source.as_ref() {
+                    Some(datatab_core::ExecutionSourceContext::InstanceMetricQuery {
+                        metric_id,
+                        ..
+                    }) => Some(metric_id.as_str()),
+                    _ => None,
+                });
+        let Some(metric_id) = metric_id else {
+            return datatab_core::InstanceMetricKind::Gauge;
+        };
+        cached_kind.unwrap_or_else(|| {
+            connection
+                .instance_catalog()
+                .and_then(|catalog| catalog.metric_kind(metric_id))
+                .unwrap_or_default()
+        })
+    }
+
     /// Apply a completed query result to the chart shell.
     ///
     /// For accumulating sources (`is_accumulating() == true`) the raw
@@ -1147,10 +999,22 @@ impl ChartDocument {
     /// shell receives the full accumulated series. For all other sources the
     /// raw result is forwarded directly.
     fn apply_result(&mut self, pending: PendingResult, cx: &mut Context<Self>) {
-        self.runner.complete_primary(pending.task_id, cx);
+        match self.runner.complete_primary_if_active(pending.task_id, cx) {
+            PrimaryCompletion::Completed => {}
+            PrimaryCompletion::Cancelled => {
+                self.exec_state = ExecState::Idle;
+                self.state = DocumentState::Clean;
+                cx.emit(DocumentEvent::MetaChanged);
+                cx.emit(DocumentEvent::ExecutionFinished);
+                cx.notify();
+                return;
+            }
+            PrimaryCompletion::Stale => return,
+        }
 
         match pending.result {
-            Ok(result) => {
+            Ok((result, kind)) => {
+                self.instance_metric_kind = Some(kind);
                 self.exec_state = ExecState::Idle;
                 self.state = DocumentState::Clean;
 
@@ -1159,7 +1023,7 @@ impl ChartDocument {
 
                 let display_result = if self.data_source.is_accumulating() {
                     let buffer = self.instance_metric_buffer.get_or_insert_with(|| {
-                        InstantSeriesBuffer::new(result.columns.clone(), 120)
+                        InstantSeriesBuffer::new_with_kind(result.columns.clone(), 120, kind)
                     });
                     buffer.push_result(&result);
 
@@ -1875,8 +1739,8 @@ fn seed_initial_window(
 
 /// In-memory accumulator for instance-metric single-sample poll results.
 ///
-/// Each `fetch_metric_series` call returns exactly one row (the current gauge
-/// value plus a timestamp). `ChartDocument` uses this buffer to stitch those
+/// Each `fetch_metric_series` call returns exactly one row (the current value
+/// plus a timestamp). `ChartDocument` uses this buffer to stitch those
 /// samples into a visible time series: each successful fetch appends a new
 /// row, and the buffer is pruned to at most `max_samples` entries so memory
 /// stays bounded.
@@ -1888,15 +1752,32 @@ pub(super) struct InstantSeriesBuffer {
     columns: Vec<datatab_core::ColumnMeta>,
     rows: Vec<datatab_core::Row>,
     max_samples: usize,
+    kind: datatab_core::InstanceMetricKind,
+    previous: Option<datatab_core::Row>,
 }
 
 impl InstantSeriesBuffer {
     /// Create an empty buffer with the given column schema and retention cap.
+    #[cfg(test)]
     pub(super) fn new(columns: Vec<datatab_core::ColumnMeta>, max_samples: usize) -> Self {
+        Self::new_with_kind(
+            columns,
+            max_samples,
+            datatab_core::InstanceMetricKind::Gauge,
+        )
+    }
+
+    fn new_with_kind(
+        columns: Vec<datatab_core::ColumnMeta>,
+        max_samples: usize,
+        kind: datatab_core::InstanceMetricKind,
+    ) -> Self {
         Self {
             columns,
             rows: Vec::new(),
             max_samples,
+            kind,
+            previous: None,
         }
     }
 
@@ -1922,17 +1803,58 @@ impl InstantSeriesBuffer {
     pub(super) fn push_result(&mut self, result: &datatab_core::QueryResult) {
         if self.schema_changed(&result.columns) {
             self.rows.clear();
+            self.previous = None;
             self.columns = result.columns.clone();
         }
 
         for row in &result.rows {
-            self.rows.push(row.clone());
+            if self.kind == datatab_core::InstanceMetricKind::Counter {
+                if let Some(previous) = self.previous.replace(row.clone())
+                    && let Some(rate) = self.counter_rate(&previous, row)
+                {
+                    self.rows.push(rate);
+                }
+            } else {
+                self.rows.push(row.clone());
+            }
         }
 
         if self.rows.len() > self.max_samples {
             let overflow = self.rows.len() - self.max_samples;
             self.rows.drain(..overflow);
         }
+    }
+
+    fn counter_rate(
+        &self,
+        previous: &datatab_core::Row,
+        current: &datatab_core::Row,
+    ) -> Option<datatab_core::Row> {
+        use datatab_core::Value;
+        let timestamp = self.timestamp_column()?;
+        let elapsed = self
+            .row_timestamp_ms(current, timestamp)?
+            .checked_sub(self.row_timestamp_ms(previous, timestamp)?)?;
+        if elapsed <= 0 {
+            return None;
+        }
+        let mut result = current.clone();
+        for (index, value) in current.iter().enumerate() {
+            if index == timestamp {
+                continue;
+            }
+            let number = |value: &Value| match value {
+                Value::Float(value) => Some(*value),
+                Value::Int(value) => Some(*value as f64),
+                _ => None,
+            };
+            let delta = number(value)? - number(previous.get(index)?)?;
+            if !delta.is_finite() || delta < 0.0 {
+                return None;
+            }
+            *result.get_mut(index)? = Value::Float(delta * 1000.0 / elapsed as f64);
+        }
+        Some(result)
     }
 
     /// Number of accumulated samples.
@@ -2085,6 +2007,8 @@ fn toggle_stats_rail(
 
 #[cfg(test)]
 mod tests {
+    mod metric_execution;
+
     use super::*;
     use datatab_core::Value as TestValue;
 
@@ -2325,15 +2249,6 @@ mod tests {
         assert!(matches!(event, DocumentEvent::DataSourceChanged));
     }
 
-    /// T-DS-11: `ChartRailTab::Metric` variant must exist.
-    ///
-    /// Fails to compile until the variant is added. RED state.
-    #[test]
-    fn chart_rail_tab_metric_variant_exists() {
-        let tab = crate::chart::ChartRailTab::Metric;
-        assert!(matches!(tab, crate::chart::ChartRailTab::Metric));
-    }
-
     /// T-DS-12: `set_data_source` replaces the data source.
     ///
     /// Simulates the state transition: a new source arrives, the existing one
@@ -2362,176 +2277,6 @@ mod tests {
         );
     }
 
-    /// Simulate the closure body installed by the `metric_apply_sub` subscription
-    /// in `ChartDocument::new` / `new_with_source`. The closure must:
-    ///   1. Clone the source via `clone_box` (the field is `Box<dyn ChartDataSource>`
-    ///      so it cannot be moved out of the borrowed event).
-    ///   2. Write it into `pending_data_source`.
-    ///
-    /// Without this closure the Apply button is dead UI.
-    #[test]
-    fn metric_picker_applied_event_populates_pending_data_source() {
-        use crate::chart::shell::ChartShellEvent;
-        use datatab_components::chart::{ChartDataSource, MetricSource};
-
-        let source = MetricSource::single(
-            "AWS/EC2".to_string(),
-            "CPUUtilization".to_string(),
-            vec![],
-            300,
-            "Average".to_string(),
-        );
-        let event = ChartShellEvent::MetricPickerApplied(Box::new(source));
-
-        // Mirror the closure body in `cx.subscribe(&chart_shell, ...)`.
-        let pending_data_source: Option<Box<dyn ChartDataSource>> = match &event {
-            ChartShellEvent::MetricPickerApplied(src) => Some(src.clone_box()),
-        };
-
-        assert!(
-            pending_data_source.is_some(),
-            "MetricPickerApplied must populate pending_data_source"
-        );
-        let captured = pending_data_source
-            .as_ref()
-            .and_then(|s| s.as_any())
-            .and_then(|a| a.downcast_ref::<MetricSource>())
-            .expect("pending_data_source must downcast back to MetricSource");
-        assert_eq!(captured.primary_namespace(), "AWS/EC2");
-        assert_eq!(captured.primary_metric_name(), "CPUUtilization");
-    }
-
-    /// `matches_metric_source` must compare against the initial identity
-    /// captured at construction, not the (possibly mutated) current data_source.
-    ///
-    /// After Apply rewrites dimensions/period/statistic the
-    /// `(namespace, metric_name)` pair stays the same, so sidebar dedup must
-    /// continue to find the existing tab.
-    #[test]
-    fn matches_metric_source_uses_initial_identity() {
-        let profile_id = Uuid::new_v4();
-        let identity = Some(("AWS/EC2".to_string(), "CPUUtilization".to_string()));
-
-        // Simulate the body of `matches_metric_source` directly without a GPUI runtime.
-        fn matches(
-            doc_profile: Option<Uuid>,
-            doc_identity: &Option<(String, String)>,
-            query_profile: Uuid,
-            query_ns: &str,
-            query_metric: &str,
-        ) -> bool {
-            if doc_profile != Some(query_profile) {
-                return false;
-            }
-            doc_identity
-                .as_ref()
-                .is_some_and(|(ns, mn)| ns == query_ns && mn == query_metric)
-        }
-
-        assert!(
-            matches(
-                Some(profile_id),
-                &identity,
-                profile_id,
-                "AWS/EC2",
-                "CPUUtilization"
-            ),
-            "exact identity must match"
-        );
-        assert!(
-            !matches(
-                Some(profile_id),
-                &identity,
-                profile_id,
-                "AWS/EC2",
-                "NetworkIn"
-            ),
-            "different metric name must not match"
-        );
-        assert!(
-            !matches(
-                Some(profile_id),
-                &identity,
-                Uuid::new_v4(),
-                "AWS/EC2",
-                "CPUUtilization"
-            ),
-            "different profile must not match"
-        );
-        assert!(
-            !matches(
-                Some(profile_id),
-                &None,
-                profile_id,
-                "AWS/EC2",
-                "CPUUtilization"
-            ),
-            "doc with no identity (non-metric chart) must not match"
-        );
-    }
-
-    /// A2 regression: `cancel_metric_fetches_if_disconnected` must early-return
-    /// when the profile is still connected and tear down the dimensions task
-    /// when the profile is no longer present. The full GPUI wiring sits behind
-    /// the subscribe -> chart_shell.update path; this test pins the pure
-    /// decision logic that selects between "no-op" and "drop task".
-    #[test]
-    fn cancel_metric_fetches_decision_logic_short_circuits_when_connected() {
-        // Pure-logic replica of `cancel_metric_fetches_if_disconnected`'s
-        // decision predicate: only proceed when we have a profile AND it is no
-        // longer in the connections map.
-        fn should_cancel(profile: Option<Uuid>, connected: bool) -> bool {
-            profile.is_some() && !connected
-        }
-
-        assert!(
-            !should_cancel(None, false),
-            "no profile_id must skip cancellation"
-        );
-        assert!(
-            !should_cancel(Some(Uuid::new_v4()), true),
-            "still-connected profile must skip cancellation"
-        );
-        assert!(
-            should_cancel(Some(Uuid::new_v4()), false),
-            "disconnected profile must trigger cancellation"
-        );
-    }
-
-    /// T-DS-13: `set_data_source` updates the title when the source describes itself.
-    ///
-    /// Simulates the title-update branch using a `MetricSource` description.
-    #[test]
-    fn set_data_source_updates_title_from_source_description() {
-        use datatab_components::chart::MetricSource;
-
-        let source = MetricSource::single(
-            "AWS/Lambda".to_string(),
-            "Invocations".to_string(),
-            vec![],
-            300,
-            "Average".to_string(),
-        );
-
-        let description = source.describe();
-        let title_update = description.display_title();
-
-        // MetricSource::describe produces "AWS/Lambda / Invocations".
-        assert!(
-            title_update.is_some(),
-            "MetricSource description must provide a display title"
-        );
-        let title = title_update.unwrap();
-        assert!(
-            title.contains("AWS/Lambda"),
-            "title must include namespace: got {title:?}"
-        );
-        assert!(
-            title.contains("Invocations"),
-            "title must include metric name: got {title:?}"
-        );
-    }
-
     // ---- stats rail helpers ----
 
     /// T-SR-01: `should_render_stats_rail` returns true when rail is open on Stats tab.
@@ -2556,7 +2301,7 @@ mod tests {
     #[test]
     fn should_not_render_when_other_tab() {
         assert!(
-            !super::should_render_stats_rail(true, crate::chart::ChartRailTab::Metric),
+            !super::should_render_stats_rail(true, crate::chart::ChartRailTab::Configure),
             "rail must not render when tab is not Stats"
         );
     }
@@ -2582,18 +2327,6 @@ mod tests {
             tab,
             crate::chart::ChartRailTab::Stats,
             "closed toggle must preserve Stats tab identity"
-        );
-    }
-
-    /// T-SR-06: toggling while rail is open on Metric tab switches to Stats without closing.
-    #[test]
-    fn toggle_while_open_on_metric_switches_to_stats() {
-        let (open, tab) = super::toggle_stats_rail(true, crate::chart::ChartRailTab::Metric);
-        assert!(open, "switching from Metric to Stats must keep rail open");
-        assert_eq!(
-            tab,
-            crate::chart::ChartRailTab::Stats,
-            "switching from Metric must set tab to Stats"
         );
     }
 
@@ -2898,6 +2631,51 @@ mod tests {
             metadata_extra: None,
             additional_results: Vec::new(),
         }
+    }
+
+    #[test]
+    fn counter_series_plots_rates() {
+        use datatab_core::Value;
+        let first = make_single_point_result(1_000, 100.0);
+        let mut buffer = InstantSeriesBuffer::new_with_kind(
+            first.columns.clone(),
+            120,
+            datatab_core::InstanceMetricKind::Counter,
+        );
+        buffer.push_result(&first);
+        assert!(buffer.to_query_result().rows.is_empty());
+        buffer.push_result(&make_single_point_result(3_000, 120.0));
+        buffer.push_result(&make_single_point_result(4_000, 5.0));
+        buffer.push_result(&make_single_point_result(6_000, 15.0));
+        let result = buffer.to_query_result();
+        assert_eq!(
+            result.rows,
+            vec![
+                vec![Value::Int(3_000), Value::Float(10.0)],
+                vec![Value::Int(6_000), Value::Float(5.0)]
+            ]
+        );
+        let ChartDetection::Ok {
+            time_col,
+            numeric_cols,
+        } = detect_chart_columns(&result)
+        else {
+            panic!("counter rates must be chartable");
+        };
+        let spec = datatab_components::chart::ChartSpec::from_detection(
+            time_col,
+            numeric_cols,
+            &result.columns,
+            10_000,
+        )
+        .expect("chart spec");
+        let view = datatab_components::chart::ChartView::build(&result, spec).expect("chart view");
+        let stats = view
+            .series_stats()
+            .first()
+            .and_then(|stats| *stats)
+            .expect("rate series");
+        assert_eq!((stats.min, stats.max, stats.last), (5.0, 10.0, 5.0));
     }
 
     /// BF5: three sequential push_result calls must accumulate 3 samples.

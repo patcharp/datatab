@@ -312,8 +312,8 @@ pub fn classify_query_for_language(
 /// conservative default. With no service, or when the service's
 /// `classify_execution` returns `None` (its default), `MongoQuery` falls back
 /// to `classify_mongo_query` (the pre-existing text heuristic, unchanged);
-/// the CloudWatch/OpenSearch trio falls back to `Read`; everything else in
-/// this group falls back to `Write`.
+/// everything else in this group, the reserved languages included, falls
+/// back to `Write`.
 pub fn classify_query_for_language_with_service(
     query_language: &QueryLanguage,
     query: &str,
@@ -322,25 +322,19 @@ pub fn classify_query_for_language_with_service(
     match query_language {
         QueryLanguage::Sql => classify_sql_execution(query),
 
-        // These languages are fixed (non-`Custom`) variants, but like `Custom`
-        // they are driver-owned dialects with no shared heuristic in core. A
-        // driver whose `LanguageService` overrides `classify_execution` gets
-        // consulted first; a driver that does not (the default returns `None`)
-        // falls back to the same conservative default this language used
-        // before delegation existed, so behavior for those drivers is
-        // unchanged.
-        QueryLanguage::CloudWatchLogsInsightsQl
-        | QueryLanguage::OpenSearchPpl
-        | QueryLanguage::OpenSearchSql => service
-            .and_then(|service| service.classify_execution(query))
-            .unwrap_or(ExecutionClassification::Read),
-
         QueryLanguage::MongoQuery => service
             .and_then(|service| service.classify_execution(query))
             .unwrap_or_else(|| classify_mongo_query(query)),
         QueryLanguage::RedisCommands => classify_redis_query(query),
 
-        QueryLanguage::InfluxQuery | QueryLanguage::Flux | QueryLanguage::Custom(_) => service
+        // The reserved wire slots are no language of their own and take the
+        // conservative default of a custom language.
+        QueryLanguage::InfluxQuery
+        | QueryLanguage::Flux
+        | QueryLanguage::Custom(_)
+        | QueryLanguage::ReservedCloudWatchLogsInsightsQl
+        | QueryLanguage::ReservedOpenSearchPpl
+        | QueryLanguage::ReservedOpenSearchSql => service
             .and_then(|service| service.classify_execution(query))
             .unwrap_or(ExecutionClassification::Write),
 
@@ -2377,21 +2371,31 @@ END $$;"#;
     }
 
     #[test]
-    fn cloudwatch_languages_delegate_to_service_when_it_classifies() {
-        let service = DestructiveOnDropService;
-
+    fn reserved_languages_classify_like_a_custom_language() {
         for language in [
-            QueryLanguage::CloudWatchLogsInsightsQl,
-            QueryLanguage::OpenSearchPpl,
-            QueryLanguage::OpenSearchSql,
+            QueryLanguage::ReservedCloudWatchLogsInsightsQl,
+            QueryLanguage::ReservedOpenSearchPpl,
+            QueryLanguage::ReservedOpenSearchSql,
         ] {
             assert_eq!(
                 classify_query_for_language_with_service(
                     &language,
                     "fields @message | filter @message like /DROP/",
-                    Some(&service),
+                    Some(&DestructiveOnDropService),
                 ),
                 ExecutionClassification::Destructive
+            );
+            assert_eq!(
+                classify_query_for_language_with_service(
+                    &language,
+                    "fields @timestamp",
+                    Some(&NeverOverridesService),
+                ),
+                ExecutionClassification::Write
+            );
+            assert_eq!(
+                classify_query_for_language(&language, "source=logs"),
+                ExecutionClassification::Write
             );
         }
     }
@@ -2511,26 +2515,6 @@ END $$;"#;
         assert_eq!(
             classify_query_for_language(&QueryLanguage::Flux, "from(bucket:\"b\")"),
             ExecutionClassification::Write
-        );
-    }
-
-    #[test]
-    fn cloudwatch_languages_fall_back_to_read_when_service_returns_none() {
-        assert_eq!(
-            classify_query_for_language_with_service(
-                &QueryLanguage::CloudWatchLogsInsightsQl,
-                "fields @timestamp",
-                Some(&NeverOverridesService),
-            ),
-            ExecutionClassification::Read
-        );
-        assert_eq!(
-            classify_query_for_language(&QueryLanguage::OpenSearchPpl, "source=logs"),
-            ExecutionClassification::Read
-        );
-        assert_eq!(
-            classify_query_for_language(&QueryLanguage::OpenSearchSql, "SELECT * FROM logs"),
-            ExecutionClassification::Read
         );
     }
 

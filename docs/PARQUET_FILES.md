@@ -22,7 +22,7 @@ downloaded whole.
 
 | Store | How the object is read |
 |-------|------------------------|
-| A store that can read part of an object (S3 today) | Only the bytes each page needs are read, and the object is checked for changes before each page. |
+| A store that can read part of an object | Only the bytes each page needs are read, and the object is checked for changes before each page. |
 | Any other store | DataTab first asks whether to download the whole object and shows its size. Declining closes the tab. |
 
 A downloaded object is kept in memory up to 64 MiB and in a temporary file

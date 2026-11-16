@@ -6,14 +6,11 @@ use secrecy::{ExposeSecret, SecretString};
 use crate::DbError;
 use crate::auth::ResolvedCredentials;
 use crate::values::cache::{CacheKey, CachedValue, ValueCache};
-use crate::values::{
-    DynParameterProvider, DynSecretProvider, ResolveContext, ResolvedValue, ValueOrigin, ValueRef,
-};
+use crate::values::{DynSecretProvider, ResolveContext, ResolvedValue, ValueOrigin, ValueRef};
 
 /// Resolves `ValueRef` values by dispatching to registered providers.
 pub struct CompositeValueResolver {
     secret_providers: HashMap<String, Arc<dyn DynSecretProvider>>,
-    parameter_providers: HashMap<String, Arc<dyn DynParameterProvider>>,
     cache: Arc<ValueCache>,
 }
 
@@ -21,7 +18,6 @@ impl CompositeValueResolver {
     pub fn new(cache: Arc<ValueCache>) -> Self {
         Self {
             secret_providers: HashMap::new(),
-            parameter_providers: HashMap::new(),
             cache,
         }
     }
@@ -31,20 +27,8 @@ impl CompositeValueResolver {
         self.secret_providers.insert(id, provider);
     }
 
-    pub fn register_parameter_provider(&mut self, provider: Arc<dyn DynParameterProvider>) {
-        let id = provider.provider_id().to_string();
-        self.parameter_providers.insert(id, provider);
-    }
-
     pub fn available_secret_providers(&self) -> Vec<(&str, &str)> {
         self.secret_providers
-            .values()
-            .map(|p| (p.provider_id(), p.display_name()))
-            .collect()
-    }
-
-    pub fn available_parameter_providers(&self) -> Vec<(&str, &str)> {
-        self.parameter_providers
             .values()
             .map(|p| (p.provider_id(), p.display_name()))
             .collect()
@@ -147,12 +131,6 @@ impl CompositeValueResolver {
                 locator,
                 json_key,
             } => self.resolve_secret(provider, locator, json_key, ctx).await,
-
-            ValueRef::Parameter {
-                provider,
-                name,
-                json_key,
-            } => self.resolve_parameter(provider, name, json_key).await,
 
             ValueRef::Auth { field } => {
                 let credentials = ctx.credentials.ok_or_else(|| {
@@ -267,80 +245,6 @@ impl CompositeValueResolver {
             },
         ))
     }
-
-    async fn resolve_parameter(
-        &self,
-        provider: &str,
-        name: &str,
-        json_key: &Option<String>,
-    ) -> Result<ResolvedValue, DbError> {
-        let cache_key = CacheKey::new(provider, name, json_key.clone());
-
-        if let Some(cached) = self.cache.get(&cache_key) {
-            let value = match cached {
-                CachedValue::Plain(v) => v,
-                CachedValue::Secret(s) => s.expose_secret().to_string(),
-            };
-
-            return Ok(ResolvedValue::new(
-                value,
-                ValueOrigin::ParameterProvider {
-                    provider: provider.to_string(),
-                    name: name.to_string(),
-                },
-            ));
-        }
-
-        let param_provider = self.parameter_providers.get(provider).ok_or_else(|| {
-            DbError::value_resolution_failed(format!(
-                "Parameter provider '{}' not registered",
-                provider
-            ))
-        })?;
-
-        let value = param_provider
-            .get_parameter(name, json_key.as_deref())
-            .await?;
-
-        self.cache.put(cache_key, CachedValue::Plain(value.clone()));
-
-        Ok(ResolvedValue::new(
-            value,
-            ValueOrigin::ParameterProvider {
-                provider: provider.to_string(),
-                name: name.to_string(),
-            },
-        ))
-    }
-}
-
-#[cfg(test)]
-#[allow(clippy::result_large_err)]
-fn extract_json_field(
-    parameter_value: &str,
-    key: &str,
-    parameter_name: &str,
-) -> Result<String, DbError> {
-    let parsed: serde_json::Value = serde_json::from_str(parameter_value).map_err(|err| {
-        DbError::ValueResolutionFailed(format!(
-            "Parameter '{}' is not valid JSON (json_key '{}' requested): {}",
-            parameter_name, key, err
-        ))
-    })?;
-
-    let field = parsed.get(key).ok_or_else(|| {
-        DbError::ValueResolutionFailed(format!(
-            "Field '{}' not found in parameter '{}'",
-            key, parameter_name
-        ))
-    })?;
-
-    let value = match field {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
-    };
-
-    Ok(value)
 }
 
 fn resolve_auth_field(credentials: &ResolvedCredentials, field: &str) -> Result<String, DbError> {
@@ -361,7 +265,7 @@ fn resolve_auth_field(credentials: &ResolvedCredentials, field: &str) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::values::{ParameterProvider, SecretProvider};
+    use crate::values::SecretProvider;
     use std::time::Duration;
 
     struct MockSecretProvider;
@@ -445,45 +349,10 @@ mod tests {
         resolver
     }
 
-    struct MockParameterProvider;
-
-    impl ParameterProvider for MockParameterProvider {
-        fn provider_id(&self) -> &'static str {
-            "mock"
-        }
-
-        fn display_name(&self) -> &'static str {
-            "Mock Params"
-        }
-
-        fn get_parameter(
-            &self,
-            name: &str,
-            json_key: Option<&str>,
-        ) -> impl std::future::Future<Output = Result<String, DbError>> + Send {
-            let name = name.to_string();
-            let json_key = json_key.map(ToString::to_string);
-
-            async move {
-                let value = if name == "json-param" {
-                    r#"{"host":"db.example.com","port":5432}"#.to_string()
-                } else {
-                    format!("param-value-for-{}", name)
-                };
-
-                match json_key {
-                    Some(key) => extract_json_field(&value, &key, &name),
-                    None => Ok(value),
-                }
-            }
-        }
-    }
-
     fn test_resolver() -> CompositeValueResolver {
         let cache = Arc::new(ValueCache::new(Duration::from_secs(60)));
         let mut resolver = CompositeValueResolver::new(cache);
         resolver.register_secret_provider(Arc::new(MockSecretProvider));
-        resolver.register_parameter_provider(Arc::new(MockParameterProvider));
         resolver
     }
 
@@ -686,30 +555,6 @@ mod tests {
             )
             .await;
         assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn resolve_parameter_delegates_to_provider() {
-        let resolver = test_resolver();
-        let result = resolver
-            .resolve(&ValueRef::parameter("mock", "db-port"), &empty_ctx())
-            .await
-            .unwrap();
-        assert_eq!(result.expose_secret(), "param-value-for-db-port");
-    }
-
-    #[tokio::test]
-    async fn resolve_parameter_json_field_delegates_to_provider() {
-        let resolver = test_resolver();
-        let result = resolver
-            .resolve(
-                &ValueRef::parameter_with_key("mock", "json-param", Some("host".to_string())),
-                &empty_ctx(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(result.expose_secret(), "db.example.com");
     }
 
     #[tokio::test]

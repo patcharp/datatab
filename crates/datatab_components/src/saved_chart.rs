@@ -26,37 +26,13 @@ use uuid::Uuid;
 // SavedChartSource
 // ---------------------------------------------------------------------------
 
-/// One CloudWatch metric series persisted on a multi-series chart.
-///
-/// Each series carries its own namespace, metric name, dimensions, sampling
-/// period, statistic, region override, and optional display label. The chart
-/// engine receives one Y column per series in the result set.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct MetricSeries {
-    pub namespace: String,
-    pub metric_name: String,
-    /// Ordered (name, value) dimension pairs. Empty for scalar metrics.
-    pub dimensions: Vec<(String, String)>,
-    /// Sampling period in seconds.
-    pub period_seconds: u32,
-    /// CloudWatch statistic (e.g. "Average", "Sum").
-    pub statistic: String,
-    /// AWS region override; `None` means use the connection's default region.
-    pub region: Option<String>,
-    /// Optional display label for the legend; falls back to `metric_name` when `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
-}
-
 /// The data source for a saved chart.
 ///
 /// `Query` wraps a SQL/Flux/etc. query string and is executed inside
 /// `ChartDocument`. `Collection` represents a collection-browse source
 /// (Mongo collection, InfluxDB measurement) — opening it re-opens the
-/// underlying `DataDocument` in chart mode. `Metric` persists a list of
-/// CloudWatch metric series so one chart can plot N metrics on shared axes;
-/// importing a CloudWatch widget with multiple `metrics` entries yields one
-/// `SavedChart` with one `MetricSeries` per entry.
+/// underlying `DataDocument` in chart mode. `InstanceMetric` names a
+/// driver-defined operational metric.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum SavedChartSource {
@@ -68,10 +44,6 @@ pub enum SavedChartSource {
         /// The time window that was active when the chart was saved, if any.
         time_window: Option<ResolvedWindow>,
     },
-    /// A CloudWatch metric source. Carries one or more series; the chart opens
-    /// via `MetricSource` (which holds the same list) and the driver issues a
-    /// single GetMetricData request batching every series.
-    Metric { series: Vec<MetricSeries> },
     /// A per-driver instance metric source. Identified by a driver-defined
     /// `metric_id` string (e.g. `"pg.cache_hit_ratio"`). The chart opens a
     /// time-bounded query via `InstanceMetricQuery`.
@@ -209,51 +181,17 @@ impl SavedChart {
         }
     }
 
-    /// Create a new `SavedChart` from a CloudWatch metric source.
-    ///
-    /// `series` must be non-empty; callers building from a single metric pass
-    /// a one-element vec. Each entry is plotted as a distinct line/series on
-    /// the chart.
-    pub fn new_metric(
-        name: String,
-        profile_id: Uuid,
-        series: Vec<MetricSeries>,
-        chart_spec: ChartSpec,
-        bindings: BindingSpec,
-    ) -> Self {
-        let now = Utc::now();
-        Self {
-            id: Uuid::new_v4(),
-            name,
-            profile_id,
-            source: SavedChartSource::Metric { series },
-            chart_spec,
-            bindings,
-            time_range_preset: None,
-            refresh_policy: SavedChartRefreshPolicy::Off,
-            created_at: now,
-            updated_at: now,
-        }
-    }
-
     /// Convenience: returns the query string if this chart has a `Query` source.
     pub fn query(&self) -> Option<&str> {
         match &self.source {
             SavedChartSource::Query { query } => Some(query.as_str()),
-            SavedChartSource::Collection { .. }
-            | SavedChartSource::Metric { .. }
-            | SavedChartSource::InstanceMetric { .. } => None,
+            SavedChartSource::Collection { .. } | SavedChartSource::InstanceMetric { .. } => None,
         }
     }
 
     /// Returns `true` if this chart has a `Collection` source.
     pub fn is_collection_source(&self) -> bool {
         matches!(self.source, SavedChartSource::Collection { .. })
-    }
-
-    /// Returns `true` if this chart has a `Metric` source.
-    pub fn is_metric_source(&self) -> bool {
-        matches!(self.source, SavedChartSource::Metric { .. })
     }
 }
 
@@ -327,117 +265,6 @@ mod tests {
                 aggregation: AggKind::None,
             },
         )
-    }
-
-    fn sample_metric_chart(name: &str, profile_id: Uuid) -> SavedChart {
-        SavedChart::new_metric(
-            name.to_string(),
-            profile_id,
-            vec![MetricSeries {
-                namespace: "AWS/EC2".to_string(),
-                metric_name: "CPUUtilization".to_string(),
-                dimensions: vec![
-                    ("InstanceId".to_string(), "i-12345".to_string()),
-                    ("Region".to_string(), "us-east-1".to_string()),
-                ],
-                period_seconds: 300,
-                statistic: "Average".to_string(),
-                region: Some("us-east-1".to_string()),
-                label: None,
-            }],
-            sample_spec(),
-            BindingSpec {
-                x: 0,
-                y: vec![1],
-                group_by: None,
-                filter: None,
-                aggregation: AggKind::None,
-            },
-        )
-    }
-
-    /// Metric source: `query()` returns `None` and `is_metric_source()` returns `true`.
-    #[test]
-    fn metric_source_query_returns_none() {
-        let profile_id = Uuid::new_v4();
-        let chart = sample_metric_chart("test", profile_id);
-        assert_eq!(chart.query(), None);
-        assert!(!chart.is_collection_source());
-        assert!(chart.is_metric_source());
-    }
-
-    /// Metric source: every series field survives a round-trip through `SavedChartSource`.
-    #[test]
-    fn metric_source_fields_accessible() {
-        let profile_id = Uuid::new_v4();
-        let chart = sample_metric_chart("my-chart", profile_id);
-        if let SavedChartSource::Metric { series } = &chart.source {
-            assert_eq!(series.len(), 1);
-            let s = &series[0];
-            assert_eq!(s.namespace, "AWS/EC2");
-            assert_eq!(s.metric_name, "CPUUtilization");
-            assert_eq!(s.dimensions.len(), 2);
-            assert_eq!(
-                s.dimensions[0],
-                ("InstanceId".to_string(), "i-12345".to_string())
-            );
-            assert_eq!(
-                s.dimensions[1],
-                ("Region".to_string(), "us-east-1".to_string())
-            );
-            assert_eq!(s.period_seconds, 300);
-            assert_eq!(s.statistic, "Average");
-            assert_eq!(s.region.as_deref(), Some("us-east-1"));
-            assert!(s.label.is_none());
-        } else {
-            panic!("expected Metric variant");
-        }
-    }
-
-    /// Multi-series metric chart: each series is independently accessible.
-    #[test]
-    fn metric_source_supports_multiple_series() {
-        let profile_id = Uuid::new_v4();
-        let chart = SavedChart::new_metric(
-            "multi".to_string(),
-            profile_id,
-            vec![
-                MetricSeries {
-                    namespace: "AWS/RDS".to_string(),
-                    metric_name: "CPUUtilization".to_string(),
-                    dimensions: vec![(
-                        "DBInstanceIdentifier".to_string(),
-                        "primary-db".to_string(),
-                    )],
-                    period_seconds: 60,
-                    statistic: "Average".to_string(),
-                    region: Some("us-east-1".to_string()),
-                    label: None,
-                },
-                MetricSeries {
-                    namespace: "AWS/RDS".to_string(),
-                    metric_name: "CPUUtilization".to_string(),
-                    dimensions: vec![(
-                        "DBInstanceIdentifier".to_string(),
-                        "replica-db".to_string(),
-                    )],
-                    period_seconds: 60,
-                    statistic: "Average".to_string(),
-                    region: Some("us-east-1".to_string()),
-                    label: Some("Replica".to_string()),
-                },
-            ],
-            sample_spec(),
-            BindingSpec::default(),
-        );
-
-        let SavedChartSource::Metric { series } = &chart.source else {
-            panic!("expected Metric variant");
-        };
-        assert_eq!(series.len(), 2);
-        assert_eq!(series[0].dimensions[0].1, "primary-db");
-        assert_eq!(series[1].dimensions[0].1, "replica-db");
-        assert_eq!(series[1].label.as_deref(), Some("Replica"));
     }
 
     /// T-CE-I07: Query source query() helper returns Some.

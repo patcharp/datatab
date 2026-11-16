@@ -15,7 +15,7 @@ Advanced open-source relational database.
 - Native console (`NATIVE_CONSOLE`): tables dock a console, and a database's sidebar menu opens one in its own tab, that runs one SQL statement line at a time through `Connection::execute` with the editor's validation, dangerous-query confirmation, audit rows and query history. The driver enforces `QueryRequest::limit` (`REQUEST_ROW_LIMIT`), so console commands carry the editor row limit.
 - Supports schemas, tables, views, indexes, foreign keys, check constraints, unique constraints, and custom types.
 - Exposes stored routines (functions, procedures, aggregates, window functions) in the schema tree with read-only definition viewer.
-- Supports authentication, SSL, SSH tunneling, and URI/manual connection modes. As in libpq, `verify-ca` validates the certificate chain only and `verify-full` also checks the hostname.
+- Supports authentication, SSL, SSH tunneling, and URI/manual connection modes. `allow`, `prefer`, and `require` do not verify the server certificate. As in libpq, `verify-ca` validates the certificate chain only and `verify-full` also checks the hostname.
 - TLS certificate files: the Connection Manager's root certificate, client certificate and client key fields, or the libpq URI parameters `sslrootcert`, `sslcert` and `sslkey` (for example `postgresql://user@host/db?sslmode=verify-full&sslrootcert=/path/ca.pem`). With `verify-ca` and `verify-full` the root certificate is added to the trusted roots; the other modes do not validate the chain and ignore it. The client certificate and key are presented for mutual TLS in every mode except `disable`. Files are PEM; the client key must be PKCS#8. A missing, unreadable or invalid file, or a client certificate without its key (or the reverse), fails the connection with an error naming the file, before any connection attempt. With `sslmode=disable` the files are ignored.
 - Supports query cancellation through PostgreSQL cancel tokens. A cancel request uses the connection's TLS connector, with the same certificate checks and client certificate. It requires TLS with `sslmode` set to `require`, `verify-ca` or `verify-full`. With `prefer` it attempts TLS, unless the connection itself fell back to clear text after a failed TLS handshake.
 - Includes PostgreSQL-specific SQL/code generation for CRUD, indexes, reindex, foreign keys, and type operations.
@@ -42,7 +42,7 @@ Exposes a curated set of live server metrics sourced from PostgreSQL system view
 - `pg.cache_hit_ratio` — buffer cache hit ratio (from `pg_statio_user_tables`)
 - `pg.active_connections` — connections in state `'active'`
 - `pg.idle_connections` — connections in state `'idle'`
-- `pg.blocks_read` — blocks read from disk (from `pg_statio_user_tables`)
+- `pg.blocks_read` — blocks read from disk per second (from `pg_statio_user_tables`)
 - `pg.stat_statements.mean_exec_ms` — mean execution time per query (requires `pg_stat_statements` extension)
 
 Each metric is returned as a single `(timestamp_ms, value)` row for live charting.
@@ -60,6 +60,9 @@ Exposes tabular snapshots of running server state:
 - Requested statement timeouts are rejected before execution.
 
 ## Limitations
+
+- URLs with a raw `?` before the first `@` are refused. Percent-encode password delimiters (for example `%3F` for `?`).
+- Unknown TLS modes, duplicate `sslmode` keys, and `%` in URL query keys are refused. URI mode also accepts libpq keyword strings, including quoted values and backslash escapes. The `sslmode` key ignores case; its value uses exact case.
 
 - A row-limited single statement that returns rows stops reading at the limit: it runs in a transaction the driver opens and commits, and fetches one row past the limit through a portal, so the server stops producing rows there and the result is flagged as truncated only when rows remain. An error the statement would raise in a later row is not reported. Mutations with `RETURNING` still complete all effects. `CALL`, statements inside an open transaction, and row-limited batches cap retained rows only, not server work, network traffic, or execution time. To detect an open transaction the driver first runs `SELECT transaction_timestamp() = statement_timestamp()`, which raises no error.
 - Row limits on instance metrics and inspectors are rejected before dispatch. Unbounded batches retain their buffered behavior.

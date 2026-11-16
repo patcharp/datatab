@@ -37,11 +37,10 @@ mod compat;
 pub use axis_bar::{AxisPickerOption, AxisPill, axis_bar_element, axis_picker_options};
 pub use data_source::{
     AuditAggregateSpec, AuditGroupBy, AuditSource, ChartDataPlan, ChartDataSource,
-    ChartSourceDescription, ChartSourceError, InstanceMetricSource, MetricSource, TimeWindow,
-    resolve_source,
+    ChartSourceDescription, ChartSourceError, InstanceMetricSource, TimeWindow, resolve_source,
 };
 pub use detect::{ChartDetection, detect_chart_columns};
-pub use engine::{ChartBuildError, ChartView, format_x_value, format_y_value};
+pub use engine::{ChartBuildError, ChartView, format_x_value, format_x_value_in, format_y_value};
 pub use legend::legend_element;
 pub use point_inspector::{DataPointRef, SourceRowRef, point_inspector_element};
 pub use spec::{

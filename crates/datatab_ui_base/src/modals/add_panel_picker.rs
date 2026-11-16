@@ -10,16 +10,14 @@ use datatab_components::primitives::Text;
 use datatab_components::saved_chart::SavedChart;
 use datatab_components::tokens::{FontSizes, Heights, Radii, Spacing};
 use datatab_components::vim::{VimBinding, VimHost};
-use datatab_core::{LogErr, MetricDescriptor};
+use datatab_core::LogErr;
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, Entity, EntityId, EventEmitter, FocusHandle, Focusable, FontWeight,
-    IntoElement, Render, SharedString, Subscription, Window, div, px,
+    IntoElement, Render, Subscription, Window, div, px,
 };
 use gpui_component::ActiveTheme;
 use gpui_component::input::EditorState;
-use gpui_component::scroll::ScrollableElement;
-use std::collections::HashMap;
 use uuid::Uuid;
 
 impl VimHost for ModalAddPanelPicker {
@@ -48,28 +46,7 @@ pub enum AddPanelOutcome {
         query: String,
         chart_kind: ChartKind,
     },
-    /// User submitted the "From metric" tab and wants a new metric-backed panel.
-    CreateFromMetric {
-        dashboard_id: Uuid,
-        profile_id: Uuid,
-        name: String,
-        namespace: String,
-        metric_name: String,
-        dimensions: Vec<(String, String)>,
-        period_seconds: u32,
-        statistic: String,
-    },
     Cancelled,
-}
-
-/// Side-channel event: modal asks the host to load metrics for a namespace.
-///
-/// The host (workspace) fetches them via the active connection's metric
-/// catalog and feeds them back through `set_metrics_for_namespace`.
-#[derive(Clone, Debug)]
-pub struct RequestMetricsForNamespace {
-    pub profile_id: Uuid,
-    pub namespace: String,
 }
 
 /// Request payload for opening the add-panel picker.
@@ -80,13 +57,6 @@ pub struct AddPanelRequest {
     pub profile_id: Uuid,
     /// All saved charts available for this profile's connection.
     pub candidates: Vec<SavedChart>,
-    /// Whether the connection advertises `DriverCapabilities::METRIC_CATALOG`.
-    pub has_metric_catalog: bool,
-    /// Pre-loaded namespaces (empty when no catalog or when still loading).
-    pub metric_namespaces: Vec<String>,
-    /// True while a background fetch for `metric_namespaces` is in flight.
-    /// The modal renders a "Loading namespaces…" placeholder while true.
-    pub metric_namespaces_loading: bool,
 }
 
 /// Active tab in the picker.
@@ -95,14 +65,6 @@ pub enum AddPanelTab {
     #[default]
     Saved,
     Query,
-    Metric,
-}
-
-/// The list of the Metric tab the keyboard is in.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MetricList {
-    Namespaces,
-    Metrics,
 }
 
 /// Pure helper: submit button label given an active tab and current
@@ -114,9 +76,7 @@ pub fn submit_label_for(tab: AddPanelTab, saved_selection_count: usize) -> Strin
             1 => datatab_i18n::t!("modals.add_panel_picker.submit.one"),
             n => datatab_i18n::t!("modals.add_panel_picker.submit.many", count = n),
         },
-        AddPanelTab::Query | AddPanelTab::Metric => {
-            datatab_i18n::t!("modals.add_panel_picker.submit.create")
-        }
+        AddPanelTab::Query => datatab_i18n::t!("modals.add_panel_picker.submit.create"),
     }
 }
 
@@ -136,46 +96,16 @@ fn chart_kind_label(kind: ChartKind) -> String {
     datatab_i18n::t!(chart_kind_label_key(kind))
 }
 
-/// CloudWatch statistic identifiers. These are API values, not user-facing
-/// prose, so they stay untranslated.
-const METRIC_STATISTICS: [&str; 5] = ["Average", "Sum", "Minimum", "Maximum", "SampleCount"];
-
-/// Pure helper: which tabs are visible given the metric-catalog capability.
-pub fn visible_tabs_for(has_metric_catalog: bool) -> Vec<AddPanelTab> {
-    let mut tabs = vec![AddPanelTab::Saved, AddPanelTab::Query];
-    if has_metric_catalog {
-        tabs.push(AddPanelTab::Metric);
-    }
-    tabs
-}
-
 /// Pure helper: query-tab form validity.
 pub fn query_tab_valid(name: &str, query: &str) -> bool {
     !name.trim().is_empty() && !query.trim().is_empty()
 }
 
-/// Pure helper: metric-tab form validity.
-pub fn metric_tab_valid(
-    name: &str,
-    namespace_selected: bool,
-    metric_selected: bool,
-    period_text: &str,
-) -> bool {
-    let period_ok = period_text
-        .trim()
-        .parse::<u32>()
-        .map(|p| p > 0)
-        .unwrap_or(false);
-    !name.trim().is_empty() && namespace_selected && metric_selected && period_ok
-}
-
 /// Modal entity for adding panels to a dashboard.
 ///
-/// Three tabs:
+/// Two tabs:
 /// - `Saved` — pick from existing saved charts (current behaviour).
 /// - `Query` — type a SQL query and pick a chart kind to spawn a new panel.
-/// - `Metric` — pick a CloudWatch-style namespace + metric (only visible when
-///   the connection advertises `METRIC_CATALOG`).
 pub struct ModalAddPanelPicker {
     request: Option<AddPanelRequest>,
     visible: bool,
@@ -196,26 +126,6 @@ pub struct ModalAddPanelPicker {
     /// Vim mode for the query editor.
     query_vim: VimBinding,
     query_chart_kind: ChartKind,
-
-    // Metric-tab state.
-    metric_name_input: Entity<InputState>,
-    metric_namespace_filter_input: Entity<InputState>,
-    /// Free-text filter applied to the metric list in the right column of the
-    /// metric picker tab. Case-insensitive substring match against
-    /// `metric_name` and against each `dimension key=value` pair.
-    metric_metric_filter_input: Entity<InputState>,
-    metric_namespace_selected: Option<String>,
-    metric_metrics_for_namespace: HashMap<String, Vec<MetricDescriptor>>,
-    metric_metric_selected: Option<usize>,
-    metric_period_input: Entity<InputState>,
-    metric_statistic: String,
-    /// Rows of the namespace and metric lists the keyboard is on (into the
-    /// filtered lists).
-    namespace_highlight: usize,
-    metric_highlight: usize,
-    /// Tab stops of the namespace and metric lists.
-    namespace_list_focus: FocusHandle,
-    metric_list_focus: FocusHandle,
 
     _subscriptions: Vec<Subscription>,
 }
@@ -240,28 +150,6 @@ impl ModalAddPanelPicker {
                     "modals.add_panel_picker.query.placeholder"
                 ))
         });
-        let metric_name_input = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder(datatab_i18n::t!("modals.add_panel_picker.name_placeholder"))
-        });
-        let metric_namespace_filter_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(datatab_i18n::t!(
-                "modals.add_panel_picker.metric.namespace_filter_placeholder"
-            ))
-        });
-        let metric_metric_filter_input = cx.new(|cx| {
-            InputState::new(window, cx).placeholder(datatab_i18n::t!(
-                "modals.add_panel_picker.metric.metric_filter_placeholder"
-            ))
-        });
-        let metric_period_input = cx.new(|cx| {
-            let mut s = InputState::new(window, cx).placeholder(datatab_i18n::t!(
-                "modals.add_panel_picker.metric.period_label"
-            ));
-            s.set_value("60", window, cx);
-            s
-        });
-
         let query_vim = VimBinding::new(query_input.clone(), window, cx);
 
         let mut picker = Self {
@@ -277,18 +165,6 @@ impl ModalAddPanelPicker {
             query_input,
             query_vim,
             query_chart_kind: ChartKind::Line,
-            metric_name_input,
-            metric_namespace_filter_input,
-            metric_metric_filter_input,
-            metric_namespace_selected: None,
-            metric_metrics_for_namespace: HashMap::new(),
-            metric_metric_selected: None,
-            metric_period_input,
-            metric_statistic: "Average".to_string(),
-            namespace_highlight: 0,
-            metric_highlight: 0,
-            namespace_list_focus: cx.focus_handle().tab_stop(true),
-            metric_list_focus: cx.focus_handle().tab_stop(true),
             _subscriptions: Vec::new(),
         };
 
@@ -311,19 +187,12 @@ impl ModalAddPanelPicker {
     }
 
     pub fn open(&mut self, request: AddPanelRequest, window: &mut Window, cx: &mut Context<Self>) {
-        let has_metric_catalog = request.has_metric_catalog;
         self.request = Some(request);
         self.visible = true;
         self.active_tab = AddPanelTab::Saved;
         self.selected_ids.clear();
         self.saved_highlight = 0;
-        self.namespace_highlight = 0;
-        self.metric_highlight = 0;
-        self.metric_namespace_selected = None;
-        self.metric_metric_selected = None;
-        self.metric_metrics_for_namespace.clear();
         self.query_chart_kind = ChartKind::Line;
-        self.metric_statistic = "Average".to_string();
 
         self.search_input.update(cx, |state, cx| {
             state.set_value("", window, cx);
@@ -334,28 +203,8 @@ impl ModalAddPanelPicker {
         self.query_input.update(cx, |state, cx| {
             state.set_value("", window, cx);
         });
-        self.metric_name_input.update(cx, |state, cx| {
-            state.set_value("", window, cx);
-        });
-        self.metric_namespace_filter_input.update(cx, |state, cx| {
-            state.set_value("", window, cx);
-        });
-        self.metric_metric_filter_input.update(cx, |state, cx| {
-            state.set_value("", window, cx);
-        });
-        self.metric_period_input.update(cx, |state, cx| {
-            state.set_value("60", window, cx);
-        });
-
         let mut subs = Vec::new();
-        for input in [
-            &self.search_input,
-            &self.query_name_input,
-            &self.metric_name_input,
-            &self.metric_namespace_filter_input,
-            &self.metric_metric_filter_input,
-            &self.metric_period_input,
-        ] {
+        for input in [&self.search_input, &self.query_name_input] {
             let sub = cx.subscribe_in(input, window, |_this, _, event: &InputEvent, _, cx| {
                 if matches!(event, InputEvent::Change) {
                     cx.notify();
@@ -379,8 +228,6 @@ impl ModalAddPanelPicker {
         let search_focus = self.search_input.read(cx).focus_handle(cx);
         self.focus.focus(Some(&search_focus), window, cx);
 
-        let _ = has_metric_catalog;
-        let _ = has_metric_catalog;
         cx.notify();
     }
 
@@ -388,9 +235,6 @@ impl ModalAddPanelPicker {
         self.visible = false;
         self.request = None;
         self.selected_ids.clear();
-        self.metric_namespace_selected = None;
-        self.metric_metric_selected = None;
-        self.metric_metrics_for_namespace.clear();
         self.focus.restore(cx);
         cx.notify();
     }
@@ -410,52 +254,6 @@ impl ModalAddPanelPicker {
         cx.notify();
     }
 
-    pub fn select_namespace(
-        &mut self,
-        namespace: String,
-        cx: &mut Context<Self>,
-    ) -> Option<RequestMetricsForNamespace> {
-        let profile_id = self.request.as_ref().map(|r| r.profile_id)?;
-        self.metric_namespace_selected = Some(namespace.clone());
-        self.metric_metric_selected = None;
-
-        let needs_fetch = !self.metric_metrics_for_namespace.contains_key(&namespace);
-        cx.notify();
-
-        if needs_fetch {
-            Some(RequestMetricsForNamespace {
-                profile_id,
-                namespace,
-            })
-        } else {
-            None
-        }
-    }
-
-    /// Cache metrics for a namespace (called by the host after fetching).
-    pub fn set_metrics_for_namespace(
-        &mut self,
-        namespace: String,
-        metrics: Vec<MetricDescriptor>,
-        cx: &mut Context<Self>,
-    ) {
-        self.metric_metrics_for_namespace.insert(namespace, metrics);
-        cx.notify();
-    }
-
-    /// Replace the cached metric namespaces and clear the loading flag.
-    ///
-    /// Called by the host after the background `list_namespaces()` task
-    /// completes (success or failure). Pass an empty vec on failure to keep
-    /// the picker out of the "loading" state.
-    pub fn set_metric_namespaces(&mut self, namespaces: Vec<String>, cx: &mut Context<Self>) {
-        if let Some(req) = self.request.as_mut() {
-            req.metric_namespaces = namespaces;
-            req.metric_namespaces_loading = false;
-            cx.notify();
-        }
-    }
-
     /// Returns the submit button label based on the active tab and state.
     pub fn submit_label(&self) -> String {
         submit_label_for(self.active_tab, self.selected_ids.len())
@@ -470,28 +268,11 @@ impl ModalAddPanelPicker {
                 let query = self.query_input.read(cx).value().to_string();
                 query_tab_valid(&name, &query)
             }
-            AddPanelTab::Metric => {
-                let name = self.metric_name_input.read(cx).value().to_string();
-                let period = self.metric_period_input.read(cx).value().to_string();
-                metric_tab_valid(
-                    &name,
-                    self.metric_namespace_selected.is_some(),
-                    self.metric_metric_selected.is_some(),
-                    &period,
-                )
-            }
         }
     }
 
-    /// Returns the visible tabs for the current request — filters out
-    /// `Metric` when the connection has no metric catalog.
     pub fn visible_tabs(&self) -> Vec<AddPanelTab> {
-        let has_metric = self
-            .request
-            .as_ref()
-            .map(|r| r.has_metric_catalog)
-            .unwrap_or(false);
-        visible_tabs_for(has_metric)
+        vec![AddPanelTab::Saved, AddPanelTab::Query]
     }
 
     /// Returns filtered candidates matching the current search query (case-insensitive).
@@ -534,38 +315,6 @@ impl ModalAddPanelPicker {
                     chart_kind: self.query_chart_kind,
                 });
             }
-            AddPanelTab::Metric => {
-                let name = self.metric_name_input.read(cx).value().to_string();
-                let period = self
-                    .metric_period_input
-                    .read(cx)
-                    .value()
-                    .to_string()
-                    .trim()
-                    .parse::<u32>()
-                    .unwrap_or(60);
-                let namespace = self.metric_namespace_selected.clone().unwrap_or_default();
-                let (metric_name, dimensions) = self
-                    .metric_metric_selected
-                    .and_then(|idx| {
-                        self.metric_metrics_for_namespace
-                            .get(&namespace)
-                            .and_then(|list| list.get(idx))
-                            .map(|m| (m.metric_name.clone(), m.dimensions.clone()))
-                    })
-                    .unwrap_or_default();
-
-                cx.emit(AddPanelOutcome::CreateFromMetric {
-                    dashboard_id: request.dashboard_id,
-                    profile_id: request.profile_id,
-                    name: name.trim().to_string(),
-                    namespace,
-                    metric_name,
-                    dimensions,
-                    period_seconds: period,
-                    statistic: self.metric_statistic.clone(),
-                });
-            }
         }
 
         self.close(cx);
@@ -586,80 +335,6 @@ impl ModalAddPanelPicker {
             .collect()
     }
 
-    /// Namespaces the filter leaves in the namespace list, in order.
-    fn filtered_namespaces(&self, cx: &App) -> Vec<String> {
-        let Some(request) = self.request.as_ref() else {
-            return Vec::new();
-        };
-        let filter = self
-            .metric_namespace_filter_input
-            .read(cx)
-            .value()
-            .to_lowercase();
-
-        request
-            .metric_namespaces
-            .iter()
-            .filter(|namespace| filter.is_empty() || namespace.to_lowercase().contains(&filter))
-            .cloned()
-            .collect()
-    }
-
-    /// Indices (into the cached metric list) the filter leaves in the metric
-    /// list, in order.
-    fn filtered_metric_indices(&self, cx: &App) -> Vec<usize> {
-        let Some(metrics) = self
-            .metric_namespace_selected
-            .as_ref()
-            .and_then(|namespace| self.metric_metrics_for_namespace.get(namespace))
-        else {
-            return Vec::new();
-        };
-        let filter = self
-            .metric_metric_filter_input
-            .read(cx)
-            .value()
-            .to_lowercase();
-
-        metrics
-            .iter()
-            .enumerate()
-            .filter(|(_, metric)| {
-                filter.is_empty()
-                    || metric.metric_name.to_lowercase().contains(&filter)
-                    || metric.dimensions.iter().any(|(key, value)| {
-                        format!("{key}={value}").to_lowercase().contains(&filter)
-                    })
-            })
-            .map(|(index, _)| index)
-            .collect()
-    }
-
-    /// The Metric tab list the keyboard works: the focused list, or the one
-    /// under the focused filter field, otherwise the namespaces.
-    fn active_metric_list(&self, window: &Window, cx: &App) -> MetricList {
-        let metric_filter_focused = self
-            .metric_metric_filter_input
-            .read(cx)
-            .focus_handle(cx)
-            .is_focused(window);
-
-        if self.metric_list_focus.is_focused(window) || metric_filter_focused {
-            MetricList::Metrics
-        } else {
-            MetricList::Namespaces
-        }
-    }
-
-    /// Moves the keyboard into a list of the Metric tab.
-    fn focus_metric_list(&mut self, list: MetricList, window: &mut Window, cx: &mut Context<Self>) {
-        match list {
-            MetricList::Namespaces => self.namespace_list_focus.focus(window, cx),
-            MetricList::Metrics => self.metric_list_focus.focus(window, cx),
-        }
-        cx.notify();
-    }
-
     /// Selects the tab `delta` places away among the visible ones, wrapping,
     /// and moves the keyboard to its first field: the field that had it is
     /// no longer drawn.
@@ -671,7 +346,7 @@ impl ModalAddPanelPicker {
             .unwrap_or(0);
         #[expect(
             clippy::indexing_slicing,
-            reason = "`visible_tabs_for` always returns at least the Saved and Query tabs, and `rem_euclid` over the positive `tabs.len()` yields an index in `[0, tabs.len())`"
+            reason = "`visible_tabs` always returns at least the Saved and Query tabs, and `rem_euclid` over the positive `tabs.len()` yields an index in `[0, tabs.len())`"
         )]
         let next = tabs[(current as isize + delta).rem_euclid(tabs.len() as isize) as usize];
 
@@ -680,7 +355,6 @@ impl ModalAddPanelPicker {
         let first_field = match next {
             AddPanelTab::Saved => self.search_input.clone(),
             AddPanelTab::Query => self.query_name_input.clone(),
-            AddPanelTab::Metric => self.metric_name_input.clone(),
         };
         first_field.update(cx, |input, cx| input.focus(window, cx));
     }
@@ -691,21 +365,11 @@ impl ModalAddPanelPicker {
         &mut self,
         delta: isize,
         to_edge: Option<bool>,
-        window: &Window,
+        _window: &Window,
         cx: &mut Context<Self>,
     ) {
         let (count, highlight) = match self.active_tab {
             AddPanelTab::Saved => (self.filtered_saved_ids(cx).len(), &mut self.saved_highlight),
-            AddPanelTab::Metric => match self.active_metric_list(window, cx) {
-                MetricList::Namespaces => (
-                    self.filtered_namespaces(cx).len(),
-                    &mut self.namespace_highlight,
-                ),
-                MetricList::Metrics => (
-                    self.filtered_metric_indices(cx).len(),
-                    &mut self.metric_highlight,
-                ),
-            },
             AddPanelTab::Query => return,
         };
 
@@ -724,49 +388,15 @@ impl ModalAddPanelPicker {
         cx.notify();
     }
 
-    /// Space: checks or unchecks the highlighted chart, or picks the
-    /// highlighted namespace or metric.
-    fn toggle_highlighted(&mut self, window: &Window, cx: &mut Context<Self>) {
-        match self.active_tab {
-            AddPanelTab::Saved => {
-                if let Some(id) = self
-                    .filtered_saved_ids(cx)
-                    .get(self.saved_highlight)
-                    .copied()
-                {
-                    self.toggle_chart(id, cx);
-                }
-            }
-            AddPanelTab::Metric => self.pick_highlighted_metric_row(window, cx),
-            AddPanelTab::Query => {}
-        }
-    }
-
-    fn pick_highlighted_metric_row(&mut self, window: &Window, cx: &mut Context<Self>) {
-        match self.active_metric_list(window, cx) {
-            MetricList::Namespaces => {
-                let namespace = self
-                    .filtered_namespaces(cx)
-                    .get(self.namespace_highlight)
-                    .cloned();
-
-                if let Some(namespace) = namespace {
-                    self.metric_highlight = 0;
-                    if let Some(request) = self.select_namespace(namespace, cx) {
-                        cx.emit(request);
-                    }
-                }
-            }
-            MetricList::Metrics => {
-                if let Some(index) = self
-                    .filtered_metric_indices(cx)
-                    .get(self.metric_highlight)
-                    .copied()
-                {
-                    self.metric_metric_selected = Some(index);
-                    cx.notify();
-                }
-            }
+    /// Space: checks or unchecks the highlighted chart.
+    fn toggle_highlighted(&mut self, _window: &Window, cx: &mut Context<Self>) {
+        if self.active_tab == AddPanelTab::Saved
+            && let Some(id) = self
+                .filtered_saved_ids(cx)
+                .get(self.saved_highlight)
+                .copied()
+        {
+            self.toggle_chart(id, cx);
         }
     }
 
@@ -778,46 +408,31 @@ impl ModalAddPanelPicker {
                 AddPanelTab::Saved => {
                     self.selected_ids.is_empty() && !self.filtered_saved_ids(cx).is_empty()
                 }
-                AddPanelTab::Metric => true,
                 AddPanelTab::Query => false,
             }
     }
 
     /// Enter: in the chart list with nothing checked, adds the highlighted
-    /// chart; in a Metric tab list, picks its highlighted row first. Then
-    /// submits, as the submit button does, once the form is complete.
-    fn confirm_from_keys(&mut self, window: &Window, cx: &mut Context<Self>) {
-        match self.active_tab {
-            AddPanelTab::Saved if self.selected_ids.is_empty() => {
-                if let Some(id) = self
-                    .filtered_saved_ids(cx)
-                    .get(self.saved_highlight)
-                    .copied()
-                {
-                    self.selected_ids.push(id);
-                }
-            }
-            AddPanelTab::Metric
-                if self.namespace_list_focus.is_focused(window)
-                    || self.metric_list_focus.is_focused(window) =>
-            {
-                self.pick_highlighted_metric_row(window, cx);
-            }
-            _ => {}
+    /// chart, then submits once the form is complete.
+    fn confirm_from_keys(&mut self, _window: &Window, cx: &mut Context<Self>) {
+        if self.active_tab == AddPanelTab::Saved
+            && self.selected_ids.is_empty()
+            && let Some(id) = self
+                .filtered_saved_ids(cx)
+                .get(self.saved_highlight)
+                .copied()
+        {
+            self.selected_ids.push(id);
         }
 
         self.confirm(cx);
     }
 
-    /// `/`: moves the keyboard to the search or filter field of the tab.
+    /// `/`: moves the keyboard to the first field of the tab.
     fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let input = match self.active_tab {
             AddPanelTab::Saved => self.search_input.clone(),
             AddPanelTab::Query => self.query_name_input.clone(),
-            AddPanelTab::Metric => match self.active_metric_list(window, cx) {
-                MetricList::Namespaces => self.metric_namespace_filter_input.clone(),
-                MetricList::Metrics => self.metric_metric_filter_input.clone(),
-            },
         };
 
         input.update(cx, |input, cx| input.focus(window, cx));
@@ -835,18 +450,6 @@ impl ModalAddPanelPicker {
             Command::SelectLast => self.move_highlight(0, Some(true), window, cx),
             Command::ExpandCollapse => self.toggle_highlighted(window, cx),
             Command::FocusSearch => self.focus_search(window, cx),
-            // Only the Metric tab has two lists; elsewhere the keys do
-            // nothing rather than reach the dashboard behind the dialog.
-            Command::ColumnLeft | Command::ColumnRight => {
-                if self.active_tab == AddPanelTab::Metric {
-                    let list = if command == Command::ColumnLeft {
-                        MetricList::Namespaces
-                    } else {
-                        MetricList::Metrics
-                    };
-                    self.focus_metric_list(list, window, cx);
-                }
-            }
             _ => return false,
         }
 
@@ -934,12 +537,10 @@ impl ModalAddPanelPicker {
                 let label = match tab {
                     AddPanelTab::Saved => datatab_i18n::t!("modals.add_panel_picker.tab.saved"),
                     AddPanelTab::Query => datatab_i18n::t!("modals.add_panel_picker.tab.query"),
-                    AddPanelTab::Metric => datatab_i18n::t!("modals.add_panel_picker.tab.metric"),
                 };
                 let id = match tab {
                     AddPanelTab::Saved => "add-panel-tab-saved",
                     AddPanelTab::Query => "add-panel-tab-query",
-                    AddPanelTab::Metric => "add-panel-tab-metric",
                 };
                 let is_active = tab == active;
 
@@ -1136,365 +737,9 @@ impl ModalAddPanelPicker {
             .child(kind_row)
             .into_any_element()
     }
-
-    fn render_namespace_list(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(request) = self.request.as_ref() else {
-            return div().into_any_element();
-        };
-        let theme = cx.theme();
-
-        // While the host is still fetching the namespace list show a clear
-        // in-modal loading state. Users opened the modal expecting feedback;
-        // an empty list with no signal was previously indistinguishable from
-        // "this connection has no metrics".
-        if request.metric_namespaces_loading {
-            return div()
-                .border_1()
-                .border_color(theme.border)
-                .rounded(Radii::SM)
-                .h(px(260.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(Text::caption(datatab_i18n::t!(
-                    "modals.add_panel_picker.metric.loading_namespaces"
-                )))
-                .into_any_element();
-        }
-
-        let filter = self
-            .metric_namespace_filter_input
-            .read(cx)
-            .value()
-            .to_string()
-            .to_lowercase();
-        let selected = self.metric_namespace_selected.clone();
-
-        let highlight = self.namespace_highlight;
-        let rows: Vec<AnyElement> = request
-            .metric_namespaces
-            .iter()
-            .filter(|ns| filter.is_empty() || ns.to_lowercase().contains(&filter))
-            .cloned()
-            .enumerate()
-            .map(|(row, ns)| {
-                let is_selected = selected.as_deref() == Some(ns.as_str());
-                let is_highlighted = row == highlight;
-                let ns_for_listener = ns.clone();
-                div()
-                    .id(gpui::ElementId::Name(
-                        format!("add-panel-namespace-{ns}").into(),
-                    ))
-                    .px(Spacing::SM)
-                    .py(Spacing::XS)
-                    .text_sm()
-                    .cursor_pointer()
-                    .border_1()
-                    .border_color(if is_highlighted {
-                        theme.ring
-                    } else {
-                        gpui::transparent_black()
-                    })
-                    .when(is_selected, |el| {
-                        el.bg(theme.accent)
-                            .text_color(theme.accent_foreground)
-                            .font_weight(FontWeight::SEMIBOLD)
-                    })
-                    .when(!is_selected, |el| el.hover(|s| s.bg(theme.muted)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(req) = this.select_namespace(ns_for_listener.clone(), cx) {
-                            cx.emit(req);
-                        }
-                    }))
-                    .child(ns)
-                    .into_any_element()
-            })
-            .collect();
-
-        div()
-            .id("add-panel-namespace-list")
-            .track_focus(&self.namespace_list_focus)
-            .border_1()
-            .border_color(theme.border)
-            .rounded(Radii::SM)
-            .h(px(260.0))
-            .overflow_y_scrollbar()
-            .children(rows)
-            .into_any_element()
-    }
-
-    fn render_metric_list(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(namespace) = self.metric_namespace_selected.clone() else {
-            return Text::body(datatab_i18n::t!(
-                "modals.add_panel_picker.metric.select_namespace_hint"
-            ))
-            .into_any_element();
-        };
-
-        let theme = cx.theme();
-        let Some(metrics) = self.metric_metrics_for_namespace.get(&namespace) else {
-            return div()
-                .border_1()
-                .border_color(theme.border)
-                .rounded(Radii::SM)
-                .h(px(260.0))
-                .p(Spacing::SM)
-                .child(
-                    Text::body(datatab_i18n::t!("modals.add_panel_picker.metric.loading"))
-                        .into_any_element(),
-                )
-                .into_any_element();
-        };
-
-        if metrics.is_empty() {
-            return div()
-                .border_1()
-                .border_color(theme.border)
-                .rounded(Radii::SM)
-                .h(px(260.0))
-                .p(Spacing::SM)
-                .child(
-                    Text::body(datatab_i18n::t!(
-                        "modals.add_panel_picker.metric.no_metrics"
-                    ))
-                    .into_any_element(),
-                )
-                .into_any_element();
-        }
-
-        // Apply the user-supplied filter (case-insensitive substring match)
-        // against the metric name AND against each `key=value` dimension pair.
-        // We preserve the original index so selection state still maps onto
-        // the cached `metric_metrics_for_namespace` entry.
-        let filter = self
-            .metric_metric_filter_input
-            .read(cx)
-            .value()
-            .to_string()
-            .to_lowercase();
-
-        let filtered: Vec<(usize, &MetricDescriptor)> = metrics
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| {
-                if filter.is_empty() {
-                    return true;
-                }
-                if m.metric_name.to_lowercase().contains(&filter) {
-                    return true;
-                }
-                m.dimensions
-                    .iter()
-                    .any(|(k, v)| format!("{k}={v}").to_lowercase().contains(&filter))
-            })
-            .collect();
-
-        if filtered.is_empty() {
-            return div()
-                .border_1()
-                .border_color(theme.border)
-                .rounded(Radii::SM)
-                .h(px(260.0))
-                .p(Spacing::SM)
-                .child(
-                    Text::body(datatab_i18n::t!(
-                        "modals.add_panel_picker.metric.no_metrics_filtered"
-                    ))
-                    .into_any_element(),
-                )
-                .into_any_element();
-        }
-
-        let selected = self.metric_metric_selected;
-        let highlight = self.metric_highlight;
-        let rows: Vec<AnyElement> = filtered
-            .iter()
-            .enumerate()
-            .map(|(row, (idx, m))| {
-                let idx = *idx;
-                let is_selected = selected == Some(idx);
-                let is_highlighted = row == highlight;
-                let dim_summary = if m.dimensions.is_empty() {
-                    String::new()
-                } else {
-                    let parts: Vec<String> = m
-                        .dimensions
-                        .iter()
-                        .map(|(k, v)| format!("{k}={v}"))
-                        .collect();
-                    format!("  [{}]", parts.join(", "))
-                };
-                let label = format!("{}{}", m.metric_name, dim_summary);
-
-                div()
-                    .id(("add-panel-metric-row", idx))
-                    .px(Spacing::SM)
-                    .py(Spacing::XS)
-                    .text_sm()
-                    .cursor_pointer()
-                    .border_1()
-                    .border_color(if is_highlighted {
-                        theme.ring
-                    } else {
-                        gpui::transparent_black()
-                    })
-                    .when(is_selected, |el| {
-                        el.bg(theme.accent)
-                            .text_color(theme.accent_foreground)
-                            .font_weight(FontWeight::SEMIBOLD)
-                    })
-                    .when(!is_selected, |el| el.hover(|s| s.bg(theme.muted)))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.metric_metric_selected = Some(idx);
-                        cx.notify();
-                    }))
-                    .child(label)
-                    .into_any_element()
-            })
-            .collect();
-
-        div()
-            .id("add-panel-metric-list")
-            .track_focus(&self.metric_list_focus)
-            .border_1()
-            .border_color(theme.border)
-            .rounded(Radii::SM)
-            .h(px(260.0))
-            .overflow_y_scrollbar()
-            .children(rows)
-            .into_any_element()
-    }
-
-    fn render_metric_tab(&self, cx: &mut Context<Self>) -> AnyElement {
-        let name_row = div()
-            .flex()
-            .flex_col()
-            .gap(Spacing::XS)
-            .child(
-                Text::body(datatab_i18n::t!("modals.add_panel_picker.name_label"))
-                    .into_any_element(),
-            )
-            .child(Input::new(&self.metric_name_input))
-            .into_any_element();
-
-        // Two-column row: Namespace (with filter) on the left, Metric on the right.
-        let namespace_column = div()
-            .flex()
-            .flex_1()
-            .min_w_0()
-            .flex_col()
-            .gap(Spacing::XS)
-            .child(
-                Text::body(datatab_i18n::t!(
-                    "modals.add_panel_picker.metric.namespace_label"
-                ))
-                .into_any_element(),
-            )
-            .child(Input::new(&self.metric_namespace_filter_input))
-            .child(self.render_namespace_list(cx))
-            .into_any_element();
-
-        let metric_column = div()
-            .flex()
-            .flex_1()
-            .min_w_0()
-            .flex_col()
-            .gap(Spacing::XS)
-            .child(
-                Text::body(datatab_i18n::t!(
-                    "modals.add_panel_picker.metric.metric_label"
-                ))
-                .into_any_element(),
-            )
-            .child(Input::new(&self.metric_metric_filter_input))
-            .child(self.render_metric_list(cx))
-            .into_any_element();
-
-        let picker_row = div()
-            .flex()
-            .items_start()
-            .gap(Spacing::MD)
-            .child(namespace_column)
-            .child(metric_column)
-            .into_any_element();
-
-        let period_row = div()
-            .flex()
-            .flex_col()
-            .gap(Spacing::XS)
-            .w(px(180.0))
-            .child(
-                Text::body(datatab_i18n::t!(
-                    "modals.add_panel_picker.metric.period_label"
-                ))
-                .into_any_element(),
-            )
-            .child(Input::new(&self.metric_period_input))
-            .into_any_element();
-
-        let current_stat = self.metric_statistic.clone();
-        let stat_buttons: Vec<AnyElement> = METRIC_STATISTICS
-            .iter()
-            .map(|s| {
-                let s_owned = s.to_string();
-                let is_active = current_stat == *s;
-                let id_string: SharedString = format!("add-panel-stat-{}", s).into();
-                let mut btn =
-                    Button::new(id_string, *s).on_click(cx.listener(move |this, _, _, cx| {
-                        this.metric_statistic = s_owned.clone();
-                        cx.notify();
-                    }));
-                if is_active {
-                    btn = btn.primary();
-                } else {
-                    btn = btn.ghost();
-                }
-                btn.into_any_element()
-            })
-            .collect();
-
-        let stat_column = div()
-            .flex()
-            .flex_1()
-            .flex_col()
-            .gap(Spacing::XS)
-            .child(
-                Text::body(datatab_i18n::t!(
-                    "modals.add_panel_picker.metric.statistic_label"
-                ))
-                .into_any_element(),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(Spacing::XS)
-                    .children(stat_buttons)
-                    .into_any_element(),
-            )
-            .into_any_element();
-
-        let period_stat_row = div()
-            .flex()
-            .items_end()
-            .gap(Spacing::MD)
-            .child(period_row)
-            .child(stat_column)
-            .into_any_element();
-
-        div()
-            .flex()
-            .flex_col()
-            .gap(Spacing::LG)
-            .child(name_row)
-            .child(picker_row)
-            .child(period_stat_row)
-            .into_any_element()
-    }
 }
 
 impl EventEmitter<AddPanelOutcome> for ModalAddPanelPicker {}
-impl EventEmitter<RequestMetricsForNamespace> for ModalAddPanelPicker {}
 
 impl Render for ModalAddPanelPicker {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1515,7 +760,6 @@ impl Render for ModalAddPanelPicker {
         let body_inner: AnyElement = match self.active_tab {
             AddPanelTab::Saved => self.render_saved_tab(&candidates, cx),
             AddPanelTab::Query => self.render_query_tab(cx),
-            AddPanelTab::Metric => self.render_metric_tab(cx),
         };
 
         let body = div()
@@ -1685,7 +929,6 @@ mod tests {
         assert_eq!(submit_label_for(AddPanelTab::Saved, 5), many_5);
         assert_eq!(submit_label_for(AddPanelTab::Query, 0), create);
         assert_eq!(submit_label_for(AddPanelTab::Query, 99), create);
-        assert_eq!(submit_label_for(AddPanelTab::Metric, 0), create);
     }
 
     #[test]
@@ -1708,72 +951,9 @@ mod tests {
     }
 
     #[test]
-    fn metric_tab_rejects_unfinished_form() {
-        assert!(!metric_tab_valid("", false, false, "60"));
-        assert!(
-            !metric_tab_valid("My metric", false, false, "60"),
-            "namespace missing"
-        );
-        assert!(
-            !metric_tab_valid("My metric", true, false, "60"),
-            "metric missing"
-        );
-        assert!(metric_tab_valid("My metric", true, true, "60"), "all set");
-        assert!(
-            !metric_tab_valid("My metric", true, true, "0"),
-            "period must be > 0"
-        );
-        assert!(!metric_tab_valid("My metric", true, true, "not a number"));
-        assert!(metric_tab_valid("My metric", true, true, "300"));
-        assert!(
-            !metric_tab_valid("   ", true, true, "60"),
-            "whitespace-only name"
-        );
-    }
-
-    #[test]
-    fn metric_tab_hidden_without_capability() {
-        let with_metric = visible_tabs_for(true);
-        assert_eq!(with_metric.len(), 3);
-        assert!(with_metric.contains(&AddPanelTab::Metric));
-
-        let without_metric = visible_tabs_for(false);
-        assert_eq!(without_metric, vec![AddPanelTab::Saved, AddPanelTab::Query]);
-        assert!(!without_metric.contains(&AddPanelTab::Metric));
-    }
-
-    #[test]
-    fn metric_descriptor_cache_keys_by_namespace() {
-        // Validates the data shape we cache in `metric_metrics_for_namespace`:
-        // a HashMap keyed by namespace can hold multiple namespaces concurrently
-        // (no overwrite when keys differ).
-        let mut cache: std::collections::HashMap<String, Vec<MetricDescriptor>> =
-            std::collections::HashMap::new();
-
-        cache.insert(
-            "AWS/EC2".to_string(),
-            vec![MetricDescriptor {
-                metric_name: "CPUUtilization".to_string(),
-                dimensions: vec![],
-            }],
-        );
-        cache.insert(
-            "AWS/RDS".to_string(),
-            vec![MetricDescriptor {
-                metric_name: "CPUUtilization".to_string(),
-                dimensions: vec![("DBInstanceIdentifier".to_string(), "db-1".to_string())],
-            }],
-        );
-
-        assert!(cache.contains_key("AWS/EC2"));
-        assert!(cache.contains_key("AWS/RDS"));
-        assert_eq!(cache.len(), 2);
-    }
-
-    #[test]
     fn outcome_variants_are_distinct() {
         // Pins the AddPanelOutcome enum shape so future refactors don't
-        // silently collapse the three paths back into one.
+        // silently collapse the two paths back into one.
         let dashboard_id = test_uuid();
         let profile_id = Uuid::new_v4();
 
@@ -1788,24 +968,13 @@ mod tests {
             query: "SELECT 1".to_string(),
             chart_kind: ChartKind::Bar,
         };
-        let from_metric = AddPanelOutcome::CreateFromMetric {
-            dashboard_id,
-            profile_id,
-            name: "CPU panel".to_string(),
-            namespace: "AWS/EC2".to_string(),
-            metric_name: "CPUUtilization".to_string(),
-            dimensions: vec![("InstanceId".to_string(), "i-abc".to_string())],
-            period_seconds: 120,
-            statistic: "Sum".to_string(),
-        };
         let cancelled = AddPanelOutcome::Cancelled;
 
         // Match exhaustively so adding a future variant forces a compile error.
-        for outcome in [&confirmed, &from_query, &from_metric, &cancelled] {
+        for outcome in [&confirmed, &from_query, &cancelled] {
             match outcome {
                 AddPanelOutcome::Confirmed { .. }
                 | AddPanelOutcome::CreateFromQuery { .. }
-                | AddPanelOutcome::CreateFromMetric { .. }
                 | AddPanelOutcome::Cancelled => {}
             }
         }
@@ -1827,41 +996,6 @@ mod tests {
         } else {
             panic!("from_query did not match CreateFromQuery");
         }
-
-        // Field round-trip on CreateFromMetric.
-        if let AddPanelOutcome::CreateFromMetric {
-            dashboard_id: d,
-            profile_id: p,
-            name,
-            namespace,
-            metric_name,
-            dimensions,
-            period_seconds,
-            statistic,
-        } = &from_metric
-        {
-            assert_eq!(*d, dashboard_id);
-            assert_eq!(*p, profile_id);
-            assert_eq!(name, "CPU panel");
-            assert_eq!(namespace, "AWS/EC2");
-            assert_eq!(metric_name, "CPUUtilization");
-            assert_eq!(dimensions.len(), 1);
-            assert_eq!(*period_seconds, 120u32);
-            assert_eq!(statistic, "Sum");
-        } else {
-            panic!("from_metric did not match CreateFromMetric");
-        }
-    }
-
-    #[test]
-    fn request_metrics_for_namespace_carries_profile_and_namespace() {
-        let profile_id = Uuid::new_v4();
-        let ev = RequestMetricsForNamespace {
-            profile_id,
-            namespace: "AWS/EC2".to_string(),
-        };
-        assert_eq!(ev.profile_id, profile_id);
-        assert_eq!(ev.namespace, "AWS/EC2");
     }
 
     // ----- i18n catalog coverage -----
@@ -1877,7 +1011,6 @@ mod tests {
         "modals.add_panel_picker.saved.search_placeholder",
         "modals.add_panel_picker.tab.saved",
         "modals.add_panel_picker.tab.query",
-        "modals.add_panel_picker.tab.metric",
         "modals.add_panel_picker.name_placeholder",
         "modals.add_panel_picker.name_label",
         "modals.add_panel_picker.query.placeholder",
@@ -1887,17 +1020,6 @@ mod tests {
         "modals.add_panel_picker.chart_kind.bar",
         "modals.add_panel_picker.chart_kind.area",
         "modals.add_panel_picker.chart_kind.scatter",
-        "modals.add_panel_picker.metric.namespace_filter_placeholder",
-        "modals.add_panel_picker.metric.metric_filter_placeholder",
-        "modals.add_panel_picker.metric.namespace_label",
-        "modals.add_panel_picker.metric.metric_label",
-        "modals.add_panel_picker.metric.period_label",
-        "modals.add_panel_picker.metric.statistic_label",
-        "modals.add_panel_picker.metric.loading_namespaces",
-        "modals.add_panel_picker.metric.select_namespace_hint",
-        "modals.add_panel_picker.metric.loading",
-        "modals.add_panel_picker.metric.no_metrics",
-        "modals.add_panel_picker.metric.no_metrics_filtered",
         "modals.add_panel_picker.cancel",
     ];
 
@@ -1948,14 +1070,6 @@ mod tests {
             datatab_i18n::t!("modals.add_panel_picker.submit.many", count = 5)
         );
         assert!(label.contains('5'));
-    }
-
-    #[test]
-    fn metric_statistics_are_not_translated() {
-        assert_eq!(
-            METRIC_STATISTICS,
-            ["Average", "Sum", "Minimum", "Maximum", "SampleCount"]
-        );
     }
 }
 
@@ -2021,9 +1135,6 @@ mod keyboard_tests {
                         dashboard_id: Uuid::nil(),
                         profile_id: Uuid::nil(),
                         candidates: vec![chart()],
-                        has_metric_catalog: false,
-                        metric_namespaces: Vec::new(),
-                        metric_namespaces_loading: false,
                     },
                     window,
                     cx,
@@ -2061,12 +1172,10 @@ mod keyboard_tests {
         assert!(!window.update(|_, cx| modal.read(cx).is_visible()));
     }
 
-    /// The same picker, open on the Metric tab's connection, with two saved
-    /// charts.
+    /// The same picker with custom saved charts.
     fn open_modal_with(
         cx: &mut TestAppContext,
         candidates: Vec<SavedChart>,
-        has_metric_catalog: bool,
     ) -> (
         Entity<ModalAddPanelPicker>,
         &mut VisualTestContext,
@@ -2088,9 +1197,6 @@ mod keyboard_tests {
                         dashboard_id: Uuid::nil(),
                         profile_id: Uuid::nil(),
                         candidates,
-                        has_metric_catalog,
-                        metric_namespaces: vec!["AWS/EC2".to_string(), "AWS/RDS".to_string()],
-                        metric_namespaces_loading: false,
                     },
                     window,
                     cx,
@@ -2113,18 +1219,18 @@ mod keyboard_tests {
     /// Alt+L and Alt+H switch the tabs from the search field, wrapping.
     #[gpui::test]
     fn alt_l_and_alt_h_switch_the_tabs(cx: &mut TestAppContext) {
-        let (modal, window, _outcomes) = open_modal_with(cx, vec![chart()], true);
+        let (modal, window, _outcomes) = open_modal_with(cx, vec![chart()]);
         let tab =
             |window: &mut VisualTestContext| window.update(|_, cx| modal.read(cx).active_tab());
 
         window.simulate_keystrokes("alt-l");
         assert_eq!(tab(window), AddPanelTab::Query);
 
-        window.simulate_keystrokes("alt-l alt-l");
+        window.simulate_keystrokes("alt-l");
         assert_eq!(tab(window), AddPanelTab::Saved, "the tabs wrap around");
 
         window.simulate_keystrokes("alt-h");
-        assert_eq!(tab(window), AddPanelTab::Metric);
+        assert_eq!(tab(window), AddPanelTab::Query);
     }
 
     /// From the search field Down moves the highlighted chart and Enter adds
@@ -2134,7 +1240,7 @@ mod keyboard_tests {
         let first = named_chart("Latency");
         let second = named_chart("Throughput");
         let second_id = second.id;
-        let (_modal, window, outcomes) = open_modal_with(cx, vec![first, second], false);
+        let (_modal, window, outcomes) = open_modal_with(cx, vec![first, second]);
 
         window.simulate_keystrokes("down enter");
 
@@ -2151,7 +1257,7 @@ mod keyboard_tests {
         let first = named_chart("Latency");
         let second = named_chart("Throughput");
         let ids = [first.id, second.id];
-        let (modal, window, outcomes) = open_modal_with(cx, vec![first, second], false);
+        let (modal, window, outcomes) = open_modal_with(cx, vec![first, second]);
 
         window.update(|window, cx| {
             let list = modal.read(cx).saved_list_focus.clone();
@@ -2170,27 +1276,6 @@ mod keyboard_tests {
             outcomes.borrow().as_slice(),
             [AddPanelOutcome::Confirmed { chart_ids, .. }] if chart_ids == &ids.to_vec()
         ));
-    }
-
-    /// On the Metric tab, the namespace list takes J and Space: Space picks
-    /// the highlighted namespace.
-    #[gpui::test]
-    fn the_metric_namespace_list_is_driven_by_keys(cx: &mut TestAppContext) {
-        let (modal, window, _outcomes) = open_modal_with(cx, vec![chart()], true);
-
-        window.update(|window, cx| {
-            modal.update(cx, |modal, cx| {
-                modal.set_active_tab(AddPanelTab::Metric, cx);
-                modal.focus_metric_list(super::MetricList::Namespaces, window, cx);
-            })
-        });
-        window.run_until_parked();
-
-        window.simulate_keystrokes("j space");
-        assert_eq!(
-            window.update(|_, cx| modal.read(cx).metric_namespace_selected.clone()),
-            Some("AWS/RDS".to_string())
-        );
     }
 
     #[gpui::test]
@@ -2294,24 +1379,12 @@ mod keyboard_tests {
                     "add-panel-tab-*",
                     KeyboardPath::Command(Command::NextPanelTab),
                 ),
-                // Rows of the chart, namespace and metric lists: Tab moves
-                // into a list, J and K move, Space checks or picks.
+                // Tab moves into the chart list, J and K move, Space checks.
                 (
                     "add-panel-chart-row-*",
                     KeyboardPath::Command(Command::ExpandCollapse),
                 ),
-                (
-                    "add-panel-namespace-*",
-                    KeyboardPath::Command(Command::ExpandCollapse),
-                ),
-                (
-                    "add-panel-metric-row*",
-                    KeyboardPath::Command(Command::ExpandCollapse),
-                ),
-                // The chart kind of the Query tab and the statistic of the
-                // Metric tab.
                 ("add-panel-kind-*", KeyboardPath::TabStop),
-                ("add-panel-stat-*", KeyboardPath::TabStop),
             ],
         };
 
@@ -2322,22 +1395,19 @@ mod keyboard_tests {
         use crate::keyboard_coverage::{Coverage, FrameCapture, MODAL_CHROME};
 
         cx.update(crate::keymap::init_keymap);
-        let (_modal, window, _outcomes) = open_modal_with(
-            cx,
-            vec![named_chart("Latency"), named_chart("Errors")],
-            true,
-        );
+        let (_modal, window, _outcomes) =
+            open_modal_with(cx, vec![named_chart("Latency"), named_chart("Errors")]);
         let capture = FrameCapture::observe(window);
         let coverage = || Coverage::new(ADD_PANEL_PICKER).with_surface(MODAL_CHROME);
 
         let mut checked = Vec::new();
-        for _tab in 0..3 {
+        for _tab in 0..2 {
             checked.extend(coverage().assert_covered(&capture.frame(window)));
             window.simulate_keystrokes("alt-l");
             window.run_until_parked();
         }
 
-        for expected in ["add-panel-chart-row-", "add-panel-kind-", "add-panel-stat-"] {
+        for expected in ["add-panel-chart-row-", "add-panel-kind-"] {
             assert!(
                 checked.iter().any(|id| id.starts_with(expected)),
                 "{expected} in {checked:?}"

@@ -277,7 +277,6 @@ fn app_state_with(
                 read_only_reason: None,
                 database_schemas: Default::default(),
                 table_details: Default::default(),
-                collection_children: Default::default(),
                 schema_types: Default::default(),
                 schema_columns: Default::default(),
                 schema_indexes: Default::default(),

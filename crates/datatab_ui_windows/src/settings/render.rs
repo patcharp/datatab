@@ -216,7 +216,7 @@ impl SettingsCoordinator {
 }
 
 impl Render for SettingsCoordinator {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.sidebar_user_resized {
             self.sidebar_width = super::scaled_default_sidebar_width(cx);
         }
@@ -224,8 +224,8 @@ impl Render for SettingsCoordinator {
         if self.pending_focus_return {
             self.pending_focus_return = false;
             self.focus_area = SettingsFocus::Content;
-            self.active_section_entity.focus_in(_window, cx);
-            self.focus_handle.focus(_window, cx);
+            self.active_section_entity.focus_in(window, cx);
+            self.focus_handle.focus(window, cx);
         }
 
         // A section asked to open a portability overlay; do it here where a
@@ -233,21 +233,21 @@ impl Render for SettingsCoordinator {
         if let Some(target) = self.pending_export_target.take() {
             self.import_visible = false;
             self.export_modal.update(cx, |modal, cx| {
-                modal.open_target(target, _window, cx);
+                modal.open_target(target, window, cx);
             });
         }
         if std::mem::take(&mut self.pending_import_open) {
             self.export_modal.update(cx, |modal, cx| modal.close(cx));
             self.import_visible = true;
             self.import_panel.update(cx, |panel, cx| {
-                panel.reset(_window, cx);
+                panel.reset(window, cx);
             });
         }
 
         let _ = self.app_state.read(cx);
 
-        let csd_title_bar = platform::render_csd_title_bar(
-            _window,
+        let csd_title_bar = platform::render_shell_title_bar(
+            window,
             cx,
             &datatab_i18n::t!("connection_manager.tab.settings"),
         );
@@ -287,7 +287,7 @@ impl Render for SettingsCoordinator {
                             .h_full()
                             .w(self.sidebar_width)
                             .flex_shrink_0()
-                            .child(self.render_sidebar(_window, cx)),
+                            .child(self.render_sidebar(window, cx)),
                     )
                     .child(self.render_sidebar_grip(cx))
                     .child(Island::new().flex_1().min_w_0().h_full().child(
@@ -295,7 +295,7 @@ impl Render for SettingsCoordinator {
                     )),
             )
             // Settings status footer
-            .child(self.render_settings_footer(_window, cx))
+            .child(self.render_settings_footer(window, cx))
             .when_some(self.pending_section_confirm, |element, target_section| {
                 let confirm_entity = cx.entity().clone();
                 let cancel_entity = confirm_entity.clone();

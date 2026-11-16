@@ -220,6 +220,7 @@ impl InfluxInstanceCatalog {
                 display_name: display_name.to_string(),
                 group: group.to_string(),
                 unit: *unit,
+                kind: datatab_core::InstanceMetricKind::Gauge,
                 description: None,
                 default_refresh_secs: 15,
             })
@@ -360,6 +361,13 @@ fn http_error_to_db_error(e: HttpError) -> DbError {
 
 #[async_trait]
 impl InstanceCatalog for InfluxInstanceCatalog {
+    fn metric_kind(&self, metric_id: &str) -> Option<datatab_core::InstanceMetricKind> {
+        Self::static_metrics()
+            .into_iter()
+            .find(|metric| metric.id == metric_id)
+            .map(|metric| metric.kind)
+    }
+
     async fn list_metrics(&self) -> Result<Vec<InstanceMetricDef>, DbError> {
         Ok(Self::static_metrics())
     }
@@ -545,6 +553,16 @@ pub fn influxdb_advertises_instance_capabilities() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn per_second_metrics_are_gauges() {
+        assert!(
+            InfluxInstanceCatalog::static_metrics()
+                .iter()
+                .filter(|metric| metric.unit == InstanceMetricUnit::PerSecond)
+                .all(|metric| metric.kind == datatab_core::InstanceMetricKind::Gauge)
+        );
+    }
 
     const FIXTURE_METRICS: &str = r#"
 # HELP go_goroutines Number of goroutines that currently exist.

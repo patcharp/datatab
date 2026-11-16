@@ -50,8 +50,6 @@ pub enum DocumentKind {
     MigrateWizard,
     // Native command console in its own tab (driver-agnostic)
     Console,
-    // One store of a secret-store connection (DatabaseCategory::SecretStore)
-    SecretStore,
 }
 
 /// Source kind for DataDocument (affects icon and behavior).
@@ -85,7 +83,6 @@ pub enum DocumentIcon {
     DumpAnalysis,
     McpApprovals,
     Migrate,
-    SecretStore,
 }
 
 impl DocumentIcon {
@@ -108,7 +105,6 @@ impl DocumentIcon {
             Self::DumpAnalysis => "hard-drive",
             Self::McpApprovals => "bot",
             Self::Migrate => "arrow-up-down",
-            Self::SecretStore => "lock",
         }
     }
 }

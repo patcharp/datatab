@@ -5,20 +5,28 @@ use async_trait::async_trait;
 use datatab_core::{
     ColumnKind, ColumnMeta, DbError, DefaultDashboardPanel, DefaultInstanceDashboard,
     DriverCapabilities, InstanceCatalog, InstanceInspectorDef, InstanceMetricDef,
-    InstanceMetricUnit, QueryResult, QueryResultShape, Row, Value,
+    InstanceMetricKind, InstanceMetricUnit, QueryResult, QueryResultShape, Row, Value,
 };
 use mysql::{Conn, prelude::Queryable};
 
 /// Curated list of `SHOW GLOBAL STATUS` variable names that map to chartable metrics.
 ///
-/// Each entry is `(status_var_name, metric_id, display_name, group, unit)`.
-pub const PIVOTED_COUNTERS: &[(&str, &str, &str, &str, InstanceMetricUnit)] = &[
+/// Each entry is `(status_var_name, metric_id, display_name, group, unit, kind)`.
+pub const PIVOTED_COUNTERS: &[(
+    &str,
+    &str,
+    &str,
+    &str,
+    InstanceMetricUnit,
+    InstanceMetricKind,
+)] = &[
     (
         "Queries",
         "mysql.queries_per_sec",
         "Queries / sec",
         "Throughput",
         InstanceMetricUnit::PerSecond,
+        InstanceMetricKind::Counter,
     ),
     (
         "Com_select",
@@ -26,6 +34,7 @@ pub const PIVOTED_COUNTERS: &[(&str, &str, &str, &str, InstanceMetricUnit)] = &[
         "SELECT / sec",
         "Throughput",
         InstanceMetricUnit::PerSecond,
+        InstanceMetricKind::Counter,
     ),
     (
         "Com_insert",
@@ -33,6 +42,7 @@ pub const PIVOTED_COUNTERS: &[(&str, &str, &str, &str, InstanceMetricUnit)] = &[
         "INSERT / sec",
         "Throughput",
         InstanceMetricUnit::PerSecond,
+        InstanceMetricKind::Counter,
     ),
     (
         "Com_update",
@@ -40,6 +50,7 @@ pub const PIVOTED_COUNTERS: &[(&str, &str, &str, &str, InstanceMetricUnit)] = &[
         "UPDATE / sec",
         "Throughput",
         InstanceMetricUnit::PerSecond,
+        InstanceMetricKind::Counter,
     ),
     (
         "Com_delete",
@@ -47,20 +58,23 @@ pub const PIVOTED_COUNTERS: &[(&str, &str, &str, &str, InstanceMetricUnit)] = &[
         "DELETE / sec",
         "Throughput",
         InstanceMetricUnit::PerSecond,
+        InstanceMetricKind::Counter,
     ),
     (
         "Innodb_buffer_pool_read_requests",
         "mysql.buffer_pool_reads",
-        "InnoDB buffer pool reads",
+        "InnoDB buffer pool reads / sec",
         "Cache",
-        InstanceMetricUnit::Count,
+        InstanceMetricUnit::PerSecond,
+        InstanceMetricKind::Counter,
     ),
     (
         "Innodb_buffer_pool_reads",
         "mysql.buffer_pool_disk_reads",
-        "InnoDB disk reads",
+        "InnoDB disk reads / sec",
         "Cache",
-        InstanceMetricUnit::Count,
+        InstanceMetricUnit::PerSecond,
+        InstanceMetricKind::Counter,
     ),
     (
         "Threads_connected",
@@ -68,6 +82,7 @@ pub const PIVOTED_COUNTERS: &[(&str, &str, &str, &str, InstanceMetricUnit)] = &[
         "Connected threads",
         "Connections",
         InstanceMetricUnit::Count,
+        InstanceMetricKind::Gauge,
     ),
     (
         "Threads_running",
@@ -75,20 +90,23 @@ pub const PIVOTED_COUNTERS: &[(&str, &str, &str, &str, InstanceMetricUnit)] = &[
         "Running threads",
         "Connections",
         InstanceMetricUnit::Count,
+        InstanceMetricKind::Gauge,
     ),
     (
         "Bytes_received",
         "mysql.bytes_received",
-        "Bytes received",
+        "Bytes received / sec",
         "Network",
-        InstanceMetricUnit::Bytes,
+        InstanceMetricUnit::PerSecond,
+        InstanceMetricKind::Counter,
     ),
     (
         "Bytes_sent",
         "mysql.bytes_sent",
-        "Bytes sent",
+        "Bytes sent / sec",
         "Network",
-        InstanceMetricUnit::Bytes,
+        InstanceMetricUnit::PerSecond,
+        InstanceMetricKind::Counter,
     ),
 ];
 
@@ -128,14 +146,17 @@ impl MysqlInstanceCatalog {
     pub fn static_metrics() -> Vec<InstanceMetricDef> {
         PIVOTED_COUNTERS
             .iter()
-            .map(|(_, id, display_name, group, unit)| InstanceMetricDef {
-                id: id.to_string(),
-                display_name: display_name.to_string(),
-                group: group.to_string(),
-                unit: *unit,
-                description: None,
-                default_refresh_secs: 15,
-            })
+            .map(
+                |(_, id, display_name, group, unit, kind)| InstanceMetricDef {
+                    id: id.to_string(),
+                    display_name: display_name.to_string(),
+                    group: group.to_string(),
+                    unit: *unit,
+                    kind: *kind,
+                    description: None,
+                    default_refresh_secs: 15,
+                },
+            )
             .collect()
     }
 
@@ -377,6 +398,13 @@ fn parse_kill_id(value: &datatab_core::Value) -> Result<u64, DbError> {
 
 #[async_trait]
 impl InstanceCatalog for MysqlInstanceCatalog {
+    fn metric_kind(&self, metric_id: &str) -> Option<datatab_core::InstanceMetricKind> {
+        Self::static_metrics()
+            .into_iter()
+            .find(|metric| metric.id == metric_id)
+            .map(|metric| metric.kind)
+    }
+
     async fn list_metrics(&self) -> Result<Vec<InstanceMetricDef>, DbError> {
         Ok(Self::static_metrics())
     }
@@ -457,10 +485,10 @@ pub(crate) fn dispatch_metric_series(
 ) -> Result<QueryResult, DbError> {
     let counter = PIVOTED_COUNTERS
         .iter()
-        .find(|(_, id, _, _, _)| *id == metric_id);
+        .find(|(_, id, _, _, _, _)| *id == metric_id);
 
     match counter {
-        Some((var_name, _, display_name, _, _)) => {
+        Some((var_name, _, display_name, _, _, _)) => {
             fetch_global_status_value(conn, var_name, display_name)
         }
         None => Err(DbError::NotSupported(format!(
@@ -597,6 +625,39 @@ pub fn mysql_advertises_instance_capabilities() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counter_metric_kinds() {
+        let counters: Vec<_> = MysqlInstanceCatalog::static_metrics()
+            .into_iter()
+            .filter(|metric| metric.kind == datatab_core::InstanceMetricKind::Counter)
+            .collect();
+
+        let actual: Vec<&str> = counters.iter().map(|metric| metric.id.as_str()).collect();
+        assert_eq!(
+            actual,
+            vec![
+                "mysql.queries_per_sec",
+                "mysql.selects_per_sec",
+                "mysql.inserts_per_sec",
+                "mysql.updates_per_sec",
+                "mysql.deletes_per_sec",
+                "mysql.buffer_pool_reads",
+                "mysql.buffer_pool_disk_reads",
+                "mysql.bytes_received",
+                "mysql.bytes_sent"
+            ]
+        );
+
+        for metric in counters {
+            assert_eq!(
+                metric.unit,
+                InstanceMetricUnit::PerSecond,
+                "counter {:?} must be charted per second",
+                metric.id
+            );
+        }
+    }
 
     #[test]
     fn pivoted_counters_list_is_non_empty() {

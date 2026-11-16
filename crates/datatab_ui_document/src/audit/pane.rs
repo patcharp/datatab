@@ -87,20 +87,8 @@ impl AuditDocument {
                 let e = entity.clone();
                 Box::new(move |policy, cx| e.update(cx, |d, cx| d.apply_refresh_policy(policy, cx)))
             },
-            // matches_dedup_key — handles Audit (singleton) and EventStream variants
-            {
-                let e = entity.clone();
-                Box::new(move |key, cx| {
-                    let d = e.read(cx);
-                    match key {
-                        DocumentKey::Audit => d.is_internal(),
-                        DocumentKey::EventStream { profile_id, target } => {
-                            d.matches_event_stream(*profile_id, target)
-                        }
-                        _ => false,
-                    }
-                })
-            },
+            // matches_dedup_key — the audit viewer is a singleton
+            Box::new(|key, _cx| matches!(key, DocumentKey::Audit)),
             // subscribe — AuditDocument emits DocumentEvent directly
             {
                 let e = entity.clone();
@@ -121,19 +109,6 @@ impl AuditDocument {
                 let category = cat.and_then(|s| EventCategory::from_str_repr(&s));
                 e.update(cx, |d, cx| d.set_category_filter(category, cx));
             }))
-        };
-
-        // matches_event_stream — used for deduplication of event-stream tabs
-        // when opening via open_event_stream_document.
-        pane.matches_event_stream = {
-            let e = entity.clone();
-            Some(Box::new(
-                move |profile_id: uuid::Uuid,
-                      target: &datatab_core::EventStreamTarget,
-                      cx: &App| {
-                    e.read(cx).matches_event_stream(profile_id, target)
-                },
-            ))
         };
 
         // set_correlation_filter — applied by the workspace when the user clicks

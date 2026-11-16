@@ -6,14 +6,8 @@ access:
   manage: Manage
   login: Login
   refresh: Refresh
-  auth_profile_hint: Used for resolving Secret/Parameter/Auth value sources in Direct mode.
+  auth_profile_hint: Used for resolving Secret and Auth value sources in Direct mode.
   session_valid: Auth profile session is valid
-  ssm_title: SSM Port Forwarding
-  ssm_instance_id: Instance ID
-  ssm_region: Region
-  ssm_remote_port: Remote Port
-  ssm_port_hint: DataTab and the OS auto-assign the local tunnel port. Only Remote Port is configurable here.
-  auth_profile: Auth Profile
   proxy_no_profiles: No proxy profiles configured
   proxy_no_profiles_hint: Add proxies in Settings > Proxies
   proxy_disabled_label: "%{name} (disabled)"
@@ -96,42 +90,22 @@ common:
       no_date_range: No date range selected
       incomplete_time_selection: Incomplete time selection
 charts:
-  default_import_name: Imported Dashboard
   orphaned_profile_label: (orphaned)
-  status:
-    loading_namespaces: Loading metric namespaces
-    loading_metrics: "Loading metrics for %{namespace}"
   toast:
     chart_not_found: Saved chart not found
     dashboard_not_found: Dashboard not found
-    connection_not_found: Connection not found for this dashboard.
     add_profile_first: Add a connection profile before creating a dashboard.
-    import_success: "Imported %{count} panels into a new dashboard."
-    panel_already_exists: "A panel for %{namespace}/%{metric} is already in this dashboard"
   error:
     cannot_open_chart: "Cannot open chart: %{error}"
     rescale_failed: Failed to rescale panel to 12-column grid
-    no_active_connection_import: "No active connection — connect to a profile before importing."
-    import_unsupported: The active connection does not support dashboard import.
-    import_failed: "Dashboard import failed: %{error}"
-    persist_import_chart_failed: "Failed to persist imported chart '%{name}'"
-    persist_import_dashboard_failed: "Failed to persist imported dashboard '%{name}'"
-    persist_import_panels_failed: Failed to persist imported dashboard panels
-    save_dashboard_failed: "Failed to save dashboard '%{name}': %{message}"
-    browsing_unsupported: The connection does not support dashboard browsing.
-    parse_unsupported: The connection cannot parse dashboards.
-    remote_parse_failed: "Dashboard parse failed: %{error}"
     create_dashboard_failed: "Failed to create dashboard: %{error}"
     delete_dashboard_failed: "Failed to delete dashboard: %{error}"
     duplicate_dashboard_failed: "Failed to duplicate dashboard: %{error}"
     rename_failed: "Failed to rename: %{error}"
     delete_chart_failed: "Failed to delete saved chart: %{error}"
     duplicate_chart_failed: "Failed to duplicate saved chart: %{error}"
-    load_namespaces_failed: "Failed to load metric namespaces: %{error}"
-    load_metrics_failed: "Failed to load metrics: %{error}"
     persist_chart_for_panel_failed: "Failed to persist chart '%{name}' for new panel"
     add_panel_failed: "Failed to add panel: %{error}"
-    persist_metric_chart_for_panel_failed: "Failed to persist metric chart '%{name}' for new panel"
     add_panels_failed: "Failed to add panels: %{error}"
   instance_overview:
     editable_name: "%{name} (editable)"
@@ -177,8 +151,6 @@ components:
     env: Environment Variable
     dotenv: "Dotenv File"
     file: "Secret File"
-    secret: Secret Manager
-    parameter: Parameter Store
     auth: Auth Session Field
     json_key_placeholder: JSON key (optional)
     placeholder:
@@ -313,7 +285,6 @@ connection_manager:
     mcp_clients:
       many: "%{count} clients"
       one: "1 client"
-    ssm: "SSM"
     proxy: "Proxy"
     ssh: "SSH"
   navigator_view:
@@ -338,6 +309,7 @@ connection_manager:
     connection_name: Connection name
     password: Password
     password_unreadable: "Saved password could not be read: the system keyring may be locked"
+    password_needs_value: "This field needs a value or a source"
     key_passphrase_optional: Key passphrase (optional)
     ssh_password: SSH password
     ca_cert_path: Path to CA certificate
@@ -353,14 +325,12 @@ connection_manager:
     no_role: No role
     no_policy: No policy
     extra_hook_ids: extra hook IDs (comma-separated)
-    use_connection_auth_profile: Use Connection Auth Profile
     select_additional_roles: "Select additional roles…"
     select_additional_policies: "Select additional policies…"
   access_method:
     direct: Direct
     ssh_tunnel: SSH Tunnel
     proxy: Proxy
-    ssm: SSM Port Forwarding
   overrides:
     refresh_policy: "Refresh policy"
     refresh_interval: "Refresh interval (s)"
@@ -377,8 +347,6 @@ connection_manager:
   connection_overrides_title: Connection Overrides
   connection_hooks_title: Connection Hooks
   new_auth_profile: "New auth profile…"
-  aws_sso_wizard_title: AWS SSO Wizard
-  aws_sso_open_failed: Failed to open AWS SSO wizard window
   select_ssh_key_title: Select SSH Private Key
   select_ca_cert: Select CA certificate
   select_client_cert: Select client certificate
@@ -387,8 +355,6 @@ connection_manager:
   filter_all_files: All files
   select_database_file: Select Database File
   auth:
-    profile_created_sso: Selected profile created by AWS SSO wizard.
-    profile_created_wizard: Selected profile created by wizard.
     refreshing_sessions: Refreshing auth profile sessions…
     select_before_login: Select an auth profile before logging in.
     provider_unavailable: "Auth provider '%{provider_id}' is not available."
@@ -449,6 +415,7 @@ connection_manager:
     safety: "Safety"
   banner:
     correct_following: Please correct the following
+    broken_value_ref_save_first: Choose a value source for each broken field, then save first. This connection cannot connect until you save.
     testing_connection: "Testing connection…"
     connection_successful: Connection successful
     connection_successful_warnings: Connection successful with warnings
@@ -476,7 +443,6 @@ connection_manager:
       key_value: "Key-value"
       time_series_and_logs: "Time series and logs"
       object_storage: "Object storage"
-      secret_store: "Secret stores"
       other: "Other"
   export:
     target:
@@ -496,7 +462,6 @@ connection_manager:
       include_ssh_password: Include SSH password
       embed_ssh_keys: Embed SSH private keys (requires encryption)
       auth_export_mode: Auth profile export mode
-      reference_aws_profile: Reference (AWS profile)
       disable_encryption: Disable encryption (force plaintext)
       confirm_passphrase: Confirm passphrase
       encryption: Encryption
@@ -520,7 +485,6 @@ connection_manager:
       write_failed: "Failed to write export file: %{error}"
     summary:
       auth_profile_line: "Auth profile: %{name}"
-      auth_profile_line_reference: "Auth profile: %{name} (reference)"
       proxy_line: "Proxy: %{name}"
       ssh_line: "SSH tunnel: %{name}"
     action:
@@ -568,7 +532,7 @@ connection_manager:
     hint:
       no_native_picker: No native file picker on this system — type or paste the bundle path above.
       external_refs: External value references travel as-is
-      external_refs_body: SSM, Secrets Manager, and environment references are imported unchanged and resolved against this machine at connect time.
+      external_refs_body: Environment, file and secret provider references are imported unchanged and resolved against this machine at connect time.
       leave_empty_skip: Leave empty to skip.
       select_profile_or_skip: "Select a profile or skip:"
     modal_title: Import
@@ -605,7 +569,6 @@ connection_manager:
     required:
       intro: The following values may be required. Leave a secret empty to skip it — the connection still imports without it.
       secret_label: "Secret for \"%{owner}\": %{field}"
-      aws_reference_label: "AWS auth profile \"%{name}\" (%{provider_id}) for \"%{owner}\""
       auth_profile_ref_label: "Auth profile for \"%{owner}\": %{field}"
       no_matching_auth_profile: No matching auth profile on this machine. The connection imports without one; assign it later in Settings > Auth Profiles.
     status:
@@ -972,17 +935,13 @@ document:
       query: Query
       script: Script
       system: System
-      secret_store: "Secret Store"
     export:
-      unsupported_source: Export is only available for the built-in audit viewer
       exported:
         one: "Exported %{count} event to %{path}"
         many: "Exported %{count} events to %{path}"
       write_failed: "Export failed to write file: %{error}"
       failed: "Export failed: %{error}"
       hint: "asks where to save"
-    task:
-      loading_event_stream: "Loading event stream: %{title}"
     detail:
       action: Action
       actor: Actor
@@ -992,12 +951,8 @@ document:
       details: Details
       duration: Duration
       error: Error
-      event_id: Event ID
       level: Level
-      message: Message
       outcome: Outcome
-      partition: Partition
-      secondary_time: Secondary Time
       source: Source
       summary: Summary
       time: Time
@@ -1025,8 +980,6 @@ document:
       loading: "Loading…"
       placeholder:
         search_events: "Search events…"
-        filter_events: "Filter events…"
-        all_time: "All time"
         last_12_hours: "Last 12 h"
         local: Local
       retry: Retry
@@ -1058,19 +1011,14 @@ document:
       success: Success
     row:
       unit:
-        events: events
         rows: rows
     source:
-      connection_not_found: Connection not found for this event source
       load_failed: "Error loading events: %{error}"
       empty:
-        external: "No events match the current filters."
         internal: "No audit events match the current filters."
       error_heading:
-        external: "Failed to load events"
         internal: "Failed to load audit events"
       loading:
-        external: "Loading events…"
         internal: "Loading audit events…"
     subtitle: "every query, hook, script and agent call on this machine"
     timeline:
@@ -1180,11 +1128,6 @@ document:
       y_axis: "Y series…"
       group_by: "Group by…"
       aggregation: "Aggregation…"
-      metric_rail: "Metric picker"
-      next_dimension: "Next dimension filter"
-      prev_dimension: "Previous dimension filter"
-      period: "Period…"
-      statistic: "Statistic…"
     toolbar:
       type_label: Type
       stats: Stats
@@ -1231,31 +1174,6 @@ document:
       connection_not_found: Connection not found
       connection_error: "Connection error: %{error}"
       collection_source_unsupported: "Collection source not supported in ChartDocument; open via DataDocument"
-    metric_picker:
-      apply: Apply
-      dropdown:
-        custom: "Custom…"
-      period:
-        placeholder: Period (seconds)
-        error: "Period: %{message}"
-        validation:
-          not_a_number: "period must be a number, got %{value}"
-          too_low: period must be at least 1 second
-          too_high: period must not exceed 86400 seconds (24 hours)
-      statistic:
-        placeholder: "Statistic (e.g. p99)"
-        error: "Statistic: %{message}"
-        validation:
-          empty: statistic must not be empty
-      dimensions:
-        title: Dimensions
-        loading: "Loading dimensions…"
-        error: "Error: %{message}"
-        retry: Retry
-        aggregate_all: Aggregate all
-        empty: No dimension combinations
-        connection_not_found: Connection not found or not active
-        catalog_unsupported: Connection does not support metric catalog
   code:
     gutter:
       run_statement: Run this statement
@@ -3418,134 +3336,6 @@ document:
     new: New tab
     close_named: "Close %{title}"
     unsaved_changes: Unsaved changes
-  secret_store:
-    title: "%{store} · %{connection}"
-    search_placeholder: "Search runs on the store, values are never listed"
-    toolbar:
-      refresh: "Refresh"
-    load_more: "Load next page"
-    loading_more: "Loading the next page…"
-    region:
-      label: "Region"
-      retry: "Retry"
-      switch_failed: "Could not switch to region %{region}: %{error}"
-    columns:
-      name: "Name"
-      description: "Description"
-      rotation: "Rotation"
-      last_changed: "Last changed"
-      type: "Type"
-      tier: "Tier"
-      version: "Version"
-      last_modified: "Last modified"
-    badge:
-      managed: "Managed by %{service}"
-      deletes: "Deletes %{date}"
-    path_mode:
-      tree: "Tree"
-      flat: "Flat"
-      toggle: "Switch tree and flat listing"
-    path:
-      up: "Up one level"
-    empty:
-      loading: "Listing secrets…"
-      error: "The secrets could not be listed: %{error}"
-      no_match: "No secret matches \"%{query}\""
-      no_secrets: "This store holds no secrets here"
-    error:
-      connection_unavailable: "The connection is not available"
-      store_unavailable: "The connection has no store %{store}"
-    footer:
-      loaded:
-        one: "%{count} secret loaded"
-        many: "%{count} secrets loaded"
-      hint:
-        open: "open"
-        retrieve: "retrieve value"
-        copy_id: "copy ID"
-        filter: "filter"
-        up: "up"
-    status:
-      list_timing:
-        one: "List · %{count} secret · %{millis} ms"
-        many: "List · %{count} secrets · %{millis} ms"
-      describe_timing: "Describe · %{millis} ms"
-      retrieve_timing: "Retrieve value · %{millis} ms"
-      duration_tooltip: "Client-side duration of the last store call"
-    rotation:
-      off: "Off"
-      enabled: "Enabled"
-      disabled: "Disabled"
-      every_days: "Every %{count} days"
-      every_hours: "Every %{count} hours"
-      schedule_with_window: "%{schedule} · window %{window} (%{expression})"
-      title: "Rotation"
-      status: "Status"
-      schedule: "Schedule"
-      next: "Next rotation"
-      function: "Function"
-      last: "Last rotated"
-    details:
-      none: "Select a secret to see its details"
-      loading: "Loading the details…"
-      failed: "The details could not be loaded"
-      title: "Secret details"
-      resource_id: "ARN"
-      type: "Type"
-      tier: "Tier"
-      data_type: "Data type"
-      encryption_key: "Encryption key"
-      description: "Description"
-      version: "Version"
-      last_modified: "Last modified"
-      created: "Created"
-      last_changed: "Last changed"
-      last_retrieved: "Last retrieved"
-      versions: "Versions"
-    tags:
-      title: "Tags"
-      none: "No tags"
-    managed:
-      title: "Managed by %{service}"
-      body: "%{name} belongs to %{service}. %{service} rotates and updates it, so DataTab shows it read only."
-    action:
-      copy_resource_id: "Copy ARN"
-    toast:
-      value_copied: "Value copied to the clipboard"
-      resource_id_copied: "ARN copied to the clipboard"
-      error_copied: "Error copied to the clipboard"
-    value:
-      title: "Value"
-      not_loaded: "Value not loaded"
-      not_loaded_hint: "DataTab fetches the value only when you ask. Each retrieval is recorded in the audit log, without the value."
-      encrypted_hint: "This value is decrypted with its encryption key when retrieved. The retrieval is audited, the value is not."
-      needs_decrypt: "Needs permission to decrypt with %{key}"
-      retrieve: "Retrieve value"
-      retrieving: "Retrieving the value…"
-      retrieved_at: "Retrieved %{time} · audited"
-      view:
-        key_value: "Key/value"
-        plaintext: "Plaintext"
-      plaintext_only: "Key/value opens only when the value parses as a one-level JSON object with scalar values. Nested JSON, arrays and any other text open as plaintext."
-      binary_size: "Binary · %{size}"
-      read_only: "Read only"
-      binary_note: "Binary values are written by other tools. DataTab shows them as base64 and does not edit them."
-      reveal: "Reveal"
-      hide: "Hide"
-      reveal_all: "Reveal or hide the value"
-      show_all: "Reveal all"
-      hide_all: "Hide all"
-      copy: "Copy value"
-      copy_json: "Copy JSON"
-      copy_all: "Copy value"
-      tab_only: "Value visible in this tab only, cleared on close"
-      failed_decrypt: "The value could not be decrypted"
-      failed: "The value could not be retrieved"
-      copy_error: "Copy error"
-      view_in_audit: "View in Audit"
-      metadata_loaded: "Metadata loaded · only the value failed"
-      deletion_scheduled: "Deletion scheduled for %{date}"
-      deletion_scheduled_body: "Its value cannot be retrieved until it is restored."
 document_tree:
   search_placeholder: Search…
   view:
@@ -3561,12 +3351,10 @@ documents:
     no_active_connection_for:
       table: No active connection for this table
       collection: No active connection for this collection
-      event_source: No active connection for this event source
       key_value_db: No active connection for this key-value database
       object_storage_account: No active connection for this object-storage account
       bucket: No active connection for this bucket
       object: No active connection for this object
-      secret_store: "No active connection for this secret store"
   error:
     write_initial_script_failed: "Failed to write initial script content: %{error}"
     save_session_failed: Failed to save session manifest
@@ -3587,6 +3375,8 @@ errors:
     clipboard: "%{summary}\nCorrelation: %{id}"
 form:
   validation:
+    broken_password_unresolved: "The broken password source needs a value or a source. You can also turn off Save password to enter it when connecting."
+    reserved_database_kind: "This driver declares a database kind that DataTab no longer supports, so the connection cannot be saved."
     connection_name_required: Connection name is required
     no_driver_selected: No driver selected
     field_required: "%{field} is required"
@@ -3594,14 +3384,7 @@ form:
     ssh_host_required: SSH Host is required when SSH is enabled
     ssh_user_required: SSH User is required when SSH is enabled
     ssh_port_invalid: SSH Port must be a valid number
-    ssm_instance_id_required: SSM Instance ID is required
-    ssm_instance_id_format: SSM Instance ID must start with 'i-' or 'mi-'
-    ssm_region_required: SSM Region is required
-    ssm_remote_port_positive: SSM Remote Port must be greater than 0
-    ssm_remote_port_invalid: SSM Remote Port must be a valid number
-    auth_profile_not_found: "AWS profile '%{id}' not found in ~/.aws/config — please restore or recreate the profile in ~/.aws/config before connecting."
-    auth_profile_dangling_keyring_only: "Auth profile '%{name}' is only in the DataTab keyring and no longer has a corresponding entry in ~/.aws/config or ~/.aws/credentials. Add the credentials to ~/.aws/credentials to connect with this profile."
-    auth_profile_dangling: "Auth profile '%{name}' could not be found in ~/.aws/config. Please recreate the profile or update the connection binding."
+    auth_profile_not_found: "Auth profile '%{id}' was not found. Select another auth profile."
     dynamic_auth_profile_required: Dynamic value sources require an Auth Profile. Select one in Access tab.
     auth_profile_no_provider: "Selected Auth Profile '%{name}' has no registered provider for dynamic value sources."
     unknown_hook: "Unknown %{label} hook '%{token}'. Configure it in Settings > Hooks"
@@ -3617,7 +3400,6 @@ form:
     test_cleanup_failed: "Test connection cleanup failed: %{error}"
     test_cleanup_warning: "%{primary_error} (cleanup warning: %{cleanup_error})"
     detached_hook_cleanup_failed: "Failed to release detached test hook tasks for profile '%{profile_name}' (%{profile_id}); scoped task IDs [%{task_ids}]: %{error}"
-    aws_credentials_missing: "AWS credentials for profile '%{name}' could not be resolved. Add the credentials to ~/.aws/credentials (or use environment variables / IAM role) and retry. DataTab does not store AWS access keys — credentials are read directly by the AWS SDK."
     pipeline_stage_failed: "Pipeline stage '%{stage}': %{source}"
 hooks:
   kind:
@@ -3710,7 +3492,6 @@ modals:
     tab:
       saved: Saved charts
       query: From query
-      metric: From metric
     name_placeholder: Panel name
     name_label: Name
     query:
@@ -3722,18 +3503,6 @@ modals:
       bar: Bar
       area: Area
       scatter: Scatter
-    metric:
-      namespace_filter_placeholder: Filter namespaces…
-      metric_filter_placeholder: Filter metrics…
-      namespace_label: Namespace
-      metric_label: Metric
-      period_label: Period (seconds)
-      statistic_label: Statistic
-      loading_namespaces: Loading namespaces…
-      select_namespace_hint: Select a namespace to load metrics.
-      loading: Loading…
-      no_metrics: No metrics in this namespace.
-      no_metrics_filtered: No metrics match the filter.
     cancel: Cancel
   cell_editor:
     title_column: "Edit %{column} (%{type_name})"
@@ -3782,17 +3551,6 @@ modals:
       materialized_view: MatView
       foreign_key: FK
       trigger: Trigger
-  import_dashboard:
-    title: Import Dashboard from JSON
-    name_label: Dashboard name
-    name_placeholder: Dashboard name
-    json_label: Dashboard JSON
-    json_placeholder: "Paste dashboard JSON here…"
-    name_error: Name cannot be empty
-    format: Format
-    compact: Compact
-    cancel: Cancel
-    confirm: Import
   mutation_confirm:
     title: Confirm mutation
     sample_unavailable: Sample preview unavailable
@@ -3899,8 +3657,6 @@ palette:
   chart:
     no_saved_charts: "No saved charts for the current profile"
     browse_suffix: "[browse]"
-  import_dashboard:
-    name: Import dashboard from JSON…
   command:
     new_query_tab:
       name: New query tab
@@ -3982,8 +3738,6 @@ palette:
       name: Open settings
     open_login_modal:
       name: Open auth profile login
-    open_sso_wizard:
-      name: Open AWS SSO wizard
     open_mcp_approvals:
       name: Open MCP approvals
     refresh_mcp_governance:
@@ -4378,7 +4132,6 @@ settings:
       reset_interface_size: "Reset interface size"
       open_settings: Open settings
       open_login_modal: Open auth profile login
-      open_sso_wizard: Open AWS SSO wizard
       open_audit_viewer: Open audit viewer
       open_last_error_in_audit: "Open last error in audit"
       open_toast_actions: "Open toast actions"
@@ -4392,7 +4145,6 @@ settings:
       open_mcp_approvals: Open MCP approvals
       refresh_mcp_governance: Refresh MCP governance
       open_saved_chart: "Open chart…"
-      import_dashboard: "Import dashboard from JSON…"
       new_dashboard: "New dashboard…"
       preview_document: Preview document
       toggle_raw_view: Toggle raw JSON view
@@ -4473,7 +4225,6 @@ settings:
       form_navigation: Form Navigation
       context_bar: Context Bar
       audit: Audit Viewer
-      event_streams_picker: Event Streams Picker
       schema_viz: Schema Viz
       document_tree: Document Tree
       data_table: Data Table
@@ -4590,12 +4341,9 @@ settings:
     profiles_label: Profiles
     new_profile: "New profile"
     import: "Import"
-    source_label: Source
     leave_blank_hint: Leave blank to keep the current value.
     auth_profile_label: Auth Profile
     editor_subtitle: Reusable authentication profile for access and value resolution
-    changed_on_disk: Profile Changed on Disk
-    reload: Reload
     name_label: Name
     provider_label: Provider
     placeholder_name: Profile name
@@ -4605,11 +4353,7 @@ settings:
     enabled: Enabled
     export: Export
     delete: Delete
-    save_to_file: Save to File
     cancel: Cancel
-    mirror_label_fallback: Read-only — managed externally
-    conflict_message: "This profile was modified on disk (%{label}) since you opened it. Reload to see the current values before saving."
-    partial_saved_message: "%{written_label} was saved successfully, but %{conflicted_label} was modified on disk since you opened the form. Reload to refresh and re-apply your changes."
     login_required_hint: "Login required — click Login to load dropdown options."
     session_expired_hint: Session expired — log in again to reload options
     session_expired_click_hint: "Session expired — click Login to refresh dropdown options."
@@ -4635,15 +4379,11 @@ settings:
       body_none: 'Are you sure you want to delete "%{name}"?'
       body_one: 'Are you sure you want to delete "%{name}"? 1 connection using this auth profile will be updated.'
       body_many: 'Are you sure you want to delete "%{name}"? %{count} connections using this auth profile will be updated.'
-    saved_fallback: Profile saved.
-    reference_invalid_title: Profile reference invalid
-    reference_invalid_body: This profile cannot be loaded.
     login_hint: Log in to load options
     inherited_from: "Inherited from %{trigger}."
     inherited_from_named: "Inherited from %{trigger} '%{name}'."
     error:
       secret_store_failed: "The profile's secret could not be stored (the OS keyring may be locked or unavailable) and will not persist after restart."
-      write_config_failed: "Failed to write profile to config: %{error}"
   mcp:
     badge:
       active: "active"
@@ -5128,10 +4868,8 @@ sidebar:
     dashboards_placeholder: "Filter dashboards…"
     connections_placeholder: Filter connections and schema
     scripts_placeholder: Filter scripts…
-    stream_placeholder: Filter stream names…
   menu:
     open: Open
-    browse_event_streams: Browse event streams
     view_schema: View schema
     view_schema_diagram: View schema diagram
     view_relationships: View relationships
@@ -5171,7 +4909,6 @@ sidebar:
     copy_path: Copy path
     schema_diff_unsupported: Schema diff is only available for relational connections.
     new_dashboard: New dashboard…
-    import_dashboard: Import dashboard from JSON…
     rename_ellipsis: Rename…
     copy_metric_id: Copy metric ID
     copy_inspector_id: Copy inspector ID
@@ -5184,16 +4921,6 @@ sidebar:
     add_script_file: New file
     add_script_folder: New folder
     import_file: Import file
-    child_picker:
-      title: "Event streams: %{name}"
-      column_name: Stream name
-      column_last_event: Last event
-      empty: No event streams found
-      prev: Prev
-      next: Next
-      page_label: "Page %{current}/%{total} (%{start}-%{end})"
-      page_label_empty: Page 0/0
-      unsupported: Event streams are not available for this collection
     skipped_tables:
       one: 1 table outside the active profile/database was skipped
       many: "%{count} tables outside the active profile/database were skipped"
@@ -5222,7 +4949,6 @@ sidebar:
     post_connect_hook_cancelled: Post-connect hook cancelled
     disconnect_hook_cancelled: Disconnect hook cancelled
     post_disconnect_hook_cancelled: Post-disconnect hook cancelled
-    loading_event_streams: "Loading event streams: %{name}"
     listing_root_section: "Listing %{section}: %{name}"
     loading_database_schema: "Loading schema: %{name}"
     connecting_to_database: "Connecting to database: %{name}"
@@ -5245,7 +4971,6 @@ sidebar:
         opening_access: "Pipeline: Opening access (%{method})"
         connecting: "Pipeline: Connecting driver (%{driver})"
         fetching_schema: "Pipeline: Fetching schema"
-    listing_secret_paths: "Listing secret paths: %{name}"
   toast:
     edit_reconnect_updated: "'%{name}' updated"
     edit_reconnect_body: Reconnect to apply the changes to the live session.
@@ -5266,7 +4991,6 @@ sidebar:
     schema_snapshot_failed: "Failed to capture schema snapshot: %{error}"
     load_failed:
       table: "Failed to load %{name} schema: %{error}"
-      collection: "Failed to load event streams for %{name}: %{error}"
       data_types: "Failed to load data types: %{error}"
       indexes: "Failed to load indexes: %{error}"
       foreign_keys: "Failed to load foreign keys: %{error}"
@@ -5282,7 +5006,6 @@ sidebar:
       approval_unavailable: "%{action} was not run: this connection requires approval, which is not available for sidebar actions yet."
     root_section_invalid_id: "The driver declared the root section \"%{section}\", which was skipped: section ids must be unique and cannot contain \"|\"."
     code_generation_failed: "Code generation failed: %{error}"
-    loading_event_streams: Loading event streams…
     load_schema_failed: "Failed to load schema: %{error}"
     connect_database_failed: "Failed to connect to database: %{error}"
     refresh_database_failed: "Failed to refresh database: %{error}"
@@ -5304,16 +5027,13 @@ sidebar:
     add_external_folder_failed: "Could not add the folder: %{error}"
     remove_external_folder_failed: "Could not remove the folder: %{error}"
     script_operation_failed: "The script operation failed: %{error}"
-    list_secret_paths_failed: "Failed to list secret paths: %{error}"
   tree:
     container:
       relational: Tables (%{count})
       document: Collections (%{count})
       key_value: Keys (%{count})
       time_series: Measurements (%{count})
-      log_stream: Log Groups (%{count})
       object_storage: Buckets (%{count})
-      secret_store: Stores (%{count})
     folder:
       empty_databases:
         one: "%{count} empty database"
@@ -5339,7 +5059,6 @@ sidebar:
       instance_metrics: Instance Metrics
       instance_inspectors: Instance Inspectors
       instance: Instance
-      metrics: Metrics
     node:
       instance_overview: Instance Overview
       untitled_chart: Untitled chart
@@ -5353,7 +5072,6 @@ sidebar:
       connect_failed: "Connection failed: %{error}"
       remote_listing_count: "%{label} (%{count})"
       load_more: "Load more"
-      remote_dashboards_error_retry: "Error: %{error} — collapse and expand to retry"
       used_by_objects:
         one: Used by 1 object
         many: "Used by %{count} objects"
@@ -5365,11 +5083,9 @@ sidebar:
     empty:
       buckets: No buckets
       dashboards: No dashboards yet — right-click to create
-      dashboards_with_import: No dashboards yet — right-click to create or import
       saved_charts: No saved charts yet — save a chart from a query result
       metrics: No metrics available
       inspectors: No inspectors available
-      remote_dashboards: No dashboards in this account/region
     scripts_root_scanning: "%{label} (scanning…)"
     scripts_root_unavailable: "%{label} (unavailable)"
   dashboards:
@@ -5420,41 +5136,6 @@ ssh:
     alias_missing: "Alias not found in ~/.ssh/config"
     load_error: "Could not read ~/.ssh/config: %{error}"
     diagnostic: "~/.ssh/config: %{diagnostic}"
-sso_wizard:
-  title: AWS SSO
-  step:
-    start: Start URL
-    account: Account
-    role: Role
-    confirm: Confirm
-  field:
-    profile_name: Profile name
-    start_url: SSO start URL
-    region: Region
-    account_id: Account ID
-    role_name: Role name
-  account:
-    discovering: Discovering accounts…
-    discover_button: Login + Discover Accounts
-    no_matches: No matching accounts for current filter
-  role:
-    discovering: Discovering roles…
-    discover_button: Discover Roles for Selected Account
-    no_matches: No matching roles for current filter
-  back: Back
-  next: Next
-  save: Save
-  status:
-    missing_required: Profile name, start URL, and region are required
-    fill_before_account_discovery: Fill profile name, start URL, and region before discovery
-    discovering_accounts: Logging in and fetching SSO accounts…
-    accounts_discovered: SSO account discovery completed
-    accounts_failed: "Failed to discover accounts: %{error}"
-    fill_before_role_discovery: Fill profile/region/start URL and select an account first
-    discovering_roles: Fetching SSO roles…
-    roles_discovered: SSO role discovery completed
-    roles_failed: "Failed to discover roles: %{error}"
-    profile_created: Created AWS SSO auth profile
 status_bar:
   no_connection: "No connection"
   ready: "Ready"
@@ -5509,6 +5190,9 @@ workspace:
     settings: "Settings"
   title_bar:
     command_search: "Search or run a command"
+    minimize: "Minimize"
+    maximize: "Maximize"
+    close: "Close"
   empty:
     title: "No tab open"
     subtitle: "Open something from the sidebar, or start here."
@@ -5529,7 +5213,6 @@ workspace:
     open: Open script from disk
     new_connection: New connection
   mcp_approvals: MCP Approvals
-  event_streams: Event Streams
   action:
     delete: Delete
     drop: Drop

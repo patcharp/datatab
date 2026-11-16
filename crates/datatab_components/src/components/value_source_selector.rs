@@ -3,8 +3,6 @@ use datatab_core::values::ValueRef;
 use gpui::prelude::*;
 use gpui::*;
 
-const AWS_SECRETS_MANAGER_PROVIDER: &str = "aws-secrets-manager";
-const AWS_SSM_PROVIDER: &str = "aws-ssm";
 const SECRET_PROVIDER_VALUE_PREFIX: &str = "value-source-secret-";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13,11 +11,8 @@ enum ValueSourceKind {
     Env,
     Dotenv,
     File,
-    Secret,
-    Parameter,
     Auth,
-    /// A secret provider other than the built-in Secrets Manager option,
-    /// identified by its registered provider id.
+    /// A secret provider, identified by its registered provider id.
     SecretProvider(String),
 }
 
@@ -31,8 +26,6 @@ impl ValueSourceKind {
             "env" => Self::Env,
             "dotenv" => Self::Dotenv,
             "file" => Self::File,
-            "secret" => Self::Secret,
-            "parameter" => Self::Parameter,
             "auth" => Self::Auth,
             _ => Self::Literal,
         }
@@ -44,11 +37,7 @@ impl ValueSourceKind {
             Some(ValueRef::Env { .. }) => Self::Env,
             Some(ValueRef::Dotenv { .. }) => Self::Dotenv,
             Some(ValueRef::File { .. }) => Self::File,
-            Some(ValueRef::Secret { provider, .. }) if provider == AWS_SECRETS_MANAGER_PROVIDER => {
-                Self::Secret
-            }
             Some(ValueRef::Secret { provider, .. }) => Self::SecretProvider(provider.clone()),
-            Some(ValueRef::Parameter { .. }) => Self::Parameter,
             Some(ValueRef::Auth { .. }) => Self::Auth,
         }
     }
@@ -74,11 +63,6 @@ fn source_items(
         DropdownItem::with_value(datatab_i18n::t!("components.value_source.env"), "env"),
         DropdownItem::with_value(datatab_i18n::t!("components.value_source.dotenv"), "dotenv"),
         DropdownItem::with_value(datatab_i18n::t!("components.value_source.file"), "file"),
-        DropdownItem::with_value(datatab_i18n::t!("components.value_source.secret"), "secret"),
-        DropdownItem::with_value(
-            datatab_i18n::t!("components.value_source.parameter"),
-            "parameter",
-        ),
         DropdownItem::with_value(datatab_i18n::t!("components.value_source.auth"), "auth"),
     ];
 
@@ -122,28 +106,10 @@ fn value_ref_for_source(source_kind: &ValueSourceKind, primary_value: &str) -> O
 
             Some(ValueRef::file(path, json_key))
         }
-        ValueSourceKind::Secret => {
-            let (locator, json_key) = parse_secret_inline_reference(primary_value);
-
-            Some(ValueRef::secret(
-                AWS_SECRETS_MANAGER_PROVIDER,
-                locator,
-                json_key,
-            ))
-        }
         ValueSourceKind::SecretProvider(provider_id) => {
             let (locator, json_key) = parse_secret_inline_reference(primary_value);
 
             Some(ValueRef::secret(provider_id.as_str(), locator, json_key))
-        }
-        ValueSourceKind::Parameter => {
-            let (name, json_key) = parse_secret_inline_reference(primary_value);
-
-            Some(ValueRef::parameter_with_key(
-                AWS_SSM_PROVIDER,
-                name,
-                json_key,
-            ))
         }
         ValueSourceKind::Auth => Some(ValueRef::auth(primary_value)),
     }
@@ -160,9 +126,6 @@ fn primary_value_for_ref(value_ref: Option<&ValueRef>) -> String {
         Some(ValueRef::Secret {
             locator, json_key, ..
         }) => format_inline_reference(locator, json_key.as_deref()),
-        Some(ValueRef::Parameter { name, json_key, .. }) => {
-            format_inline_reference(name, json_key.as_deref())
-        }
         Some(ValueRef::Auth { field }) => field.clone(),
     }
 }
@@ -173,8 +136,6 @@ fn selected_index_for(items: &[DropdownItem], source_kind: &ValueSourceKind) -> 
         ValueSourceKind::Env => "env".to_string(),
         ValueSourceKind::Dotenv => "dotenv".to_string(),
         ValueSourceKind::File => "file".to_string(),
-        ValueSourceKind::Secret => "secret".to_string(),
-        ValueSourceKind::Parameter => "parameter".to_string(),
         ValueSourceKind::Auth => "auth".to_string(),
         ValueSourceKind::SecretProvider(provider_id) => secret_provider_item_value(provider_id),
     };
@@ -389,11 +350,9 @@ fn source_placeholder(kind: ValueSourceKind) -> Option<String> {
         ValueSourceKind::Env => "components.value_source.placeholder.env",
         ValueSourceKind::Dotenv => "components.value_source.placeholder.dotenv",
         ValueSourceKind::File => "components.value_source.placeholder.file",
-        ValueSourceKind::Literal
-        | ValueSourceKind::Secret
-        | ValueSourceKind::SecretProvider(_)
-        | ValueSourceKind::Parameter
-        | ValueSourceKind::Auth => return None,
+        ValueSourceKind::Literal | ValueSourceKind::SecretProvider(_) | ValueSourceKind::Auth => {
+            return None;
+        }
     };
 
     Some(datatab_i18n::t!(key))
@@ -437,11 +396,9 @@ fn source_hint(kind: ValueSourceKind, primary_value: &str) -> Option<String> {
                 path = path
             )),
         },
-        ValueSourceKind::Literal
-        | ValueSourceKind::Secret
-        | ValueSourceKind::SecretProvider(_)
-        | ValueSourceKind::Parameter
-        | ValueSourceKind::Auth => None,
+        ValueSourceKind::Literal | ValueSourceKind::SecretProvider(_) | ValueSourceKind::Auth => {
+            None
+        }
     }
 }
 
@@ -510,7 +467,13 @@ mod tests {
         assert_eq!(source_hint(ValueSourceKind::Literal, "secret"), None);
         assert_eq!(source_hint(ValueSourceKind::Env, "  "), None);
         assert_eq!(source_placeholder(ValueSourceKind::Literal), None);
-        assert_eq!(source_hint(ValueSourceKind::Secret, "prod/db"), None);
+        assert_eq!(
+            source_hint(
+                ValueSourceKind::SecretProvider("vault".to_string()),
+                "prod/db"
+            ),
+            None
+        );
 
         let env = source_hint(ValueSourceKind::Env, "DB_PASSWORD").expect("env hint");
         assert!(env.contains("DB_PASSWORD"), "{env}");
@@ -581,12 +544,35 @@ mod tests {
     }
 
     #[test]
+    fn value_source_offers_only_registered_secret_providers() {
+        let values = |providers: &[(String, String)]| -> Vec<String> {
+            source_items(providers, None)
+                .iter()
+                .map(|item| item.value.to_string())
+                .collect()
+        };
+
+        assert_eq!(values(&[]), ["literal", "env", "dotenv", "file", "auth"]);
+        assert_eq!(
+            values(&vault_providers()),
+            [
+                "literal",
+                "env",
+                "dotenv",
+                "file",
+                "auth",
+                "value-source-secret-vault"
+            ]
+        );
+    }
+
+    #[test]
     fn value_source_external_secret_ref_selects_its_provider_option() {
         let value_ref = ValueRef::secret("vault", "kv/db", None);
         let items = source_items(&vault_providers(), None);
         let index = selected_index_for(&items, &ValueSourceKind::for_value_ref(Some(&value_ref)));
 
-        assert_eq!(index, Some(7));
+        assert_eq!(index, Some(5));
         assert_same_ref(round_trip(&value_ref, &vault_providers()), Some(value_ref));
     }
 
@@ -602,18 +588,23 @@ mod tests {
         assert_same_ref(round_trip(&value_ref, &vault_providers()), Some(value_ref));
     }
 
+    /// A reference to a former built-in AWS provider id is handled like any
+    /// provider that is not registered: its raw id is shown and it round-trips.
     #[test]
-    fn value_source_aws_refs_keep_builtin_options() {
+    fn value_source_former_builtin_secret_ref_round_trips_as_unregistered_provider() {
         let secret = ValueRef::secret("aws-secrets-manager", "prod/db", Some("pw".to_string()));
-        let parameter = ValueRef::parameter_with_key("aws-ssm", "/prod/db", None);
 
         assert_eq!(
             ValueSourceKind::for_value_ref(Some(&secret)),
-            ValueSourceKind::Secret
+            ValueSourceKind::SecretProvider("aws-secrets-manager".to_string())
+        );
+        assert_eq!(
+            source_items(&vault_providers(), Some("aws-secrets-manager"))
+                .last()
+                .map(|item| item.label.to_string()),
+            Some("aws-secrets-manager".to_string())
         );
         assert_same_ref(round_trip(&secret, &vault_providers()), Some(secret));
-        assert_same_ref(round_trip(&parameter, &[]), Some(parameter));
-        assert_eq!(source_items(&[], None).len(), 7);
     }
 
     #[test]
@@ -674,8 +665,6 @@ mod tests {
             "components.value_source.env",
             "components.value_source.dotenv",
             "components.value_source.file",
-            "components.value_source.secret",
-            "components.value_source.parameter",
             "components.value_source.auth",
             "components.value_source.json_key_placeholder",
             "components.value_source.placeholder.env",

@@ -3,7 +3,6 @@ pub mod cell_editor;
 pub mod delete_connection;
 pub mod document_preview;
 pub mod drop_table;
-pub mod import_dashboard;
 pub mod modal;
 pub mod mutation_confirm;
 // The rendering moved to `bolt`; this path keeps the product's code preview,
@@ -24,9 +23,6 @@ pub use document_preview::{
     DOC_INDEX_NEW, DocumentPreviewClosedEvent, DocumentPreviewModal, DocumentPreviewSaveEvent,
 };
 pub use drop_table::{DropTableOutcome, DropTableRequest, ModalDropTable};
-pub use import_dashboard::{
-    ImportDashboardCancelled, ImportDashboardConfirmed, ModalImportDashboard,
-};
 pub use modal::{MODAL_KEY_CONTEXT, Modal, ModalFocus, ModalVariant};
 pub use mutation_confirm::{
     ModalMutationConfirm, ModalMutationConfirmHard, MutationConfirmHardRequest,

@@ -1083,7 +1083,8 @@ mod tests {
         let host_bytes = postcard::to_allocvec(&decoded).expect("encode host flags");
         assert_eq!(host_bytes, legacy_bytes);
 
-        let widened = DriverCapabilities::SECRET_STORE | DriverCapabilities::OBJECT_STORAGE;
+        let widened =
+            DriverCapabilities::RESERVED_SECRET_STORE | DriverCapabilities::OBJECT_STORAGE;
         let widened_bytes = postcard::to_allocvec(&widened).expect("encode widened flags");
         let round_trip: DriverCapabilities =
             postcard::from_bytes(&widened_bytes).expect("decode widened flags");

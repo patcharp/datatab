@@ -26,6 +26,50 @@ fn service_for_test(name: &str) -> AuditService {
 }
 
 #[test]
+fn retired_secret_store_category_rows_are_queried_and_exported() {
+    let directory = temp_sqlite_path("retired-category");
+    std::fs::create_dir(&directory).expect("create temporary directory");
+    let path = directory.join("audit.sqlite");
+    let service = AuditService::new_sqlite(&path).expect("create audit store");
+    for (timestamp, summary) in [(1000, "current row"), (1001, "old row")] {
+        service
+            .record(
+                EventRecord::new(
+                    timestamp,
+                    EventSeverity::Info,
+                    EventCategory::System,
+                    EventOutcome::Success,
+                )
+                .with_typed_action(SYSTEM_STARTUP)
+                .with_summary(summary),
+            )
+            .expect("record event");
+    }
+    let connection = rusqlite::Connection::open(&path).expect("open audit store");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE aud_audit_events SET category = 'secret_store' WHERE created_at_epoch_ms = 1001",
+                [],
+            )
+            .expect("write old category"),
+        1
+    );
+    drop(connection);
+
+    let filter = AuditQueryFilter::default();
+    assert_eq!(service.query(&filter).expect("query rows").len(), 2);
+    let exported = service
+        .export_extended(&filter, AuditExportFormat::Json)
+        .expect("export rows");
+    assert!(exported.contains("current row"));
+    assert!(exported.contains("old row"));
+    assert!(exported.contains("secret_store"));
+    drop(service);
+    std::fs::remove_dir_all(directory).expect("remove temporary directory");
+}
+
+#[test]
 fn append_is_immutable_and_returns_stored_record() {
     let service = service_for_test("datatab-audit-immutable.sqlite");
 

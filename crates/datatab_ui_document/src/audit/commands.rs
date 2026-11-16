@@ -632,7 +632,7 @@ impl AuditDocument {
             }
             // Alt+L / Alt+H switch the view of the internal audit log
             // between the event table and the chart.
-            Command::NextPanelTab | Command::PrevPanelTab if !self.is_external_event_stream() => {
+            Command::NextPanelTab | Command::PrevPanelTab => {
                 let to_chart = matches!(self.view_mode, super::chart_view::AuditViewMode::Table);
                 self.set_view_mode(to_chart, cx);
                 true

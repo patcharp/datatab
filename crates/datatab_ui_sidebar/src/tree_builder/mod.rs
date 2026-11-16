@@ -70,11 +70,9 @@ impl Sidebar {
     pub(super) fn build_tree_items_with_overrides(&self, cx: &Context<Self>) -> Vec<TreeItem> {
         let items = Self::build_tree_items_with_errors(
             self.app_state.read(cx),
-            &self.metric_fetch_errors,
             &self.instance_metrics_cache,
             &self.instance_inspectors_cache,
             &self.root_section_cache,
-            &self.secret_path_cache,
         );
         let state = self.app_state.read(cx);
         self.reconcile_table_details_retry(state);
@@ -96,8 +94,6 @@ impl Sidebar {
                     &self.table_details_recovery,
                     &self.recovered_table_databases,
                     &known,
-                    state.metric_catalog_cache(),
-                    &self.metric_fetch_errors,
                 )
             })
             .collect();
@@ -118,7 +114,6 @@ impl Sidebar {
                 .any(|child| Self::contains_tree_item(child, id))
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn with_table_details_status(
         item: TreeItem,
         state: &AppStateEntity,
@@ -126,8 +121,6 @@ impl Sidebar {
         recovering: &HashMap<String, SessionRequest>,
         recovered: &HashMap<(Uuid, String), (String, u64)>,
         known: &HashMap<(Uuid, String), KnownInvalidatedDatabase>,
-        metric_cache: &datatab_app::MetricCatalogCache,
-        metric_fetch_errors: &HashMap<String, String>,
     ) -> TreeItem {
         use datatab_ui_base::object_tree::{ObjectTreeOutcome, ObjectTreeRequestKey};
 
@@ -137,16 +130,7 @@ impl Sidebar {
             .children
             .into_iter()
             .map(|child| {
-                Self::with_table_details_status(
-                    child,
-                    state,
-                    retries,
-                    recovering,
-                    recovered,
-                    known,
-                    metric_cache,
-                    metric_fetch_errors,
-                )
+                Self::with_table_details_status(child, state, retries, recovering, recovered, known)
             })
             .collect();
         if let Some(SchemaNodeId::Database { profile_id, name }) = parse_node_id(&id) {
@@ -289,10 +273,7 @@ impl Sidebar {
                             let sources = FolderSources {
                                 profile_id,
                                 connected,
-                                capabilities: metadata.capabilities,
                                 connection_category: metadata.category,
-                                metric_cache: Some(metric_cache),
-                                metric_fetch_errors,
                             };
                             object_folder::folder_content(
                                 &sources,
@@ -525,29 +506,23 @@ impl Sidebar {
             state,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             &crate::root_sections::RootSectionCache::default(),
-            &HashMap::new(),
         )
     }
 
     pub(super) fn build_tree_items_with_errors(
         state: &AppStateEntity,
-        metric_fetch_errors: &HashMap<String, String>,
         instance_metrics_cache: &HashMap<Uuid, Vec<datatab_core::InstanceMetricDef>>,
         instance_inspectors_cache: &HashMap<Uuid, Vec<datatab_core::InstanceInspectorDef>>,
         root_sections: &crate::root_sections::RootSectionCache,
-        secret_path_cache: &crate::secret_store::SecretPathCache,
     ) -> Vec<TreeItem> {
         let root_nodes = state.connection_tree().root_nodes();
         Self::build_tree_nodes_recursive_with_errors(
             &root_nodes,
             state,
-            metric_fetch_errors,
             instance_metrics_cache,
             instance_inspectors_cache,
             root_sections,
-            secret_path_cache,
         )
     }
 
@@ -654,11 +629,9 @@ impl Sidebar {
     fn build_tree_nodes_recursive_with_errors(
         nodes: &[&ConnectionTreeNode],
         state: &AppStateEntity,
-        metric_fetch_errors: &HashMap<String, String>,
         instance_metrics_cache: &HashMap<Uuid, Vec<datatab_core::InstanceMetricDef>>,
         instance_inspectors_cache: &HashMap<Uuid, Vec<datatab_core::InstanceInspectorDef>>,
         root_sections: &crate::root_sections::RootSectionCache,
-        secret_path_cache: &crate::secret_store::SecretPathCache,
     ) -> Vec<TreeItem> {
         let mut items = Vec::new();
 
@@ -671,11 +644,9 @@ impl Sidebar {
                     let children = Self::build_tree_nodes_recursive_with_errors(
                         &children_refs,
                         state,
-                        metric_fetch_errors,
                         instance_metrics_cache,
                         instance_inspectors_cache,
                         root_sections,
-                        secret_path_cache,
                     );
 
                     let folder_item = TreeItem::new(
@@ -695,11 +666,9 @@ impl Sidebar {
                         let profile_item = Self::build_profile_item_with_errors(
                             profile,
                             state,
-                            metric_fetch_errors,
                             instance_metrics_cache,
                             instance_inspectors_cache,
                             root_sections,
-                            secret_path_cache,
                         );
                         items.push(profile_item);
                         items.extend(Self::build_connect_failure_rows(profile_id, state));
@@ -737,11 +706,9 @@ impl Sidebar {
     fn build_profile_item_with_errors(
         profile: &datatab_core::ConnectionProfile,
         state: &AppStateEntity,
-        metric_fetch_errors: &HashMap<String, String>,
         instance_metrics_cache: &HashMap<Uuid, Vec<datatab_core::InstanceMetricDef>>,
         instance_inspectors_cache: &HashMap<Uuid, Vec<datatab_core::InstanceInspectorDef>>,
         root_sections: &crate::root_sections::RootSectionCache,
-        secret_path_cache: &crate::secret_store::SecretPathCache,
     ) -> TreeItem {
         let profile_id = profile.id;
         let is_connected = state.connections().contains_key(&profile_id);
@@ -792,19 +759,8 @@ impl Sidebar {
                 profile_children.push(Self::build_saved_charts_folder_item(profile_id, state));
             }
 
-            // Drivers that can browse upstream dashboards get a read-only
-            // listing container. Capability-gated — no driver_id branching.
-            if !simple_view && conn_capabilities.contains(DriverCapabilities::DASHBOARD_SYNC) {
-                profile_children.push(Self::build_remote_dashboards_folder_item(
-                    profile_id,
-                    state,
-                    metric_fetch_errors,
-                ));
-            }
-
             let conn_category = conn_metadata.category;
             let supports_routines = conn_capabilities.contains(DriverCapabilities::ROUTINES);
-            let metric_cache = state.metric_catalog_cache().clone();
 
             if conn_capabilities.contains(DriverCapabilities::ROOT_SECTIONS) {
                 // Driver-declared root sections replace the database tree:
@@ -813,18 +769,6 @@ impl Sidebar {
                 profile_children.extend(crate::root_sections::build_root_section_folders(
                     profile_id,
                     root_sections,
-                ));
-            } else if conn_category == DatabaseCategory::SecretStore {
-                let stores: Vec<datatab_core::SecretStoreDescriptor> = connected
-                    .connection
-                    .secret_stores()
-                    .into_iter()
-                    .map(|store| store.descriptor().clone())
-                    .collect();
-                profile_children.extend(crate::secret_store::build_secret_store_nodes(
-                    profile_id,
-                    &stores,
-                    secret_path_cache,
                 ));
             } else if layout == DatabaseLayout::Keyspaces {
                 let kv_items = build_kv_database_children(profile_id, connected, state);
@@ -866,10 +810,7 @@ impl Sidebar {
                     let sources = FolderSources {
                         profile_id,
                         connected,
-                        capabilities: conn_capabilities,
                         connection_category: conn_category,
-                        metric_cache: Some(&metric_cache),
-                        metric_fetch_errors,
                     };
                     let named_items = build_named_db_children(
                         &sources,
@@ -966,89 +907,6 @@ impl Sidebar {
         )
         .expanded(false)
         .children(children)
-    }
-
-    /// Build the container that lists dashboards fetched live from the
-    /// connection's upstream source (drivers advertising `DASHBOARD_SYNC`).
-    ///
-    /// The label is taken from the driver's `DashboardSource::container_label`
-    /// so the UI never hard-codes a driver name. Children are lazy: a "Loading"
-    /// placeholder until the listing cache is populated on first expansion.
-    fn build_remote_dashboards_folder_item(
-        profile_id: Uuid,
-        state: &AppStateEntity,
-        fetch_errors: &HashMap<String, String>,
-    ) -> TreeItem {
-        let label = state
-            .connections()
-            .get(&profile_id)
-            .and_then(|conn| {
-                conn.connection
-                    .dashboard_source()
-                    .map(|s| s.container_label().to_string())
-            })
-            .unwrap_or_else(crate::labels::dashboards_folder_label);
-
-        let folder_id = SchemaNodeId::RemoteDashboardsFolder { profile_id }.to_string();
-        let children =
-            Self::build_remote_dashboard_children(profile_id, state, &folder_id, fetch_errors);
-
-        let label = match state.remote_dashboard_cache().peek(profile_id) {
-            Some(list) => crate::labels::remote_dashboards_count_label(&label, list.len()),
-            None => label,
-        };
-
-        TreeItem::new(folder_id, label)
-            .expanded(false)
-            .children(children)
-    }
-
-    /// Build the `RemoteDashboardItem` children for a `RemoteDashboardsFolder`.
-    ///
-    /// Reads the session listing cache. A cache miss yields a single "Loading"
-    /// placeholder; the fetch is kicked off when the folder is expanded. A
-    /// recorded fetch error yields an error node, and an empty listing yields a
-    /// non-clickable hint.
-    fn build_remote_dashboard_children(
-        profile_id: Uuid,
-        state: &AppStateEntity,
-        folder_id: &str,
-        fetch_errors: &HashMap<String, String>,
-    ) -> Vec<TreeItem> {
-        let Some(dashboards) = state.remote_dashboard_cache().peek(profile_id) else {
-            if let Some(error) = fetch_errors.get(folder_id) {
-                return vec![TreeItem::new(
-                    format!("remote_dashboards_error:{profile_id}"),
-                    crate::labels::remote_dashboards_error_label(error),
-                )];
-            }
-            return vec![Self::loading_placeholder(
-                profile_id,
-                "",
-                "remote-dashboards-loading",
-            )];
-        };
-
-        if dashboards.is_empty() {
-            return vec![TreeItem::new(
-                format!("remote_dashboards_empty:{profile_id}"),
-                crate::labels::remote_dashboards_empty_label(),
-            )];
-        }
-
-        dashboards
-            .iter()
-            .map(|d| {
-                TreeItem::new(
-                    SchemaNodeId::RemoteDashboardItem {
-                        profile_id,
-                        name: d.name.clone(),
-                    }
-                    .to_string(),
-                    d.name.clone(),
-                )
-            })
-            .collect()
     }
 
     /// Build the `SavedChartsFolder` tree node for a connected profile.
@@ -1225,17 +1083,9 @@ impl Sidebar {
         dashboards.sort_by_key(|d| std::cmp::Reverse(d.updated_at));
 
         if dashboards.is_empty() {
-            let can_import = state
-                .connections()
-                .get(&profile_id)
-                .map(|conn| conn.connection.metadata().capabilities)
-                .is_some_and(|caps| {
-                    caps.contains(datatab_core::DriverCapabilities::DASHBOARD_IMPORT)
-                });
-
             return vec![TreeItem::new(
                 format!("dashboards_empty:{profile_id}"),
-                crate::labels::no_dashboards_yet_label(can_import),
+                crate::labels::no_dashboards_yet_label(),
             )];
         }
 
@@ -1290,23 +1140,10 @@ impl Sidebar {
     /// imported before the title-fallback fix or for any future code path
     /// that persists an empty name.
     ///
-    /// Order: persisted name -> joined distinct metric names (for Metric
-    /// sources) -> "Untitled chart".
+    /// Order: persisted name -> "Untitled chart".
     fn saved_chart_display_label(chart: &datatab_components::SavedChart) -> String {
         if !chart.name.trim().is_empty() {
             return chart.name.clone();
-        }
-
-        if let datatab_components::SavedChartSource::Metric { series } = &chart.source
-            && !series.is_empty()
-        {
-            let mut names: Vec<&str> = series.iter().map(|s| s.metric_name.as_str()).collect();
-            names.sort_unstable();
-            names.dedup();
-            let joined = names.join(", ");
-            if !joined.is_empty() {
-                return joined;
-            }
         }
 
         crate::labels::untitled_chart_label()
@@ -1366,114 +1203,6 @@ impl Sidebar {
         None
     }
 
-    /// Build the namespace children for a `MetricsFolder` node.
-    ///
-    /// Peeks the `MetricCatalogCache`; if populated, emits one
-    /// `MetricNamespaceFolder` child per cached namespace. On a cache miss
-    /// (data not yet fetched) emits a single "Loading..." placeholder so the
-    /// user sees feedback. The expansion handler triggers the background fetch.
-    /// If `metric_fetch_errors` contains an entry for the parent MetricsFolder
-    /// node id, an error placeholder is rendered instead.
-    pub(crate) fn build_metric_namespace_children(
-        profile_id: Uuid,
-        database_name: &str,
-        metric_catalog_cache: Option<&datatab_app::MetricCatalogCache>,
-    ) -> Vec<TreeItem> {
-        let Some(cache) = metric_catalog_cache else {
-            return vec![Self::loading_placeholder(
-                profile_id,
-                database_name,
-                "metrics-loading",
-            )];
-        };
-
-        let Some(namespaces) = cache.peek_namespaces(profile_id) else {
-            return vec![Self::loading_placeholder(
-                profile_id,
-                database_name,
-                "metrics-loading",
-            )];
-        };
-
-        namespaces
-            .iter()
-            .map(|ns| {
-                let leaf_children = Self::build_metric_leaf_children(
-                    profile_id,
-                    database_name,
-                    ns,
-                    metric_catalog_cache,
-                );
-                TreeItem::new(
-                    SchemaNodeId::MetricNamespaceFolder {
-                        profile_id,
-                        database: database_name.to_string(),
-                        namespace: ns.clone(),
-                    }
-                    .to_string(),
-                    ns.clone(),
-                )
-                .expanded(false)
-                .children(leaf_children)
-            })
-            .collect()
-    }
-
-    /// Build the metric leaf children for a `MetricNamespaceFolder` node.
-    ///
-    /// Peeks the cache for this `(profile_id, namespace)` pair. On a miss,
-    /// returns a single loading placeholder. On a hit, returns one `MetricLeaf`
-    /// per cached descriptor.
-    pub(crate) fn build_metric_leaf_children(
-        profile_id: Uuid,
-        database_name: &str,
-        namespace: &datatab_core::MetricNamespace,
-        metric_catalog_cache: Option<&datatab_app::MetricCatalogCache>,
-    ) -> Vec<TreeItem> {
-        let Some(cache) = metric_catalog_cache else {
-            return vec![Self::loading_placeholder(
-                profile_id,
-                database_name,
-                &format!("metrics-ns-loading|{}", namespace),
-            )];
-        };
-
-        let Some(page) = cache.peek_metrics(profile_id, namespace) else {
-            return vec![Self::loading_placeholder(
-                profile_id,
-                database_name,
-                &format!("metrics-ns-loading|{}", namespace),
-            )];
-        };
-
-        // CloudWatch returns one descriptor per (metric_name, dimension_combo)
-        // pair, so a 1000-instance AWS/EC2 account would otherwise produce 1000
-        // identical "CPUUtilization" leaves. Deduplicate by metric_name; the
-        // dimension picker inside the chart document handles dimension choice.
-        // BTreeSet keeps the order alphabetical, which is also nicer UX.
-        let unique_names: std::collections::BTreeSet<&str> = page
-            .accumulated
-            .iter()
-            .map(|desc| desc.metric_name.as_str())
-            .collect();
-
-        unique_names
-            .into_iter()
-            .map(|metric_name| {
-                TreeItem::new(
-                    SchemaNodeId::MetricLeaf {
-                        profile_id,
-                        database: database_name.to_string(),
-                        namespace: namespace.clone(),
-                        metric_name: metric_name.to_string(),
-                    }
-                    .to_string(),
-                    metric_name.to_string(),
-                )
-            })
-            .collect()
-    }
-
     /// Build a non-typed placeholder `TreeItem` used for Loading / error sentinel nodes.
     ///
     /// The sentinel ID is purposely not a valid `SchemaNodeId` so the expansion
@@ -1487,7 +1216,7 @@ impl Sidebar {
         TreeItem::new(id, datatab_i18n::t!("sidebar.tree.status.loading"))
     }
 
-    /// Build an error retry placeholder child for metric sidebar nodes.
+    /// Build an error retry placeholder child for schema sidebar nodes.
     ///
     /// The sentinel ID encodes the retry key so `execute_item` can route it
     /// back to the appropriate fetch helper.
@@ -1501,10 +1230,6 @@ impl Sidebar {
         database_name: &str,
         collection: &datatab_core::TableInfo,
         table_details: &HashMap<(String, Option<String>, String), TableInfo>,
-        collection_children_cache: &HashMap<
-            (String, String),
-            datatab_core::CollectionChildrenCache,
-        >,
     ) -> TreeItem {
         let coll_name = &collection.name;
         // Collections carry their database as the schema key component —
@@ -1515,16 +1240,11 @@ impl Sidebar {
             coll_name.clone(),
         );
         let effective = table_details.get(&details_key).unwrap_or(collection);
-        let children_key = (database_name.to_string(), coll_name.clone());
-        let paged_children = collection_children_cache.get(&children_key);
-        let child_items = paged_children
-            .map(|cache| cache.items.clone())
-            .or_else(|| effective.child_items.clone());
-        let has_more_children = paged_children
-            .and_then(|cache| cache.next_page_token.as_ref())
-            .is_some();
         let details_loaded = effective.sample_fields.is_some()
-            || child_items.as_ref().is_some_and(|items| !items.is_empty());
+            || effective
+                .child_items
+                .as_ref()
+                .is_some_and(|items| !items.is_empty());
 
         let (field_children, field_count) = if let Some(fields) = effective.sample_fields.as_ref() {
             (
@@ -1536,93 +1256,35 @@ impl Sidebar {
         };
 
         let (index_children, index_count) = if details_loaded {
-            match effective.indexes.as_ref() {
-                Some(IndexData::Document(doc_indexes)) => {
-                    let children: Vec<TreeItem> = doc_indexes
-                        .iter()
-                        .map(|idx| {
-                            let label = format_collection_index_label(idx);
-
-                            TreeItem::new(
-                                SchemaNodeId::CollectionIndex {
-                                    profile_id,
-                                    collection: coll_name.to_string(),
-                                    name: idx.name.clone(),
-                                }
-                                .to_string(),
-                                label,
-                            )
-                        })
-                        .collect();
-
-                    let count = children.len();
-                    (children, count)
-                }
-
-                Some(IndexData::Relational(indexes)) => {
-                    let children: Vec<TreeItem> = indexes
-                        .iter()
-                        .map(|idx| {
-                            let unique_marker = if idx.is_unique { " UNIQUE" } else { "" };
-                            let pk_marker = if idx.is_primary { " PK" } else { "" };
-                            let cols = idx.columns.join(", ");
-                            let label =
-                                format!("{} ({}){}{}", idx.name, cols, unique_marker, pk_marker);
-
-                            TreeItem::new(
-                                SchemaNodeId::CollectionIndex {
-                                    profile_id,
-                                    collection: coll_name.to_string(),
-                                    name: idx.name.clone(),
-                                }
-                                .to_string(),
-                                label,
-                            )
-                        })
-                        .collect();
-
-                    let count = children.len();
-                    (children, count)
-                }
-
-                _ => (Vec::new(), 0),
-            }
+            Self::collection_index_children(profile_id, coll_name, effective.indexes.as_ref())
         } else {
             (Vec::new(), 0)
         };
 
-        let collection_children = if effective.presentation == CollectionPresentation::EventStream {
-            // Event-stream collections are leaves in the tree: streams are
-            // browsed exclusively through the dedicated picker modal, never
-            // inline. Suppressing children also removes the expand chevron.
-            let _ = (child_items, has_more_children);
-            Vec::new()
-        } else {
-            vec![
-                TreeItem::new(
-                    SchemaNodeId::CollectionFieldsFolder {
-                        profile_id,
-                        database: database_name.to_string(),
-                        collection: coll_name.to_string(),
-                    }
-                    .to_string(),
-                    crate::labels::fields_folder_label(field_count),
-                )
-                .expanded(false)
-                .children(field_children),
-                TreeItem::new(
-                    SchemaNodeId::CollectionIndexesFolder {
-                        profile_id,
-                        database: database_name.to_string(),
-                        collection: coll_name.to_string(),
-                    }
-                    .to_string(),
-                    crate::labels::indexes_folder_label(index_count),
-                )
-                .expanded(false)
-                .children(index_children),
-            ]
-        };
+        let children = vec![
+            TreeItem::new(
+                SchemaNodeId::CollectionFieldsFolder {
+                    profile_id,
+                    database: database_name.to_string(),
+                    collection: coll_name.to_string(),
+                }
+                .to_string(),
+                crate::labels::fields_folder_label(field_count),
+            )
+            .expanded(false)
+            .children(field_children),
+            TreeItem::new(
+                SchemaNodeId::CollectionIndexesFolder {
+                    profile_id,
+                    database: database_name.to_string(),
+                    collection: coll_name.to_string(),
+                }
+                .to_string(),
+                crate::labels::indexes_folder_label(index_count),
+            )
+            .expanded(false)
+            .children(index_children),
+        ];
 
         TreeItem::new(
             SchemaNodeId::Collection {
@@ -1634,7 +1296,65 @@ impl Sidebar {
             coll_name.clone(),
         )
         .expanded(false)
-        .children(collection_children)
+        .children(children)
+    }
+
+    fn collection_index_children(
+        profile_id: Uuid,
+        collection_name: &str,
+        indexes: Option<&IndexData>,
+    ) -> (Vec<TreeItem>, usize) {
+        match indexes {
+            Some(IndexData::Document(doc_indexes)) => {
+                let children: Vec<TreeItem> = doc_indexes
+                    .iter()
+                    .map(|idx| {
+                        let label = format_collection_index_label(idx);
+
+                        TreeItem::new(
+                            SchemaNodeId::CollectionIndex {
+                                profile_id,
+                                collection: collection_name.to_string(),
+                                name: idx.name.clone(),
+                            }
+                            .to_string(),
+                            label,
+                        )
+                    })
+                    .collect();
+
+                let count = children.len();
+                (children, count)
+            }
+
+            Some(IndexData::Relational(indexes)) => {
+                let children: Vec<TreeItem> = indexes
+                    .iter()
+                    .map(|idx| {
+                        let unique_marker = if idx.is_unique { " UNIQUE" } else { "" };
+                        let pk_marker = if idx.is_primary { " PK" } else { "" };
+                        let cols = idx.columns.join(", ");
+                        let label =
+                            format!("{} ({}){}{}", idx.name, cols, unique_marker, pk_marker);
+
+                        TreeItem::new(
+                            SchemaNodeId::CollectionIndex {
+                                profile_id,
+                                collection: collection_name.to_string(),
+                                name: idx.name.clone(),
+                            }
+                            .to_string(),
+                            label,
+                        )
+                    })
+                    .collect();
+
+                let count = children.len();
+                (children, count)
+            }
+
+            _ => (Vec::new(), 0),
+        }
     }
 
     fn build_custom_type_item(
@@ -3266,225 +2986,10 @@ pub(crate) mod tree_shape_tests;
 #[cfg(test)]
 mod tests {
     use super::Sidebar;
-    use datatab_core::{
-        CollectionChildInfo, CollectionChildrenCache, CollectionPresentation, FieldInfo, TableInfo,
-    };
+    use datatab_core::{CollectionChildInfo, CollectionPresentation, FieldInfo, TableInfo};
     use gpui_component::tree::TreeItem;
     use std::collections::{HashMap, HashSet};
     use uuid::Uuid;
-
-    #[test]
-    fn metric_namespaces_render_from_cache() {
-        use datatab_app::MetricCatalogCache;
-        use datatab_core::{MetricNamespace, SchemaNodeId};
-
-        let profile_id = Uuid::new_v4();
-        let cache = MetricCatalogCache::new();
-        let ns1: MetricNamespace = "AWS/EC2".to_string();
-        let ns2: MetricNamespace = "AWS/S3".to_string();
-        cache.store_namespaces(profile_id, vec![ns1.clone(), ns2.clone()]);
-
-        let children =
-            Sidebar::build_metric_namespace_children(profile_id, "default", Some(&*cache));
-
-        assert_eq!(children.len(), 2, "One child per namespace");
-        let ids: Vec<SchemaNodeId> = children
-            .iter()
-            .map(|item| item.id.as_ref().parse().expect("valid SchemaNodeId"))
-            .collect();
-        assert!(
-            ids.iter().any(|id| matches!(
-                id,
-                SchemaNodeId::MetricNamespaceFolder { namespace, .. } if namespace == "AWS/EC2"
-            )),
-            "AWS/EC2 namespace must appear"
-        );
-        assert!(
-            ids.iter().any(|id| matches!(
-                id,
-                SchemaNodeId::MetricNamespaceFolder { namespace, .. } if namespace == "AWS/S3"
-            )),
-            "AWS/S3 namespace must appear"
-        );
-    }
-
-    #[test]
-    fn metric_leaves_dedupe_by_metric_name() {
-        use datatab_app::MetricCatalogCache;
-        use datatab_core::{MetricDescriptor, MetricNamespace};
-
-        let profile_id = Uuid::new_v4();
-        let cache = MetricCatalogCache::new();
-        let ns: MetricNamespace = "AWS/EC2".to_string();
-
-        // Three CPUUtilization entries (one per instance) plus two NetworkIn entries
-        // (one per instance). CloudWatch emits one descriptor per
-        // (metric_name, dimension_combo); the sidebar must collapse them.
-        let descriptors = vec![
-            MetricDescriptor {
-                metric_name: "CPUUtilization".to_string(),
-                dimensions: vec![("InstanceId".to_string(), "i-1".to_string())],
-            },
-            MetricDescriptor {
-                metric_name: "CPUUtilization".to_string(),
-                dimensions: vec![("InstanceId".to_string(), "i-2".to_string())],
-            },
-            MetricDescriptor {
-                metric_name: "CPUUtilization".to_string(),
-                dimensions: vec![("InstanceId".to_string(), "i-3".to_string())],
-            },
-            MetricDescriptor {
-                metric_name: "NetworkIn".to_string(),
-                dimensions: vec![("InstanceId".to_string(), "i-1".to_string())],
-            },
-            MetricDescriptor {
-                metric_name: "NetworkIn".to_string(),
-                dimensions: vec![("InstanceId".to_string(), "i-2".to_string())],
-            },
-        ];
-        cache.store_metrics_page(profile_id, ns.clone(), descriptors, None);
-
-        let children =
-            Sidebar::build_metric_leaf_children(profile_id, "default", &ns, Some(&*cache));
-
-        assert_eq!(
-            children.len(),
-            2,
-            "5 descriptors with 2 distinct metric_names must produce 2 leaves; got {}",
-            children.len()
-        );
-
-        let labels: Vec<&str> = children.iter().map(|c| c.label.as_ref()).collect();
-        assert!(
-            labels.contains(&"CPUUtilization"),
-            "CPUUtilization leaf must exist: {:?}",
-            labels
-        );
-        assert!(
-            labels.contains(&"NetworkIn"),
-            "NetworkIn leaf must exist: {:?}",
-            labels
-        );
-    }
-
-    #[test]
-    fn loading_placeholder_when_namespace_cache_miss() {
-        use datatab_app::MetricCatalogCache;
-        use datatab_core::SchemaNodeId;
-
-        let profile_id = Uuid::new_v4();
-        let cache = MetricCatalogCache::new();
-        // No data stored — cache miss
-
-        let children =
-            Sidebar::build_metric_namespace_children(profile_id, "default", Some(&*cache));
-
-        assert_eq!(
-            children.len(),
-            1,
-            "Single loading placeholder on cache miss"
-        );
-        // Loading placeholder must not be a valid MetricNamespaceFolder
-        let parsed = children[0].id.as_ref().parse::<SchemaNodeId>();
-        assert!(
-            parsed.is_err()
-                || !matches!(parsed.unwrap(), SchemaNodeId::MetricNamespaceFolder { .. }),
-            "Loading placeholder must not parse as MetricNamespaceFolder"
-        );
-        assert!(
-            children[0].label.as_ref().contains("Loading"),
-            "Placeholder label must contain 'Loading'"
-        );
-    }
-
-    #[test]
-    fn metrics_folder_appears_when_capability_present() {
-        use datatab_core::{DbSchemaInfo, DriverCapabilities, SchemaNodeId};
-
-        let profile_id = Uuid::new_v4();
-        let db_schema = DbSchemaInfo {
-            name: "default".to_string(),
-            tables: vec![],
-            views: vec![],
-            custom_types: None,
-        };
-        let capabilities = DriverCapabilities::METRIC_CATALOG;
-        let connected = make_connected_profile(profile_id, capabilities);
-        let metric_fetch_errors = HashMap::new();
-        let sources = super::FolderSources {
-            profile_id,
-            connected: &connected,
-            capabilities,
-            connection_category: datatab_core::DatabaseCategory::Document,
-            metric_cache: None,
-            metric_fetch_errors: &metric_fetch_errors,
-        };
-
-        let content = super::object_folder::folder_content(
-            &sources,
-            datatab_core::ObjectFolder::Collections,
-            "default",
-            &db_schema.tables,
-        );
-
-        let metrics_folder = content.iter().find(|item| {
-            item.id
-                .as_ref()
-                .parse::<SchemaNodeId>()
-                .ok()
-                .is_some_and(|id| matches!(id, SchemaNodeId::MetricsFolder { .. }))
-        });
-        assert!(
-            metrics_folder.is_some(),
-            "Metrics folder must appear when METRIC_CATALOG capability is set"
-        );
-        let folder = metrics_folder.unwrap();
-        assert_eq!(folder.label.as_ref(), crate::labels::metrics_folder_label());
-        assert!(!folder.is_expanded());
-    }
-
-    #[test]
-    fn metrics_folder_absent_without_capability() {
-        use datatab_core::{DbSchemaInfo, DriverCapabilities, SchemaNodeId};
-
-        let profile_id = Uuid::new_v4();
-        let db_schema = DbSchemaInfo {
-            name: "default".to_string(),
-            tables: vec![],
-            views: vec![],
-            custom_types: None,
-        };
-        let capabilities = DriverCapabilities::empty();
-        let connected = make_connected_profile(profile_id, capabilities);
-        let metric_fetch_errors = HashMap::new();
-        let sources = super::FolderSources {
-            profile_id,
-            connected: &connected,
-            capabilities,
-            connection_category: datatab_core::DatabaseCategory::Document,
-            metric_cache: None,
-            metric_fetch_errors: &metric_fetch_errors,
-        };
-
-        let content = super::object_folder::folder_content(
-            &sources,
-            datatab_core::ObjectFolder::Collections,
-            "default",
-            &db_schema.tables,
-        );
-
-        let has_metrics_folder = content.iter().any(|item| {
-            item.id
-                .as_ref()
-                .parse::<SchemaNodeId>()
-                .ok()
-                .is_some_and(|id| matches!(id, SchemaNodeId::MetricsFolder { .. }))
-        });
-        assert!(
-            !has_metrics_folder,
-            "Metrics folder must not appear when METRIC_CATALOG capability is absent"
-        );
-    }
 
     #[test]
     fn collection_item_builds_default_field_and_index_sections() {
@@ -3505,7 +3010,6 @@ mod tests {
                 pseudo_columns: Box::default(),
             },
             &Default::default(),
-            &Default::default(),
         );
 
         assert_eq!(item.label.as_ref(), "/aws/lambda/app");
@@ -3521,84 +3025,112 @@ mod tests {
     }
 
     #[test]
-    fn event_stream_collections_are_leaves_regardless_of_driver_child_items() {
-        // Event-stream collections are now leaves in the tree; their streams
-        // are reached exclusively through the picker modal so the row never
-        // shows an expand chevron.
+    fn reserved_event_stream_collections_show_fields_and_indexes_with_legacy_child_items() {
         let item = Sidebar::build_collection_item(
             Uuid::new_v4(),
             "logs",
             &TableInfo {
-                name: "/aws/lambda/app".to_string(),
+                name: "events".to_string(),
                 schema: None,
                 columns: None,
                 indexes: None,
                 foreign_keys: None,
                 constraints: None,
                 sample_fields: Some(vec![FieldInfo {
-                    name: "2026/04/25/[$LATEST]abc".to_string(),
+                    name: "message".to_string(),
                     common_type: "text".to_string(),
                     occurrence_rate: None,
                     nested_fields: None,
                 }]),
-                presentation: CollectionPresentation::EventStream,
+                presentation: CollectionPresentation::ReservedEventStream,
                 child_items: Some(vec![CollectionChildInfo {
-                    id: "stream-1".to_string(),
-                    label: "2026/04/25/[$LATEST]abc".to_string(),
-                    last_event_ts_ms: Some(1_776_777_600_000),
-                    presentation: CollectionPresentation::EventStream,
+                    id: "legacy-child".to_string(),
+                    label: "Legacy child".to_string(),
+                    last_event_ts_ms: Some(1),
+                    presentation: CollectionPresentation::ReservedEventStream,
                 }]),
                 storage_hints: None,
                 pseudo_columns: Box::default(),
             },
             &Default::default(),
-            &Default::default(),
         );
 
-        assert!(item.children.is_empty());
+        assert_eq!(
+            item.children.len(),
+            2,
+            "reserved presentation uses normal grid folders"
+        );
+        let fields = item.children.first().expect("fields folder");
+        assert_eq!(fields.label.as_ref(), crate::labels::fields_folder_label(1));
+        assert_eq!(fields.children.len(), 1);
+        assert_eq!(
+            fields
+                .children
+                .first()
+                .expect("sample field")
+                .label
+                .as_ref(),
+            "message: text"
+        );
+        let indexes = item.children.get(1).expect("indexes folder");
+        assert_eq!(
+            indexes.label.as_ref(),
+            crate::labels::indexes_folder_label(0)
+        );
+        assert!(indexes.children.is_empty());
     }
 
     #[test]
-    fn event_stream_collections_stay_leaves_even_with_pending_pagination() {
-        // The presence of a `next_page_token` from the driver must not
-        // promote an event-stream collection to an expandable folder.
+    fn reserved_event_stream_collections_use_cached_fields_and_indexes() {
         let profile_id = Uuid::new_v4();
-        let collection = "/aws/lambda/app".to_string();
-        let mut child_cache = HashMap::new();
-        child_cache.insert(
-            ("logs".to_string(), collection.clone()),
-            CollectionChildrenCache {
-                items: vec![CollectionChildInfo {
-                    id: "stream-1".to_string(),
-                    label: "stream-1".to_string(),
-                    last_event_ts_ms: Some(1),
-                    presentation: CollectionPresentation::EventStream,
-                }],
-                next_page_token: Some("next".to_string()),
+        let mut collection = relational_table("events", Some("logs"));
+        collection.presentation = CollectionPresentation::ReservedEventStream;
+        let mut details = collection.clone();
+        details.sample_fields = Some(vec![]);
+        details.indexes = Some(datatab_core::IndexData::Document(vec![
+            datatab_core::CollectionIndexInfo {
+                name: "message_index".to_string(),
+                keys: vec![(
+                    "message".to_string(),
+                    datatab_core::IndexDirection::Ascending,
+                )],
+                is_unique: false,
+                is_sparse: false,
+                expire_after_seconds: None,
             },
-        );
+        ]));
+        let details_cache = HashMap::from([(
+            (
+                "logs".to_string(),
+                Some("logs".to_string()),
+                "events".to_string(),
+            ),
+            details,
+        )]);
 
-        let item = Sidebar::build_collection_item(
-            profile_id,
-            "logs",
-            &TableInfo {
-                name: collection.clone(),
-                schema: None,
-                columns: None,
-                indexes: None,
-                foreign_keys: None,
-                constraints: None,
-                sample_fields: None,
-                presentation: CollectionPresentation::EventStream,
-                child_items: None,
-                storage_hints: None,
-                pseudo_columns: Box::default(),
-            },
-            &Default::default(),
-            &child_cache,
-        );
+        let item = Sidebar::build_collection_item(profile_id, "logs", &collection, &details_cache);
 
-        assert!(item.children.is_empty());
+        assert_eq!(
+            item.children.len(),
+            2,
+            "reserved presentation uses normal grid folders"
+        );
+        let fields = item.children.first().expect("fields folder");
+        assert_eq!(fields.label.as_ref(), crate::labels::fields_folder_label(0));
+        let indexes = item.children.get(1).expect("indexes folder");
+        assert_eq!(
+            indexes.label.as_ref(),
+            crate::labels::indexes_folder_label(1)
+        );
+        assert_eq!(indexes.children.len(), 1);
+        assert!(
+            indexes
+                .children
+                .first()
+                .expect("cached index")
+                .label
+                .contains("message_index")
+        );
     }
 
     fn time_series_folder_content(
@@ -3608,14 +3140,10 @@ mod tests {
     ) -> Vec<TreeItem> {
         let connected =
             make_connected_profile(profile_id, datatab_core::DriverCapabilities::empty());
-        let metric_fetch_errors = HashMap::new();
         let sources = super::FolderSources {
             profile_id,
             connected: &connected,
-            capabilities: datatab_core::DriverCapabilities::empty(),
             connection_category: datatab_core::DatabaseCategory::TimeSeries,
-            metric_cache: None,
-            metric_fetch_errors: &metric_fetch_errors,
         };
 
         super::object_folder::folder_content(
@@ -3743,15 +3271,10 @@ mod tests {
                 custom_types: None,
             },
         );
-        let metric_cache = datatab_app::MetricCatalogCache::new();
-        let metric_fetch_errors = HashMap::new();
         let sources = super::FolderSources {
             profile_id,
             connected: &connected,
-            capabilities: DriverCapabilities::empty(),
             connection_category: DatabaseCategory::TimeSeries,
-            metric_cache: Some(&metric_cache),
-            metric_fetch_errors: &metric_fetch_errors,
         };
 
         let resolve = |db_name: &str, is_current: bool| {
@@ -3929,10 +3452,9 @@ mod tests {
         );
     }
 
-    const C2_TREE_KEYS: [&str; 4] = [
+    const C2_TREE_KEYS: [&str; 3] = [
         "sidebar.tree.folder.instance_metrics",
         "sidebar.tree.folder.instance_inspectors",
-        "sidebar.tree.folder.metrics",
         "sidebar.tree.node.instance_overview",
     ];
 
@@ -3951,126 +3473,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_remote_dashboards_folder_item_falls_back_to_translated_label() {
-        let (state, profile_id) = make_state_with_profile();
-        let item =
-            Sidebar::build_remote_dashboards_folder_item(profile_id, &state, &HashMap::new());
-        assert_eq!(
-            item.label.as_ref(),
-            crate::labels::dashboards_folder_label()
-        );
-    }
-
-    #[test]
-    fn test_build_remote_dashboards_folder_item_appends_cached_count() {
-        let (state, profile_id) = make_state_with_profile();
-        state.remote_dashboard_cache().store(
-            profile_id,
-            vec![
-                datatab_core::DashboardRef {
-                    name: "prod".to_string(),
-                    last_modified: None,
-                },
-                datatab_core::DashboardRef {
-                    name: "staging".to_string(),
-                    last_modified: None,
-                },
-            ],
-        );
-
-        let item =
-            Sidebar::build_remote_dashboards_folder_item(profile_id, &state, &HashMap::new());
-        assert_eq!(
-            item.label.as_ref(),
-            crate::labels::remote_dashboards_count_label(
-                &crate::labels::dashboards_folder_label(),
-                2
-            )
-        );
-    }
-
-    #[test]
-    fn test_remote_dashboard_children_show_loading_on_cache_miss() {
-        let (state, profile_id) = make_state_with_profile();
-        let folder_id =
-            datatab_core::SchemaNodeId::RemoteDashboardsFolder { profile_id }.to_string();
-        let errors = HashMap::new();
-
-        let children =
-            Sidebar::build_remote_dashboard_children(profile_id, &state, &folder_id, &errors);
-
-        assert_eq!(children.len(), 1);
-        assert_eq!(
-            children[0].label.as_ref(),
-            datatab_i18n::t!("sidebar.tree.status.loading")
-        );
-    }
-
-    #[test]
-    fn test_remote_dashboard_children_show_error_when_recorded() {
-        let (state, profile_id) = make_state_with_profile();
-        let folder_id =
-            datatab_core::SchemaNodeId::RemoteDashboardsFolder { profile_id }.to_string();
-        let mut errors = HashMap::new();
-        errors.insert(folder_id.clone(), "access denied".to_string());
-
-        let children =
-            Sidebar::build_remote_dashboard_children(profile_id, &state, &folder_id, &errors);
-
-        assert_eq!(children.len(), 1);
-        assert_eq!(
-            children[0].label.as_ref(),
-            crate::labels::remote_dashboards_error_label("access denied")
-        );
-    }
-
-    #[test]
-    fn test_remote_dashboard_children_show_placeholder_when_listing_is_empty() {
-        let (state, profile_id) = make_state_with_profile();
-        state.remote_dashboard_cache().store(profile_id, Vec::new());
-
-        let folder_id =
-            datatab_core::SchemaNodeId::RemoteDashboardsFolder { profile_id }.to_string();
-        let errors = HashMap::new();
-        let children =
-            Sidebar::build_remote_dashboard_children(profile_id, &state, &folder_id, &errors);
-
-        assert_eq!(children.len(), 1);
-        assert_eq!(
-            children[0].label.as_ref(),
-            crate::labels::remote_dashboards_empty_label()
-        );
-    }
-
-    #[test]
-    fn test_remote_dashboard_children_list_items_when_cached() {
-        let (state, profile_id) = make_state_with_profile();
-        state.remote_dashboard_cache().store(
-            profile_id,
-            vec![
-                datatab_core::DashboardRef {
-                    name: "prod".to_string(),
-                    last_modified: None,
-                },
-                datatab_core::DashboardRef {
-                    name: "staging".to_string(),
-                    last_modified: None,
-                },
-            ],
-        );
-
-        let folder_id =
-            datatab_core::SchemaNodeId::RemoteDashboardsFolder { profile_id }.to_string();
-        let errors = HashMap::new();
-        let children =
-            Sidebar::build_remote_dashboard_children(profile_id, &state, &folder_id, &errors);
-
-        assert_eq!(children.len(), 2);
-        assert_eq!(children[0].label.as_ref(), "prod");
-        assert!(children[0].id.as_ref().starts_with("RDBI"));
-    }
-
-    #[test]
     fn test_build_dashboards_folder_empty_state_shows_placeholder() {
         let (state, profile_id) = make_state_with_profile();
         let children = Sidebar::build_dashboard_children(profile_id, &state);
@@ -4081,7 +3483,7 @@ mod tests {
         );
         assert_eq!(
             children[0].label.as_ref(),
-            crate::labels::no_dashboards_yet_label(false)
+            crate::labels::no_dashboards_yet_label()
         );
     }
 
@@ -4316,7 +3718,6 @@ mod tests {
             read_only_reason: None,
             database_schemas: HashMap::new(),
             table_details: HashMap::new(),
-            collection_children: HashMap::new(),
             schema_types: HashMap::new(),
             schema_columns: HashMap::new(),
             schema_indexes: HashMap::new(),
@@ -4453,9 +3854,7 @@ mod tests {
                 &state,
                 &HashMap::new(),
                 &HashMap::new(),
-                &HashMap::new(),
                 &crate::root_sections::RootSectionCache::default(),
-                &HashMap::new(),
             )
         };
 
@@ -4519,9 +3918,7 @@ mod tests {
             &state,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
             &crate::root_sections::RootSectionCache::default(),
-            &HashMap::new(),
         );
         let ids: Vec<_> = item
             .children
@@ -4610,9 +4007,7 @@ mod tests {
                 &state,
                 &HashMap::new(),
                 &HashMap::new(),
-                &HashMap::new(),
                 &crate::root_sections::RootSectionCache::default(),
-                &HashMap::new(),
             )
             .children
             .iter()
@@ -5122,30 +4517,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_empty_hint_includes_import_when_driver_has_dashboard_import_capability() {
-        let (mut state, profile_id) = make_state_with_profile();
-
-        let connected = make_connected_profile(
-            profile_id,
-            datatab_core::DriverCapabilities::DASHBOARD_IMPORT,
-        );
-        state.connections_mut().insert(profile_id, connected);
-
-        let children = Sidebar::build_dashboard_children(profile_id, &state);
-        assert_eq!(
-            children.len(),
-            1,
-            "empty state must produce one placeholder"
-        );
-        assert_eq!(
-            children[0].label.as_ref(),
-            crate::labels::no_dashboards_yet_label(true),
-            "hint must use the import-capable variant when driver has DASHBOARD_IMPORT"
-        );
-    }
-
-    #[test]
-    fn dashboard_empty_hint_excludes_import_when_driver_lacks_dashboard_import_capability() {
+    fn empty_dashboard_shows_create_hint() {
         let (state, profile_id) = make_state_with_profile();
         // No connected profile inserted — connection map stays empty.
 
@@ -5157,8 +4529,8 @@ mod tests {
         );
         assert_eq!(
             children[0].label.as_ref(),
-            crate::labels::no_dashboards_yet_label(false),
-            "hint must use the non-import variant without DASHBOARD_IMPORT"
+            crate::labels::no_dashboards_yet_label(),
+            "empty dashboard keeps its creation hint"
         );
     }
 
@@ -5297,6 +4669,7 @@ mod tests {
                 display_name: "Cache hit ratio".to_string(),
                 group: "Cache".to_string(),
                 unit: InstanceMetricUnit::Percent,
+                kind: datatab_core::InstanceMetricKind::Gauge,
                 description: None,
                 default_refresh_secs: 15,
             },
@@ -5305,6 +4678,7 @@ mod tests {
                 display_name: "Commits / sec".to_string(),
                 group: "Throughput".to_string(),
                 unit: InstanceMetricUnit::PerSecond,
+                kind: datatab_core::InstanceMetricKind::Gauge,
                 description: None,
                 default_refresh_secs: 10,
             },
@@ -5356,6 +4730,7 @@ mod tests {
             display_name: "TPS".to_string(),
             group: "Throughput".to_string(),
             unit: InstanceMetricUnit::PerSecond,
+            kind: datatab_core::InstanceMetricKind::Gauge,
             description: None,
             default_refresh_secs: 15,
         }];

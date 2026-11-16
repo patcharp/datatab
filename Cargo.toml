@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/datatab",
+    "crates/datatab_cli",
     "crates/datatab_app",
     "crates/datatab_ui",
     "crates/datatab_ui_base",
@@ -21,8 +22,6 @@ members = [
     "crates/datatab_driver_mysql",
     "crates/datatab_driver_mongodb",
     "crates/datatab_driver_redis",
-    "crates/datatab_driver_dynamodb",
-    "crates/datatab_driver_cloudwatch",
     "crates/datatab_driver_mssql",
     "crates/datatab_driver_redshift",
     "crates/datatab_driver_clickhouse",
@@ -38,8 +37,6 @@ members = [
     "crates/datatab_parquet",
     "crates/datatab_spreadsheet",
     "crates/datatab_driver_host",
-    "crates/datatab_aws",
-    "crates/datatab_ssm",
     "crates/datatab_mcp",
     "crates/datatab_mcp_server",
     "crates/datatab_policy",
@@ -49,8 +46,6 @@ members = [
     "crates/datatab_schema_viz",
     "crates/datatab_driver_influxdb",
     "crates/datatab_portability",
-    "crates/datatab_driver_s3",
-    "crates/datatab_driver_aws_secrets",
     "crates/datatab_i18n",
     # Upstream themixednuts/gpui-mcp crates for UI automation; see vendor/gpui-mcp/VENDOR.md.
     "vendor/gpui-mcp/crates/gpui-mcp",
@@ -64,7 +59,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 rust-version = "1.88"
-version = "0.1.2"
+version = "0.1.3"
 authors = ["PCPLab <me@pcplab.me>"]
 description = "A fast, keyboard-first database client"
 repository = "https://github.com/patcharp/datatab"
@@ -73,6 +68,8 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 datatab = { path = "crates/datatab" }
+datatab_cli = { path = "crates/datatab_cli" }
+clap = { version = "4.6.7", features = ["derive"] }
 datatab_core = { path = "crates/datatab_core" }
 datatab_lua = { path = "crates/datatab_lua" }
 datatab_js = { path = "crates/datatab_js" }
@@ -82,8 +79,6 @@ datatab_driver_postgres = { path = "crates/datatab_driver_postgres" }
 datatab_driver_mysql = { path = "crates/datatab_driver_mysql" }
 datatab_driver_mongodb = { path = "crates/datatab_driver_mongodb" }
 datatab_driver_redis = { path = "crates/datatab_driver_redis" }
-datatab_driver_dynamodb = { path = "crates/datatab_driver_dynamodb" }
-datatab_driver_cloudwatch = { path = "crates/datatab_driver_cloudwatch" }
 datatab_driver_mssql = { path = "crates/datatab_driver_mssql" }
 datatab_driver_redshift = { path = "crates/datatab_driver_redshift" }
 datatab_driver_clickhouse = { path = "crates/datatab_driver_clickhouse" }
@@ -98,8 +93,6 @@ datatab_parquet = { path = "crates/datatab_parquet" }
 datatab_spreadsheet = { path = "crates/datatab_spreadsheet" }
 datatab_ipc = { path = "crates/datatab_ipc" }
 datatab_driver_ipc = { path = "crates/datatab_driver_ipc" }
-datatab_aws = { path = "crates/datatab_aws" }
-datatab_ssm = { path = "crates/datatab_ssm" }
 datatab_mcp = { path = "crates/datatab_mcp" }
 datatab_mcp_server = { path = "crates/datatab_mcp_server" }
 datatab_policy = { path = "crates/datatab_policy" }
@@ -109,8 +102,6 @@ datatab_storage = { path = "crates/datatab_storage" }
 datatab_schema_viz = { path = "crates/datatab_schema_viz" }
 datatab_driver_influxdb = { path = "crates/datatab_driver_influxdb" }
 datatab_portability = { path = "crates/datatab_portability" }
-datatab_driver_s3 = { path = "crates/datatab_driver_s3" }
-datatab_driver_aws_secrets = { path = "crates/datatab_driver_aws_secrets" }
 datatab_app = { path = "crates/datatab_app" }
 datatab_components = { path = "crates/datatab_components" }
 bolt = { path = "crates/bolt" }

@@ -11,7 +11,7 @@ window is organized into sections down the left side.
 | [General](#general) | App-wide behavior: theme, startup, refresh, query safety. |
 | [Audit](#audit) | What the audit log captures and how long it's kept. |
 | [Keybindings](#keybindings) | Browse and change the keymap. |
-| [Auth Profiles](#auth-profiles-proxies-ssh-tunnels) | AWS SSO / shared-credentials profiles. |
+| [Auth Profiles](#auth-profiles-proxies-ssh-tunnels) | Provider-driven login profiles from RPC auth providers. |
 | [Proxies](#auth-profiles-proxies-ssh-tunnels) | SOCKS5 / HTTP proxy profiles. |
 | [SSH Tunnels](#auth-profiles-proxies-ssh-tunnels) | Reusable SSH tunnel profiles. |
 | [Services](#services-rpc) | External RPC drivers and auth providers. |
@@ -166,7 +166,7 @@ still runs.
 
 The limit reaches only a driver whose `execute` enforces it: PostgreSQL,
 MySQL/MariaDB, SQL Server, SQLite, DuckDB, MongoDB, Redis, Turso, InfluxDB,
-ClickHouse, Redshift, CloudWatch and DynamoDB. Some of them still read the
+ClickHouse and Redshift. Some of them still read the
 whole response before cutting it, and Redis bounds only replies shown as a
 table; each driver's page lists its limits. External RPC drivers receive the
 limit when DataTab and the driver both speak driver RPC 1.6 or newer and the
@@ -290,11 +290,11 @@ default binding a later release removes is ignored.
 ## Auth Profiles, Proxies, SSH Tunnels
 
 These three sections manage the reusable profiles you then select per connection
-on the Access tab. They're documented in full — fields, AWS SSO flow, no-proxy
+on the Access tab. They're documented in full — fields, login flow, no-proxy
 rules, SSH auth methods — in
 [Connecting to a Database → Advanced Setup](CONNECTIONS.md):
 
-- [Auth Profiles](CONNECTIONS.md#auth-profiles-aws-sso-and-shared-credentials)
+- [Auth Profiles](CONNECTIONS.md#auth-profiles)
 - [Proxies](CONNECTIONS.md#proxies)
 - [SSH Tunnels](CONNECTIONS.md#ssh-tunnels)
 

@@ -228,7 +228,7 @@ pub static MONGODB_METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverM
         },
         datatab_core::SslModeOption {
             id: "on",
-            label: "on",
+            label: "on (encrypted, server certificate not verified)",
         },
         datatab_core::SslModeOption {
             id: "verify",
@@ -238,6 +238,8 @@ pub static MONGODB_METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverM
     ssl_cert_fields: Some(datatab_core::SslCertFields {
         root_cert: true,
         client_cert: true,
+        root_cert_modes: Some(&["verify"]),
+        client_cert_modes: Some(&["verify"]),
     }),
     classification_override: None,
     default_chunk_size: None,
@@ -553,28 +555,7 @@ impl DbDriver for MongoDriver {
         // because MongoDB's `tlsCertificateKeyFile` accepts only one file. The
         // resulting guard is moved into the connection so the temp file outlives
         // every TLS handshake performed by the underlying client.
-        let (ssl_params, pem_guard) = if config.use_uri {
-            (String::new(), None)
-        } else {
-            let pem_guard = build_combined_pem_if_needed(
-                config.ssl_client_cert_path.as_deref(),
-                config.ssl_client_key_path.as_deref(),
-            )?;
-
-            let effective_client_cert_path: Option<String> = match &pem_guard {
-                Some(guard) => Some(guard.path().to_string_lossy().into_owned()),
-                None => config.ssl_client_cert_path.clone(),
-            };
-
-            let params = mongo_ssl_mode_to_uri_params(
-                config.ssl_mode.as_deref(),
-                config.ssl_root_cert_path.as_deref(),
-                effective_client_cert_path.as_deref(),
-            )
-            .map_err(DbError::InvalidProfile)?;
-
-            (params, pem_guard)
-        };
+        let (ssl_params, pem_guard) = prepare_mongo_tls(&config)?;
 
         if config.use_uri {
             self.connect_with_uri(
@@ -787,6 +768,33 @@ impl MongoDriver {
             _tls_pem_guard: pem_guard,
         }))
     }
+}
+
+fn prepare_mongo_tls(
+    config: &ExtractedMongoConfig,
+) -> Result<(String, Option<CombinedPemFile>), DbError> {
+    if config.use_uri {
+        return Ok((String::new(), None));
+    }
+    let pem_guard = if config.ssl_mode.as_deref() == Some("verify") {
+        build_combined_pem_if_needed(
+            config.ssl_client_cert_path.as_deref(),
+            config.ssl_client_key_path.as_deref(),
+        )?
+    } else {
+        None
+    };
+    let effective_client_cert_path = match &pem_guard {
+        Some(guard) => Some(guard.path().to_string_lossy().into_owned()),
+        None => config.ssl_client_cert_path.clone(),
+    };
+    let params = mongo_ssl_mode_to_uri_params(
+        config.ssl_mode.as_deref(),
+        config.ssl_root_cert_path.as_deref(),
+        effective_client_cert_path.as_deref(),
+    )
+    .map_err(DbError::InvalidProfile)?;
+    Ok((params, pem_guard))
 }
 
 /// Returns a `CombinedPemFile` guard when the user has supplied BOTH the
@@ -4548,6 +4556,8 @@ fn bson_type_name(value: &Bson) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod tls_metadata;
+
     use super::*;
     use crate::query_parser::parse_query;
     use datatab_core::{

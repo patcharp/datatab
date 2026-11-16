@@ -125,6 +125,9 @@ impl IsolationLevel {
 ///
 /// The actual icon paths are resolved by the UI layer.
 /// This allows the core to reference icons without depending on asset paths.
+///
+/// `DriverMetadata` carries the icon over the driver RPC wire by position
+/// (postcard), so a retired icon keeps its position as a `Reserved*` slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Icon {
     // Database brands
@@ -134,9 +137,17 @@ pub enum Icon {
     Sqlite,
     Mongodb,
     Redis,
-    Dynamodb,
+    /// Holds postcard wire index 6 (formerly the DynamoDB icon, removed in
+    /// #311) so the icons after it keep their indices in the
+    /// `DriverMetadata` that driver RPC peers send. It draws as
+    /// [`Self::Database`].
+    #[doc(hidden)]
+    ReservedDynamodb,
     Redshift,
-    S3,
+    /// Holds postcard wire index 8 (formerly the Amazon S3 icon), like
+    /// [`Self::ReservedDynamodb`].
+    #[doc(hidden)]
+    ReservedS3,
     Clickhouse,
     Turso,
     Duckdb,
@@ -184,17 +195,19 @@ pub enum DatabaseCategory {
     #[doc(hidden)]
     ReservedWideColumn,
 
-    /// Log streaming services with log groups and queryable log events.
-    /// Examples: AWS CloudWatch Logs
-    LogStream,
+    /// Holds postcard wire index 6 (formerly the log-stream category, removed
+    /// in #311), like [`Self::ReservedGraph`].
+    #[doc(hidden)]
+    ReservedLogStream,
 
     /// Object storage services with buckets and key-addressed binary objects.
-    /// Examples: AWS S3, Cloudflare R2, MinIO
+    /// No built-in driver uses this category; an RPC driver can.
     ObjectStorage,
 
-    /// Secret managers with named, versioned secret values.
-    /// Examples: AWS Secrets Manager, AWS Systems Manager Parameter Store
-    SecretStore,
+    /// Holds postcard wire index 8 (formerly the secret-store category), like
+    /// [`Self::ReservedGraph`].
+    #[doc(hidden)]
+    ReservedSecretStore,
 }
 
 impl DatabaseCategory {
@@ -204,10 +217,11 @@ impl DatabaseCategory {
             DatabaseCategory::Document => "Document",
             DatabaseCategory::KeyValue => "Key-Value",
             DatabaseCategory::TimeSeries => "Time Series",
-            DatabaseCategory::LogStream => "Log Stream",
             DatabaseCategory::ObjectStorage => "Object Storage",
-            DatabaseCategory::SecretStore => "Secret Store",
-            DatabaseCategory::ReservedGraph | DatabaseCategory::ReservedWideColumn => "Unknown",
+            DatabaseCategory::ReservedGraph
+            | DatabaseCategory::ReservedWideColumn
+            | DatabaseCategory::ReservedLogStream
+            | DatabaseCategory::ReservedSecretStore => "Unknown",
         }
     }
 
@@ -219,10 +233,11 @@ impl DatabaseCategory {
             DatabaseCategory::Document => "Collections",
             DatabaseCategory::KeyValue => "Keys",
             DatabaseCategory::TimeSeries => "Measurements",
-            DatabaseCategory::LogStream => "Log Groups",
             DatabaseCategory::ObjectStorage => "Buckets",
-            DatabaseCategory::SecretStore => "Stores",
-            DatabaseCategory::ReservedGraph | DatabaseCategory::ReservedWideColumn => "Objects",
+            DatabaseCategory::ReservedGraph
+            | DatabaseCategory::ReservedWideColumn
+            | DatabaseCategory::ReservedLogStream
+            | DatabaseCategory::ReservedSecretStore => "Objects",
         }
     }
 
@@ -233,10 +248,11 @@ impl DatabaseCategory {
             DatabaseCategory::Document => "Collection",
             DatabaseCategory::KeyValue => "Key",
             DatabaseCategory::TimeSeries => "Measurement",
-            DatabaseCategory::LogStream => "Log Group",
             DatabaseCategory::ObjectStorage => "Bucket",
-            DatabaseCategory::SecretStore => "Store",
-            DatabaseCategory::ReservedGraph | DatabaseCategory::ReservedWideColumn => "Object",
+            DatabaseCategory::ReservedGraph
+            | DatabaseCategory::ReservedWideColumn
+            | DatabaseCategory::ReservedLogStream
+            | DatabaseCategory::ReservedSecretStore => "Object",
         }
     }
 
@@ -247,10 +263,11 @@ impl DatabaseCategory {
             DatabaseCategory::Document => "Documents",
             DatabaseCategory::KeyValue => "Values",
             DatabaseCategory::TimeSeries => "Points",
-            DatabaseCategory::LogStream => "Log events",
             DatabaseCategory::ObjectStorage => "Objects",
-            DatabaseCategory::SecretStore => "Secrets",
-            DatabaseCategory::ReservedGraph | DatabaseCategory::ReservedWideColumn => "Records",
+            DatabaseCategory::ReservedGraph
+            | DatabaseCategory::ReservedWideColumn
+            | DatabaseCategory::ReservedLogStream
+            | DatabaseCategory::ReservedSecretStore => "Records",
         }
     }
 
@@ -261,23 +278,12 @@ impl DatabaseCategory {
             DatabaseCategory::Document => "Document",
             DatabaseCategory::KeyValue => "Value",
             DatabaseCategory::TimeSeries => "Point",
-            DatabaseCategory::LogStream => "Log event",
             DatabaseCategory::ObjectStorage => "Object",
-            DatabaseCategory::SecretStore => "Secret",
-            DatabaseCategory::ReservedGraph | DatabaseCategory::ReservedWideColumn => "Record",
+            DatabaseCategory::ReservedGraph
+            | DatabaseCategory::ReservedWideColumn
+            | DatabaseCategory::ReservedLogStream
+            | DatabaseCategory::ReservedSecretStore => "Record",
         }
-    }
-
-    /// Whether the sidebar should expand the primary container folder by
-    /// default when a profile is freshly connected.
-    ///
-    /// LogStream connections (CloudWatch) routinely surface hundreds of log
-    /// groups per account/region; pre-expanding that folder buries the rest
-    /// of the tree (Dashboards, Saved Charts, Metrics) below a long list.
-    /// Other categories typically have a handful of tables/collections where
-    /// auto-expand is the productive default.
-    pub fn default_expand_container(&self) -> bool {
-        !matches!(self, DatabaseCategory::LogStream)
     }
 
     /// Bitmask of capabilities the UI should display for this category.
@@ -322,14 +328,12 @@ impl DatabaseCategory {
                 )
             }
 
-            DatabaseCategory::Document | DatabaseCategory::LogStream => {
-                DriverCapabilities::from_bits_truncate(
-                    DriverCapabilities::INDEXES.bits()
-                        | DriverCapabilities::NESTED_DOCUMENTS.bits()
-                        | DriverCapabilities::ARRAYS.bits()
-                        | DriverCapabilities::AGGREGATION.bits(),
-                )
-            }
+            DatabaseCategory::Document => DriverCapabilities::from_bits_truncate(
+                DriverCapabilities::INDEXES.bits()
+                    | DriverCapabilities::NESTED_DOCUMENTS.bits()
+                    | DriverCapabilities::ARRAYS.bits()
+                    | DriverCapabilities::AGGREGATION.bits(),
+            ),
 
             DatabaseCategory::KeyValue => DriverCapabilities::from_bits_truncate(
                 DriverCapabilities::KV_SCAN.bits()
@@ -347,16 +351,15 @@ impl DatabaseCategory {
                     | DriverCapabilities::KV_STREAM_DELETE.bits(),
             ),
 
-            DatabaseCategory::ReservedGraph | DatabaseCategory::ReservedWideColumn => {
-                DriverCapabilities::empty()
-            }
+            DatabaseCategory::ReservedGraph
+            | DatabaseCategory::ReservedWideColumn
+            | DatabaseCategory::ReservedLogStream
+            | DatabaseCategory::ReservedSecretStore => DriverCapabilities::empty(),
 
             DatabaseCategory::ObjectStorage => DriverCapabilities::from_bits_truncate(
                 DriverCapabilities::OBJECT_STORAGE.bits()
                     | DriverCapabilities::OBJECT_PREFIX_DELETE.bits(),
             ),
-
-            DatabaseCategory::SecretStore => DriverCapabilities::SECRET_STORE,
         };
 
         common.union(category_specific)
@@ -576,30 +579,21 @@ bitflags! {
         /// a Routines folder for each schema.
         const ROUTINES = 1 << 47;
 
-        /// Driver can execute CloudWatch GetMetricData requests and return time-series
-        /// metric data as a `QueryResult`. The UI uses this flag to gate the metrics
-        /// chart entry point — no driver_id or category checks are needed.
-        const METRIC_SERIES = 1 << 49;
+        /// Retired in #311; stays defined because `DriverCapabilities` decodes with `from_bits`, and a peer that still sets the bit would otherwise decode to no capabilities.
+        #[doc(hidden)]
+        const RESERVED_METRIC_SERIES = 1 << 49;
 
-        /// Driver exposes a browsable metric catalog (namespaces + metrics +
-        /// dimensions) via the `MetricCatalog` trait accessor on `Connection`.
-        /// Independent from `METRIC_SERIES` — a driver MAY set one without the other.
-        const METRIC_CATALOG = 1 << 50;
+        /// Retired in #311; stays defined because `DriverCapabilities` decodes with `from_bits`, and a peer that still sets the bit would otherwise decode to no capabilities.
+        #[doc(hidden)]
+        const RESERVED_METRIC_CATALOG = 1 << 50;
 
-        /// Driver can import a dashboard from a JSON blob via the `DashboardImporter` seam.
-        ///
-        /// When set, the UI exposes an \"Import dashboard\" affordance that calls
-        /// `Connection::dashboard_importer()` to parse the JSON. The check is purely
-        /// capability-driven — no `driver_id` comparison is needed.
-        const DASHBOARD_IMPORT = 1 << 51;
+        /// Retired in #311; stays defined because `DriverCapabilities` decodes with `from_bits`, and a peer that still sets the bit would otherwise decode to no capabilities.
+        #[doc(hidden)]
+        const RESERVED_DASHBOARD_IMPORT = 1 << 51;
 
-        /// Driver implements the `DashboardSource` trait: it can list dashboards
-        /// from the upstream system and fetch a dashboard body on demand.
-        ///
-        /// When set, the UI lists the driver's dashboards in the sidebar and
-        /// opens them read-only. Gating flows exclusively through this
-        /// capability — no `driver_id` comparisons are allowed.
-        const DASHBOARD_SYNC = 1 << 52;
+        /// Retired in #311; stays defined because `DriverCapabilities` decodes with `from_bits`, and a peer that still sets the bit would otherwise decode to no capabilities.
+        #[doc(hidden)]
+        const RESERVED_DASHBOARD_SYNC = 1 << 52;
 
         /// Driver participates in DataTab's local chart-authoring flow: users
         /// commonly turn its query/metric results into `SavedChart`s and group
@@ -608,9 +602,7 @@ bitflags! {
         /// When set, the sidebar surfaces the per-profile `Dashboards` and
         /// `Saved Charts` folders. When unset, those folders are hidden so the
         /// driver's tree stays focused on its native browsing model. This is
-        /// independent of `DASHBOARD_SYNC` (upstream listing) and
-        /// `DASHBOARD_IMPORT` (JSON import). Gating flows exclusively through
-        /// this capability — no `driver_id` or `category` comparisons.
+        /// gated exclusively by this capability, without driver or category checks.
         const CHART_AUTHORING = 1 << 53;
 
         /// Driver can list and serve chartable operational metric series
@@ -671,19 +663,13 @@ bitflags! {
         /// limit only to drivers that advertise this.
         const REQUEST_ROW_LIMIT = 1 << 63;
 
-        /// Connection exposes one or more secret stores through
-        /// `Connection::secret_stores`. A driver whose connections return no
-        /// stores MUST NOT advertise this flag.
-        const SECRET_STORE = 1 << 64;
+        /// Retired in #311; stays defined because `DriverCapabilities` decodes with `from_bits`, and a peer that still sets the bit would otherwise decode to no capabilities.
+        #[doc(hidden)]
+        const RESERVED_SECRET_STORE = 1 << 64;
 
-        /// Connection reaches one cloud region, and the user can move it to
-        /// another one without editing the profile: `Connection::current_region`
-        /// reports the region in use, `Connection::available_regions` lists the
-        /// ones it can move to, and `DbDriver::with_region` builds the config
-        /// for the new one. Gates the region control in the documents that
-        /// browse cloud resources; a driver without a region MUST NOT
-        /// advertise this flag.
-        const REGION_SWITCH = 1 << 65;
+        /// Retired in #311; stays defined because `DriverCapabilities` decodes with `from_bits`, and a peer that still sets the bit would otherwise decode to no capabilities.
+        #[doc(hidden)]
+        const RESERVED_REGION_SWITCH = 1 << 65;
 
         /// Connection declares sidebar root sections through
         /// `Connection::root_section_source`. The sidebar renders them with
@@ -749,12 +735,18 @@ mod capability_bits_tests {
 
     #[test]
     fn secret_store_bit_value() {
-        assert_eq!(DriverCapabilities::SECRET_STORE.bits(), 1u128 << 64);
+        assert_eq!(
+            DriverCapabilities::RESERVED_SECRET_STORE.bits(),
+            1u128 << 64
+        );
     }
 
     #[test]
     fn region_switch_bit_value() {
-        assert_eq!(DriverCapabilities::REGION_SWITCH.bits(), 1u128 << 65);
+        assert_eq!(
+            DriverCapabilities::RESERVED_REGION_SWITCH.bits(),
+            1u128 << 65
+        );
     }
 
     #[test]
@@ -814,10 +806,10 @@ mod capability_bits_tests {
             DriverCapabilities::EDGE_PROPERTIES,
             DriverCapabilities::TRANSACTIONAL_DDL,
             DriverCapabilities::ROUTINES,
-            DriverCapabilities::METRIC_SERIES,
-            DriverCapabilities::METRIC_CATALOG,
-            DriverCapabilities::DASHBOARD_IMPORT,
-            DriverCapabilities::DASHBOARD_SYNC,
+            DriverCapabilities::RESERVED_METRIC_SERIES,
+            DriverCapabilities::RESERVED_METRIC_CATALOG,
+            DriverCapabilities::RESERVED_DASHBOARD_IMPORT,
+            DriverCapabilities::RESERVED_DASHBOARD_SYNC,
             DriverCapabilities::CHART_AUTHORING,
             DriverCapabilities::INSTANCE_METRICS,
             DriverCapabilities::INSTANCE_INSPECTOR,
@@ -829,8 +821,8 @@ mod capability_bits_tests {
             DriverCapabilities::SCRIPT_EXECUTION,
             DriverCapabilities::NATIVE_CONSOLE,
             DriverCapabilities::REQUEST_ROW_LIMIT,
-            DriverCapabilities::SECRET_STORE,
-            DriverCapabilities::REGION_SWITCH,
+            DriverCapabilities::RESERVED_SECRET_STORE,
+            DriverCapabilities::RESERVED_REGION_SWITCH,
             DriverCapabilities::ROOT_SECTIONS,
         ];
 
@@ -1012,14 +1004,21 @@ pub enum QueryLanguage {
     /// Standard SQL (with dialect variations).
     Sql,
 
-    /// CloudWatch Logs Insights query language.
-    CloudWatchLogsInsightsQl,
+    /// Holds postcard wire index 1 (formerly CloudWatch Logs Insights QL,
+    /// removed in #311) so the languages after it keep their indices in the
+    /// frames driver RPC peers send. It behaves like [`Self::Custom`].
+    #[doc(hidden)]
+    ReservedCloudWatchLogsInsightsQl,
 
-    /// OpenSearch Piped Processing Language.
-    OpenSearchPpl,
+    /// Holds postcard wire index 2 (formerly OpenSearch PPL), like
+    /// [`Self::ReservedCloudWatchLogsInsightsQl`].
+    #[doc(hidden)]
+    ReservedOpenSearchPpl,
 
-    /// OpenSearch SQL as exposed by CloudWatch Logs.
-    OpenSearchSql,
+    /// Holds postcard wire index 3 (formerly OpenSearch SQL), like
+    /// [`Self::ReservedCloudWatchLogsInsightsQl`].
+    #[doc(hidden)]
+    ReservedOpenSearchSql,
 
     /// MongoDB Query Language (find, aggregate, etc.).
     MongoQuery,
@@ -1061,8 +1060,6 @@ impl QueryLanguage {
         let ext = path.extension()?.to_str()?.to_lowercase();
         match ext.as_str() {
             "sql" => Some(Self::Sql),
-            "cwli" => Some(Self::CloudWatchLogsInsightsQl),
-            "ppl" => Some(Self::OpenSearchPpl),
             "js" | "mongodb" => Some(Self::MongoQuery),
             "redis" | "red" => Some(Self::RedisCommands),
             "cypher" | "cyp" => Some(Self::Cypher),
@@ -1081,9 +1078,6 @@ impl QueryLanguage {
     pub fn context_id(&self) -> &'static str {
         match self {
             Self::Sql => "sql",
-            Self::CloudWatchLogsInsightsQl => "cloudwatch_insights",
-            Self::OpenSearchPpl => "opensearch_ppl",
-            Self::OpenSearchSql => "opensearch_sql",
             Self::MongoQuery => "mongo",
             Self::RedisCommands => "redis",
             Self::Cypher => "cypher",
@@ -1093,16 +1087,17 @@ impl QueryLanguage {
             Self::Lua => "lua",
             Self::Python => "python",
             Self::Bash => "bash",
-            Self::Custom(_) => "custom",
+            Self::Custom(_)
+            | Self::ReservedCloudWatchLogsInsightsQl
+            | Self::ReservedOpenSearchPpl
+            | Self::ReservedOpenSearchSql => "custom",
         }
     }
 
     /// Default file extension for "Save As" dialogs.
     pub fn default_extension(&self) -> &'static str {
         match self {
-            Self::Sql | Self::OpenSearchSql | Self::Cql => "sql",
-            Self::CloudWatchLogsInsightsQl => "cwli",
-            Self::OpenSearchPpl => "ppl",
+            Self::Sql | Self::Cql => "sql",
             Self::MongoQuery => "js",
             Self::RedisCommands => "redis",
             Self::Cypher => "cypher",
@@ -1111,7 +1106,10 @@ impl QueryLanguage {
             Self::Lua => "lua",
             Self::Python => "py",
             Self::Bash => "sh",
-            Self::Custom(_) => "txt",
+            Self::Custom(_)
+            | Self::ReservedCloudWatchLogsInsightsQl
+            | Self::ReservedOpenSearchPpl
+            | Self::ReservedOpenSearchSql => "txt",
         }
     }
 
@@ -1119,9 +1117,6 @@ impl QueryLanguage {
     pub fn file_dialog_extensions(&self) -> &[&'static str] {
         match self {
             Self::Sql => &["sql"],
-            Self::CloudWatchLogsInsightsQl => &["cwli"],
-            Self::OpenSearchPpl => &["ppl"],
-            Self::OpenSearchSql => &["sql"],
             Self::MongoQuery => &["js", "mongodb"],
             Self::RedisCommands => &["redis", "red"],
             Self::Cypher => &["cypher", "cyp"],
@@ -1131,16 +1126,16 @@ impl QueryLanguage {
             Self::Lua => &["lua"],
             Self::Python => &["py"],
             Self::Bash => &["sh", "bash"],
-            Self::Custom(_) => &["txt"],
+            Self::Custom(_)
+            | Self::ReservedCloudWatchLogsInsightsQl
+            | Self::ReservedOpenSearchPpl
+            | Self::ReservedOpenSearchSql => &["txt"],
         }
     }
 
     pub fn display_name(&self) -> &str {
         match self {
             QueryLanguage::Sql => "SQL",
-            QueryLanguage::CloudWatchLogsInsightsQl => "CloudWatch Logs Insights QL",
-            QueryLanguage::OpenSearchPpl => "OpenSearch PPL",
-            QueryLanguage::OpenSearchSql => "OpenSearch SQL",
             QueryLanguage::MongoQuery => "MongoDB Query",
             QueryLanguage::RedisCommands => "Redis Commands",
             QueryLanguage::Cypher => "Cypher",
@@ -1151,6 +1146,9 @@ impl QueryLanguage {
             QueryLanguage::Python => "Python",
             QueryLanguage::Bash => "Bash",
             QueryLanguage::Custom(name) => name,
+            QueryLanguage::ReservedCloudWatchLogsInsightsQl
+            | QueryLanguage::ReservedOpenSearchPpl
+            | QueryLanguage::ReservedOpenSearchSql => "Unknown",
         }
     }
 
@@ -1158,9 +1156,6 @@ impl QueryLanguage {
     pub fn file_extension(&self) -> &'static str {
         match self {
             QueryLanguage::Sql => "sql",
-            QueryLanguage::CloudWatchLogsInsightsQl => "cwli",
-            QueryLanguage::OpenSearchPpl => "ppl",
-            QueryLanguage::OpenSearchSql => "sql",
             QueryLanguage::MongoQuery => "mongodb",
             QueryLanguage::RedisCommands => "redis",
             QueryLanguage::Cypher => "cypher",
@@ -1170,15 +1165,17 @@ impl QueryLanguage {
             QueryLanguage::Lua => "lua",
             QueryLanguage::Python => "py",
             QueryLanguage::Bash => "sh",
-            QueryLanguage::Custom(_) => "txt",
+            QueryLanguage::Custom(_)
+            | QueryLanguage::ReservedCloudWatchLogsInsightsQl
+            | QueryLanguage::ReservedOpenSearchPpl
+            | QueryLanguage::ReservedOpenSearchSql => "txt",
         }
     }
 
     /// Returns the syntax highlighting mode for code editors.
     pub fn editor_mode(&self) -> &'static str {
         match self {
-            QueryLanguage::Sql | QueryLanguage::OpenSearchSql | QueryLanguage::Cql => "sql",
-            QueryLanguage::CloudWatchLogsInsightsQl | QueryLanguage::OpenSearchPpl => "plaintext",
+            QueryLanguage::Sql | QueryLanguage::Cql => "sql",
             QueryLanguage::MongoQuery => "javascript",
             QueryLanguage::RedisCommands => "plaintext",
             QueryLanguage::Cypher => "cypher",
@@ -1187,7 +1184,10 @@ impl QueryLanguage {
             QueryLanguage::Lua => "lua",
             QueryLanguage::Python => "python",
             QueryLanguage::Bash => "bash",
-            QueryLanguage::Custom(_) => "plaintext",
+            QueryLanguage::Custom(_)
+            | QueryLanguage::ReservedCloudWatchLogsInsightsQl
+            | QueryLanguage::ReservedOpenSearchPpl
+            | QueryLanguage::ReservedOpenSearchSql => "plaintext",
         }
     }
 
@@ -1195,15 +1195,6 @@ impl QueryLanguage {
     pub fn placeholder(&self) -> &'static str {
         match self {
             QueryLanguage::Sql => "-- Enter SQL here…",
-            QueryLanguage::CloudWatchLogsInsightsQl => {
-                "fields @timestamp, @message | sort @timestamp desc | limit 100"
-            }
-            QueryLanguage::OpenSearchPpl => {
-                "source = logGroups(logGroupIdentifier: ['LogGroup']) | fields @timestamp, @message | head 100"
-            }
-            QueryLanguage::OpenSearchSql => {
-                "SELECT `@timestamp`, `@message` FROM `logGroups(logGroupIdentifier: ['LogGroup'])` LIMIT 100"
-            }
             QueryLanguage::MongoQuery => "// db.collection.find({})",
             QueryLanguage::RedisCommands => "# Enter Redis command…",
             QueryLanguage::Cypher => "// Enter Cypher query…",
@@ -1213,22 +1204,24 @@ impl QueryLanguage {
             QueryLanguage::Lua => "-- Enter Lua script…",
             QueryLanguage::Python => "# Enter Python script…",
             QueryLanguage::Bash => "# Enter Bash script…",
-            QueryLanguage::Custom(_) => "Enter query…",
+            QueryLanguage::Custom(_)
+            | QueryLanguage::ReservedCloudWatchLogsInsightsQl
+            | QueryLanguage::ReservedOpenSearchPpl
+            | QueryLanguage::ReservedOpenSearchSql => "Enter query…",
         }
     }
 
     /// Returns the comment prefix for this query language.
     pub fn comment_prefix(&self) -> &'static str {
         match self {
-            QueryLanguage::Sql
-            | QueryLanguage::OpenSearchSql
-            | QueryLanguage::InfluxQuery
-            | QueryLanguage::Cql => "--",
-            QueryLanguage::CloudWatchLogsInsightsQl | QueryLanguage::OpenSearchPpl => "#",
+            QueryLanguage::Sql | QueryLanguage::InfluxQuery | QueryLanguage::Cql => "--",
             QueryLanguage::MongoQuery | QueryLanguage::Cypher | QueryLanguage::Flux => "//",
             QueryLanguage::RedisCommands | QueryLanguage::Python | QueryLanguage::Bash => "#",
             QueryLanguage::Lua => "--",
-            QueryLanguage::Custom(_) => "#",
+            QueryLanguage::Custom(_)
+            | QueryLanguage::ReservedCloudWatchLogsInsightsQl
+            | QueryLanguage::ReservedOpenSearchPpl
+            | QueryLanguage::ReservedOpenSearchSql => "#",
         }
     }
 
@@ -1236,9 +1229,6 @@ impl QueryLanguage {
         matches!(
             self,
             QueryLanguage::Sql
-                | QueryLanguage::CloudWatchLogsInsightsQl
-                | QueryLanguage::OpenSearchPpl
-                | QueryLanguage::OpenSearchSql
                 | QueryLanguage::MongoQuery
                 | QueryLanguage::RedisCommands
                 | QueryLanguage::Cypher
@@ -2028,7 +2018,7 @@ pub struct SslModeOption {
 /// Used by the UI to conditionally render cert-path inputs in the TRANSPORT
 /// section. The UI reads this from `DriverMetadata::ssl_cert_fields` rather
 /// than branching on driver IDs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SslCertFields {
     /// Whether the driver accepts a root CA certificate path (`sslrootcert`).
     pub root_cert: bool,
@@ -2036,6 +2026,31 @@ pub struct SslCertFields {
     /// Whether the driver accepts a client certificate and key pair
     /// (`sslcert` / `sslkey`).
     pub client_cert: bool,
+
+    /// Modes that use the root CA path. `None` keeps the legacy mode rules.
+    pub root_cert_modes: Option<&'static [&'static str]>,
+
+    /// Modes that use the client certificate/key. `None` keeps the legacy mode rules.
+    pub client_cert_modes: Option<&'static [&'static str]>,
+}
+
+impl SslCertFields {
+    /// Certificate pickers to show for the selected driver-native TLS mode.
+    /// Returns `(show_root_cert, show_client_cert_and_key)`.
+    pub fn visible_for_mode(&self, mode: &str) -> (bool, bool) {
+        (
+            self.root_cert
+                && self.root_cert_modes.map_or_else(
+                    || crate::ssl_mode_id_requires_root_cert(mode),
+                    |modes| modes.contains(&mode),
+                ),
+            self.client_cert
+                && self.client_cert_modes.map_or_else(
+                    || crate::ssl_mode_id_is_cert_active(mode),
+                    |modes| modes.contains(&mode),
+                ),
+        )
+    }
 }
 
 /// Metadata that a driver provides about itself.
@@ -2249,11 +2264,6 @@ impl DriverMetadata {
     /// Check if this is a key-value database.
     pub fn is_key_value(&self) -> bool {
         self.category == DatabaseCategory::KeyValue
-    }
-
-    /// Check if this is a log-stream service (e.g. CloudWatch Logs).
-    pub fn is_log_stream(&self) -> bool {
-        self.category == DatabaseCategory::LogStream
     }
 
     /// Presentation of the native command console, or `None` when the driver
@@ -2553,6 +2563,9 @@ impl DriverMetadataBuilder {
 
 #[cfg(test)]
 mod tests {
+    mod reserved_slots;
+    mod tls_metadata;
+
     use super::*;
 
     #[test]
@@ -2722,9 +2735,6 @@ mod tests {
     fn editor_profile_from_language_matches_accessors() {
         let variants = [
             QueryLanguage::Sql,
-            QueryLanguage::CloudWatchLogsInsightsQl,
-            QueryLanguage::OpenSearchPpl,
-            QueryLanguage::OpenSearchSql,
             QueryLanguage::MongoQuery,
             QueryLanguage::RedisCommands,
             QueryLanguage::Cypher,
@@ -3273,7 +3283,6 @@ mod tests {
         assert!(matches!(Icon::Sqlite, Icon::Sqlite));
         assert!(matches!(Icon::Mongodb, Icon::Mongodb));
         assert!(matches!(Icon::Redis, Icon::Redis));
-        assert!(matches!(Icon::Dynamodb, Icon::Dynamodb));
         assert!(matches!(Icon::Redshift, Icon::Redshift));
         assert!(matches!(Icon::Clickhouse, Icon::Clickhouse));
         assert!(matches!(Icon::Turso, Icon::Turso));
@@ -3511,185 +3520,38 @@ mod tests {
         }
     }
 
-    // T-5: METRIC_CATALOG bit must equal exactly 1 << 50 and must be a power
-    // of two independent from METRIC_SERIES. Guards against accidental bit reuse.
     #[test]
-    fn metric_catalog_capability_bit_value_and_unique() {
-        let bits = DriverCapabilities::METRIC_CATALOG.bits();
-
-        assert_eq!(bits, 1u128 << 50, "METRIC_CATALOG must equal 1 << 50");
+    fn reserved_metric_series_keeps_bit_49() {
         assert_eq!(
-            bits.count_ones(),
-            1,
-            "METRIC_CATALOG must be a power of two"
+            DriverCapabilities::RESERVED_METRIC_SERIES.bits(),
+            1u128 << 49
         );
-        assert_ne!(
-            bits,
-            DriverCapabilities::METRIC_SERIES.bits(),
-            "METRIC_CATALOG must not collide with METRIC_SERIES"
-        );
-
-        // Spot-check against a representative set of existing flags.
-        let collision_check = [
-            DriverCapabilities::MULTIPLE_DATABASES,
-            DriverCapabilities::METRIC_SERIES,
-            DriverCapabilities::TRANSACTIONAL_DDL,
-            DriverCapabilities::ROUTINES,
-            DriverCapabilities::MULTI_STATEMENT,
-        ];
-        for other in collision_check {
-            assert_ne!(
-                bits,
-                other.bits(),
-                "METRIC_CATALOG bit ({bits}) collides with another flag ({})",
-                other.bits()
-            );
-        }
-    }
-
-    // T-4: METRIC_SERIES bit must be a power of two and must not collide with
-    // any existing flag. Guards against accidental bit reuse.
-    #[test]
-    fn metric_series_capability_bit_unique() {
-        let bits = DriverCapabilities::METRIC_SERIES.bits();
-
-        // A power-of-two value has exactly one bit set.
-        assert_eq!(bits.count_ones(), 1, "METRIC_SERIES must be a power of two");
-
-        // Must not equal any other defined flag.
-        let all_others = [
-            DriverCapabilities::MULTIPLE_DATABASES,
-            DriverCapabilities::SCHEMAS,
-            DriverCapabilities::SSH_TUNNEL,
-            DriverCapabilities::SSL,
-            DriverCapabilities::AUTHENTICATION,
-            DriverCapabilities::QUERY_CANCELLATION,
-            DriverCapabilities::QUERY_TIMEOUT,
-            DriverCapabilities::TRANSACTIONS,
-            DriverCapabilities::PREPARED_STATEMENTS,
-            DriverCapabilities::VIEWS,
-            DriverCapabilities::FOREIGN_KEYS,
-            DriverCapabilities::INDEXES,
-            DriverCapabilities::CHECK_CONSTRAINTS,
-            DriverCapabilities::UNIQUE_CONSTRAINTS,
-            DriverCapabilities::CUSTOM_TYPES,
-            DriverCapabilities::TRIGGERS,
-            DriverCapabilities::STORED_PROCEDURES,
-            DriverCapabilities::SEQUENCES,
-            DriverCapabilities::INSERT,
-            DriverCapabilities::UPDATE,
-            DriverCapabilities::DELETE,
-            DriverCapabilities::RETURNING,
-            DriverCapabilities::PAGINATION,
-            DriverCapabilities::SORTING,
-            DriverCapabilities::FILTERING,
-            DriverCapabilities::EXPORT_CSV,
-            DriverCapabilities::EXPORT_JSON,
-            DriverCapabilities::NESTED_DOCUMENTS,
-            DriverCapabilities::ARRAYS,
-            DriverCapabilities::AGGREGATION,
-            DriverCapabilities::KV_SCAN,
-            DriverCapabilities::KV_GET,
-            DriverCapabilities::KV_SET,
-            DriverCapabilities::KV_DELETE,
-            DriverCapabilities::KV_EXISTS,
-            DriverCapabilities::KV_TTL,
-            DriverCapabilities::KV_KEY_TYPES,
-            DriverCapabilities::KV_VALUE_SIZE,
-            DriverCapabilities::KV_RENAME,
-            DriverCapabilities::KV_BULK_GET,
-            DriverCapabilities::KV_STREAM_RANGE,
-            DriverCapabilities::KV_STREAM_ADD,
-            DriverCapabilities::KV_STREAM_DELETE,
-            DriverCapabilities::PUBSUB,
-            DriverCapabilities::GRAPH_TRAVERSAL,
-            DriverCapabilities::EDGE_PROPERTIES,
-            DriverCapabilities::TRANSACTIONAL_DDL,
-        ];
-
-        for other in all_others {
-            assert_ne!(
-                bits,
-                other.bits(),
-                "METRIC_SERIES bit ({bits}) collides with an existing flag ({})",
-                other.bits()
-            );
-        }
     }
 
     #[test]
-    fn test_dashboard_import_bit_value() {
+    fn reserved_metric_catalog_keeps_bit_50() {
         assert_eq!(
-            DriverCapabilities::DASHBOARD_IMPORT.bits(),
+            DriverCapabilities::RESERVED_METRIC_CATALOG.bits(),
+            1u128 << 50
+        );
+    }
+
+    #[test]
+    fn reserved_dashboard_import_keeps_bit_51() {
+        assert_eq!(
+            DriverCapabilities::RESERVED_DASHBOARD_IMPORT.bits(),
             1u128 << 51,
-            "DASHBOARD_IMPORT must equal 1 << 51"
+            "RESERVED_DASHBOARD_IMPORT must equal 1 << 51"
         );
     }
 
     #[test]
-    fn test_dashboard_import_no_collision() {
-        let bits = DriverCapabilities::DASHBOARD_IMPORT.bits();
-
-        // Exactly one bit must be set (power of two).
+    fn reserved_dashboard_sync_keeps_bit_52() {
         assert_eq!(
-            bits.count_ones(),
-            1,
-            "DASHBOARD_IMPORT must be a power of two"
-        );
-
-        // No other named constant may share the same bit.
-        for (name, cap) in DriverCapabilities::all().iter_names() {
-            if name == "DASHBOARD_IMPORT" {
-                continue;
-            }
-            assert_eq!(
-                cap.bits() & bits,
-                0,
-                "DASHBOARD_IMPORT bit (1 << 51) collides with existing flag '{name}'"
-            );
-        }
-    }
-
-    #[test]
-    fn test_dashboard_sync_bit_value() {
-        assert_eq!(
-            DriverCapabilities::DASHBOARD_SYNC.bits(),
+            DriverCapabilities::RESERVED_DASHBOARD_SYNC.bits(),
             1u128 << 52,
-            "DASHBOARD_SYNC must equal 1 << 52"
+            "RESERVED_DASHBOARD_SYNC must equal 1 << 52"
         );
-    }
-
-    #[test]
-    fn test_dashboard_sync_no_collision() {
-        let bits = DriverCapabilities::DASHBOARD_SYNC.bits();
-
-        assert_eq!(
-            bits.count_ones(),
-            1,
-            "DASHBOARD_SYNC must be a power of two"
-        );
-
-        for (name, cap) in DriverCapabilities::all().iter_names() {
-            if name == "DASHBOARD_SYNC" {
-                continue;
-            }
-            assert_eq!(
-                cap.bits() & bits,
-                0,
-                "DASHBOARD_SYNC bit (1 << 52) collides with existing flag '{name}'"
-            );
-        }
-    }
-
-    #[test]
-    fn test_dashboard_sync_composes_with_dashboard_import() {
-        let combined = DriverCapabilities::DASHBOARD_IMPORT | DriverCapabilities::DASHBOARD_SYNC;
-        assert!(combined.contains(DriverCapabilities::DASHBOARD_IMPORT));
-        assert!(combined.contains(DriverCapabilities::DASHBOARD_SYNC));
-        // Both bits must round-trip through Debug.
-        let dbg = format!("{combined:?}");
-        assert!(dbg.contains("DASHBOARD_IMPORT"));
-        assert!(dbg.contains("DASHBOARD_SYNC"));
     }
 
     #[test]

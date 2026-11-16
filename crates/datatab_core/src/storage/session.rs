@@ -36,9 +36,6 @@ impl SessionTab {
     pub fn query_language(&self) -> QueryLanguage {
         match self.language.as_str() {
             "sql" => QueryLanguage::Sql,
-            "cwli" => QueryLanguage::CloudWatchLogsInsightsQl,
-            "ppl" => QueryLanguage::OpenSearchPpl,
-            "opensearch-sql" => QueryLanguage::OpenSearchSql,
             "mongo" => QueryLanguage::MongoQuery,
             "redis" => QueryLanguage::RedisCommands,
             "cypher" => QueryLanguage::Cypher,
@@ -55,9 +52,6 @@ impl SessionTab {
     pub fn language_key(language: QueryLanguage) -> String {
         match language {
             QueryLanguage::Sql => "sql".into(),
-            QueryLanguage::CloudWatchLogsInsightsQl => "cwli".into(),
-            QueryLanguage::OpenSearchPpl => "ppl".into(),
-            QueryLanguage::OpenSearchSql => "opensearch-sql".into(),
             QueryLanguage::MongoQuery => "mongo".into(),
             QueryLanguage::RedisCommands => "redis".into(),
             QueryLanguage::Cypher => "cypher".into(),
@@ -67,7 +61,10 @@ impl SessionTab {
             QueryLanguage::Lua => "lua".into(),
             QueryLanguage::Python => "python".into(),
             QueryLanguage::Bash => "bash".into(),
-            QueryLanguage::Custom(_) => "sql".into(),
+            QueryLanguage::Custom(_)
+            | QueryLanguage::ReservedCloudWatchLogsInsightsQl
+            | QueryLanguage::ReservedOpenSearchPpl
+            | QueryLanguage::ReservedOpenSearchSql => "sql".into(),
         }
     }
 }
@@ -205,6 +202,25 @@ mod tests {
         let root = dir.path().join("sessions");
         fs::create_dir_all(&root).unwrap();
         (dir, SessionStore { root })
+    }
+
+    /// A tab stored in a language of the removed AWS drivers (#311) reopens
+    /// as SQL, like any unknown language key.
+    #[test]
+    fn retired_language_keys_reopen_as_sql() {
+        for key in ["cwli", "ppl", "opensearch-sql", "not-a-language"] {
+            let tab = SessionTab {
+                id: "tab".to_string(),
+                kind: SessionTabKind::Scratch {
+                    scratch_path: PathBuf::from("scratch.sql"),
+                    title: "Scratch".to_string(),
+                },
+                language: key.to_string(),
+                exec_ctx: ExecutionContext::default(),
+            };
+
+            assert_eq!(tab.query_language(), QueryLanguage::Sql, "{key}");
+        }
     }
 
     #[test]

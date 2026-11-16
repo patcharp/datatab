@@ -23,6 +23,8 @@ use crate::chart::stats::{
 };
 use crate::semantic::ChartColors;
 use crate::tokens::ChromeColors;
+use bolt::chart::format::datetime_in_zone;
+use datatab_core::chrono::Local;
 use datatab_core::{ColumnKind, LogErr, QueryResult, Value};
 
 // ---------------------------------------------------------------------------
@@ -1448,6 +1450,7 @@ impl Render for ChartView {
         // captured during the previous paint. `None` until the first paint
         // has run or while the cursor is outside the plot area.
         let readout = build_readout(
+            &Local,
             hover_x,
             plot_bounds_rc.borrow().as_ref(),
             &decimated,
@@ -3103,7 +3106,7 @@ struct SeriesReadoutEntry {
 
 /// Pre-computed content for the crosshair readout panel.
 struct HoverReadout {
-    /// Header: the hovered point's X, e.g. "2025-03-01" or "11:34 UTC"
+    /// Header: the hovered point's X, e.g. "2025-03-01" or "11:34"
     header_time: SharedString,
     series: Vec<SeriesReadoutEntry>,
     focused_idx: usize,
@@ -3118,7 +3121,8 @@ struct HoverReadout {
 /// has run), when the cursor falls outside the plot area, or when no series
 /// has usable samples near the cursor.
 #[allow(clippy::too_many_arguments)]
-fn build_readout(
+fn build_readout<Z>(
+    tz: &Z,
     hover_x_window: Option<Pixels>,
     plot_bounds: Option<&Bounds<Pixels>>,
     decimated: &[Vec<(f64, f64)>],
@@ -3129,7 +3133,10 @@ fn build_readout(
     x_min: f64,
     x_range: f64,
     x_is_time: bool,
-) -> Option<HoverReadout> {
+) -> Option<HoverReadout>
+where
+    Z: datatab_core::chrono::TimeZone,
+{
     let hover_x = hover_x_window?;
     let bounds = plot_bounds?;
 
@@ -3158,7 +3165,7 @@ fn build_readout(
         .map_or(cursor_data_x, |pts| nearest_sample(pts, cursor_data_x).0);
 
     let header_time = SharedString::from(if x_is_time {
-        format_readout_time(header_x, x_range)
+        format_readout_time(tz, header_x, x_range)
     } else {
         format!("{:.3}", header_x)
     });
@@ -3205,24 +3212,27 @@ fn build_readout(
     })
 }
 
-/// Format a hovered point's timestamp for the readout header.
+/// Format a hovered point's timestamp for the readout header in `tz`.
 ///
 /// Spans of a day or more lead with the date and add the time of day only when
 /// the point is not at midnight, so daily and monthly data read `2025-03-01`
 /// while hourly data over several days keeps its hour. Shorter spans show the
 /// time of day alone. Seconds appear only when the point has them.
-fn format_readout_time(x_ms: f64, x_range_ms: f64) -> String {
+fn format_readout_time<Z: datatab_core::chrono::TimeZone>(
+    tz: &Z,
+    x_ms: f64,
+    x_range_ms: f64,
+) -> String {
     use datatab_core::chrono::Timelike;
 
-    let Some(datetime) = datatab_core::chrono::DateTime::from_timestamp_millis(x_ms.round() as i64)
-    else {
+    let Some(datetime) = datetime_in_zone(tz, x_ms) else {
         return format!("{:.3}", x_ms);
     };
 
     let time_format = if datetime.second() == 0 {
-        "%H:%M UTC"
+        "%H:%M"
     } else {
-        "%H:%M:%S UTC"
+        "%H:%M:%S"
     };
 
     let format = if x_range_ms < 86_400_000.0 {
@@ -3269,7 +3279,7 @@ fn nearest_sample(points: &[(f64, f64)], target_x: f64) -> (f64, f64) {
 // The readout formatters moved to `bolt::chart::format` (product-neutral);
 // re-exported so `chart::engine::format_*` and the flat chart re-exports keep
 // resolving.
-pub use bolt::chart::format::{format_x_value, format_y_value};
+pub use bolt::chart::format::{format_x_value, format_x_value_in, format_y_value};
 
 /// Build the absolute-positioned overlay div that shows the multi-series readout.
 ///
@@ -3404,11 +3414,26 @@ mod tests {
             .timestamp_millis() as f64
     }
 
-    fn readout_header(points: Vec<(f64, f64)>, hover_fraction: f32) -> String {
-        readout_header_for(vec![points], 0, &[], hover_fraction)
+    /// A fixed UTC offset in whole hours and minutes, e.g. `fixed_offset(5, 30)`
+    /// for UTC+05:30. Tests pass one explicitly so no process-wide timezone is
+    /// read or set (#186).
+    fn fixed_offset(hours: i32, minutes: i32) -> datatab_core::chrono::FixedOffset {
+        let negative = hours < 0 || minutes < 0;
+        let magnitude = hours.abs() * 3_600 + minutes.abs() * 60;
+        datatab_core::chrono::FixedOffset::east_opt(if negative { -magnitude } else { magnitude })
+            .expect("valid fixed zone offset")
     }
 
-    fn readout_header_for(
+    fn readout_header<Z: datatab_core::chrono::TimeZone>(
+        tz: &Z,
+        points: Vec<(f64, f64)>,
+        hover_fraction: f32,
+    ) -> String {
+        readout_header_for(tz, vec![points], 0, &[], hover_fraction)
+    }
+
+    fn readout_header_for<Z: datatab_core::chrono::TimeZone>(
+        tz: &Z,
         series: Vec<Vec<(f64, f64)>>,
         focused_idx: usize,
         hidden: &[usize],
@@ -3425,6 +3450,7 @@ mod tests {
         let hidden: HashSet<usize> = hidden.iter().copied().collect();
 
         build_readout(
+            tz,
             Some(gpui::px(1000.0 * hover_fraction)),
             Some(&bounds),
             &series,
@@ -3454,8 +3480,8 @@ mod tests {
         let series = vec![daily_series(0), daily_series(12), daily_series(0)];
 
         assert_eq!(
-            readout_header_for(series, 0, &[0], 0.3),
-            "2025-01-03 12:00 UTC"
+            readout_header_for(&fixed_offset(0, 0), series, 0, &[0], 0.3),
+            "2025-01-03 12:00"
         );
     }
 
@@ -3464,8 +3490,8 @@ mod tests {
         let series = vec![Vec::new(), daily_series(12), daily_series(0)];
 
         assert_eq!(
-            readout_header_for(series, 0, &[], 0.3),
-            "2025-01-03 12:00 UTC"
+            readout_header_for(&fixed_offset(0, 0), series, 0, &[], 0.3),
+            "2025-01-03 12:00"
         );
     }
 
@@ -3476,7 +3502,10 @@ mod tests {
             .map(|day| (start + day as f64 * DAY_MS, day as f64))
             .collect();
 
-        assert_eq!(readout_header(points, 0.42), "2025-01-05");
+        assert_eq!(
+            readout_header(&fixed_offset(0, 0), points, 0.42),
+            "2025-01-05"
+        );
     }
 
     #[test]
@@ -3485,7 +3514,10 @@ mod tests {
             .map(|month| (utc_ms(2025, month, 1, 0, 0), month as f64))
             .collect();
 
-        assert_eq!(readout_header(points, 0.17), "2025-03-01");
+        assert_eq!(
+            readout_header(&fixed_offset(0, 0), points, 0.17),
+            "2025-03-01"
+        );
     }
 
     #[test]
@@ -3495,7 +3527,10 @@ mod tests {
             .map(|hour| (start + hour as f64 * 3_600_000.0, hour as f64))
             .collect();
 
-        assert_eq!(readout_header(points, 29.0 / 71.0), "2025-01-02 05:00 UTC");
+        assert_eq!(
+            readout_header(&fixed_offset(0, 0), points, 29.0 / 71.0),
+            "2025-01-02 05:00"
+        );
     }
 
     #[test]
@@ -3505,7 +3540,51 @@ mod tests {
             .map(|step| (start + step as f64 * 600_000.0, step as f64))
             .collect();
 
-        assert_eq!(readout_header(points, 0.34), "10:40 UTC");
+        assert_eq!(readout_header(&fixed_offset(0, 0), points, 0.34), "10:40");
+    }
+
+    /// The readout and the axis share one clock: a UTC+7 chart must read 19:00
+    /// for a 12:00 UTC point, with no "UTC" suffix (#186).
+    #[test]
+    fn readout_header_uses_the_axis_zone_clock() {
+        let series = vec![daily_series(0), daily_series(12), daily_series(0)];
+
+        assert_eq!(
+            readout_header_for(&fixed_offset(7, 0), series, 1, &[], 0.3),
+            "2025-01-03 19:00"
+        );
+    }
+
+    #[test]
+    fn readout_header_uses_the_axis_zone_at_a_fractional_offset() {
+        let start = utc_ms(2025, 1, 1, 10, 0);
+        let points = (0..13)
+            .map(|step| (start + step as f64 * 600_000.0, step as f64))
+            .collect();
+
+        assert_eq!(readout_header(&fixed_offset(5, 30), points, 0.34), "16:10");
+    }
+
+    /// The date is dropped only at the *local* midnight, so a UTC-8 chart
+    /// whose samples sit at 08:00 UTC reads a bare date, and its 12:00 UTC
+    /// sample keeps a local 04:00 clock.
+    #[test]
+    fn readout_header_reads_midnight_in_the_axis_zone() {
+        let midnight_local = (0..3)
+            .map(|day| (utc_ms(2025, 1, 1, 8, 0) + day as f64 * DAY_MS, day as f64))
+            .collect();
+        assert_eq!(
+            readout_header(&fixed_offset(-8, 0), midnight_local, 0.5),
+            "2025-01-02"
+        );
+
+        let noon_utc = (0..3)
+            .map(|day| (utc_ms(2025, 1, 1, 12, 0) + day as f64 * DAY_MS, day as f64))
+            .collect();
+        assert_eq!(
+            readout_header(&fixed_offset(-8, 0), noon_utc, 0.5),
+            "2025-01-02 04:00"
+        );
     }
 
     #[test]

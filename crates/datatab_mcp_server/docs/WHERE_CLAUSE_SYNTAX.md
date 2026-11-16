@@ -23,7 +23,6 @@ The WHERE clause syntax is a driver-agnostic JSON format for filtering records a
 - SQL WHERE clauses for PostgreSQL, MySQL, SQLite
 - MongoDB query filters
 - Redis SCAN patterns
-- DynamoDB FilterExpression
 
 This unified syntax allows AI agents to query any database without knowing driver-specific query languages.
 
@@ -40,7 +39,6 @@ This unified syntax allows AI agents to query any database without knowing drive
 Translates to:
 - SQL: `WHERE column_name = 'value'`
 - MongoDB: `{ column_name: "value" }`
-- DynamoDB: `column_name = :val`
 
 ### Multiple Conditions (Implicit AND)
 
@@ -590,18 +588,6 @@ If a column does not exist:
 - No WHERE clause support (Redis is key-value)
 - Only pattern matching on keys
 
-### DynamoDB
-
-**Features:**
-- FilterExpression with comparison operators (`=`, `<>`, `<`, `<=`, `>`, `>=`)
-- Logical operators (`AND`, `OR`, `NOT`)
-- Function operators (`attribute_exists`, `attribute_not_exists`, `begins_with`, `contains`)
-
-**Limitations:**
-- No LIKE or regex
-- FilterExpression runs after query/scan (not indexed)
-- Limited to simple conditions on non-key attributes
-
 ## Limitations
 
 ### General Limitations
@@ -671,7 +657,7 @@ If a column does not exist:
 
 ## Summary
 
-The WHERE clause syntax is a powerful, driver-agnostic filtering language for DataTab MCP tools. By using JSON operators and logical composition, AI agents can query any database without knowing SQL, MongoDB query syntax, or DynamoDB filter expressions.
+The WHERE clause syntax is a powerful, driver-agnostic filtering language for DataTab MCP tools. By using JSON operators and logical composition, AI agents can query any database without knowing SQL or MongoDB query syntax.
 
 **Key takeaways:**
 - Use comparison operators (`$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`)

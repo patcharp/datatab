@@ -288,11 +288,6 @@ fn chart_pane_action_labels_resolve_in_english() {
         "y_axis",
         "group_by",
         "aggregation",
-        "metric_rail",
-        "next_dimension",
-        "prev_dimension",
-        "period",
-        "statistic",
     ];
 
     for key in keys {

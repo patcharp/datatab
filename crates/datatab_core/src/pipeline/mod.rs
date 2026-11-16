@@ -161,11 +161,12 @@ impl std::error::Error for PipelineError {
 
 /// Everything the pipeline needs to run the pre-connect stages.
 ///
-/// The actual driver connect and schema fetch happen in the caller
-/// (workspace), since they need driver-specific types that `datatab_core`
-/// doesn't own.
+/// The caller owns driver connect, schema fetch and installation so it can keep
+/// the access handle alive with the installed connection. The driver handle
+/// here supports pure profile refusal before authentication and access setup.
 pub struct PipelineInput {
     pub profile: ConnectionProfile,
+    pub driver: Arc<dyn crate::DbDriver>,
     pub auth_provider: Option<Box<dyn DynAuthProvider>>,
     pub auth_profile: Option<AuthProfile>,
     pub resolver: CompositeValueResolver,
@@ -181,10 +182,10 @@ pub struct PipelineOutput {
     /// Resolved password extracted from ValueRefs (if any).
     pub resolved_password: Option<SecretString>,
 
-    /// Auth session if SSO/cloud authentication was performed.
+    /// Auth session if the auth provider logged in.
     pub auth_session: Option<AuthSession>,
 
-    /// RAII handle for tunnel lifetime (SSH, proxy, SSM).
+    /// RAII handle for tunnel lifetime (SSH, proxy).
     /// Drop this to tear down the tunnel.
     pub access_handle: AccessHandle,
 }
@@ -201,6 +202,8 @@ pub struct PipelineOutput {
 /// This function runs on a background executor. The caller spawns it via
 /// `cx.background_executor().spawn(...)` and polls the watcher.
 ///
+/// Before these stages, the driver may refuse the unresolved profile without I/O.
+///
 /// Stages:
 /// 1. **Authenticating** — validate session, login if needed, resolve credentials
 /// 2. **ResolvingValues** — resolve all `ValueRef` entries in the profile
@@ -208,9 +211,14 @@ pub struct PipelineOutput {
 ///
 /// Driver connect and schema fetch are handled by the caller.
 pub async fn run_pipeline(
-    mut input: PipelineInput,
+    input: PipelineInput,
     state_tx: &StateSender,
 ) -> Result<PipelineOutput, PipelineError> {
+    input
+        .driver
+        .validate_profile(&input.profile)
+        .map_err(PipelineError::connect)?;
+
     let cancel = &input.cancel;
     let needs_auth_credentials = !input.profile.value_refs.is_empty();
 
@@ -226,15 +234,6 @@ pub async fn run_pipeline(
     .await?;
 
     cancel.check_pipeline()?;
-
-    if let Some(provider) = input.auth_provider.as_deref()
-        && let Some(profile) = input.auth_profile.as_ref()
-        && needs_auth_credentials
-    {
-        provider
-            .register_value_providers(profile, auth_session.as_ref(), &mut input.resolver)
-            .map_err(PipelineError::resolve)?;
-    }
 
     // --- Stage 2: Resolve values ---
 
@@ -345,7 +344,7 @@ async fn run_auth_stage(
             log::debug!("[pipeline] session expired or missing, starting login flow");
 
             // Send an initial WaitingForLogin with no URL — the real device URL
-            // arrives asynchronously once the AWS CLI starts and prints to stdout.
+            // arrives asynchronously once the provider starts its login and reports it.
             let _ = state_tx.send(PipelineState::WaitingForLogin {
                 provider_name: provider_name.clone(),
                 verification_url: None,
@@ -354,7 +353,7 @@ async fn run_auth_stage(
             cancel.check_pipeline()?;
 
             // Build a callback that updates the state channel with the real URL
-            // as soon as the provider discovers it (e.g. from `aws sso login` stdout).
+            // as soon as the provider discovers it (for example from the login output of an external tool).
             let state_tx_for_url = state_tx.clone();
             let provider_name_for_url = provider_name.clone();
             let url_callback = Box::new(move |url: Option<String>| {
@@ -412,10 +411,14 @@ fn access_kind_label(kind: &AccessKind) -> String {
 
 #[cfg(test)]
 mod tests {
+    mod driver;
+    mod refusal;
+
     use super::*;
     use crate::auth::{AuthProfile, AuthSession, AuthSessionState, ResolvedCredentials};
     use crate::connection::profile::{ConnectionProfile, DbConfig};
     use crate::values::{SecretProvider, ValueCache, ValueRef};
+    use driver::TestDriver;
     use secrecy::{ExposeSecret, SecretString};
     use std::collections::HashMap;
     use std::time::Duration;
@@ -563,6 +566,7 @@ mod tests {
         let (state_tx, mut state_rx) = pipeline_state_channel();
 
         let input = PipelineInput {
+            driver: Arc::new(TestDriver::default()),
             profile,
             auth_provider: None,
             auth_profile: None,
@@ -602,6 +606,7 @@ mod tests {
         let (state_tx, _state_rx) = pipeline_state_channel();
 
         let input = PipelineInput {
+            driver: Arc::new(TestDriver::default()),
             profile,
             auth_provider: Some(Box::new(MockAuthProvider {
                 should_require_login: false,
@@ -640,6 +645,7 @@ mod tests {
         cancel.cancel();
 
         let input = PipelineInput {
+            driver: Arc::new(TestDriver::default()),
             profile,
             auth_provider: None,
             auth_profile: None,
@@ -667,6 +673,7 @@ mod tests {
         let (state_tx, mut state_rx) = pipeline_state_channel();
 
         let input = PipelineInput {
+            driver: Arc::new(TestDriver::default()),
             profile,
             auth_provider: Some(Box::new(MockAuthProvider {
                 should_require_login: true,
@@ -699,6 +706,7 @@ mod tests {
         let (state_tx, mut state_rx) = pipeline_state_channel();
 
         let input = PipelineInput {
+            driver: Arc::new(TestDriver::default()),
             profile,
             auth_provider: Some(Box::new(MockAuthProvider {
                 should_require_login: true,
@@ -739,6 +747,7 @@ mod tests {
         let (state_tx, _state_rx) = pipeline_state_channel();
 
         let input = PipelineInput {
+            driver: Arc::new(TestDriver::default()),
             profile,
             auth_provider: None,
             auth_profile: None,
@@ -759,12 +768,12 @@ mod tests {
 
     #[tokio::test]
     async fn pipeline_with_auth_and_no_value_refs_skips_credential_resolution() {
-        let profile =
-            ConnectionProfile::new("test-cloudwatch", DbConfig::default_cloudwatch_logs());
+        let profile = ConnectionProfile::new("test-sqlite", DbConfig::default_sqlite());
         let auth_profile = test_auth_profile();
         let (state_tx, _state_rx) = pipeline_state_channel();
 
         let input = PipelineInput {
+            driver: Arc::new(TestDriver::default()),
             profile,
             auth_provider: Some(Box::new(MockAuthProvider {
                 should_require_login: false,
@@ -785,7 +794,7 @@ mod tests {
         assert!(output.resolved_password.is_none());
         assert!(matches!(
             output.resolved_profile.config,
-            DbConfig::CloudWatchLogs { .. }
+            DbConfig::SQLite { .. }
         ));
     }
 }

@@ -174,11 +174,11 @@ pub static MYSQL_METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverMet
         },
         datatab_core::SslModeOption {
             id: "PREFERRED",
-            label: "preferred",
+            label: "preferred (unverified)",
         },
         datatab_core::SslModeOption {
             id: "REQUIRED",
-            label: "required",
+            label: "required (unverified)",
         },
         datatab_core::SslModeOption {
             id: "VERIFY_CA",
@@ -192,6 +192,8 @@ pub static MYSQL_METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverMet
     ssl_cert_fields: Some(datatab_core::SslCertFields {
         root_cert: true,
         client_cert: true,
+        root_cert_modes: Some(&["VERIFY_CA", "VERIFY_IDENTITY"]),
+        client_cert_modes: Some(&["PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY"]),
     }),
     classification_override: None,
     default_chunk_size: None,
@@ -341,11 +343,11 @@ pub static MARIADB_METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverM
         },
         datatab_core::SslModeOption {
             id: "PREFERRED",
-            label: "preferred",
+            label: "preferred (unverified)",
         },
         datatab_core::SslModeOption {
             id: "REQUIRED",
-            label: "required",
+            label: "required (unverified)",
         },
         datatab_core::SslModeOption {
             id: "VERIFY_CA",
@@ -359,6 +361,8 @@ pub static MARIADB_METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverM
     ssl_cert_fields: Some(datatab_core::SslCertFields {
         root_cert: true,
         client_cert: true,
+        root_cert_modes: Some(&["VERIFY_CA", "VERIFY_IDENTITY"]),
+        client_cert_modes: Some(&["PREFERRED", "REQUIRED", "VERIFY_CA", "VERIFY_IDENTITY"]),
     }),
     classification_override: None,
     default_chunk_size: None,
@@ -758,12 +762,21 @@ impl DbDriver for MysqlDriver {
         }
     }
 
+    fn validate_profile(&self, profile: &ConnectionProfile) -> Result<(), DbError> {
+        let config = extract_mysql_config(&profile.config)?;
+        if !config.use_uri {
+            MysqlSslMode::parse(&config.ssl_mode)?;
+        }
+        Ok(())
+    }
+
     fn connect_with_secrets(
         &self,
         profile: &ConnectionProfile,
         password: Option<&SecretString>,
         ssh_secret: Option<&SecretString>,
     ) -> Result<Box<dyn Connection>, DbError> {
+        self.validate_profile(profile)?;
         let config = extract_mysql_config(&profile.config)?;
 
         let password = password.map(|value| value.expose_secret());
@@ -1186,6 +1199,30 @@ fn extract_mysql_config(config: &DbConfig) -> Result<ExtractedMysqlConfig, DbErr
     }
 }
 
+#[derive(Clone, Copy)]
+enum MysqlSslMode {
+    Disabled,
+    Preferred,
+    Required,
+    VerifyCa,
+    VerifyIdentity,
+}
+
+impl MysqlSslMode {
+    fn parse(value: &str) -> Result<Self, DbError> {
+        match value {
+            "DISABLED" => Ok(Self::Disabled),
+            "PREFERRED" => Ok(Self::Preferred),
+            "REQUIRED" | "disable" | "allow" | "prefer" | "require" => Ok(Self::Required),
+            "VERIFY_CA" | "verify-ca" => Ok(Self::VerifyCa),
+            "VERIFY_IDENTITY" | "verify-full" => Ok(Self::VerifyIdentity),
+            _ => Err(DbError::InvalidProfile(format!(
+                "Unknown MySQL/MariaDB SSL mode '{value}'. Accepted values: DISABLED, PREFERRED, REQUIRED, VERIFY_CA, VERIFY_IDENTITY, disable, allow, prefer, require, verify-ca, verify-full"
+            ))),
+        }
+    }
+}
+
 /// Builds MySQL connection options from the given parameters.
 ///
 /// Maps MySQL native ssl-mode identifiers to the appropriate `SslOpts`:
@@ -1194,6 +1231,10 @@ fn extract_mysql_config(config: &DbConfig) -> Result<ExtractedMysqlConfig, DbErr
 /// - `"REQUIRED"` — TLS required, server cert not verified
 /// - `"VERIFY_CA"` — TLS required, verify the server chain but skip hostname validation
 /// - `"VERIFY_IDENTITY"` — TLS required, verify both the server chain and the hostname
+///
+/// Store names `disable`, `allow`, `prefer`, and `require` map to `REQUIRED`
+/// (unverified TLS without plaintext fallback). `verify-ca` maps to `VERIFY_CA`,
+/// and `verify-full` maps to `VERIFY_IDENTITY`.
 ///
 /// For every TLS mode a client identity (mutual TLS) is attached when both a
 /// client cert and key are configured. For the verifying modes a custom root
@@ -1207,7 +1248,8 @@ fn build_mysql_opts(
     password: Option<&str>,
     ssl_mode: &str,
     ssl_paths: &MysqlSslPaths,
-) -> Opts {
+) -> Result<Opts, DbError> {
+    let ssl_mode = MysqlSslMode::parse(ssl_mode)?;
     let host = normalize_mysql_tcp_host(host);
 
     let mut builder = OptsBuilder::new()
@@ -1226,35 +1268,30 @@ fn build_mysql_opts(
     }
 
     match ssl_mode {
-        "DISABLED" => {
+        MysqlSslMode::Disabled => {
             // No SSL — leave ssl_opts unset.
         }
-        "PREFERRED" | "REQUIRED" => {
+        MysqlSslMode::Preferred | MysqlSslMode::Required => {
             // TLS without server verification; still present a client identity
             // for mutual TLS when one is configured.
             let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
             builder = builder.ssl_opts(apply_client_identity(ssl_opts, ssl_paths));
         }
-        "VERIFY_CA" => {
+        MysqlSslMode::VerifyCa => {
             // Verify the server chain against the (optionally custom) CA, but do
             // not require the hostname to match the certificate.
             let ssl_opts = SslOpts::default().with_danger_skip_domain_validation(true);
             let ssl_opts = apply_root_cert(ssl_opts, ssl_paths);
             builder = builder.ssl_opts(apply_client_identity(ssl_opts, ssl_paths));
         }
-        "VERIFY_IDENTITY" => {
+        MysqlSslMode::VerifyIdentity => {
             // Full validation: verify the server chain and the hostname.
             let ssl_opts = apply_root_cert(SslOpts::default(), ssl_paths);
             builder = builder.ssl_opts(apply_client_identity(ssl_opts, ssl_paths));
         }
-        _ => {
-            // Unknown mode — treat as PREFERRED (accept-invalid, allow fallback).
-            let ssl_opts = SslOpts::default().with_danger_accept_invalid_certs(true);
-            builder = builder.ssl_opts(apply_client_identity(ssl_opts, ssl_paths));
-        }
     }
 
-    builder.into()
+    Ok(builder.into())
 }
 
 fn initial_database_from_opts(opts: &Opts) -> Option<String> {
@@ -1369,7 +1406,7 @@ impl MysqlDriver {
         // For PREFERRED mode: attempt SSL first, fall back to plain on failure.
         let (opts, catalog_conn) = if ssl_mode == "PREFERRED" {
             let ssl_opts =
-                build_mysql_opts(host, port, user, database, password, "PREFERRED", ssl_paths);
+                build_mysql_opts(host, port, user, database, password, "PREFERRED", ssl_paths)?;
             match Conn::new(ssl_opts.clone()) {
                 Ok(c) => {
                     log::info!("[SSL] Catalog connection established with SSL (PREFERRED mode)");
@@ -1385,14 +1422,14 @@ impl MysqlDriver {
                     );
                     let no_ssl_opts = build_mysql_opts(
                         host, port, user, database, password, "DISABLED", ssl_paths,
-                    );
+                    )?;
                     let c = Conn::new(no_ssl_opts.clone())
                         .map_err(|e| format_mysql_error(&e, host, port))?;
                     (no_ssl_opts, c)
                 }
             }
         } else {
-            let opts = build_mysql_opts(host, port, user, database, password, ssl_mode, ssl_paths);
+            let opts = build_mysql_opts(host, port, user, database, password, ssl_mode, ssl_paths)?;
             let c = Conn::new(opts.clone()).map_err(|e| format_mysql_error(&e, host, port))?;
             (opts, c)
         };
@@ -1469,7 +1506,7 @@ impl MysqlDriver {
                 db_password,
                 "PREFERRED",
                 ssl_paths,
-            );
+            )?;
             match Conn::new(ssl_opts) {
                 Ok(c) => {
                     log::info!("[SSL] Catalog connection established with SSL");
@@ -1491,7 +1528,7 @@ impl MysqlDriver {
                         db_password,
                         "DISABLED",
                         ssl_paths,
-                    );
+                    )?;
                     let c = Conn::new(no_ssl_opts)
                         .map_err(|e| format_mysql_error(&e, "127.0.0.1", local_port1))?;
                     ("DISABLED", c)
@@ -1506,7 +1543,7 @@ impl MysqlDriver {
                 db_password,
                 ssl_mode,
                 ssl_paths,
-            );
+            )?;
             let c =
                 Conn::new(opts).map_err(|e| format_mysql_error(&e, "127.0.0.1", local_port1))?;
             (ssl_mode, c)
@@ -1531,7 +1568,7 @@ impl MysqlDriver {
             db_password,
             working_ssl_mode,
             ssl_paths,
-        );
+        )?;
         let mut query_conn = Conn::new(query_opts.clone())
             .map_err(|e| format_mysql_error(&e, "127.0.0.1", local_port2))?;
 
@@ -1592,7 +1629,7 @@ impl MysqlErrorFormatter {
                 "Access denied at {}:{}.
 MySQL says: {}
 
-If you are using SSM, verify the tunnel target host/port and that the DB user is valid for that target.",
+If you connect through a tunnel or proxy, verify the target host and port and that the DB user is valid for that target.",
                 host, port, source
             )
         } else if source.contains("Unknown database") {
@@ -4807,6 +4844,9 @@ fn resolve_write_privilege(
 
 #[cfg(test)]
 mod tests {
+    mod sslmode;
+    mod tls_metadata;
+
     use super::rowid_pseudo_columns;
     use super::{
         GrantLineVerdict, MysqlCodeGenerator, MysqlDialect, MysqlDriver, MysqlGrantsVerdict,
@@ -5139,7 +5179,8 @@ mod tests {
                 client_cert: None,
                 client_key: None,
             },
-        );
+        )
+        .expect("known mode");
 
         let program_name = opts
             .get_connect_attrs()
@@ -5199,7 +5240,8 @@ mod tests {
                 client_cert: None,
                 client_key: None,
             },
-        );
+        )
+        .expect("known mode");
         assert_eq!(
             initial_database_from_opts(&opts).as_deref(),
             Some("direct_database")

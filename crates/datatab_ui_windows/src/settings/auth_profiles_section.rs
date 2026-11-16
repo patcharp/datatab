@@ -12,11 +12,11 @@ use datatab_components::controls::{Button, Checkbox, Input};
 use datatab_components::controls::{Dropdown, DropdownItem, DropdownSelectionChanged};
 use datatab_components::icons::AppIcon;
 use datatab_components::primitives::{Badge, BadgeTone, BannerBlock, BannerVariant, Chamfer, Text};
-use datatab_components::tokens::{ChamferCut, ChromeColors, Fields, ui};
+use datatab_components::tokens::{ChamferCut, Fields, ui};
 use datatab_core::secrecy::{ExposeSecret, SecretString};
 use datatab_core::{
-    AccessKind, AuthEditCapabilities, AuthEditSnapshot, AuthProfile, AuthSaveOutcome,
-    DanglingMessage, FetchOptionsError, FetchOptionsRequest, FormFieldKind, LogErr, RefreshTrigger,
+    AccessKind, AuthProfile, FetchOptionsError, FetchOptionsRequest, FormFieldKind, LogErr,
+    RefreshTrigger,
 };
 use datatab_ui_base::keymap::key_chord_from_gpui;
 use datatab_ui_base::user_error::{ErrorKind, UserFacingError, report_error};
@@ -55,36 +55,16 @@ pub(super) struct AuthProfilesSection {
     pending_delete_profile_id: Option<Uuid>,
     pending_sync_from_app_state: bool,
 
-    /// Whether the currently-displayed profile is read-only (i.e. it is a
-    /// dangling reflected profile with no on-disk section to target). When
-    /// `true` the form is rendered in mirror mode: no editable inputs, no
-    /// Save/Delete buttons.
-    ///
-    /// Non-dangling reflected profiles have `read_only = false` and are
-    /// editable — their edits are written directly to external configuration
-    /// files via `save_edit` (design §13, §14).
-    profile_is_read_only: bool,
-    /// Why the currently-displayed profile is dangling, if it is.
-    /// Known values: `"keyring-only"`, `"file-gone"`. `None` for healthy profiles.
-    profile_dangling_origin: Option<String>,
-
-    /// Opaque snapshot token captured when an editable reflected profile is
-    /// loaded for editing. Passed back to `save_edit` at save time for the
-    /// optimistic-concurrency check (spec R9.3.1, design §10).
-    ///
-    /// `None` for stored (non-reflected) profiles — those use the standard
-    /// SQLite save path which has no snapshot concept.
-    edit_snapshot: Option<AuthEditSnapshot>,
-    /// Non-`None` when a `save_edit` call returned `Conflict` or `PartialSaved`.
-    /// Contains a human-readable message to display, plus `true` if a Reload
-    /// button should be shown.
-    edit_conflict_msg: Option<(String, bool)>,
-
     input_name: Entity<InputState>,
     form_inputs: HashMap<String, Entity<InputState>>,
     provider_field_order: Vec<String>,
     provider_login_loading: bool,
     provider_login_status: Option<(String, bool)>,
+    /// Identifies the login the form waits for. `release_login` advances it
+    /// when a login starts, finishes or is cancelled and when the form is
+    /// replaced (a profile loaded, a new profile, another provider), so the
+    /// result of an earlier login is ignored when it arrives.
+    login_generation: u64,
 
     /// Dropdown for selecting the auth provider.
     provider_dropdown: Entity<Dropdown>,
@@ -99,8 +79,8 @@ pub(super) struct AuthProfilesSection {
     field_login_hint: HashMap<String, String>,
     /// When set, the URL is routed to the login modal via the pending pattern.
     ///
-    /// Fields: `(provider_name, profile_name, url)`.
-    pending_sso_url: Option<(String, String, Option<String>)>,
+    /// Fields: `(provider_name, profile_name, url, login_generation)`.
+    pending_sso_url: Option<(String, String, Option<String>, u64)>,
     /// Active login verification URL displayed inline under the Login button.
     /// Cleared when the login completes or the user cancels.
     active_login_url: Option<String>,
@@ -153,12 +133,89 @@ pub(super) enum AuthFormField {
 pub(super) enum AuthProfilesSectionEvent {
     /// A login flow produced a URL that should be displayed in the login modal.
     ///
-    /// Fields: `(provider_name, profile_name, url)`.
+    /// `generation` is the `login_generation` of that login.
     OpenLoginModal {
         provider_name: String,
         profile_name: String,
         url: Option<String>,
+        generation: u64,
     },
+    /// The form stopped waiting for the login of `generation`: its result
+    /// arrived, or the form let go of it.
+    LoginEnded { generation: u64 },
+}
+
+/// A login the auth profile form waits for, as the surface that shows its
+/// verification URL in another window holds it.
+///
+/// It reaches the section itself, not the Settings window: the login keeps
+/// its section alive after the user leaves the auth profiles page.
+#[derive(Clone)]
+pub struct SettingsLoginHandle {
+    section: WeakEntity<AuthProfilesSection>,
+    generation: u64,
+}
+
+impl SettingsLoginHandle {
+    pub(super) fn new(section: WeakEntity<AuthProfilesSection>, generation: u64) -> Self {
+        Self {
+            section,
+            generation,
+        }
+    }
+
+    /// Whether the form still waits for this login.
+    pub fn is_waiting(&self, cx: &App) -> bool {
+        self.section.upgrade().is_some_and(|section| {
+            let section = section.read(cx);
+            section.provider_login_loading && section.login_generation == self.generation
+        })
+    }
+
+    /// Cancels the login as the form's own Cancel does. Does nothing once the
+    /// form stopped waiting for this login.
+    pub fn cancel(&self, cx: &mut App) {
+        if !self.is_waiting(cx) {
+            return;
+        }
+
+        if let Some(section) = self.section.upgrade() {
+            section.update(cx, |section, cx| section.cancel_provider_login(cx));
+        }
+    }
+
+    /// Calls `on_ended` when the form stops waiting for this login: its
+    /// result arrived, with success or failure, or the form let go of it.
+    /// Returns `None` when the section is gone.
+    pub fn on_ended<T: 'static>(
+        &self,
+        cx: &mut Context<T>,
+        on_ended: impl Fn(&mut T, &mut Context<T>) + 'static,
+    ) -> Option<Subscription> {
+        let section = self.section.upgrade()?;
+        let generation = self.generation;
+
+        Some(cx.subscribe(
+            &section,
+            move |this, _, event: &AuthProfilesSectionEvent, cx| {
+                if matches!(
+                    event,
+                    AuthProfilesSectionEvent::LoginEnded { generation: ended } if *ended == generation
+                ) {
+                    on_ended(this, cx);
+                }
+            },
+        ))
+    }
+}
+
+impl std::fmt::Debug for SettingsLoginHandle {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SettingsLoginHandle")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
 }
 
 impl EventEmitter<AuthProfilesSectionEvent> for AuthProfilesSection {}
@@ -171,12 +228,10 @@ fn build_form_rows(
     selected_provider_supports_login: bool,
     login_url_shown: bool,
     is_editing: bool,
-    is_reflected: bool,
 ) -> Vec<Vec<AuthFormField>> {
     let mut rows = vec![vec![AuthFormField::Name]];
 
-    // Reflected profiles have a fixed provider; the selector is not shown.
-    if has_providers && !is_reflected {
+    if has_providers {
         rows.push(vec![AuthFormField::Provider(0)]);
     }
 
@@ -196,13 +251,9 @@ fn build_form_rows(
         }
     }
 
-    // Reflected profiles do not expose the Enabled toggle (it is managed by
-    // the file) and do not have a Delete button.
-    if !is_reflected {
-        rows.push(vec![AuthFormField::Enabled]);
-    }
+    rows.push(vec![AuthFormField::Enabled]);
 
-    if is_editing && !is_reflected {
+    if is_editing {
         rows.push(vec![
             AuthFormField::ExportButton,
             AuthFormField::DeleteButton,
@@ -237,63 +288,7 @@ fn build_auth_profile_from_form(
         // from here. The SQLite save path splits them out separately.
         secret_fields: HashMap::new(),
         enabled,
-        read_only: false,
-        dangling_origin: None,
     })
-}
-
-fn mirror_label_fallback() -> String {
-    datatab_i18n::t!("settings.auth_profiles.mirror_label_fallback")
-}
-fn success_written_fallback() -> String {
-    datatab_i18n::t!("settings.auth_profiles.saved_fallback")
-}
-const NAME_HINT_FALLBACK: &str = "";
-
-fn dangling_fallback() -> DanglingMessage {
-    DanglingMessage {
-        title: datatab_i18n::t!("settings.auth_profiles.reference_invalid_title"),
-        body: datatab_i18n::t!("settings.auth_profiles.reference_invalid_body"),
-    }
-}
-
-fn resolve_mirror_label(edit_caps: Option<&AuthEditCapabilities>) -> String {
-    edit_caps
-        .map(|e| e.mirror_label.clone())
-        .unwrap_or_else(mirror_label_fallback)
-}
-
-fn resolve_success_text(edit_caps: Option<&AuthEditCapabilities>) -> String {
-    edit_caps
-        .map(|e| e.success_written.clone())
-        .unwrap_or_else(success_written_fallback)
-}
-
-fn resolve_dangling(edit_caps: Option<&AuthEditCapabilities>, origin: &str) -> DanglingMessage {
-    edit_caps
-        .and_then(|e| e.dangling_messages.get(origin))
-        .cloned()
-        .unwrap_or_else(dangling_fallback)
-}
-
-/// Build the user-visible conflict message for a `Conflict` save outcome.
-///
-/// The message names the target's label and instructs the user to reload
-/// before saving again.
-fn resolve_conflict_message(target: &datatab_core::AuthEditTarget) -> String {
-    crate::labels::auth_profiles_conflict_message(&target.label)
-}
-
-/// Build the user-visible message for a `PartialSaved` save outcome.
-///
-/// The message names both the written and conflicted targets. The phrasing
-/// is provider-neutral — it does not reference any provider-specific
-/// directory structure.
-fn resolve_partial_saved_message(
-    written: &datatab_core::AuthEditTarget,
-    conflicted: &datatab_core::AuthEditTarget,
-) -> String {
-    crate::labels::auth_profiles_partial_saved_message(&written.label, &conflicted.label)
 }
 
 /// Update `field_login_hint` and `provider_login_status` for a
@@ -421,6 +416,7 @@ impl AuthProfilesSection {
 
                 this.options_cache.clear();
                 this.field_login_hint.clear();
+                this.release_login_of_replaced_form(cx);
 
                 cx.notify();
             },
@@ -436,15 +432,12 @@ impl AuthProfilesSection {
             profile_enabled: true,
             pending_delete_profile_id: None,
             pending_sync_from_app_state: false,
-            profile_is_read_only: false,
-            profile_dangling_origin: None,
-            edit_snapshot: None,
-            edit_conflict_msg: None,
             input_name,
             form_inputs: HashMap::new(),
             provider_field_order: Vec::new(),
             provider_login_loading: false,
             provider_login_status: None,
+            login_generation: 0,
 
             provider_dropdown,
             dynamic_dropdowns: HashMap::new(),
@@ -479,12 +472,9 @@ impl AuthProfilesSection {
 
     /// Ask the coordinator to export the auth profile currently loaded in the form.
     ///
-    /// Only emits for a stored, non-reflected, non-read-only profile being edited.
+    /// Only emits when editing a stored profile.
     pub(super) fn request_export(&mut self, cx: &mut Context<Self>) {
-        if !self.profile_is_read_only
-            && self.edit_snapshot.is_none()
-            && let Some(id) = self.editing_profile_id
-        {
+        if let Some(id) = self.editing_profile_id {
             cx.emit(SectionPortabilityEvent::OpenExport(
                 ExportTarget::AuthProfile(id),
             ));
@@ -817,18 +807,17 @@ impl AuthProfilesSection {
             name: self.input_name.read(cx).value().to_string(),
             provider_id: provider_id_snap,
             fields: fields_snap,
-            // Transient snapshot for live option fetching: secrets stay inline
-            // and are sent to the provider verbatim; nothing here is persisted.
+            // Transient snapshot for live option fetching: secret inputs stay
+            // inline in `fields`, and nothing here is persisted. An in-process
+            // provider reads the snapshot as it is. An RPC provider receives
+            // only the fields its form declares, and a secret one only when
+            // it opted in (`RpcAuthProvider::fetch_dynamic_options`).
             secret_fields: HashMap::new(),
             enabled: self.profile_enabled,
-            read_only: false,
-            dangling_origin: None,
         };
 
-        // Expand AuthProfileRef fields so the provider sees the same flat
-        // field map it would see at connect time (e.g. an `aws-sso` profile
-        // with an `sso_session_ref` gets `sso_start_url`/`sso_region` merged
-        // in from the referenced session profile).
+        // Expand AuthProfileRef fields so option fetching sees the same flat
+        // field map as the connection pipeline.
         let profile_registry_snapshot: Vec<AuthProfile> =
             self.app_state.read(cx).list_auth_profiles();
         let profile_snapshot = datatab_core::auth::expand_auth_profile_refs(
@@ -1068,10 +1057,7 @@ impl AuthProfilesSection {
             "— None —".to_string(),
             String::new(),
         )];
-        // Use the reflected union, not the stored-only slice: some reflected
-        // profiles are absent from storage, while stale stored rows are excluded
-        // by list_auth_profiles(). Their deterministic UUIDs match the expansion
-        // lookup, which reads the same seam.
+        // Read through the same profile list used by reference expansion.
         let referenced_profiles: Vec<(String, String)> = self
             .app_state
             .read(cx)
@@ -1111,8 +1097,6 @@ impl AuthProfilesSection {
     fn clear_form(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.editing_profile_id = None;
         self.profile_enabled = true;
-        self.edit_snapshot = None;
-        self.edit_conflict_msg = None;
 
         self.input_name.update(cx, |state, cx| {
             state.set_value("", window, cx);
@@ -1137,6 +1121,8 @@ impl AuthProfilesSection {
         // for a new/reset profile.
         self.options_cache.clear();
         self.field_login_hint.clear();
+
+        self.release_login_of_replaced_form(cx);
     }
 
     fn sync_from_app_state(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1321,20 +1307,7 @@ impl AuthProfilesSection {
         };
 
         self.selected_profile_id = Some(profile.id);
-        self.profile_is_read_only = profile.read_only;
-        self.profile_dangling_origin = profile.dangling_origin.clone();
-        self.edit_conflict_msg = None;
-
-        // Reflected (file-backed) profiles use the edit-save path; stored
-        // profiles use the SQLite path.  Both require an editing_profile_id
-        // for the save-button to appear.
-        self.editing_profile_id = if profile.dangling_origin.is_some() {
-            // Dangling profiles are truly read-only: no section to write to.
-            None
-        } else {
-            Some(profile.id)
-        };
-
+        self.editing_profile_id = Some(profile.id);
         self.profile_enabled = profile.enabled;
         self.selected_provider_id = Some(profile.provider_id.clone());
 
@@ -1391,30 +1364,14 @@ impl AuthProfilesSection {
             });
         }
 
-        // Capture the edit snapshot for editable reflected profiles.  The
-        // snapshot is used at save time for the optimistic-concurrency check
-        // (spec R9.3.1, design §10).
-        //
-        // Dangling profiles have no snapshot (no section to hash); stored
-        // profiles don't need one (they go through SQLite, not save_edit).
-        self.edit_snapshot = if profile.dangling_origin.is_none() && !profile.read_only {
-            // Reflected, editable profile — snapshot the on-disk section.
-            let provider = self
-                .app_state
-                .read(cx)
-                .auth_provider_by_id(&profile.provider_id);
-
-            provider.map(|p| p.open_edit_snapshot(&profile.name))
-        } else {
-            None
-        };
-
         // Clear options cache so DynamicSelect dropdowns are re-fetched for
         // the newly loaded profile's field values.
         self.options_cache.clear();
         self.field_login_hint.clear();
 
-        self.provider_login_loading = false;
+        // A login still in flight belongs to the form as it was: its result
+        // must not land on the profile loaded now.
+        self.release_login(cx);
         self.provider_login_status = None;
 
         cx.notify();
@@ -1422,37 +1379,15 @@ impl AuthProfilesSection {
 
     fn begin_create_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.selected_profile_id = None;
-        self.profile_is_read_only = false;
-        self.profile_dangling_origin = None;
         self.clear_form(window, cx);
         self.enter_form(window, cx);
         cx.notify();
     }
 
-    fn save_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        // Dangling profiles (truly read-only) cannot be saved.
-        if self.profile_is_read_only {
-            return;
-        }
-
-        let name = self.input_name.read(cx).value().trim().to_string();
-        if name.is_empty() {
-            return;
-        }
-
-        let Some(provider_id) = self.selected_provider_id.clone() else {
-            return;
-        };
-
-        // When an edit snapshot is present, this is a reflected (file-backed) profile.
-        // Route through save_edit rather than SQLite.
-        if let Some(snapshot) = self.edit_snapshot.clone() {
-            self.save_edit_profile(name, provider_id, snapshot, window, cx);
-            return;
-        }
-
-        let profile_id = self.editing_profile_id.unwrap_or_else(Uuid::new_v4);
-
+    fn collect_profile_fields(
+        &self,
+        cx: &App,
+    ) -> (HashMap<String, String>, HashMap<String, SecretString>) {
         // Secret-kind fields (Password / WriteOnly) are split out of `fields`
         // into `secret_fields` so they are routed to the keyring and never
         // persisted as plaintext.
@@ -1508,6 +1443,23 @@ impl AuthProfilesSection {
             }
         }
 
+        (fields, secret_fields)
+    }
+
+    fn save_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.input_name.read(cx).value().trim().to_string();
+        if name.is_empty() {
+            return;
+        }
+
+        let Some(provider_id) = self.selected_provider_id.clone() else {
+            return;
+        };
+
+        let profile_id = self.editing_profile_id.unwrap_or_else(Uuid::new_v4);
+
+        let (fields, secret_fields) = self.collect_profile_fields(cx);
+
         let has_secret_fields = !secret_fields.is_empty();
 
         let profile = AuthProfile {
@@ -1517,63 +1469,7 @@ impl AuthProfilesSection {
             fields,
             secret_fields,
             enabled: self.profile_enabled,
-            read_only: false,
-            dangling_origin: None,
         };
-
-        // For file-backed providers, write to the external configuration file
-        // instead of DataTab's SQLite store. The provider returns `Some(result)`
-        // when it handles the write. Reflection will surface the new profile on
-        // the next `list_auth_profiles()` call.
-        let is_new = self.editing_profile_id.is_none();
-        if is_new
-            && let Some(provider) = self
-                .app_state
-                .read(cx)
-                .auth_provider_by_id(&profile.provider_id)
-        {
-            match provider.write_new_profile_to_config(&profile) {
-                Some(Ok(())) => {
-                    // File-backed create succeeded. Signal a refresh so
-                    // the reflection pass picks up the new entry.
-                    self.app_state.update(cx, |_, cx| {
-                        cx.emit(AppStateChanged);
-                    });
-
-                    self.selected_profile_id = None;
-                    self.profile_is_read_only = false;
-                    self.profile_dangling_origin = None;
-
-                    let success_text = resolve_success_text(
-                        self.app_state
-                            .read(cx)
-                            .auth_provider_by_id(&profile.provider_id)
-                            .and_then(|p| p.capabilities().edit.clone())
-                            .as_ref(),
-                    );
-                    self.provider_login_status = Some((success_text, true));
-                    cx.notify();
-                    return;
-                }
-
-                Some(Err(msg)) => {
-                    self.provider_login_status = Some((
-                        datatab_i18n::t!(
-                            "settings.auth_profiles.error.write_config_failed",
-                            error = msg
-                        ),
-                        false,
-                    ));
-                    cx.notify();
-                    return;
-                }
-
-                None => {
-                    // Provider does not do file-backed writes; fall through
-                    // to the standard SQLite path below.
-                }
-            }
-        }
 
         let is_edit = self.editing_profile_id.is_some();
         let secrets_persisted = self.app_state.update(cx, |state, cx| {
@@ -1601,143 +1497,8 @@ impl AuthProfilesSection {
             );
         }
 
-        if let Some(provider) = self
-            .app_state
-            .read(cx)
-            .auth_provider_by_id(&profile.provider_id)
-        {
-            provider.after_profile_saved(&profile);
-        }
-
         self.selected_profile_id = Some(profile_id);
         self.load_profile_into_form(profile_id, window, cx);
-    }
-
-    /// Save path for reflected (file-backed) profiles: calls `save_edit` with the
-    /// optimistic-concurrency snapshot and handles `Conflict` / `PartialSaved`
-    /// outcomes (spec R9.3.4, R9.3.6, S29, S35, design §14).
-    ///
-    /// Fields with `FormFieldKind::WriteOnly` that are left blank are omitted
-    /// from the field map so the provider preserves the existing on-disk value
-    /// (spec R9.4.2, S27). Secret values transit only through this method's
-    /// stack frame — they are never stored in `self` beyond the call site
-    /// (spec R9.6.1, R9.6.4).
-    fn save_edit_profile(
-        &mut self,
-        name: String,
-        provider_id: String,
-        snapshot: AuthEditSnapshot,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(provider) = self.app_state.read(cx).auth_provider_by_id(&provider_id) else {
-            return;
-        };
-
-        // Determine which fields are WriteOnly so blank values can be omitted.
-        let write_only_ids: std::collections::HashSet<String> = provider
-            .form_def()
-            .tabs
-            .iter()
-            .flat_map(|tab| tab.sections.iter())
-            .flat_map(|section| section.fields.iter())
-            .filter(|field| field.kind == FormFieldKind::WriteOnly)
-            .map(|field| field.id.clone())
-            .collect();
-
-        // Build the edited fields map.  Blank WriteOnly fields are excluded so
-        // the provider treats them as "preserve existing on-disk value".
-        let raw_fields: HashMap<String, String> = self
-            .form_inputs
-            .iter()
-            .filter_map(|(field_id, input)| {
-                let value = input.read(cx).value().to_string();
-                if write_only_ids.contains(field_id) && value.is_empty() {
-                    // Blank secret field — omit so the provider preserves the
-                    // existing on-disk value (spec R9.4.2).
-                    None
-                } else {
-                    Some((field_id.clone(), value))
-                }
-            })
-            .collect();
-
-        // Expand AuthProfileRef fields so save_edit() receives the referenced
-        // profile's name (e.g. `sso_session_ref_name`) and can persist the
-        // `sso_session = NAME` indirection. Mirrors the login path; a no-op for
-        // providers whose form declares no AuthProfileRef fields.
-        let registry_snapshot: Vec<AuthProfile> = self.app_state.read(cx).list_auth_profiles();
-        let raw_profile = AuthProfile {
-            id: self.editing_profile_id.unwrap_or_else(Uuid::new_v4),
-            name: name.clone(),
-            provider_id: provider_id.clone(),
-            fields: raw_fields,
-            // File-backed save path: secrets transit inline to save_edit (which
-            // writes them to the external config file), never to DataTab storage.
-            secret_fields: HashMap::new(),
-            enabled: self.profile_enabled,
-            read_only: false,
-            dangling_origin: None,
-        };
-        let fields = datatab_core::auth::expand_auth_profile_refs(
-            &raw_profile,
-            provider.form_def(),
-            &|target_id| {
-                registry_snapshot
-                    .iter()
-                    .find(|p| p.id == *target_id)
-                    .cloned()
-            },
-        )
-        .fields;
-
-        let outcome = provider.save_edit(&name, &fields, &snapshot);
-
-        match outcome {
-            AuthSaveOutcome::Saved => {
-                // Write succeeded. Signal a refresh so reflection picks up the
-                // updated section (mtime change drives cache invalidation).
-                self.edit_conflict_msg = None;
-                self.app_state.update(cx, |_, cx| {
-                    cx.emit(AppStateChanged);
-                });
-
-                // Reload the form to pick up the new values and a fresh snapshot.
-                // This must run before setting the status: load_profile_into_form
-                // resets provider_login_status, which would otherwise wipe the
-                // success message before it is ever rendered.
-                let profile_id = self.editing_profile_id;
-                if let Some(id) = profile_id {
-                    self.load_profile_into_form(id, window, cx);
-                }
-
-                let success_text = resolve_success_text(
-                    self.app_state
-                        .read(cx)
-                        .auth_provider_by_id(&provider_id)
-                        .and_then(|p| p.capabilities().edit.clone())
-                        .as_ref(),
-                );
-                self.provider_login_status = Some((success_text, true));
-                cx.notify();
-            }
-
-            AuthSaveOutcome::Conflict { target } => {
-                // Section changed on disk since the form was opened — block save.
-                self.edit_conflict_msg = Some((resolve_conflict_message(&target), true));
-                cx.notify();
-            }
-
-            AuthSaveOutcome::PartialSaved {
-                written,
-                conflicted,
-            } => {
-                // One resource succeeded; the other conflicted.
-                self.edit_conflict_msg =
-                    Some((resolve_partial_saved_message(&written, &conflicted), true));
-                cx.notify();
-            }
-        }
     }
 
     fn login_selected_profile(&mut self, cx: &mut Context<Self>) {
@@ -1783,6 +1544,8 @@ impl AuthProfilesSection {
             },
         );
 
+        self.release_login(cx);
+        let login_generation = self.login_generation;
         self.provider_login_loading = true;
         self.provider_login_status = Some((
             crate::labels::auth_profiles_starting_login(&profile.name),
@@ -1813,10 +1576,13 @@ impl AuthProfilesSection {
                     Ok(Some(url)) => {
                         cx.update(|cx| {
                             this_for_url.update(cx, |this, cx| {
-                                this.active_login_url = Some(url.clone());
-                                this.pending_sso_url =
-                                    Some((provider_name_for_url, profile_name_for_url, Some(url)));
-                                cx.notify();
+                                this.show_login_url(
+                                    login_generation,
+                                    provider_name_for_url,
+                                    profile_name_for_url,
+                                    url,
+                                    cx,
+                                );
                             });
                         });
                         break;
@@ -1840,11 +1606,16 @@ impl AuthProfilesSection {
 
             cx.update(|cx| {
                 this.update(cx, |this, cx| {
-                    this.provider_login_loading = false;
-                    // Login finished — clear the inline URL display regardless
-                    // of outcome (success means token cached, failure means
-                    // the URL is no longer actionable).
-                    this.active_login_url = None;
+                    // Cancel, or a login started since, took the form over:
+                    // this result is late and changes nothing.
+                    if this.login_generation != login_generation {
+                        return;
+                    }
+
+                    // Login finished — nothing waits for it any more, and its
+                    // URL goes regardless of outcome (success means token
+                    // cached, failure means the URL is no longer actionable).
+                    this.release_login(cx);
                     this.provider_login_status = Some(match &result {
                         Ok(_) => (
                             crate::labels::auth_profiles_login_completed(&profile.name),
@@ -1874,6 +1645,42 @@ impl AuthProfilesSection {
             });
         })
         .detach();
+    }
+
+    /// Shows the verification URL of the login of `generation`: inline under
+    /// the Login button, and in the login modal. A URL that arrives after the
+    /// form let go of its login is dropped.
+    fn show_login_url(
+        &mut self,
+        generation: u64,
+        provider_name: String,
+        profile_name: String,
+        url: String,
+        cx: &mut Context<Self>,
+    ) {
+        if self.login_generation != generation {
+            return;
+        }
+
+        self.active_login_url = Some(url.clone());
+        self.pending_sso_url = Some((provider_name, profile_name, Some(url), generation));
+        cx.notify();
+    }
+
+    /// Lets go of the login in flight, if any, because it finished or the
+    /// form moved on: the Login button is enabled again, a result or a URL of
+    /// that login is ignored when it arrives later, and whoever shows its URL
+    /// is told once that it ended.
+    fn release_login(&mut self, cx: &mut Context<Self>) {
+        let released = self.login_generation;
+
+        self.login_generation = self.login_generation.wrapping_add(1);
+        self.provider_login_loading = false;
+        self.active_login_url = None;
+        self.pending_sso_url = None;
+        cx.emit(AuthProfilesSectionEvent::LoginEnded {
+            generation: released,
+        });
     }
 
     fn request_delete_selected_profile(&mut self, cx: &mut Context<Self>) {
@@ -1920,8 +1727,7 @@ impl AuthProfilesSection {
                 state.update_profile(profile);
             }
 
-            // Stored-only access is intentional: `remove_auth_profile` operates
-            // on the stored list by index; reflected profiles are not removable.
+            // remove_auth_profile takes an index in the stored list.
             #[allow(deprecated)]
             if let Some(index) = state
                 .auth_profiles()
@@ -1935,8 +1741,7 @@ impl AuthProfilesSection {
         });
 
         self.editing_profile_id = None;
-        // Stored-only access is intentional: after deletion the sidebar re-selects
-        // the first stored profile (reflected profiles are not user-managed).
+        // After deletion the sidebar selects the first stored profile.
         #[allow(deprecated)]
         let first_stored_id = self
             .app_state
@@ -1978,9 +1783,22 @@ impl AuthProfilesSection {
             .count()
     }
 
-    /// Asks the active provider to abort whatever in-flight login it has for
-    /// the profile being edited. The provider's login future then returns an
-    /// error and the spawned login task cleans up the final status.
+    /// Lets go of a login in flight because the form was emptied for a new
+    /// profile or switched to another provider: the login belongs to the form
+    /// as it was, and its "starting" status goes with it. A form with no
+    /// login in flight keeps its status.
+    fn release_login_of_replaced_form(&mut self, cx: &mut Context<Self>) {
+        if self.provider_login_loading {
+            self.release_login(cx);
+            self.provider_login_status = None;
+        }
+    }
+
+    /// Stops waiting for the in-flight login of the profile being edited: the
+    /// Login button is enabled again at once, and the result of that login is
+    /// ignored when it arrives. A provider may never answer, and an RPC
+    /// provider cannot be told to stop. The active provider is still asked to
+    /// abort the login, for the ones that can.
     fn cancel_provider_login(&mut self, cx: &mut Context<Self>) {
         if let Some(profile) = self.current_form_profile(cx)
             && let Some(provider) = self.selected_provider(cx)
@@ -1988,7 +1806,7 @@ impl AuthProfilesSection {
             let _aborted = provider.abort_login(&profile);
         }
 
-        self.active_login_url = None;
+        self.release_login(cx);
         self.provider_login_status = Some((
             datatab_i18n::t!("settings.auth_profiles.login_cancelled"),
             false,
@@ -2055,9 +1873,7 @@ impl AuthProfilesSection {
     /// surface the referenced field's value in disabled inputs.
     fn resolve_ref_profile(&self, trigger_value: &str, cx: &App) -> Option<AuthProfile> {
         let target_id = Uuid::parse_str(trigger_value.trim()).ok()?;
-        // Stored-only access is intentional: ref-profile resolution in the form
-        // editor resolves display hints for profiles that were explicitly linked
-        // in the stored form data; reflected profiles cannot be referenced here.
+        // Resolve display hints for profiles linked in the stored form data.
         #[allow(deprecated)]
         let result = self
             .app_state
@@ -2295,110 +2111,8 @@ impl AuthProfilesSection {
             ))
     }
 
-    /// Renders a read-only info panel for profiles that are reflected from
-    /// external configuration files. No editable inputs are shown; all field
-    /// values are displayed as plain text. A dangling-profile banner is shown
-    /// when `profile_dangling_origin` is set.
-    fn render_read_only_mirror(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-
-        let profile_name = self.input_name.read(cx).value().to_string();
-
-        let provider_label = self
-            .selected_provider_id
-            .as_deref()
-            .and_then(|id| self.app_state.read(cx).auth_provider_by_id(id))
-            .map(|provider| provider.display_name().to_string())
-            .or_else(|| self.selected_provider_id.clone())
-            .unwrap_or_default();
-
-        let field_rows: Vec<(String, String)> = self
-            .provider_field_order
-            .iter()
-            .filter_map(|field_id| {
-                let value = self.form_inputs.get(field_id)?.read(cx).value().to_string();
-
-                if value.is_empty() {
-                    return None;
-                }
-
-                Some((field_id.replace('_', " "), value))
-            })
-            .collect();
-
-        let dangling_origin = self.profile_dangling_origin.clone();
-
-        let edit_caps: Option<AuthEditCapabilities> = self
-            .selected_provider_id
-            .as_deref()
-            .and_then(|id| self.app_state.read(cx).auth_provider_by_id(id))
-            .and_then(|p| p.capabilities().edit.clone());
-
-        let value_row = |label: String, value: String| {
-            layout::form_row(
-                label,
-                div()
-                    .pt(FormMetrics::LABEL_PADDING_TOP)
-                    .child(Text::body(value).text_color(ChromeColors::strong(&theme))),
-                None,
-            )
-        };
-
-        layout::sticky_form_shell(
-            datatab_components::composites::section_header(
-                datatab_i18n::t!("settings.auth_profiles.group.profile"),
-                Some(AppIcon::KeyRound.into()),
-                cx,
-            ),
-            div()
-                .flex()
-                .flex_col()
-                .when_some(dangling_origin, |content, origin| {
-                    let dangling = resolve_dangling(edit_caps.as_ref(), &origin);
-
-                    content.child(
-                        div().py(FormMetrics::ROW_PADDING_Y).child(
-                            BannerBlock::new(BannerVariant::Warning, dangling.title)
-                                .with_body(dangling.body),
-                        ),
-                    )
-                })
-                .child(value_row(
-                    datatab_i18n::t!("settings.auth_profiles.name_label"),
-                    profile_name,
-                ))
-                .child(value_row(
-                    datatab_i18n::t!("settings.auth_profiles.provider_label"),
-                    provider_label,
-                ))
-                .child(value_row(
-                    datatab_i18n::t!("settings.auth_profiles.source_label"),
-                    resolve_mirror_label(edit_caps.as_ref()).to_string(),
-                ))
-                .children(
-                    field_rows
-                        .into_iter()
-                        .map(|(label, value)| value_row(label, value)),
-                ),
-            None,
-            &theme,
-        )
-    }
-
     fn render_editor_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        // Read-only (reflected) profiles get a mirror view with no editable
-        // inputs and no save/delete controls.
-        if self.profile_is_read_only {
-            return self.render_read_only_mirror(cx).into_any_element();
-        }
-
         let theme = cx.theme().clone();
-
-        let edit_caps: Option<AuthEditCapabilities> = self
-            .selected_provider_id
-            .as_deref()
-            .and_then(|id| self.app_state.read(cx).auth_provider_by_id(id))
-            .and_then(|p| p.capabilities().edit.clone());
 
         // Drive DynamicSelect fetches for the current provider's fields.
         // `fetch_dynamic_options_if_needed` is a no-op for fields already
@@ -2427,12 +2141,12 @@ impl AuthProfilesSection {
         // unblock once the user has either completed login in this editor
         // pass or has a valid status from a previous login. We never
         // serialize real session data into the form snapshot — the auth
-        // provider re-establishes its session from its own cache (e.g. the
-        // SSO token cache on disk). When no valid session exists the
+        // provider re-establishes its session from its own cache. When no
+        // valid session exists the
         // provider returns `NeedsLogin` / `SessionExpired`, which
         // `apply_fetch_error` surfaces as a re-login hint below the field.
         // We pass the marker unconditionally so users with a valid session
-        // from a prior `aws sso login` or DataTab run see options without
+        // from a prior provider login or DataTab run see options without
         // having to click Login again.
         let session_marker = Some(serde_json::Value::Null);
 
@@ -2538,8 +2252,6 @@ impl AuthProfilesSection {
             })
             .collect();
 
-        let conflict_msg = self.edit_conflict_msg.clone();
-
         layout::sticky_form_shell(
             datatab_components::composites::section_header(
                 datatab_i18n::t!("settings.auth_profiles.group.profile"),
@@ -2549,51 +2261,10 @@ impl AuthProfilesSection {
             div()
                 .flex()
                 .flex_col()
-                .when_some(conflict_msg, |content, (msg, show_reload)| {
-                    let mut banner = BannerBlock::new(
-                        BannerVariant::Warning,
-                        datatab_i18n::t!("settings.auth_profiles.changed_on_disk"),
-                    )
-                    .with_body(msg);
-
-                    if show_reload {
-                        banner = banner.with_actions(
-                            Button::new(
-                                "edit-reload-profile",
-                                datatab_i18n::t!("settings.auth_profiles.reload"),
-                            )
-                            .secondary()
-                            .icon(AppIcon::RefreshCcw)
-                            .on_click(cx.listener(
-                                |this, _, window, cx| {
-                                    if let Some(id) = this.selected_profile_id {
-                                        this.load_profile_into_form(id, window, cx);
-                                    }
-                                },
-                            )),
-                        );
-                    }
-
-                    content.child(div().py(FormMetrics::ROW_PADDING_Y).child(banner))
-                })
                 .child({
                     let is_focused = self.auth_form_field == AuthFormField::Name
                         && self.auth_focus == AuthFocus::Form
                         && self.content_focused;
-                    let is_reflected = self.edit_snapshot.is_some();
-                    let name_hint = if is_reflected {
-                        let hint = edit_caps
-                            .as_ref()
-                            .map(|e| e.name_field_hint.as_str())
-                            .unwrap_or(NAME_HINT_FALLBACK);
-                        if hint.is_empty() {
-                            None
-                        } else {
-                            Some(hint.to_string())
-                        }
-                    } else {
-                        None
-                    };
                     let name_label = datatab_i18n::t!("settings.auth_profiles.name_label");
                     self.render_input_row_disabled(
                         &name_label,
@@ -2601,51 +2272,26 @@ impl AuthProfilesSection {
                         AuthFormField::Name,
                         false,
                         is_focused,
-                        is_reflected,
-                        name_hint,
+                        false,
+                        None,
                         None,
                         cx,
                     )
                 })
                 .child({
-                    let provider_control = if self.edit_snapshot.is_none() {
-                        self.render_provider_selector(window, cx).into_any_element()
-                    } else {
-                        // Reflected profiles: provider is fixed by the file section type.
-                        let provider_label = self
-                            .selected_provider_id
-                            .as_deref()
-                            .and_then(|id| {
-                                self.app_state
-                                    .read(cx)
-                                    .auth_provider_by_id(id)
-                                    .map(|p| p.display_name().to_string())
-                            })
-                            .or_else(|| self.selected_provider_id.clone())
-                            .unwrap_or_default();
-
-                        div()
-                            .pt(FormMetrics::LABEL_PADDING_TOP)
-                            .child(Text::body(provider_label))
-                            .into_any_element()
-                    };
-
                     layout::form_row(
                         datatab_i18n::t!("settings.auth_profiles.provider_label"),
-                        provider_control,
+                        self.render_provider_selector(window, cx),
                         None,
                     )
                 })
                 .children(dynamic_fields)
-                .when(self.edit_snapshot.is_none(), |content| {
-                    // The enabled toggle only applies to stored (SQLite-backed)
-                    // profiles. Reflected (externally-managed) profiles are
-                    // always enabled and managed by the provider's config file.
+                .child({
                     let cursor = self.content_focused
                         && self.auth_focus == AuthFocus::Form
                         && self.auth_form_field == AuthFormField::Enabled;
 
-                    content.child(layout::check_row(
+                    layout::check_row(
                         layout::cursor_ring(
                             cursor,
                             Checkbox::new("auth-profile-enabled")
@@ -2658,7 +2304,7 @@ impl AuthProfilesSection {
                             cx,
                         ),
                         None,
-                    ))
+                    )
                 })
                 .when(self.selected_provider_supports_login, |content| {
                     let login_focused = self.content_focused
@@ -2730,10 +2376,9 @@ impl AuthProfilesSection {
     }
 
     /// Export and Delete, on the left of the footer, for a stored profile.
+    #[expect(clippy::question_mark, reason = "Keep the footer guard explicit.")]
     fn render_section_footer_leading_actions(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        // Reflected profiles are edited in-place via save_edit; they cannot be
-        // deleted from DataTab (the file section is the source of truth).
-        if self.editing_profile_id.is_none() || self.edit_snapshot.is_some() {
+        if self.editing_profile_id.is_none() {
             return None;
         }
 
@@ -2769,7 +2414,6 @@ impl AuthProfilesSection {
 
     fn render_section_footer_actions(&self, cx: &mut Context<Self>) -> AnyElement {
         let is_editing = self.editing_profile_id.is_some();
-        let is_reflected = self.edit_snapshot.is_some();
 
         layout::inline_controls()
             .child(
@@ -2790,9 +2434,7 @@ impl AuthProfilesSection {
             .child(
                 Button::new(
                     "save-auth-profile",
-                    if is_reflected {
-                        datatab_i18n::t!("settings.auth_profiles.save_to_file")
-                    } else if is_editing {
+                    if is_editing {
                         datatab_i18n::t!("settings.auth_profiles.update")
                     } else {
                         datatab_i18n::t!("settings.auth_profiles.create")
@@ -2869,7 +2511,6 @@ impl FormSection for AuthProfilesSection {
             self.selected_provider_supports_login,
             self.active_login_url.is_some(),
             self.editing_profile_id.is_some(),
-            self.edit_snapshot.is_some(),
         )
     }
 
@@ -2924,7 +2565,11 @@ impl FormSection for AuthProfilesSection {
                 self.profile_enabled = !self.profile_enabled;
             }
             AuthFormField::ProviderLogin => {
-                self.login_selected_profile(cx);
+                // The Login button is disabled while a login is in flight;
+                // its keyboard path follows it.
+                if !self.provider_login_loading {
+                    self.login_selected_profile(cx);
+                }
             }
             AuthFormField::LoginOpenBrowser => {
                 if let Some(url) = self.active_login_url.as_deref() {
@@ -2996,11 +2641,6 @@ impl SettingsSection for AuthProfilesSection {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        // Read-only profiles have no editable state — suppress Save/Delete.
-        if self.profile_is_read_only {
-            return None;
-        }
-
         Some(self.render_section_footer_actions(cx))
     }
 
@@ -3009,17 +2649,11 @@ impl SettingsSection for AuthProfilesSection {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if self.profile_is_read_only {
-            return None;
-        }
-
         self.render_section_footer_leading_actions(cx)
     }
 
     fn save_from_shortcut(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.profile_is_read_only {
-            self.save_profile(window, cx);
-        }
+        self.save_profile(window, cx);
     }
 }
 
@@ -3032,11 +2666,12 @@ impl Render for AuthProfilesSection {
 
         // Consume a pending login URL and emit it as an event so the settings
         // coordinator can route it to the login modal in the workspace window.
-        if let Some((provider_name, profile_name, url)) = self.pending_sso_url.take() {
+        if let Some((provider_name, profile_name, url, generation)) = self.pending_sso_url.take() {
             cx.emit(AuthProfilesSectionEvent::OpenLoginModal {
                 provider_name,
                 profile_name,
                 url,
+                generation,
             });
         }
 
@@ -3106,10 +2741,711 @@ impl Render for AuthProfilesSection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ::core::prelude::v1::test;
+
+    struct StoredTestProvider;
+
+    impl datatab_core::auth::AuthProvider for StoredTestProvider {
+        fn provider_id(&self) -> &'static str {
+            "rpc-auth"
+        }
+        fn display_name(&self) -> &'static str {
+            "Test provider"
+        }
+        async fn validate_session(
+            &self,
+            _: &AuthProfile,
+        ) -> Result<datatab_core::AuthSessionState, datatab_core::DbError> {
+            Ok(datatab_core::AuthSessionState::LoginRequired)
+        }
+        async fn login(
+            &self,
+            profile: &AuthProfile,
+        ) -> Result<datatab_core::AuthSession, datatab_core::DbError> {
+            Ok(datatab_core::AuthSession {
+                provider_id: "rpc-auth".into(),
+                profile_id: profile.id,
+                expires_at: None,
+                data: None,
+            })
+        }
+        async fn resolve_credentials(
+            &self,
+            _: &AuthProfile,
+        ) -> Result<datatab_core::ResolvedCredentials, datatab_core::DbError> {
+            Ok(datatab_core::ResolvedCredentials::default())
+        }
+    }
+
+    #[gpui::test]
+    fn save_profile_creates_and_edits_a_stored_provider_profile(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(datatab_components::theme::init);
+        let app_state = cx.update(|cx| {
+            cx.new(|_| {
+                let runtime =
+                    datatab_storage::bootstrap::StorageRuntime::in_memory().expect("storage");
+                let mut state =
+                    AppStateEntity::new_with_storage_runtime(runtime).expect("app state");
+                state.register_auth_provider_for_test(Arc::new(StoredTestProvider));
+                state
+            })
+        });
+        let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (_, window) = cx.add_window_view({
+            let app_state = app_state.clone();
+            let slot = slot.clone();
+            move |window, cx| {
+                let section = cx.new(|cx| AuthProfilesSection::new(app_state, window, cx));
+                slot.replace(Some(section.clone()));
+                gpui_component::Root::new(section, window, cx)
+            }
+        });
+        let section = slot.borrow().clone().expect("section");
+        let mut profile_id = None;
+        for name in ["Created", "Edited"] {
+            window.update(|window, cx| {
+                section.update(cx, |section, cx| {
+                    section
+                        .input_name
+                        .update(cx, |input, cx| input.set_value(name, window, cx));
+                    section.save_profile(window, cx);
+                    let profiles = app_state.read(cx).list_auth_profiles();
+                    assert_eq!(profiles.len(), 1);
+                    assert_eq!(profiles[0].name, name);
+                    assert_eq!(profiles[0].provider_id, "rpc-auth");
+                    if let Some(id) = profile_id {
+                        assert_eq!(profiles[0].id, id);
+                    }
+                    profile_id = Some(profiles[0].id);
+                    let stored = app_state
+                        .read(cx)
+                        .storage_runtime()
+                        .auth_profiles()
+                        .get(&profiles[0].id.to_string())
+                        .expect("read stored row")
+                        .expect("stored profile");
+                    assert_eq!(stored.name, name);
+                    assert_eq!(stored.provider_id, "rpc-auth");
+                })
+            });
+        }
+    }
+
+    // --- A login the provider is still working on (#369) ---
+
+    /// One `login` call of `HeldLoginProvider`. It waits until the test
+    /// finishes it.
+    #[derive(Default)]
+    struct HeldLogin {
+        state: std::sync::Mutex<HeldLoginState>,
+    }
+
+    #[derive(Default)]
+    struct HeldLoginState {
+        /// Whether the login succeeded, once the test finished it.
+        succeeded: Option<bool>,
+        waker: Option<std::task::Waker>,
+    }
+
+    impl HeldLogin {
+        fn finish(&self, succeeded: bool) {
+            let mut state = self.state.lock().expect("held login state");
+            state.succeeded = Some(succeeded);
+            if let Some(waker) = state.waker.take() {
+                waker.wake();
+            }
+        }
+
+        /// Waits until the test finishes the login; `true` when it succeeded.
+        async fn finished(&self) -> bool {
+            std::future::poll_fn(|context| {
+                let mut state = self.state.lock().expect("held login state");
+                match state.succeeded {
+                    Some(succeeded) => std::task::Poll::Ready(succeeded),
+                    None => {
+                        state.waker = Some(context.waker().clone());
+                        std::task::Poll::Pending
+                    }
+                }
+            })
+            .await
+        }
+    }
+
+    /// A provider whose login succeeds only when the test finishes it, as an
+    /// RPC provider answers only after the browser step. Clones share the
+    /// logins, so the test keeps one and registers the other.
+    #[derive(Clone, Default)]
+    struct HeldLoginProvider {
+        logins: Arc<std::sync::Mutex<Vec<Arc<HeldLogin>>>>,
+    }
+
+    impl HeldLoginProvider {
+        /// Lets the login started by the `index`-th `login` call succeed.
+        fn finish_login(&self, index: usize) {
+            self.held_login(index).finish(true);
+        }
+
+        /// Lets the login started by the `index`-th `login` call fail.
+        fn fail_login(&self, index: usize) {
+            self.held_login(index).finish(false);
+        }
+
+        fn held_login(&self, index: usize) -> Arc<HeldLogin> {
+            self.logins
+                .lock()
+                .expect("held logins")
+                .get(index)
+                .cloned()
+                .expect("the login was started")
+        }
+    }
+
+    static HELD_LOGIN_CAPABILITIES: datatab_core::auth::AuthProviderCapabilities =
+        datatab_core::auth::AuthProviderCapabilities {
+            login: datatab_core::auth::AuthProviderLoginCapabilities {
+                supported: true,
+                verification_url_progress: false,
+            },
+        };
+
+    impl datatab_core::auth::AuthProvider for HeldLoginProvider {
+        fn provider_id(&self) -> &'static str {
+            "held-login-auth"
+        }
+        fn display_name(&self) -> &'static str {
+            "Held login provider"
+        }
+        fn capabilities(&self) -> &'static datatab_core::auth::AuthProviderCapabilities {
+            &HELD_LOGIN_CAPABILITIES
+        }
+        async fn validate_session(
+            &self,
+            _: &AuthProfile,
+        ) -> Result<datatab_core::AuthSessionState, datatab_core::DbError> {
+            Ok(datatab_core::AuthSessionState::LoginRequired)
+        }
+        async fn login(
+            &self,
+            profile: &AuthProfile,
+        ) -> Result<datatab_core::AuthSession, datatab_core::DbError> {
+            let login = Arc::new(HeldLogin::default());
+            self.logins.lock().expect("held logins").push(login.clone());
+            if !login.finished().await {
+                return Err(datatab_core::DbError::connection_failed(
+                    "the held login failed".to_string(),
+                ));
+            }
+
+            Ok(datatab_core::AuthSession {
+                provider_id: "held-login-auth".into(),
+                profile_id: profile.id,
+                expires_at: None,
+                data: None,
+            })
+        }
+        async fn resolve_credentials(
+            &self,
+            _: &AuthProfile,
+        ) -> Result<datatab_core::ResolvedCredentials, datatab_core::DbError> {
+            Ok(datatab_core::ResolvedCredentials::default())
+        }
+    }
+
+    const HELD_LOGIN_PROFILE_NAME: &str = "Held";
+
+    /// Opens the section on a named, unsaved profile of a `HeldLoginProvider`.
+    fn section_with_held_login_provider(
+        cx: &mut TestAppContext,
+    ) -> (
+        HeldLoginProvider,
+        Entity<AuthProfilesSection>,
+        &mut VisualTestContext,
+    ) {
+        cx.update(gpui_component::init);
+        cx.update(datatab_components::theme::init);
+        let provider = HeldLoginProvider::default();
+        let app_state = cx.update(|cx| {
+            cx.new(|_| {
+                let runtime =
+                    datatab_storage::bootstrap::StorageRuntime::in_memory().expect("storage");
+                let mut state =
+                    AppStateEntity::new_with_storage_runtime(runtime).expect("app state");
+                state.register_auth_provider_for_test(Arc::new(provider.clone()));
+                state
+            })
+        });
+        let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (_, window) = cx.add_window_view({
+            let slot = slot.clone();
+            move |window, cx| {
+                let section = cx.new(|cx| AuthProfilesSection::new(app_state, window, cx));
+                slot.replace(Some(section.clone()));
+                gpui_component::Root::new(section, window, cx)
+            }
+        });
+        let section = slot.borrow().clone().expect("section");
+        window.update(|window, cx| {
+            section.update(cx, |section, cx| {
+                section.input_name.update(cx, |input, cx| {
+                    input.set_value(HELD_LOGIN_PROFILE_NAME, window, cx)
+                });
+            })
+        });
+
+        (provider, section, window)
+    }
+
+    fn start_login(section: &Entity<AuthProfilesSection>, window: &mut VisualTestContext) {
+        window.update(|_, cx| section.update(cx, |section, cx| section.login_selected_profile(cx)));
+        window.run_until_parked();
+    }
+
+    fn cancel_login(section: &Entity<AuthProfilesSection>, window: &mut VisualTestContext) {
+        window.update(|_, cx| section.update(cx, |section, cx| section.cancel_provider_login(cx)));
+        window.run_until_parked();
+    }
+
+    fn login_cancelled_status() -> Option<(String, bool)> {
+        Some((
+            datatab_i18n::t!("settings.auth_profiles.login_cancelled"),
+            false,
+        ))
+    }
+
+    /// Cancel must not leave the Login button waiting for a provider that may
+    /// never answer.
+    #[gpui::test]
+    fn cancel_enables_the_login_button_before_the_provider_answers(cx: &mut TestAppContext) {
+        let (_provider, section, window) = section_with_held_login_provider(cx);
+
+        start_login(&section, window);
+        assert!(
+            window.read(|cx| section.read(cx).provider_login_loading),
+            "the form waits for the login"
+        );
+
+        cancel_login(&section, window);
+
+        window.read(|cx| {
+            let section = section.read(cx);
+            assert!(
+                !section.provider_login_loading,
+                "the Login button must be enabled right after Cancel"
+            );
+            assert_eq!(section.provider_login_status, login_cancelled_status());
+        });
+    }
+
+    /// A login that succeeds after Cancel is late: it must not report
+    /// "login completed", and it must not drop the cached options, which is
+    /// what makes the form fetch them again.
+    #[gpui::test]
+    fn login_result_after_cancel_changes_nothing(cx: &mut TestAppContext) {
+        let (provider, section, window) = section_with_held_login_provider(cx);
+        let cached_options_key = ("held-login-auth".to_string(), "account".to_string(), 0);
+
+        start_login(&section, window);
+        window.update(|_, cx| {
+            section.update(cx, |section, _| {
+                section.options_cache.insert(
+                    cached_options_key.clone(),
+                    CachedOptions {
+                        options: Vec::new(),
+                        expires_at: Instant::now(),
+                    },
+                );
+            })
+        });
+        cancel_login(&section, window);
+
+        provider.finish_login(0);
+        window.run_until_parked();
+
+        window.read(|cx| {
+            let section = section.read(cx);
+            assert_eq!(section.provider_login_status, login_cancelled_status());
+            assert!(!section.provider_login_loading);
+            assert!(
+                section.options_cache.contains_key(&cached_options_key),
+                "a late login result must not trigger option fetches"
+            );
+        });
+    }
+
+    /// The result of a cancelled login must not end the login started after it.
+    #[gpui::test]
+    fn login_result_after_cancel_leaves_the_next_login_waiting(cx: &mut TestAppContext) {
+        let (provider, section, window) = section_with_held_login_provider(cx);
+
+        start_login(&section, window);
+        cancel_login(&section, window);
+        start_login(&section, window);
+
+        provider.finish_login(0);
+        window.run_until_parked();
+
+        window.read(|cx| {
+            let section = section.read(cx);
+            assert!(
+                section.provider_login_loading,
+                "the second login is still waiting for its provider"
+            );
+            assert_eq!(
+                section.provider_login_status,
+                Some((
+                    crate::labels::auth_profiles_starting_login(HELD_LOGIN_PROFILE_NAME),
+                    false
+                ))
+            );
+        });
+
+        provider.finish_login(1);
+        window.run_until_parked();
+
+        window.read(|cx| {
+            let section = section.read(cx);
+            assert!(!section.provider_login_loading);
+            assert_eq!(
+                section.provider_login_status,
+                Some((
+                    crate::labels::auth_profiles_login_completed(HELD_LOGIN_PROFILE_NAME),
+                    true
+                ))
+            );
+        });
+    }
+
+    // --- A login the form lets go of, and the login modal (#369, ruling 1) ---
+
+    /// Stores the form as a profile, as Save does, and returns its id.
+    fn save_held_login_profile(
+        section: &Entity<AuthProfilesSection>,
+        window: &mut VisualTestContext,
+    ) -> Uuid {
+        window.update(|window, cx| {
+            section.update(cx, |section, cx| {
+                section.save_profile(window, cx);
+                section.editing_profile_id.expect("the profile was stored")
+            })
+        })
+    }
+
+    fn login_handle(
+        section: &Entity<AuthProfilesSection>,
+        window: &mut VisualTestContext,
+    ) -> SettingsLoginHandle {
+        window.read(|cx| {
+            SettingsLoginHandle::new(section.downgrade(), section.read(cx).login_generation)
+        })
+    }
+
+    /// Counts the "login ended" calls of one `SettingsLoginHandle`.
+    struct LoginEndProbe {
+        ended: usize,
+        _subscription: Subscription,
+    }
+
+    fn watch_login_end(
+        handle: &SettingsLoginHandle,
+        window: &mut VisualTestContext,
+    ) -> Entity<LoginEndProbe> {
+        window.update(|_, cx| {
+            cx.new(|cx| LoginEndProbe {
+                ended: 0,
+                _subscription: handle
+                    .on_ended(cx, |probe: &mut LoginEndProbe, _| probe.ended += 1)
+                    .expect("the section is alive"),
+            })
+        })
+    }
+
+    /// Loading a profile into the form, as selecting one or Save does, lets
+    /// go of the login in flight: its result belongs to the form as it was.
+    #[gpui::test]
+    fn login_result_after_a_profile_is_loaded_changes_nothing(cx: &mut TestAppContext) {
+        let (provider, section, window) = section_with_held_login_provider(cx);
+        let profile_id = save_held_login_profile(&section, window);
+        let cached_options_key = ("held-login-auth".to_string(), "account".to_string(), 0);
+
+        start_login(&section, window);
+        window.update(|window, cx| {
+            section.update(cx, |section, cx| {
+                section.load_profile_into_form(profile_id, window, cx);
+                section.options_cache.insert(
+                    cached_options_key.clone(),
+                    CachedOptions {
+                        options: Vec::new(),
+                        expires_at: Instant::now(),
+                    },
+                );
+            })
+        });
+
+        provider.finish_login(0);
+        window.run_until_parked();
+
+        window.read(|cx| {
+            let section = section.read(cx);
+            assert_eq!(
+                section.provider_login_status, None,
+                "the late result must not report on the loaded profile"
+            );
+            assert!(
+                section.options_cache.contains_key(&cached_options_key),
+                "the late result must not trigger option fetches"
+            );
+        });
+    }
+
+    /// Asserts that the form has let go of its login: Login is enabled, no
+    /// login status is left, and the result that then arrives for the
+    /// `login_index`-th login changes neither.
+    fn assert_login_released(
+        provider: &HeldLoginProvider,
+        login_index: usize,
+        section: &Entity<AuthProfilesSection>,
+        window: &mut VisualTestContext,
+    ) {
+        let cached_options_key = ("held-login-auth".to_string(), "account".to_string(), 0);
+
+        window.update(|_, cx| {
+            section.update(cx, |section, _| {
+                assert!(
+                    !section.provider_login_loading,
+                    "the Login button must be enabled on the new form"
+                );
+                assert_eq!(section.provider_login_status, None);
+                section.options_cache.insert(
+                    cached_options_key.clone(),
+                    CachedOptions {
+                        options: Vec::new(),
+                        expires_at: Instant::now(),
+                    },
+                );
+            })
+        });
+
+        provider.finish_login(login_index);
+        window.run_until_parked();
+
+        window.read(|cx| {
+            let section = section.read(cx);
+            assert_eq!(
+                section.provider_login_status, None,
+                "the late result must not report on the new form"
+            );
+            assert!(!section.provider_login_loading);
+            assert!(
+                section.options_cache.contains_key(&cached_options_key),
+                "the late result must not trigger option fetches"
+            );
+        });
+    }
+
+    /// Enter on the Login row is the keyboard path of the Login button, which
+    /// is disabled while a login is in flight: it must not start a second
+    /// login and let go of the first.
+    #[gpui::test]
+    fn enter_on_login_starts_no_second_login_while_one_waits(cx: &mut TestAppContext) {
+        let (provider, section, window) = section_with_held_login_provider(cx);
+
+        start_login(&section, window);
+        window.update(|window, cx| {
+            section.update(cx, |section, cx| {
+                section.auth_form_field = AuthFormField::ProviderLogin;
+                section.activate_current_field(window, cx);
+            })
+        });
+        window.run_until_parked();
+
+        assert_eq!(
+            provider.logins.lock().expect("held logins").len(),
+            1,
+            "Enter started a second login"
+        );
+
+        provider.finish_login(0);
+        window.run_until_parked();
+
+        assert_eq!(
+            window.read(|cx| section.read(cx).provider_login_status.clone()),
+            Some((
+                crate::labels::auth_profiles_login_completed(HELD_LOGIN_PROFILE_NAME),
+                true
+            )),
+            "the login in flight must still report its result"
+        );
+    }
+
+    /// Starting a new profile during a login replaces the form: the login
+    /// belongs to the form as it was.
+    #[gpui::test]
+    fn login_result_after_a_new_profile_is_started_changes_nothing(cx: &mut TestAppContext) {
+        let (provider, section, window) = section_with_held_login_provider(cx);
+
+        start_login(&section, window);
+        window.update(|window, cx| {
+            section.update(cx, |section, cx| section.begin_create_profile(window, cx));
+        });
+        window.run_until_parked();
+
+        assert_login_released(&provider, 0, &section, window);
+    }
+
+    /// Choosing a provider in the form during a login replaces the form's
+    /// fields: the login belongs to the form as it was.
+    #[gpui::test]
+    fn login_result_after_a_provider_is_chosen_changes_nothing(cx: &mut TestAppContext) {
+        let (provider, section, window) = section_with_held_login_provider(cx);
+
+        start_login(&section, window);
+        window.update(|_, cx| {
+            let provider_dropdown = section.read(cx).provider_dropdown.clone();
+            provider_dropdown.update(cx, |_, cx| {
+                cx.emit(DropdownSelectionChanged {
+                    index: 0,
+                    item: DropdownItem::with_value("Held login provider", "held-login-auth"),
+                });
+            });
+        });
+        window.run_until_parked();
+
+        assert_login_released(&provider, 0, &section, window);
+    }
+
+    /// The verification URL of the login in flight opens the URL panel and
+    /// is queued for the login modal under that login's generation. One that
+    /// arrives after the form let go of its login does neither.
+    #[gpui::test]
+    fn verification_url_is_shown_only_for_the_login_in_flight(cx: &mut TestAppContext) {
+        let (_provider, section, window) = section_with_held_login_provider(cx);
+        let url = "https://verify.example/device";
+        let show_url = |section: &mut AuthProfilesSection,
+                        generation: u64,
+                        cx: &mut Context<AuthProfilesSection>| {
+            section.show_login_url(
+                generation,
+                "Held login provider".to_string(),
+                HELD_LOGIN_PROFILE_NAME.to_string(),
+                url.to_string(),
+                cx,
+            );
+        };
+
+        start_login(&section, window);
+        let generation = window.update(|_, cx| {
+            section.update(cx, |section, cx| {
+                let generation = section.login_generation;
+                show_url(section, generation, cx);
+
+                assert_eq!(section.active_login_url.as_deref(), Some(url));
+                assert_eq!(
+                    section
+                        .pending_sso_url
+                        .as_ref()
+                        .map(|(_, _, url, generation)| (url.as_deref(), *generation)),
+                    Some((Some(url), generation))
+                );
+                generation
+            })
+        });
+
+        window.update(|_, cx| {
+            section.update(cx, |section, cx| {
+                section.cancel_provider_login(cx);
+                show_url(section, generation, cx);
+
+                assert_eq!(section.active_login_url, None);
+                assert!(section.pending_sso_url.is_none());
+            })
+        });
+    }
+
+    /// The login modal cancels through the handle: the same login, with the
+    /// same result as the form's own Cancel. A handle of an earlier login
+    /// must not cancel the one in flight.
+    #[gpui::test]
+    fn login_handle_cancels_only_its_own_login(cx: &mut TestAppContext) {
+        let (_provider, section, window) = section_with_held_login_provider(cx);
+
+        start_login(&section, window);
+        let first = login_handle(&section, window);
+        assert!(window.read(|cx| first.is_waiting(cx)));
+
+        window.update(|_, cx| first.cancel(cx));
+        window.run_until_parked();
+
+        window.read(|cx| {
+            let section = section.read(cx);
+            assert!(
+                !section.provider_login_loading,
+                "the Login button must be enabled after the modal's Cancel"
+            );
+            assert_eq!(section.provider_login_status, login_cancelled_status());
+            assert!(!first.is_waiting(cx));
+        });
+
+        start_login(&section, window);
+        window.update(|_, cx| first.cancel(cx));
+        window.run_until_parked();
+
+        assert!(
+            window.read(|cx| section.read(cx).provider_login_loading),
+            "the handle of a cancelled login must leave the next login alone"
+        );
+    }
+
+    /// The login modal closes when its handle reports the end of the login:
+    /// a result, with success or failure, a Cancel, or a profile loaded into
+    /// the form. The end of another login is not reported.
+    #[gpui::test]
+    fn login_handle_reports_each_way_its_login_ends(cx: &mut TestAppContext) {
+        let (provider, section, window) = section_with_held_login_provider(cx);
+        let profile_id = save_held_login_profile(&section, window);
+        let ended = |probe: &Entity<LoginEndProbe>, window: &mut VisualTestContext| {
+            window.read(|cx| probe.read(cx).ended)
+        };
+
+        start_login(&section, window);
+        let succeeded = watch_login_end(&login_handle(&section, window), window);
+        assert_eq!(ended(&succeeded, window), 0);
+        provider.finish_login(0);
+        window.run_until_parked();
+        assert_eq!(ended(&succeeded, window), 1, "a successful login ended");
+
+        start_login(&section, window);
+        let failed = watch_login_end(&login_handle(&section, window), window);
+        provider.fail_login(1);
+        window.run_until_parked();
+        assert_eq!(ended(&failed, window), 1, "a failed login ended");
+
+        start_login(&section, window);
+        let cancelled = watch_login_end(&login_handle(&section, window), window);
+        cancel_login(&section, window);
+        assert_eq!(ended(&cancelled, window), 1, "a cancelled login ended");
+
+        start_login(&section, window);
+        let released = watch_login_end(&login_handle(&section, window), window);
+        window.update(|window, cx| {
+            section.update(cx, |section, cx| {
+                section.load_profile_into_form(profile_id, window, cx);
+            })
+        });
+        window.run_until_parked();
+        assert_eq!(ended(&released, window), 1, "a released login ended");
+
+        assert_eq!(
+            ended(&succeeded, window),
+            1,
+            "the end of a later login is not the end of this one"
+        );
+    }
 
     #[::core::prelude::v1::test]
     fn form_rows_include_generic_provider_login_without_aws_feature() {
-        let rows = build_form_rows(true, 2, true, false, false, false);
+        let rows = build_form_rows(true, 2, true, false, false);
 
         assert!(
             rows.iter()
@@ -3132,14 +3468,14 @@ mod tests {
             AuthFormField::LoginCancel,
         ];
 
-        let waiting = build_form_rows(true, 0, true, true, true, false);
+        let waiting = build_form_rows(true, 0, true, true, true);
         let login_index = waiting
             .iter()
             .position(|row| row == &vec![AuthFormField::ProviderLogin])
             .expect("the login row is listed");
         assert_eq!(waiting.get(login_index + 1), Some(&login_url_row));
 
-        let idle = build_form_rows(true, 0, true, false, true, false);
+        let idle = build_form_rows(true, 0, true, false, true);
         assert!(!idle.contains(&login_url_row));
     }
 
@@ -3448,17 +3784,9 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // T-5.2: read_only profile → no save/delete in UI logic
-    // -----------------------------------------------------------------------
-
-    /// `build_form_rows` should always include a SaveButton row; the guard that
-    /// suppresses it for read-only profiles lives in `render_footer_actions`
-    /// (UI path), not in the form-row builder. Verify the builder is
-    /// unaffected so it continues to serve editable profiles.
     #[::core::prelude::v1::test]
     fn form_rows_include_save_and_delete_when_editing() {
-        let rows = build_form_rows(true, 0, false, false, true, false);
+        let rows = build_form_rows(true, 0, false, false, true);
         assert!(
             rows.iter()
                 .any(|row| row.contains(&AuthFormField::SaveButton)),
@@ -3471,126 +3799,17 @@ mod tests {
         );
     }
 
-    /// When creating a new profile (not editing), there must be no DeleteButton.
     #[::core::prelude::v1::test]
-    fn form_rows_no_delete_when_creating() {
-        let rows = build_form_rows(true, 0, false, false, false, false);
-        assert!(
-            !rows
-                .iter()
-                .any(|row| row.contains(&AuthFormField::DeleteButton)),
-            "DeleteButton must not appear when creating a new profile"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // T-5.3: read-only guard in save_profile is enforced by profile_is_read_only
-    // -----------------------------------------------------------------------
-
-    /// `build_auth_profile_from_form` always produces `read_only: false` —
-    /// read-only is only set by the load path from the reflected provider.
-    #[::core::prelude::v1::test]
-    fn build_auth_profile_from_form_always_produces_writable_profile() {
-        let profile =
-            build_auth_profile_from_form(Uuid::nil(), "test", "aws-sso", HashMap::new(), true)
-                .expect("should build");
-        assert!(
-            !profile.read_only,
-            "profiles built from the form must be writable (read_only = false)"
-        );
-        assert!(
-            profile.dangling_origin.is_none(),
-            "profiles built from the form must have no dangling origin"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // T-5.4: dangling-reference guard produces distinct messages per origin
-    // -----------------------------------------------------------------------
-
-    /// The message for a "keyring-only" dangling profile must reference
-    /// `~/.aws/credentials` and must not mention any secret value.
-    #[::core::prelude::v1::test]
-    fn dangling_keyring_only_message_references_credentials_file() {
-        let msg = format!(
-            "Auth profile '{}' is only in the DataTab keyring and no longer has a \
-             corresponding entry in ~/.aws/config or ~/.aws/credentials. \
-             Add the credentials to ~/.aws/credentials to connect with this profile.",
-            "legacy-key"
-        );
-        assert!(
-            msg.contains("~/.aws/credentials"),
-            "keyring-only dangling message must direct user to ~/.aws/credentials"
-        );
-        assert!(
-            !msg.to_ascii_lowercase().contains("secret"),
-            "keyring-only dangling message must not expose the word 'secret'"
-        );
-        assert!(
-            msg.contains("legacy-key"),
-            "dangling message must name the profile"
-        );
-    }
-
-    /// The message for a "file-gone" dangling profile must reference
-    /// `~/.aws/config`.
-    #[::core::prelude::v1::test]
-    fn dangling_file_gone_message_references_config_file() {
-        let msg = format!(
-            "Auth profile '{}' could not be found in ~/.aws/config. \
-             Please recreate the profile or update the connection binding.",
-            "old-env"
-        );
-        assert!(
-            msg.contains("~/.aws/config"),
-            "file-gone dangling message must reference ~/.aws/config"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Editable form state-transition logic (non-GPUI-render parts)
-    // -----------------------------------------------------------------------
-
-    /// E4: Reflected profiles (non-dangling) must NOT produce a Delete button
-    /// row in `build_form_rows` — they are edited via `save_edit`, not deleted
-    /// from DataTab (spec S36, design §14).
-    #[::core::prelude::v1::test]
-    fn reflected_profile_has_no_delete_button_row() {
-        let rows = build_form_rows(true, 3, false, false, true, /* is_reflected */ true);
-        assert!(
-            !rows
-                .iter()
-                .any(|row| row.contains(&AuthFormField::DeleteButton)),
-            "reflected profiles must not expose a Delete button"
-        );
-        assert!(
-            rows.iter()
-                .any(|row| row.contains(&AuthFormField::SaveButton)),
-            "reflected profiles must still expose a Save button"
-        );
-    }
-
-    /// Reflected (AWS) profiles are read-only mirrors and must NOT expose an
-    /// Export button; a stored editable profile must.
-    #[::core::prelude::v1::test]
-    fn export_button_only_for_stored_editable_profile() {
-        let reflected = build_form_rows(true, 2, false, false, true, /* is_reflected */ true);
-        assert!(
-            !reflected
-                .iter()
-                .any(|row| row.contains(&AuthFormField::ExportButton)),
-            "reflected profiles must not expose an Export button"
-        );
-
-        let stored = build_form_rows(true, 2, false, false, /* is_editing */ true, false);
+    fn export_button_only_for_stored_profile() {
+        let stored = build_form_rows(true, 2, false, false, true);
         assert!(
             stored
                 .iter()
                 .any(|row| row.contains(&AuthFormField::ExportButton)),
-            "stored editable profiles must expose an Export button"
+            "stored profiles must expose an Export button"
         );
 
-        let creating = build_form_rows(true, 2, false, false, /* is_editing */ false, false);
+        let creating = build_form_rows(true, 2, false, false, false);
         assert!(
             !creating
                 .iter()
@@ -3599,448 +3818,30 @@ mod tests {
         );
     }
 
-    /// E4: Reflected profiles must NOT include the Enabled row — the enabled
-    /// state is managed by the AWS file, not DataTab.
+    /// When creating a new profile (not editing), there must be no DeleteButton.
     #[::core::prelude::v1::test]
-    fn reflected_profile_has_no_enabled_row() {
-        let rows = build_form_rows(true, 2, false, false, true, /* is_reflected */ true);
-        assert!(
-            !rows.iter().any(|row| row.contains(&AuthFormField::Enabled)),
-            "reflected profiles must not expose the Enabled toggle"
-        );
-    }
-
-    /// E4: Reflected profiles must NOT include the Provider selector row —
-    /// provider is fixed by the file section type.
-    #[::core::prelude::v1::test]
-    fn reflected_profile_has_no_provider_selector_row() {
-        let rows = build_form_rows(
-            /* has_providers */ true, 2, false, false, true, /* is_reflected */ true,
-        );
+    fn form_rows_no_delete_when_creating() {
+        let rows = build_form_rows(true, 0, false, false, false);
         assert!(
             !rows
                 .iter()
-                .any(|row| { row.iter().any(|f| matches!(f, AuthFormField::Provider(_))) }),
-            "reflected profiles must not expose the provider selector row"
+                .any(|row| row.contains(&AuthFormField::DeleteButton)),
+            "DeleteButton must not appear when creating a new profile"
         );
-    }
-
-    /// E4: `collect_edited_fields` omits blank `WriteOnly` fields so the
-    /// provider preserves the existing on-disk value (spec R9.4.2, S27).
-    ///
-    /// This exercises the logic inline rather than through the GPUI form
-    /// (render code cannot be unit-tested without a GPUI context).
-    #[::core::prelude::v1::test]
-    fn edited_fields_omit_blank_write_only_field() {
-        let write_only_ids: std::collections::HashSet<String> = [
-            "aws_secret_access_key".to_string(),
-            "aws_session_token".to_string(),
-        ]
-        .into_iter()
-        .collect();
-
-        // Simulate the form value map: access key present, secret blank.
-        let form_values: Vec<(String, String)> = vec![
-            (
-                "aws_access_key_id".to_string(),
-                "AKIAIOSFODNN7EXAMPLE".to_string(),
-            ),
-            ("aws_secret_access_key".to_string(), String::new()), // blank — must be omitted
-            ("aws_session_token".to_string(), String::new()),     // blank — must be omitted
-        ];
-
-        let fields: HashMap<String, String> = form_values
-            .into_iter()
-            .filter_map(|(field_id, value)| {
-                if write_only_ids.contains(&field_id) && value.is_empty() {
-                    None
-                } else {
-                    Some((field_id, value))
-                }
-            })
-            .collect();
-
-        assert!(
-            fields.contains_key("aws_access_key_id"),
-            "non-secret fields must be included"
-        );
-        assert!(
-            !fields.contains_key("aws_secret_access_key"),
-            "blank secret field must be omitted so provider preserves on-disk value"
-        );
-        assert!(
-            !fields.contains_key("aws_session_token"),
-            "blank session token must be omitted"
-        );
-    }
-
-    /// E4: A non-blank `WriteOnly` field IS included in the edited fields map
-    /// so the provider overwrites the on-disk value (spec R9.4.3, S26).
-    #[::core::prelude::v1::test]
-    fn edited_fields_include_non_blank_write_only_field() {
-        let write_only_ids: std::collections::HashSet<String> =
-            ["aws_secret_access_key".to_string()].into_iter().collect();
-
-        let form_values: Vec<(String, String)> = vec![
-            (
-                "aws_access_key_id".to_string(),
-                "AKIAIOSFODNN7EXAMPLE".to_string(),
-            ),
-            (
-                "aws_secret_access_key".to_string(),
-                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
-            ),
-        ];
-
-        let fields: HashMap<String, String> = form_values
-            .into_iter()
-            .filter_map(|(field_id, value)| {
-                if write_only_ids.contains(&field_id) && value.is_empty() {
-                    None
-                } else {
-                    Some((field_id, value))
-                }
-            })
-            .collect();
-
-        assert!(
-            fields.contains_key("aws_secret_access_key"),
-            "non-blank secret field must be included in the save payload"
-        );
-    }
-
-    /// E4: `Conflict` outcome produces a conflict message that names the target
-    /// label and offers a Reload affordance (spec R9.3.4, S29). The test calls
-    /// `resolve_conflict_message` directly with a sentinel label to verify the
-    /// production dispatch path, not a format!() reconstruction.
-    #[::core::prelude::v1::test]
-    fn conflict_message_references_file_and_suggests_reload() {
-        use datatab_core::AuthEditTarget;
-
-        let target = AuthEditTarget {
-            id: "cfg".to_string(),
-            label: "FAKE_TARGET_A".to_string(),
-        };
-
-        let msg = resolve_conflict_message(&target);
-
-        assert!(
-            msg.contains("FAKE_TARGET_A"),
-            "conflict message must name the affected target"
-        );
-        assert!(
-            msg.to_lowercase().contains("reload"),
-            "conflict message must mention the Reload action"
-        );
-        assert!(
-            msg.to_lowercase().contains("modified"),
-            "conflict message must indicate the resource was modified"
-        );
-        assert!(
-            !msg.contains("AKIA"),
-            "conflict message must not contain credential patterns"
-        );
-    }
-
-    /// E4: `PartialSaved` outcome produces a message that names BOTH targets
-    /// (written and conflicted) and offers a Reload affordance (spec S35). The
-    /// test calls `resolve_partial_saved_message` with sentinel labels to verify
-    /// the production dispatch path.
-    #[::core::prelude::v1::test]
-    fn partial_saved_message_names_both_files() {
-        use datatab_core::AuthEditTarget;
-
-        let written = AuthEditTarget {
-            id: "cfg".to_string(),
-            label: "FAKE_TARGET_A".to_string(),
-        };
-        let conflicted = AuthEditTarget {
-            id: "creds".to_string(),
-            label: "FAKE_TARGET_B".to_string(),
-        };
-
-        let msg = resolve_partial_saved_message(&written, &conflicted);
-
-        assert!(
-            msg.contains("FAKE_TARGET_A"),
-            "partial-saved message must name the written target"
-        );
-        assert!(
-            msg.contains("FAKE_TARGET_B"),
-            "partial-saved message must name the conflicted target"
-        );
-        assert!(
-            msg.to_lowercase().contains("reload"),
-            "partial-saved message must mention the Reload action"
-        );
-        assert!(
-            msg.to_lowercase().contains("saved successfully"),
-            "partial-saved message must confirm the successful write"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Security: outcomes and types carry no secrets
-    // -----------------------------------------------------------------------
-
-    /// E5.1: `AuthSaveOutcome` Debug representation contains no secret patterns.
-    /// This is also tested in datatab_core, but we re-verify at the UI boundary
-    /// where the type is matched and messages are constructed.
-    #[::core::prelude::v1::test]
-    fn auth_save_outcome_debug_has_no_secrets() {
-        use datatab_core::{AuthEditTarget, AuthSaveOutcome};
-
-        let config_target = AuthEditTarget {
-            id: "config".to_string(),
-            label: "~/.aws/config".to_string(),
-        };
-        let credentials_target = AuthEditTarget {
-            id: "credentials".to_string(),
-            label: "~/.aws/credentials".to_string(),
-        };
-
-        let outcomes = [
-            AuthSaveOutcome::Saved,
-            AuthSaveOutcome::Conflict {
-                target: config_target.clone(),
-            },
-            AuthSaveOutcome::PartialSaved {
-                written: config_target,
-                conflicted: credentials_target,
-            },
-        ];
-
-        let secret_patterns = ["AKIA", "wJalrX", "aws_secret_access_key", "SECRET"];
-
-        for outcome in &outcomes {
-            let repr = format!("{outcome:?}");
-            for pattern in &secret_patterns {
-                assert!(
-                    !repr.contains(pattern),
-                    "AuthSaveOutcome debug must not contain '{pattern}' (found in: {repr})"
-                );
-            }
-        }
-    }
-
-    // -----------------------------------------------------------------------
-    // W1 — S7: Provider without edit capabilities uses fallback strings
-    // -----------------------------------------------------------------------
-
-    /// When `capabilities().edit` is `None`, `resolve_mirror_label` returns
-    /// the fallback constant and the result contains no AWS-specific strings.
-    #[::core::prelude::v1::test]
-    fn no_edit_caps_mirror_label_returns_fallback() {
-        let result = resolve_mirror_label(None);
-        assert_eq!(
-            result,
-            mirror_label_fallback(),
-            "resolve_mirror_label must return the fallback when edit caps are absent"
-        );
-        assert!(
-            !result.contains("~/.aws/"),
-            "fallback mirror label must not contain AWS path"
-        );
-    }
-
-    /// When `capabilities().edit` is `None`, `resolve_success_text` returns
-    /// the fallback constant and the result contains no AWS-specific strings.
-    #[::core::prelude::v1::test]
-    fn no_edit_caps_success_text_returns_fallback() {
-        let result = resolve_success_text(None);
-        assert_eq!(
-            result,
-            success_written_fallback(),
-            "resolve_success_text must return the fallback when edit caps are absent"
-        );
-        assert!(
-            !result.contains("~/.aws/"),
-            "fallback success text must not contain AWS path"
-        );
-    }
-
-    /// When `capabilities().edit` is `None`, `resolve_dangling` returns the
-    /// generic fallback message and does not panic.
-    #[::core::prelude::v1::test]
-    fn no_edit_caps_dangling_returns_fallback() {
-        let msg = resolve_dangling(None, "keyring-only");
-        let expected = dangling_fallback();
-        assert_eq!(
-            msg.title, expected.title,
-            "resolve_dangling must return fallback title when edit caps are absent"
-        );
-        assert_eq!(
-            msg.body, expected.body,
-            "resolve_dangling must return fallback body when edit caps are absent"
-        );
-        assert!(
-            !msg.title.contains("~/.aws/") && !msg.body.contains("~/.aws/"),
-            "fallback dangling message must not contain AWS path"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // W2 — S1: resolve_success_text reads capabilities.edit.success_written
-    // -----------------------------------------------------------------------
-
-    /// `resolve_success_text` returns the provider's `success_written` string
-    /// when `edit` capabilities are present, and falls back to the constant
-    /// when they are absent.
-    #[::core::prelude::v1::test]
-    fn resolve_success_text_reads_from_edit_caps() {
-        use datatab_core::AuthEditCapabilities;
-        use std::collections::HashMap;
-
-        let caps = AuthEditCapabilities {
-            mirror_label: "irrelevant".to_string(),
-            success_written: "TEST_SUCCESS_MARKER".to_string(),
-            name_field_hint: String::new(),
-            dangling_messages: HashMap::new(),
-        };
-
-        let with_caps = resolve_success_text(Some(&caps));
-        assert_eq!(
-            with_caps, "TEST_SUCCESS_MARKER",
-            "resolve_success_text must return capabilities.edit.success_written"
-        );
-
-        let without_caps = resolve_success_text(None);
-        assert_eq!(
-            without_caps,
-            success_written_fallback(),
-            "resolve_success_text must return the saved-fallback translation when edit is None"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // W3 — S4: resolve_mirror_label reads capabilities.edit.mirror_label
-    // -----------------------------------------------------------------------
-
-    /// `resolve_mirror_label` returns the provider's `mirror_label` string
-    /// when `edit` capabilities are present, and falls back to the constant
-    /// when they are absent.
-    #[::core::prelude::v1::test]
-    fn resolve_mirror_label_reads_from_edit_caps() {
-        use datatab_core::AuthEditCapabilities;
-        use std::collections::HashMap;
-
-        let caps = AuthEditCapabilities {
-            mirror_label: "TEST_MIRROR_MARKER".to_string(),
-            success_written: "irrelevant".to_string(),
-            name_field_hint: String::new(),
-            dangling_messages: HashMap::new(),
-        };
-
-        let with_caps = resolve_mirror_label(Some(&caps));
-        assert_eq!(
-            with_caps, "TEST_MIRROR_MARKER",
-            "resolve_mirror_label must return capabilities.edit.mirror_label"
-        );
-
-        let without_caps = resolve_mirror_label(None);
-        assert_eq!(
-            without_caps,
-            mirror_label_fallback(),
-            "resolve_mirror_label must return the translated fallback when edit is None"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // W4 — S5 + S6: resolve_dangling dispatches through capabilities
-    // -----------------------------------------------------------------------
-
-    /// S5: `resolve_dangling` returns the provider's message for a known origin.
-    #[::core::prelude::v1::test]
-    fn resolve_dangling_returns_caps_message_for_known_origin() {
-        use datatab_core::{AuthEditCapabilities, DanglingMessage};
-        use std::collections::HashMap;
-
-        let mut dangling_messages = HashMap::new();
-        dangling_messages.insert(
-            "keyring-only".to_string(),
-            DanglingMessage {
-                title: "TEST_KEYRING_TITLE".to_string(),
-                body: "TEST_KEYRING_BODY".to_string(),
-            },
-        );
-        let caps = AuthEditCapabilities {
-            mirror_label: String::new(),
-            success_written: String::new(),
-            name_field_hint: String::new(),
-            dangling_messages,
-        };
-
-        let msg = resolve_dangling(Some(&caps), "keyring-only");
-        assert_eq!(
-            msg.title, "TEST_KEYRING_TITLE",
-            "resolve_dangling must return title from capabilities for known origin"
-        );
-        assert_eq!(
-            msg.body, "TEST_KEYRING_BODY",
-            "resolve_dangling must return body from capabilities for known origin"
-        );
-    }
-
-    /// S6: `resolve_dangling` falls back to `dangling_fallback()` when the
-    /// origin key is absent from `capabilities.edit.dangling_messages`.
-    #[::core::prelude::v1::test]
-    fn resolve_dangling_falls_back_for_unknown_origin() {
-        use datatab_core::AuthEditCapabilities;
-        use std::collections::HashMap;
-
-        let caps = AuthEditCapabilities {
-            mirror_label: String::new(),
-            success_written: String::new(),
-            name_field_hint: String::new(),
-            dangling_messages: HashMap::new(),
-        };
-
-        let msg = resolve_dangling(Some(&caps), "unknown-foo-origin");
-        let expected = dangling_fallback();
-        assert_eq!(
-            msg.title, expected.title,
-            "resolve_dangling must return fallback title for unknown origin"
-        );
-        assert_eq!(
-            msg.body, expected.body,
-            "resolve_dangling must return fallback body for unknown origin"
-        );
-    }
-
-    /// E5.4: `build_form_rows` for a reflected profile never exposes the
-    /// Enabled or Delete rows, regardless of the field count.
-    #[::core::prelude::v1::test]
-    fn reflected_form_rows_have_no_enabled_or_delete_for_any_field_count() {
-        for field_count in [0usize, 1, 5, 10] {
-            let rows = build_form_rows(true, field_count, false, false, true, true);
-            assert!(
-                !rows.iter().any(|r| r.contains(&AuthFormField::Enabled)),
-                "Enabled row must be absent for reflected profiles (field_count={field_count})"
-            );
-            assert!(
-                !rows
-                    .iter()
-                    .any(|r| r.contains(&AuthFormField::DeleteButton)),
-                "Delete row must be absent for reflected profiles (field_count={field_count})"
-            );
-        }
     }
 
     // ---------------------------------------------------------------------------
     // i18n — chrome keys (spec S15): section header, profiles list, form
-    // labels/buttons, export/delete dialogs, changed-on-disk banner.
+    // labels/buttons and export/delete dialogs.
     // ---------------------------------------------------------------------------
 
     const AUTH_PROFILES_CHROME_KEYS: &[&str] = &[
         "settings.auth_profiles.profiles_label",
         "settings.auth_profiles.new_profile",
         "settings.auth_profiles.import",
-        "settings.auth_profiles.source_label",
         "settings.auth_profiles.leave_blank_hint",
         "settings.auth_profiles.auth_profile_label",
         "settings.auth_profiles.editor_subtitle",
-        "settings.auth_profiles.changed_on_disk",
-        "settings.auth_profiles.reload",
         "settings.auth_profiles.name_label",
         "settings.auth_profiles.provider_label",
         "settings.auth_profiles.placeholder_name",
@@ -4050,16 +3851,12 @@ mod tests {
         "settings.auth_profiles.enabled",
         "settings.auth_profiles.export",
         "settings.auth_profiles.delete",
-        "settings.auth_profiles.save_to_file",
         "settings.auth_profiles.cancel",
         "settings.auth_profiles.update",
         "settings.auth_profiles.create",
         "settings.auth_profiles.section_title",
         "settings.auth_profiles.section_description",
         "settings.auth_profiles.delete_dialog_title",
-        "settings.auth_profiles.saved_fallback",
-        "settings.auth_profiles.reference_invalid_title",
-        "settings.auth_profiles.reference_invalid_body",
         "settings.auth_profiles.login_hint",
         "settings.auth_profiles.delete_dialog.body_none",
         "settings.auth_profiles.delete_dialog.body_one",
@@ -4105,7 +3902,6 @@ mod tests {
 
     const AUTH_PROFILES_LOGIN_KEYS: &[&str] = &[
         "settings.auth_profiles.cancel",
-        "settings.auth_profiles.mirror_label_fallback",
         "settings.auth_profiles.login_required_hint",
         "settings.auth_profiles.session_expired_hint",
         "settings.auth_profiles.session_expired_click_hint",

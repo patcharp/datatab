@@ -906,8 +906,8 @@ Initial words that belong to no entry.
             .expect("the package version parses");
         let release = release_for_version(bundled(), &current).expect("notes for this build");
 
-        assert_eq!(release.version(), Some(&version("0.1.2")));
-        assert_eq!(release.date.as_deref(), Some("2026-11-13"));
+        assert_eq!(release.version(), Some(&version("0.1.3")));
+        assert_eq!(release.date.as_deref(), Some("2026-11-16"));
 
         let titles: Vec<&str> = release
             .sections
@@ -916,7 +916,7 @@ Initial words that belong to no entry.
             .map(|entry| entry.title.as_str())
             .collect();
         assert!(
-            titles.contains(&"ClickHouse over HTTP"),
+            titles.contains(&"macOS disk images"),
             "unexpected notes: {titles:?}"
         );
     }

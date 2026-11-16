@@ -53,7 +53,10 @@ pub struct ConnectionDriverConfigDto {
     // Redis-specific
     pub redis_tls: bool,
     pub redis_database: Option<i32>,
-    // DynamoDB-specific
+    // Columns of the removed AWS drivers (#311), with `s3_access_key_id` and
+    // `s3_path_style` below. No config reads or sets them. They stay in the
+    // DTO so the SQL column lists and the row indices do not move, and so
+    // `s3_path_style` (`NOT NULL`) is still bound on every write.
     pub dynamo_region: Option<String>,
     pub dynamo_profile: Option<String>,
     pub dynamo_endpoint: Option<String>,
@@ -64,8 +67,6 @@ pub struct ConnectionDriverConfigDto {
     // SQL Server-specific
     pub mssql_instance: Option<String>,
     pub mssql_trust_server_certificate: bool,
-    // S3-specific (region/profile/endpoint reuse the dynamo_* columns above,
-    // the same convention CloudWatchLogs already uses)
     pub s3_access_key_id: Option<String>,
     pub s3_path_style: bool,
     // Redis topology fields
@@ -259,26 +260,6 @@ impl ConnectionDriverConfigDto {
                 dto.sqlite_path = Some(path.to_string_lossy().to_string());
                 dto.sqlite_connection_id = connection_id.clone();
             }
-            DbConfig::DynamoDB {
-                region,
-                profile,
-                endpoint,
-                table,
-            } => {
-                dto.dynamo_region = Some(region.clone());
-                dto.dynamo_profile = profile.clone();
-                dto.dynamo_endpoint = endpoint.clone();
-                dto.dynamo_table = table.clone();
-            }
-            DbConfig::CloudWatchLogs {
-                region,
-                profile,
-                endpoint,
-            } => {
-                dto.dynamo_region = Some(region.clone());
-                dto.dynamo_profile = profile.clone();
-                dto.dynamo_endpoint = endpoint.clone();
-            }
             DbConfig::InfluxDB {
                 version,
                 url,
@@ -358,30 +339,6 @@ impl ConnectionDriverConfigDto {
                     fill_ssh_tunnel_fields(&mut dto, tunnel);
                 }
             }
-            DbConfig::S3 {
-                region,
-                profile,
-                access_key_id,
-                endpoint,
-                path_style,
-            } => {
-                dto.dynamo_region = Some(region.clone());
-                dto.dynamo_profile = profile.clone();
-                dto.dynamo_endpoint = endpoint.clone();
-                dto.s3_access_key_id = access_key_id.clone();
-                dto.s3_path_style = *path_style;
-            }
-            DbConfig::AwsSecrets {
-                region,
-                profile,
-                access_key_id,
-                endpoint,
-            } => {
-                dto.dynamo_region = Some(region.clone());
-                dto.dynamo_profile = profile.clone();
-                dto.dynamo_endpoint = endpoint.clone();
-                dto.s3_access_key_id = access_key_id.clone();
-            }
             // The insecure-HTTP opt-in rides in the external values column,
             // the way DuckDB keeps its extras, so ClickHouse needs no schema
             // migration. It is written only when on, so existing rows match.
@@ -407,8 +364,7 @@ impl ConnectionDriverConfigDto {
                 dto.uri = Some(url.clone());
             }
             // The DuckLake fields and init SQL ride in the external values
-            // column, the way S3 reuses the dynamo_* columns, so DuckDB needs
-            // no schema migration.
+            // column, so DuckDB needs no schema migration.
             DbConfig::DuckDB {
                 path,
                 ducklake_catalog,
@@ -536,17 +492,11 @@ impl ConnectionDriverConfigDto {
                 path: std::path::PathBuf::from(self.sqlite_path.clone().unwrap_or_default()),
                 connection_id: self.sqlite_connection_id.clone(),
             }),
-            DbKind::DynamoDB => Some(DbConfig::DynamoDB {
-                region: self.dynamo_region.clone().unwrap_or_default(),
-                profile: self.dynamo_profile.clone(),
-                endpoint: self.dynamo_endpoint.clone(),
-                table: self.dynamo_table.clone(),
-            }),
-            DbKind::CloudWatchLogs => Some(DbConfig::CloudWatchLogs {
-                region: self.dynamo_region.clone().unwrap_or_default(),
-                profile: self.dynamo_profile.clone(),
-                endpoint: self.dynamo_endpoint.clone(),
-            }),
+            // `str_to_db_kind` never returns a reserved wire slot.
+            DbKind::ReservedDynamoDb
+            | DbKind::ReservedCloudWatchLogs
+            | DbKind::ReservedS3
+            | DbKind::ReservedAwsSecrets => None,
             DbKind::InfluxDB => {
                 let json: serde_json::Value = self
                     .external_values_json
@@ -631,19 +581,6 @@ impl ConnectionDriverConfigDto {
                     ssh_tunnel_profile_id: None,
                 })
             }
-            DbKind::S3 => Some(DbConfig::S3 {
-                region: self.dynamo_region.clone().unwrap_or_default(),
-                profile: self.dynamo_profile.clone(),
-                access_key_id: self.s3_access_key_id.clone(),
-                endpoint: self.dynamo_endpoint.clone(),
-                path_style: self.s3_path_style,
-            }),
-            DbKind::AwsSecrets => Some(DbConfig::AwsSecrets {
-                region: self.dynamo_region.clone().unwrap_or_default(),
-                profile: self.dynamo_profile.clone(),
-                access_key_id: self.s3_access_key_id.clone(),
-                endpoint: self.dynamo_endpoint.clone(),
-            }),
             DbKind::ClickHouse => Some(DbConfig::ClickHouse {
                 url: self
                     .uri
@@ -696,16 +633,18 @@ fn db_kind_to_str(kind: DbKind) -> String {
         DbKind::MariaDB => "MariaDB",
         DbKind::MongoDB => "MongoDB",
         DbKind::Redis => "Redis",
-        DbKind::DynamoDB => "DynamoDB",
-        DbKind::CloudWatchLogs => "CloudWatchLogs",
         DbKind::InfluxDB => "InfluxDB",
         DbKind::SqlServer => "SqlServer",
         DbKind::Redshift => "Redshift",
-        DbKind::S3 => "S3",
         DbKind::ClickHouse => "ClickHouse",
         DbKind::Turso => "Turso",
         DbKind::DuckDB => "DuckDB",
-        DbKind::AwsSecrets => "AwsSecrets",
+        // A reserved wire slot has no stored name. `str_to_db_kind` does not
+        // parse this one, and the app refuses to save such a profile.
+        DbKind::ReservedDynamoDb
+        | DbKind::ReservedCloudWatchLogs
+        | DbKind::ReservedS3
+        | DbKind::ReservedAwsSecrets => "Reserved",
     }
     .to_string()
 }
@@ -718,16 +657,14 @@ fn str_to_db_kind(s: &str) -> Option<DbKind> {
         "MariaDB" => Some(DbKind::MariaDB),
         "MongoDB" => Some(DbKind::MongoDB),
         "Redis" => Some(DbKind::Redis),
-        "DynamoDB" => Some(DbKind::DynamoDB),
-        "CloudWatchLogs" => Some(DbKind::CloudWatchLogs),
         "InfluxDB" => Some(DbKind::InfluxDB),
         "SqlServer" => Some(DbKind::SqlServer),
         "Redshift" => Some(DbKind::Redshift),
-        "S3" => Some(DbKind::S3),
         "ClickHouse" => Some(DbKind::ClickHouse),
         "Turso" => Some(DbKind::Turso),
         "DuckDB" => Some(DbKind::DuckDB),
-        "AwsSecrets" => Some(DbKind::AwsSecrets),
+        // The names of the removed AWS drivers ("DynamoDB", "CloudWatchLogs",
+        // "S3", "AwsSecrets") are unknown like any other string.
         _ => None,
     }
 }
@@ -1167,6 +1104,11 @@ mod tests {
     use super::*;
     use crate::StorageRuntime;
 
+    type WriteConfig = fn(
+        &ConnectionDriverConfigsRepository,
+        &ConnectionDriverConfigDto,
+    ) -> Result<(), StorageError>;
+
     fn temp_repo() -> (tempfile::TempDir, ConnectionDriverConfigsRepository) {
         let temp_dir = tempfile::tempdir().expect("tempdir");
         let runtime =
@@ -1281,47 +1223,101 @@ mod tests {
         }
     }
 
+    /// `s3_path_style` is `NOT NULL DEFAULT 0` and no config sets it any more,
+    /// so every write must still bind a value for it.
     #[test]
-    fn cloudwatch_driver_config_roundtrips_through_repository() {
+    fn postgres_driver_config_roundtrips_on_fresh_migrated_db() {
         let (_temp_dir, repo) = temp_repo();
-        let profile_id = uuid::Uuid::new_v4().to_string();
-
-        repo.conn()
-            .execute(
-                r#"
-                INSERT INTO cfg_connection_profiles (
-                    id, name, driver_id, kind, created_at, updated_at
-                ) VALUES (?1, 'CloudWatch', 'cloudwatch', 'cloudwatchlogs', datetime('now'), datetime('now'))
-                "#,
-                params![profile_id],
-            )
-            .expect("insert profile");
-
-        let config = DbConfig::CloudWatchLogs {
-            region: "us-east-1".to_string(),
-            profile: Some("dev".to_string()),
-            endpoint: Some("http://localhost:4566".to_string()),
+        let config = DbConfig::Postgres {
+            use_uri: false,
+            uri: None,
+            host: "db.internal.test".to_string(),
+            port: 6432,
+            user: "app".to_string(),
+            database: "orders".to_string(),
+            ssl_mode: Some("verify-full".to_string()),
+            ssl_root_cert_path: Some("/etc/ssl/root.pem".to_string()),
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
+            ssh_tunnel: None,
+            ssh_tunnel_profile_id: None,
         };
 
-        let dto = ConnectionDriverConfigDto::from_db_config(profile_id.clone(), &config);
-        repo.insert(&dto).expect("insert config");
+        for (name, write) in [
+            (
+                "insert",
+                ConnectionDriverConfigsRepository::insert as WriteConfig,
+            ),
+            (
+                "upsert",
+                ConnectionDriverConfigsRepository::upsert as WriteConfig,
+            ),
+        ] {
+            let profile_id = uuid::Uuid::new_v4().to_string();
+            repo.conn()
+                .execute(
+                    r#"
+                    INSERT INTO cfg_connection_profiles (
+                        id, name, driver_id, kind, created_at, updated_at
+                    ) VALUES (?1, 'PostgreSQL', 'postgres', 'Postgres', datetime('now'), datetime('now'))
+                    "#,
+                    params![profile_id],
+                )
+                .expect("insert profile");
 
-        let restored = repo
-            .get_for_profile(&profile_id)
-            .expect("load config")
-            .expect("stored config");
+            let dto = ConnectionDriverConfigDto::from_db_config(profile_id.clone(), &config);
+            write(&repo, &dto).unwrap_or_else(|error| panic!("{name} config: {error}"));
 
-        match restored.to_db_config().expect("db config") {
-            DbConfig::CloudWatchLogs {
-                region,
-                profile,
-                endpoint,
-            } => {
-                assert_eq!(region, "us-east-1");
-                assert_eq!(profile.as_deref(), Some("dev"));
-                assert_eq!(endpoint.as_deref(), Some("http://localhost:4566"));
+            let path_style: i64 = repo
+                .conn()
+                .query_row(
+                    "SELECT s3_path_style FROM cfg_connection_driver_configs WHERE profile_id = ?1",
+                    params![profile_id],
+                    |row| row.get(0),
+                )
+                .expect("read s3_path_style");
+            assert_eq!(path_style, 0, "{name}");
+
+            let restored = repo
+                .get_for_profile(&profile_id)
+                .expect("load config")
+                .expect("stored config");
+            match restored.to_db_config().expect("db config") {
+                DbConfig::Postgres {
+                    host,
+                    port,
+                    user,
+                    database,
+                    ssl_mode,
+                    ssl_root_cert_path,
+                    ..
+                } => {
+                    assert_eq!(host, "db.internal.test", "{name}");
+                    assert_eq!(port, 6432, "{name}");
+                    assert_eq!(user, "app", "{name}");
+                    assert_eq!(database, "orders", "{name}");
+                    assert_eq!(ssl_mode.as_deref(), Some("verify-full"), "{name}");
+                    assert_eq!(
+                        ssl_root_cert_path.as_deref(),
+                        Some("/etc/ssl/root.pem"),
+                        "{name}"
+                    );
+                }
+                other => panic!("unexpected config: {other:?}"),
             }
-            other => panic!("unexpected config: {other:?}"),
+        }
+    }
+
+    /// The config keys of the removed AWS drivers (#311) load no config, so
+    /// the loaders drop that profile alone.
+    #[test]
+    fn aws_config_keys_load_no_config() {
+        for key in ["DynamoDB", "CloudWatchLogs", "S3", "AwsSecrets"] {
+            let mut dto = ConnectionDriverConfigDto::new("profile".to_string(), key.to_string());
+            dto.dynamo_region = Some("us-east-1".to_string());
+            dto.s3_access_key_id = Some("stored-key-id".to_string());
+
+            assert!(dto.to_db_config().is_none(), "{key}");
         }
     }
 
@@ -1444,153 +1440,6 @@ mod tests {
                 request_timeout_seconds,
                 ..
             } => assert_eq!(request_timeout_seconds, Some(i32::MAX as u64)),
-            other => panic!("unexpected config: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn s3_driver_config_roundtrips_through_repository_with_profile_auth() {
-        let (_temp_dir, repo) = temp_repo();
-        let profile_id = uuid::Uuid::new_v4().to_string();
-
-        repo.conn()
-            .execute(
-                r#"
-                INSERT INTO cfg_connection_profiles (
-                    id, name, driver_id, kind, created_at, updated_at
-                ) VALUES (?1, 'S3', 's3', 's3', datetime('now'), datetime('now'))
-                "#,
-                params![profile_id],
-            )
-            .expect("insert profile");
-
-        let config = DbConfig::S3 {
-            region: "us-east-1".to_string(),
-            profile: Some("dev-sso".to_string()),
-            access_key_id: None,
-            endpoint: None,
-            path_style: false,
-        };
-
-        let dto = ConnectionDriverConfigDto::from_db_config(profile_id.clone(), &config);
-        repo.insert(&dto).expect("insert config");
-
-        let restored = repo
-            .get_for_profile(&profile_id)
-            .expect("load config")
-            .expect("stored config");
-
-        match restored.to_db_config().expect("db config") {
-            DbConfig::S3 {
-                region,
-                profile,
-                access_key_id,
-                endpoint,
-                path_style,
-            } => {
-                assert_eq!(region, "us-east-1");
-                assert_eq!(profile.as_deref(), Some("dev-sso"));
-                assert_eq!(access_key_id, None);
-                assert_eq!(endpoint, None);
-                assert!(!path_style);
-            }
-            other => panic!("unexpected config: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn s3_driver_config_roundtrips_through_repository_with_static_credentials() {
-        let (_temp_dir, repo) = temp_repo();
-        let profile_id = uuid::Uuid::new_v4().to_string();
-
-        repo.conn()
-            .execute(
-                r#"
-                INSERT INTO cfg_connection_profiles (
-                    id, name, driver_id, kind, created_at, updated_at
-                ) VALUES (?1, 'MinIO', 's3', 's3', datetime('now'), datetime('now'))
-                "#,
-                params![profile_id],
-            )
-            .expect("insert profile");
-
-        let config = DbConfig::S3 {
-            region: "us-east-1".to_string(),
-            profile: None,
-            access_key_id: Some("AKIAEXAMPLE".to_string()),
-            endpoint: Some("http://localhost:9000".to_string()),
-            path_style: true,
-        };
-
-        let dto = ConnectionDriverConfigDto::from_db_config(profile_id.clone(), &config);
-        repo.upsert(&dto).expect("upsert config");
-
-        let restored = repo
-            .get_for_profile(&profile_id)
-            .expect("load config")
-            .expect("stored config");
-
-        match restored.to_db_config().expect("db config") {
-            DbConfig::S3 {
-                region,
-                profile,
-                access_key_id,
-                endpoint,
-                path_style,
-            } => {
-                assert_eq!(region, "us-east-1");
-                assert_eq!(profile, None);
-                assert_eq!(access_key_id.as_deref(), Some("AKIAEXAMPLE"));
-                assert_eq!(endpoint.as_deref(), Some("http://localhost:9000"));
-                assert!(path_style);
-            }
-            other => panic!("unexpected config: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn aws_secrets_driver_config_roundtrips_through_repository() {
-        let (_temp_dir, repo) = temp_repo();
-        let profile_id = uuid::Uuid::new_v4().to_string();
-
-        repo.conn()
-            .execute(
-                r#"
-                INSERT INTO cfg_connection_profiles (
-                    id, name, driver_id, kind, created_at, updated_at
-                ) VALUES (?1, 'Secrets', 'aws_secrets', 'aws_secrets', datetime('now'), datetime('now'))
-                "#,
-                params![profile_id],
-            )
-            .expect("insert profile");
-
-        let config = DbConfig::AwsSecrets {
-            region: "eu-west-1".to_string(),
-            profile: Some("prod-sso".to_string()),
-            access_key_id: Some("AKIAEXAMPLE".to_string()),
-            endpoint: Some("http://localhost:4566".to_string()),
-        };
-
-        let dto = ConnectionDriverConfigDto::from_db_config(profile_id.clone(), &config);
-        repo.upsert(&dto).expect("upsert config");
-
-        let restored = repo
-            .get_for_profile(&profile_id)
-            .expect("load config")
-            .expect("stored config");
-
-        match restored.to_db_config().expect("db config") {
-            DbConfig::AwsSecrets {
-                region,
-                profile,
-                access_key_id,
-                endpoint,
-            } => {
-                assert_eq!(region, "eu-west-1");
-                assert_eq!(profile.as_deref(), Some("prod-sso"));
-                assert_eq!(access_key_id.as_deref(), Some("AKIAEXAMPLE"));
-                assert_eq!(endpoint.as_deref(), Some("http://localhost:4566"));
-            }
             other => panic!("unexpected config: {other:?}"),
         }
     }

@@ -540,18 +540,18 @@ mod tests {
 
     #[tokio::test]
     async fn run_explain_request_consults_the_connections_language_service() {
-        // `OpenSearchPpl` falls back to `Read` (and executes) with no driver
-        // service; a driver service overriding `classify_execution` to
+        // A `MongoQuery` find falls back to `Read` (and executes) with no
+        // driver service; a driver service overriding `classify_execution` to
         // `Destructive` must be consulted and reject the preview instead.
         let plan = Some(SemanticPlan::single_query(
             SemanticPlanKind::Query,
-            datatab_core::PlannedQuery::new(QueryLanguage::OpenSearchPpl, "source=logs | head 1"),
+            datatab_core::PlannedQuery::new(QueryLanguage::MongoQuery, "db.logs.find({})"),
         ));
 
         let connection_without_override = Arc::new(TestConnection::new(plan.clone(), true));
         DataTabServer::run_explain_request(
             connection_without_override.clone(),
-            ExplainRequest::new(TableRef::new("logs")).with_query("source=logs | head 1"),
+            ExplainRequest::new(TableRef::new("logs")).with_query("db.logs.find({})"),
             "Preview",
         )
         .await
@@ -561,7 +561,7 @@ mod tests {
             Arc::new(TestConnection::new(plan, true).with_destructive_language_service());
         let error = DataTabServer::run_explain_request(
             connection_with_override,
-            ExplainRequest::new(TableRef::new("logs")).with_query("source=logs | head 1"),
+            ExplainRequest::new(TableRef::new("logs")).with_query("db.logs.find({})"),
             "Preview",
         )
         .await

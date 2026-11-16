@@ -21,17 +21,16 @@ mod sql;
 mod storage;
 pub mod values;
 
-pub use access::{AccessHandle, AccessKind, AccessManager, SsmAccessParams};
+pub use access::{AccessHandle, AccessKind, AccessManager};
 
 pub use document_id::DocumentId;
 
 pub use release_channel::{ReleaseChannel, client_identity, client_identity_token};
 
 pub use auth::{
-    AuthEditCapabilities, AuthEditSnapshot, AuthEditTarget, AuthFormDef, AuthProfile,
-    AuthProfileSummary, AuthProvider, AuthSaveOutcome, AuthSession, AuthSessionState,
-    DanglingMessage, DynAuthProvider, FetchOptionsError, FetchOptionsRequest, FetchOptionsResponse,
-    ImportableProfile, ResolvedCredentials,
+    AuthFormDef, AuthProfile, AuthProfileSummary, AuthProvider, AuthSession, AuthSessionState,
+    DynAuthProvider, FetchOptionsError, FetchOptionsRequest, FetchOptionsResponse,
+    ResolvedCredentials,
 };
 
 pub use config::{
@@ -54,57 +53,41 @@ pub use connection::{
     ConnectionTreeManager, ConnectionTreeNode, ConnectionTreeNodeKind, DatabaseConnection,
     DatabaseRefreshGuard, DbConfig, DbKind, DefaultMutationPolicyResolver, DetachedProcessHandle,
     DetachedProcessReceiver, DetachedProcessSender, ExecutionContext, ExecutionSourceContext,
-    FencedTableDetailsParams, FetchCollectionChildrenParams, FetchCollectionChildrenResult,
-    FetchDatabaseListParams, FetchDatabaseSchemaParams, FetchDatabaseSchemaResult,
-    FetchExplicitDatabaseSchemaParams, FetchSchemaColumnsParams, FetchSchemaColumnsResult,
-    FetchSchemaForeignKeysParams, FetchSchemaForeignKeysResult, FetchSchemaIndexesParams,
-    FetchSchemaIndexesResult, FetchSchemaRoutinesParams, FetchSchemaRoutinesResult,
-    FetchSchemaTypesParams, FetchSchemaTypesResult, FetchTableDetailsParams,
-    FetchTableDetailsResult, FetchedDatabaseList, FetchedExplicitDatabaseSchema,
-    FetchedTableDetails, GuardedDatabaseConnectionInstall, GuardedInstalledDatabaseConnection,
-    HookContext, HookExecution, HookExecutionContext, HookExecutionMode, HookExecutor,
-    HookFailureMode, HookKind, HookPhase, HookPhaseOutcome, HookResult, HookRunner, Identifiable,
-    InfluxVersion, InstallDatabaseConnectionOutcome, ItemManager, LuaCapabilities,
-    MetricQuerySeries, MutationPolicy, NavigatorView, OutputEvent, OutputReceiver, OutputSender,
-    OutputStreamKind, OwnedCacheEntry, PendingOperation, PrepareConnectError, ProcessContainment,
-    ProcessExecutionError, ProcessExecutor, ProfileManager, ProfilePolicyResolver, ProxyAuth,
-    ProxyKind, ProxyManager, ProxyProfile, ReadOnlyReason, RedisKeyCache, RedisKeyCacheEntry,
-    RefreshViewsParams, RefreshedViews, ResolvedProxy, SchemaCacheKey, ScriptLanguage,
-    ScriptSource, SshAuthMethod, SshTunnelConfig, SshTunnelManager, SshTunnelProfile, SslInfo,
-    SslMode, StaleFetchReason, StaleInstallReason, SwitchDatabaseParams, SwitchDatabaseResult,
-    SwitchRegionParams, SwitchRegionResult, TableDetailsPrepareError, TestConnectionResult,
-    TreeLoadResult, TreeStore, WritePrivilege, compose_mutation_policy, detached_process_channel,
+    FencedTableDetailsParams, FetchDatabaseListParams, FetchDatabaseSchemaParams,
+    FetchDatabaseSchemaResult, FetchExplicitDatabaseSchemaParams, FetchSchemaColumnsParams,
+    FetchSchemaColumnsResult, FetchSchemaForeignKeysParams, FetchSchemaForeignKeysResult,
+    FetchSchemaIndexesParams, FetchSchemaIndexesResult, FetchSchemaRoutinesParams,
+    FetchSchemaRoutinesResult, FetchSchemaTypesParams, FetchSchemaTypesResult,
+    FetchTableDetailsParams, FetchTableDetailsResult, FetchedDatabaseList,
+    FetchedExplicitDatabaseSchema, FetchedTableDetails, GuardedDatabaseConnectionInstall,
+    GuardedInstalledDatabaseConnection, HookContext, HookExecution, HookExecutionContext,
+    HookExecutionMode, HookExecutor, HookFailureMode, HookKind, HookPhase, HookPhaseOutcome,
+    HookResult, HookRunner, Identifiable, InfluxVersion, InstallDatabaseConnectionOutcome,
+    ItemManager, LuaCapabilities, MutationPolicy, NavigatorView, OutputEvent, OutputReceiver,
+    OutputSender, OutputStreamKind, OwnedCacheEntry, PendingOperation, PrepareConnectError,
+    ProcessContainment, ProcessExecutionError, ProcessExecutor, ProfileManager,
+    ProfilePolicyResolver, ProxyAuth, ProxyKind, ProxyManager, ProxyProfile, ReadOnlyReason,
+    RedisKeyCache, RedisKeyCacheEntry, RefreshViewsParams, RefreshedViews, ResolvedProxy,
+    SchemaCacheKey, ScriptLanguage, ScriptSource, SshAuthMethod, SshTunnelConfig, SshTunnelManager,
+    SshTunnelProfile, SslInfo, SslMode, StaleFetchReason, StaleInstallReason, SwitchDatabaseParams,
+    SwitchDatabaseResult, TableDetailsPrepareError, TestConnectionResult, TreeLoadResult,
+    TreeStore, WritePrivilege, compose_mutation_policy, detached_process_channel,
     execute_streaming_process, host_matches_no_proxy, output_channel, ssl_mode_from_id,
     ssl_mode_id_is_cert_active, ssl_mode_id_requires_root_cert, ssl_mode_requires_root_cert,
-};
-
-pub use connection::{
-    DimensionFilter, MetricCatalog, MetricCatalogPage, MetricDescriptor, MetricNamespace,
-};
-
-pub use connection::dashboard_import::{
-    DashboardImporter, ImportedMetricSeries, MetricView, WidgetImportKind, WidgetImportSpec,
-    WidgetLayout,
-};
-
-pub use connection::dashboard_source::{DashboardRef, DashboardSource, RemoteDashboard};
-pub use connection::root_section::{
-    LocalizedText, RootItemPresentation, RootSectionAction, RootSectionDef, RootSectionItem,
-    RootSectionPage, RootSectionPresentation, RootSectionSource,
-};
-pub use connection::secret_store::{
-    SecretDetails, SecretListPage, SecretListRequest, SecretPayload, SecretRotation,
-    SecretStoreCapabilities, SecretStoreDescriptor, SecretStoreSource, SecretSummary, SecretTag,
-    SecretValue,
 };
 
 pub use connection::dump_analysis::{
     DumpAnalysisError, DumpAnalysisReport, DumpAnalyzer, DumpKeyEntry, DumpPrefixEntry,
 };
+pub use connection::root_section::{
+    LocalizedText, RootItemPresentation, RootSectionAction, RootSectionDef, RootSectionItem,
+    RootSectionPage, RootSectionPresentation, RootSectionSource,
+};
 
 pub use connection::{
     DefaultDashboardPanel, DefaultInstanceDashboard, InspectorRowAction, InstanceCatalog,
-    InstanceInspectorDef, InstanceMetricDef, InstanceMetricId, InstanceMetricUnit,
+    InstanceInspectorDef, InstanceMetricDef, InstanceMetricId, InstanceMetricKind,
+    InstanceMetricUnit,
 };
 
 pub use core::{
@@ -112,14 +95,14 @@ pub use core::{
     BucketSizeEstimate, CancelToken, CodeGenScope, CodeGeneratorInfo, Connection,
     ConnectionErrorFormatter, ConnectionExt, ConnectionOverrides, DbDriver, DbError,
     DefaultErrorFormatter, DeletePrefixOutcome, DocumentConnection, ErrorLocation,
-    EventStreamTarget, ExecutionSession, ExecutionSessionFactory, ExecutionSessionScope,
-    FormattedError, KeyValueApi, KeyValueConnection, LogErr, NoopCancelHandle, ObjectListingPage,
-    ObjectMetadata, ObjectStoreConnection, ObjectSummary, ObjectVersionSummary, PresignMethod,
-    PublicAccessStatus, QueryCancelHandle, QueryErrorFormatter, RelationalConnection,
-    SchemaDropTarget, SchemaFeatures, SchemaLoadingStrategy, SchemaObjectKind,
-    SchemaSnapshotAuthority, ShutdownCoordinator, ShutdownPhase, SourceContextSpec,
-    SourceQueryMode, TaskId, TaskKind, TaskManager, TaskSlot, TaskSnapshot, TaskStatus, TaskTarget,
-    TransactionStateNote, Value, VersioningStatus, redact_uri_credentials, sanitize_uri,
+    ExecutionSession, ExecutionSessionFactory, ExecutionSessionScope, FormattedError, KeyValueApi,
+    KeyValueConnection, LogErr, NoopCancelHandle, ObjectListingPage, ObjectMetadata,
+    ObjectStoreConnection, ObjectSummary, ObjectVersionSummary, PresignMethod, PublicAccessStatus,
+    QueryCancelHandle, QueryErrorFormatter, RelationalConnection, SchemaDropTarget, SchemaFeatures,
+    SchemaLoadingStrategy, SchemaObjectKind, SchemaSnapshotAuthority, ShutdownCoordinator,
+    ShutdownPhase, SourceContextSpec, SourceQueryMode, TaskId, TaskKind, TaskManager, TaskSlot,
+    TaskSnapshot, TaskStatus, TaskTarget, TransactionStateNote, Value, VersioningStatus,
+    redact_uri_credentials, sanitize_uri,
 };
 
 pub use data::{AggregatePipelineError, CollectionAggregateRequest, parse_aggregate_pipeline};
@@ -251,13 +234,12 @@ pub fn build_count_of_grouped_query(
 
 pub use schema::node_id as schema_node_id;
 pub use schema::{
-    CollectionChildInfo, CollectionChildrenCache, CollectionChildrenPage,
-    CollectionChildrenRequest, CollectionIndexInfo, CollectionInfo, CollectionPresentation,
-    ColumnDiff, ColumnInfo, ColumnSnapshot, ConstraintInfo, ConstraintKind, ContainerInfo,
-    CreationBlocker, CustomTypeInfo, CustomTypeKind, DataStructure, DatabaseInfo, DatabaseLayout,
-    DbSchemaInfo, DocumentSchema, DriftOutcome, FieldInfo, ForeignKeyBuilder, ForeignKeyInfo,
-    IdentitySpec, IndexBuilder, IndexData, IndexDirection, IndexInfo, IndexSnapshot, KeyInfo,
-    KeySpaceInfo, KeyValueSchema, MeasurementInfo, MetadataCompleteness, MissingCreationMetadata,
+    CollectionChildInfo, CollectionIndexInfo, CollectionInfo, CollectionPresentation, ColumnDiff,
+    ColumnInfo, ColumnSnapshot, ConstraintInfo, ConstraintKind, ContainerInfo, CreationBlocker,
+    CustomTypeInfo, CustomTypeKind, DataStructure, DatabaseInfo, DatabaseLayout, DbSchemaInfo,
+    DocumentSchema, DriftOutcome, FieldInfo, ForeignKeyBuilder, ForeignKeyInfo, IdentitySpec,
+    IndexBuilder, IndexData, IndexDirection, IndexInfo, IndexSnapshot, KeyInfo, KeySpaceInfo,
+    KeyValueSchema, MeasurementInfo, MetadataCompleteness, MissingCreationMetadata,
     NEAREST_DISTANCE_COLUMN, NearestNeighborRequest, ObjectFacet, ObjectFolder, OrderResult,
     ParseSchemaNodeIdError, PrimaryKeySpec, QueryTableRef, RelationKind, RelationRef,
     RelationalSchema, RetentionPolicyInfo, RiskedChange, RoutineInfo, RoutineKind, SchemaChange,
@@ -290,9 +272,9 @@ pub use pipeline::{
     pipeline_state_channel, resolve_profile_values, run_pipeline,
 };
 pub use values::{
-    CachedValue, CompositeValueResolver, DynParameterProvider, DynSecretProvider, FieldValue,
-    ParameterProvider, ProviderError, ResolveContext, ResolvedValue, SecretProvider, ValueCache,
-    ValueCacheKey, ValueOrigin, ValueRef,
+    CachedValue, CompositeValueResolver, DynSecretProvider, FieldValue, ProviderError,
+    ResolveContext, ResolvedValue, SecretProvider, ValueCache, ValueCacheKey, ValueOrigin,
+    ValueRef,
 };
 
 pub use chrono;

@@ -5,7 +5,7 @@ opens in the view its driver declares for that object, and offers the other
 views it declares:
 
 - **Table view** for relational tables and query results.
-- **Tree view** for document collections (for example MongoDB, DynamoDB), with
+- **Tree view** for document collections (for example MongoDB), with
   **Table** and **JSON** views of the same page (see
   [Document collections](DOCUMENTS.md)).
 - **Table view** with a **Tree** view of the same rows for a table with JSON
@@ -17,9 +17,6 @@ views it declares:
 
 A table with a vector column also lists the rows most
 [similar](#similar-rows) to the one selected.
-
-Event-stream-style containers open as event streams when the driver declares that
-presentation.
 
 ## Results beside the editor
 

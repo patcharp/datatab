@@ -39,12 +39,21 @@ pub enum LoginModalState {
 
 pub enum LoginModalEvent {
     OpenAuthProfilesSettings,
+    /// The user pressed Cancel while the modal waited for the login
+    /// `open_for_login` named: that login is to be cancelled.
+    LoginCancelled {
+        login_id: u64,
+    },
 }
 
 pub struct LoginModal {
     visible: bool,
     state: LoginModalState,
     focus_handle: FocusHandle,
+    /// The login started outside the connect pipeline that the modal shows,
+    /// as `open_for_login` named it. Unset once anything else takes the modal
+    /// over or closes it.
+    shown_login: Option<u64>,
     last_provider_name: Option<String>,
     timeout_generation: u64,
     success_generation: u64,
@@ -62,6 +71,7 @@ impl LoginModal {
             visible: false,
             state: LoginModalState::Idle,
             focus_handle: cx.focus_handle(),
+            shown_login: None,
             last_provider_name: None,
             timeout_generation: 0,
             success_generation: 0,
@@ -88,6 +98,7 @@ impl LoginModal {
                     verification_url
                 );
                 self.visible = true;
+                self.shown_login = None;
                 self.last_provider_name = Some(provider_name.clone());
                 self.state = LoginModalState::WaitingForBrowser {
                     provider_name: provider_name.clone(),
@@ -102,6 +113,7 @@ impl LoginModal {
             }
             PipelineState::Failed { stage, error } => {
                 self.visible = true;
+                self.shown_login = None;
                 self.state = LoginModalState::Failed {
                     provider_name: self.last_provider_name.clone(),
                     error: format!("{}: {}", stage, error),
@@ -110,6 +122,7 @@ impl LoginModal {
             }
             PipelineState::Cancelled => {
                 self.visible = false;
+                self.shown_login = None;
                 self.state = LoginModalState::Cancelled;
             }
             PipelineState::Connected
@@ -118,6 +131,7 @@ impl LoginModal {
             | PipelineState::Connecting { .. }
             | PipelineState::FetchingSchema => {
                 if self.visible {
+                    self.shown_login = None;
                     self.state = LoginModalState::Success;
                     self.visible = true;
                     self.schedule_success_close(cx);
@@ -131,8 +145,35 @@ impl LoginModal {
 
     pub fn close(&mut self, cx: &mut Context<Self>) {
         self.visible = false;
+        self.shown_login = None;
         self.state = LoginModalState::Cancelled;
         cx.notify();
+    }
+
+    /// The Cancel button: closes the modal and, while it waits for a login
+    /// `open_for_login` named, asks for that login to be cancelled. Nothing
+    /// else cancels. `close` only hides the modal: Escape, the close button
+    /// and a click on the backdrop call it, and so does a connect that
+    /// finishes. A click that only brings the window forward can land on the
+    /// backdrop.
+    fn cancel(&mut self, cx: &mut Context<Self>) {
+        let cancelled_login = self
+            .shown_login
+            .filter(|_| matches!(self.state, LoginModalState::WaitingForBrowser { .. }));
+
+        self.close(cx);
+
+        if let Some(login_id) = cancelled_login {
+            cx.emit(LoginModalEvent::LoginCancelled { login_id });
+        }
+    }
+
+    /// Closes the modal when it still shows the login `login_id`, because
+    /// that login ended.
+    pub fn login_ended(&mut self, login_id: u64, cx: &mut Context<Self>) {
+        if self.shown_login == Some(login_id) {
+            self.close(cx);
+        }
     }
 
     fn schedule_timeout(&mut self, cx: &mut Context<Self>) {
@@ -234,6 +275,7 @@ impl LoginModal {
     ) {
         let provider_name = provider_name.into();
         self.visible = true;
+        self.shown_login = None;
         self.last_provider_name = Some(provider_name.clone());
         self.state = LoginModalState::WaitingForBrowser {
             provider_name,
@@ -246,6 +288,22 @@ impl LoginModal {
         self.schedule_timeout(cx);
         self.start_spinner(cx);
         cx.notify();
+    }
+
+    /// Opens the modal for a login started outside the connect pipeline.
+    /// `login_id` names it: `login_ended` with that id closes the modal, and
+    /// the Cancel button emits `LoginModalEvent::LoginCancelled` with it.
+    pub fn open_for_login(
+        &mut self,
+        login_id: u64,
+        provider_name: impl Into<String>,
+        profile_name: impl Into<String>,
+        verification_url: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_manual(provider_name, profile_name, verification_url, window, cx);
+        self.shown_login = Some(login_id);
     }
 
     fn open_browser(&mut self, cx: &mut Context<Self>) {
@@ -483,7 +541,7 @@ impl Render for LoginModal {
                     .gap(ModalMetrics::FOOTER_GAP)
                     .child(
                         Button::new("sso-cancel", datatab_i18n::t!("login.action.cancel"))
-                            .on_click(cx.listener(|this, _, _, cx| this.close(cx))),
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel(cx))),
                     )
                     .child(
                         Button::new("sso-copy-url", datatab_i18n::t!("login.action.copy_url"))
@@ -569,8 +627,8 @@ impl Render for LoginModal {
 #[cfg(test)]
 mod tests {
     use super::{
-        LoginModal, SSO_LOGIN_TIMEOUT, failed_state_shows_open_auth_profiles_button,
-        login_progress_label,
+        LoginModal, LoginModalEvent, SSO_LOGIN_TIMEOUT,
+        failed_state_shows_open_auth_profiles_button, login_progress_label,
     };
     use crate::ui::labels::login_user_code;
     use datatab_core::PipelineState;
@@ -749,6 +807,181 @@ mod tests {
                 .all(|seconds| *seconds <= wall_clock_seconds),
             "the elapsed caption ran ahead of the wall clock ({wall_clock_seconds}s): \
              {shown_seconds:?}"
+        );
+    }
+
+    // --- A login started outside the connect pipeline (#369, ruling 1) ---
+
+    /// The id a test gives the Settings login it shows.
+    const SHOWN_LOGIN_ID: u64 = 7;
+
+    /// Opens a modal window and records the logins it asks to cancel.
+    fn modal_with_cancel_log(
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::Entity<LoginModal>,
+        Arc<Mutex<Vec<u64>>>,
+        &mut VisualTestContext,
+    ) {
+        let (modal, _outside, visual) =
+            datatab_ui_base::modals::test_host::host_modal(cx, LoginModal::new);
+        let cancelled = Arc::new(Mutex::new(Vec::new()));
+
+        visual.update(|_, cx| {
+            let cancelled = cancelled.clone();
+            cx.subscribe(&modal, move |_, event: &LoginModalEvent, _| {
+                if let LoginModalEvent::LoginCancelled { login_id } = event {
+                    cancelled.lock().expect("cancel log").push(*login_id);
+                }
+            })
+            .detach();
+        });
+
+        (modal, cancelled, visual)
+    }
+
+    fn open_shown_login(modal: &gpui::Entity<LoginModal>, visual: &mut VisualTestContext) {
+        visual.update(|window, cx| {
+            modal.update(cx, |modal, cx| {
+                modal.open_for_login(
+                    SHOWN_LOGIN_ID,
+                    "Custom OIDC",
+                    "dev",
+                    Some("https://verify.example/device".to_string()),
+                    window,
+                    cx,
+                );
+            });
+        });
+        visual.run_until_parked();
+    }
+
+    fn waiting_for_login(provider_name: &str) -> PipelineState {
+        PipelineState::WaitingForLogin {
+            provider_name: provider_name.to_string(),
+            verification_url: None,
+        }
+    }
+
+    /// The Cancel button, while the modal waits for a Settings login, asks
+    /// for that login to be cancelled.
+    #[gpui::test]
+    fn cancel_button_cancels_the_login_the_modal_shows(cx: &mut TestAppContext) {
+        let (modal, cancelled, visual) = modal_with_cancel_log(cx);
+
+        open_shown_login(&modal, visual);
+        visual.update(|_, cx| modal.update(cx, |modal, cx| modal.cancel(cx)));
+        visual.run_until_parked();
+
+        assert!(!visual.update(|_, cx| modal.read(cx).visible));
+        assert_eq!(*cancelled.lock().expect("cancel log"), vec![SHOWN_LOGIN_ID]);
+    }
+
+    /// Escape and a click on the backdrop only hide the modal: the login goes
+    /// on in Settings. A click that brings the window forward can land on
+    /// the backdrop, and it must never cancel a login.
+    #[gpui::test]
+    fn escape_and_backdrop_close_the_modal_without_cancelling(cx: &mut TestAppContext) {
+        let (modal, cancelled, visual) = modal_with_cancel_log(cx);
+
+        open_shown_login(&modal, visual);
+        visual.simulate_keystrokes("escape");
+        visual.run_until_parked();
+        assert!(!visual.update(|_, cx| modal.read(cx).visible));
+
+        open_shown_login(&modal, visual);
+        datatab_ui_base::modals::test_host::click_backdrop(visual);
+        assert!(!visual.update(|_, cx| modal.read(cx).visible));
+
+        assert!(
+            cancelled.lock().expect("cancel log").is_empty(),
+            "only the Cancel button cancels the login"
+        );
+    }
+
+    /// Cancel cancels only a waiting Settings login: not a login of the
+    /// connect pipeline and not a manually opened modal. A programmatic
+    /// `close`, which a finished connect calls, cancels nothing.
+    #[gpui::test]
+    fn cancel_button_cancels_only_a_waiting_settings_login(cx: &mut TestAppContext) {
+        let (modal, cancelled, visual) = modal_with_cancel_log(cx);
+
+        open_shown_login(&modal, visual);
+        visual.update(|_, cx| modal.update(cx, |modal, cx| modal.close(cx)));
+
+        open_shown_login(&modal, visual);
+        visual.update(|window, cx| {
+            modal.update(cx, |modal, cx| {
+                modal.apply_pipeline_state("dev", &waiting_for_login("Custom OIDC"), window, cx);
+                modal.cancel(cx);
+            });
+        });
+
+        visual.update(|window, cx| {
+            modal.update(cx, |modal, cx| {
+                modal.open_manual("Auth Provider", "dev", None, window, cx);
+                modal.cancel(cx);
+            });
+        });
+        visual.run_until_parked();
+
+        assert!(cancelled.lock().expect("cancel log").is_empty());
+    }
+
+    /// The modal closes when the login it shows ends, and only then: not for
+    /// another login, and not once the connect pipeline took the modal over.
+    #[gpui::test]
+    fn modal_closes_when_the_login_it_shows_ends(cx: &mut TestAppContext) {
+        let (modal, cancelled, visual) = modal_with_cancel_log(cx);
+        let visible =
+            |visual: &mut VisualTestContext| visual.update(|_, cx| modal.read(cx).visible);
+        let end_login = |login_id: u64, visual: &mut VisualTestContext| {
+            visual.update(|_, cx| modal.update(cx, |modal, cx| modal.login_ended(login_id, cx)));
+        };
+
+        open_shown_login(&modal, visual);
+        end_login(SHOWN_LOGIN_ID + 1, visual);
+        assert!(visible(visual), "another login ended");
+
+        end_login(SHOWN_LOGIN_ID, visual);
+        assert!(!visible(visual), "the shown login ended");
+
+        open_shown_login(&modal, visual);
+        visual.update(|window, cx| {
+            modal.update(cx, |modal, cx| {
+                modal.apply_pipeline_state("dev", &waiting_for_login("Custom OIDC"), window, cx);
+            });
+        });
+        end_login(SHOWN_LOGIN_ID, visual);
+        assert!(
+            visible(visual),
+            "the modal now shows a login of the connect pipeline"
+        );
+
+        assert!(
+            cancelled.lock().expect("cancel log").is_empty(),
+            "the end of a login cancels nothing"
+        );
+    }
+
+    /// A connect that succeeds takes the modal over to show its own success.
+    /// The end of the Settings login the modal showed before must not close
+    /// that.
+    #[gpui::test]
+    fn connect_success_takes_the_modal_over_from_the_shown_login(cx: &mut TestAppContext) {
+        let (modal, _cancelled, visual) = modal_with_cancel_log(cx);
+
+        open_shown_login(&modal, visual);
+        visual.update(|window, cx| {
+            modal.update(cx, |modal, cx| {
+                modal.apply_pipeline_state("dev", &PipelineState::Connected, window, cx);
+                modal.login_ended(SHOWN_LOGIN_ID, cx);
+            });
+        });
+
+        assert!(
+            visual.update(|_, cx| modal.read(cx).visible),
+            "the modal now shows the success of the connect"
         );
     }
 

@@ -4,11 +4,11 @@
 
 use super::Sidebar;
 use datatab_core::{
-    CollectionChildInfo, CollectionIndexInfo, CollectionInfo, CollectionPresentation,
-    ConnectedProfile, DatabaseCategory, DatabaseConnection, DatabaseInfo, DbSchemaInfo,
-    DocumentSchema, DriverCapabilities, FieldInfo, IndexData, IndexDirection, IndexInfo,
-    KeySpaceInfo, KeyValueSchema, MeasurementInfo, NavigatorView, RelationalSchema,
-    SchemaLoadingStrategy, SchemaSnapshot, TableInfo, TimeSeriesSchema, ViewInfo,
+    CollectionIndexInfo, CollectionInfo, CollectionPresentation, ConnectedProfile,
+    DatabaseCategory, DatabaseConnection, DatabaseInfo, DbSchemaInfo, DocumentSchema,
+    DriverCapabilities, FieldInfo, IndexData, IndexDirection, IndexInfo, KeySpaceInfo,
+    KeyValueSchema, MeasurementInfo, NavigatorView, RelationalSchema, SchemaLoadingStrategy,
+    SchemaSnapshot, TableInfo, TimeSeriesSchema, ViewInfo,
 };
 use datatab_ui_base::app_state_entity::AppStateEntity;
 use gpui_component::tree::TreeItem;
@@ -136,7 +136,6 @@ pub(crate) fn connected_profile(
         read_only_reason: None,
         database_schemas: HashMap::new(),
         table_details: HashMap::new(),
-        collection_children: HashMap::new(),
         schema_types: HashMap::new(),
         schema_columns: HashMap::new(),
         schema_indexes: HashMap::new(),
@@ -161,7 +160,6 @@ fn empty_state() -> AppStateEntity {
 #[derive(Default)]
 struct Surroundings {
     pending_databases: Vec<&'static str>,
-    metric_fetch_errors: HashMap<String, String>,
     root_sections: crate::root_sections::RootSectionCache,
 }
 
@@ -178,11 +176,9 @@ fn render_profile(connected: ConnectedProfile, surroundings: Surroundings) -> St
     let item = Sidebar::build_profile_item_with_errors(
         &profile,
         &state,
-        &surroundings.metric_fetch_errors,
         &HashMap::new(),
         &HashMap::new(),
         &surroundings.root_sections,
-        &HashMap::new(),
     );
 
     let mut text = String::new();
@@ -294,19 +290,6 @@ fn collection(name: &str, database: Option<&str>) -> CollectionInfo {
         is_capped: false,
         presentation: CollectionPresentation::DataGrid,
         child_items: None,
-    }
-}
-
-fn event_stream_collection(name: &str) -> CollectionInfo {
-    CollectionInfo {
-        presentation: CollectionPresentation::EventStream,
-        child_items: Some(vec![CollectionChildInfo {
-            id: format!("{name}/stream-1"),
-            label: "stream-1".to_string(),
-            last_event_ts_ms: None,
-            presentation: CollectionPresentation::EventStream,
-        }]),
-        ..collection(name, None)
     }
 }
 
@@ -604,50 +587,6 @@ fn document_database_connection_slot_lists_nothing() {
     assert_shape!(
         &render_profile(connected, Surroundings::default()),
         "document_per_database",
-    );
-}
-
-fn log_stream_profile() -> ConnectedProfile {
-    connected_profile(
-        DatabaseCategory::LogStream,
-        DriverCapabilities::METRIC_CATALOG,
-        SchemaLoadingStrategy::SingleDatabase,
-        SchemaSnapshot::document(DocumentSchema {
-            databases: vec![database("default", true)],
-            current_database: Some("default".to_string()),
-            collections: vec![
-                event_stream_collection("/aws/lambda/api"),
-                event_stream_collection("/aws/lambda/worker"),
-            ],
-        }),
-    )
-}
-
-#[test]
-fn log_stream_lists_event_stream_leaves_and_the_metrics_folder() {
-    assert_shape!(
-        &render_profile(log_stream_profile(), Surroundings::default()),
-        "log_stream",
-    );
-}
-
-#[test]
-fn log_stream_metrics_folder_shows_its_fetch_error() {
-    let metrics_folder = datatab_core::SchemaNodeId::MetricsFolder {
-        profile_id: PROFILE_ID,
-        database: "default".to_string(),
-    }
-    .to_string();
-
-    assert_shape!(
-        &render_profile(
-            log_stream_profile(),
-            Surroundings {
-                metric_fetch_errors: HashMap::from([(metrics_folder, "throttled".to_string())]),
-                ..Surroundings::default()
-            },
-        ),
-        "log_stream_metrics_error",
     );
 }
 

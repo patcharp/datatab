@@ -1,7 +1,7 @@
 //! Repository for connection profile value references in datatab.db.
 //!
 //! This module provides CRUD operations for the cfg_connection_profile_value_refs child table,
-//! which stores value references (secrets, params, auth) for connection profiles.
+//! which stores value references (environment, files, secrets, auth) for connection profiles.
 
 use log::info;
 use rusqlite::{Connection, params};
@@ -18,7 +18,6 @@ pub enum RefKind {
     Dotenv,
     File,
     Secret,
-    Param,
     Auth,
 }
 
@@ -30,7 +29,6 @@ impl RefKind {
             RefKind::Dotenv => "dotenv",
             RefKind::File => "file",
             RefKind::Secret => "secret",
-            RefKind::Param => "param",
             RefKind::Auth => "auth",
         }
     }
@@ -42,10 +40,42 @@ impl RefKind {
             "dotenv" => Some(RefKind::Dotenv),
             "file" => Some(RefKind::File),
             "secret" => Some(RefKind::Secret),
-            "param" => Some(RefKind::Param),
             "auth" => Some(RefKind::Auth),
             _ => None,
         }
+    }
+}
+
+/// A broken stored reference, without any stored value or locator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueRefLoadFailure {
+    DotenvKey,
+    SecretProvider,
+    UnknownSourceKind(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValueRefLoadDiagnostic {
+    pub field: String,
+    pub failure: ValueRefLoadFailure,
+}
+
+const MAX_UNKNOWN_SOURCE_KIND_CHARS: usize = 64;
+
+impl ValueRefLoadDiagnostic {
+    pub fn message(&self) -> String {
+        let (kind, missing) = match &self.failure {
+            ValueRefLoadFailure::DotenvKey => ("Dotenv", "its key"),
+            ValueRefLoadFailure::SecretProvider => ("Secret", "provider"),
+            ValueRefLoadFailure::UnknownSourceKind(kind) => {
+                let kind: String = kind.chars().take(MAX_UNKNOWN_SOURCE_KIND_CHARS).collect();
+                return format!(
+                    "Value ref '{}' has unknown source kind {kind:?}",
+                    self.field
+                );
+            }
+        };
+        format!("{kind} value ref '{}' is missing {missing}", self.field)
     }
 }
 
@@ -247,19 +277,40 @@ pub struct ConnectionProfileValueRefDto {
     /// Legacy scalar value (use native variant columns instead).
     /// Native columns: literal_value, env_key, secret_locator, param_name, auth_field.
     pub ref_value: String,
-    /// Provider ID for Secret and Parameter variants.
+    /// Provider ID for the Secret variant.
     pub ref_provider: Option<String>,
-    /// Optional JSON key for Secret and Parameter variants.
+    /// Optional JSON key for the File and Secret variants.
     pub ref_json_key: Option<String>,
     /// Native columns for ValueRef variants.
     pub literal_value: Option<String>,
     pub env_key: Option<String>,
     pub secret_locator: Option<String>,
+    /// No source kind writes this column any more. It stays because the schema is unchanged.
     pub param_name: Option<String>,
     pub auth_field: Option<String>,
 }
 
 impl ConnectionProfileValueRefDto {
+    pub fn load_diagnostic(&self) -> Option<ValueRefLoadDiagnostic> {
+        self.load_kind().err()
+    }
+
+    /// Validates a stored reference before returning its source kind.
+    pub fn load_kind(&self) -> Result<RefKind, ValueRefLoadDiagnostic> {
+        let failure = match RefKind::try_parse(&self.ref_kind) {
+            Some(RefKind::Dotenv) if self.env_key.is_none() => ValueRefLoadFailure::DotenvKey,
+            Some(RefKind::Secret) if self.ref_provider.is_none() => {
+                ValueRefLoadFailure::SecretProvider
+            }
+            None => ValueRefLoadFailure::UnknownSourceKind(self.ref_kind.clone()),
+            Some(kind) => return Ok(kind),
+        };
+        Err(ValueRefLoadDiagnostic {
+            field: self.ref_key.clone(),
+            failure,
+        })
+    }
+
     pub fn new_literal(profile_id: String, ref_key: String, value: String) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
@@ -360,29 +411,6 @@ impl ConnectionProfileValueRefDto {
         }
     }
 
-    pub fn new_param(
-        profile_id: String,
-        ref_key: String,
-        provider: String,
-        name: String,
-        json_key: Option<String>,
-    ) -> Self {
-        Self {
-            id: uuid::Uuid::new_v4().to_string(),
-            profile_id,
-            ref_key,
-            ref_kind: "param".to_string(),
-            ref_value: name.clone(),
-            ref_provider: Some(provider.clone()),
-            ref_json_key: json_key.clone(),
-            literal_value: None,
-            env_key: None,
-            secret_locator: None,
-            param_name: Some(name),
-            auth_field: None,
-        }
-    }
-
     pub fn new_auth(profile_id: String, ref_key: String, field: String) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
@@ -400,3 +428,6 @@ impl ConnectionProfileValueRefDto {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -332,7 +332,7 @@ impl DataTabServer {
         Ok(serde_json::json!({ "schemas": schemas }))
     }
 
-    /// Handle list_tables for document databases (MongoDB, DynamoDB)
+    /// Handle list_tables for document databases (MongoDB)
     async fn list_tables_document(
         connection: &Arc<dyn Connection>,
         database: &str,

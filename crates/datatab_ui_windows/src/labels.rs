@@ -280,25 +280,6 @@ pub(crate) fn auth_profiles_inherited_hint(
     }
 }
 
-/// Builds the user-visible conflict message for a `Conflict` save outcome,
-/// naming the target's label and pointing to the Reload affordance.
-pub(crate) fn auth_profiles_conflict_message(label: &str) -> String {
-    datatab_i18n::t!("settings.auth_profiles.conflict_message", label = label)
-}
-
-/// Builds the user-visible message for a `PartialSaved` save outcome,
-/// naming both the written and conflicted targets.
-pub(crate) fn auth_profiles_partial_saved_message(
-    written_label: &str,
-    conflicted_label: &str,
-) -> String {
-    datatab_i18n::t!(
-        "settings.auth_profiles.partial_saved_message",
-        written_label = written_label,
-        conflicted_label = conflicted_label
-    )
-}
-
 /// Formats the status message shown while the Settings-window auth-profile
 /// login is starting.
 pub(crate) fn auth_profiles_starting_login(name: &str) -> String {
@@ -576,20 +557,6 @@ pub(crate) fn import_required_secret_label(owner: &str, field: &str) -> String {
     )
 }
 
-/// Formats the "AWS auth profile "<name>" (<provider>) for "<owner>"" import required-resolution label.
-pub(crate) fn import_required_aws_reference_label(
-    name: &str,
-    provider_id: &str,
-    owner: &str,
-) -> String {
-    datatab_i18n::t!(
-        "connection_manager.import.required.aws_reference_label",
-        name = name,
-        provider_id = provider_id,
-        owner = owner
-    )
-}
-
 /// Formats the "Auth profile for "<owner>": <field>" import required-resolution label.
 pub(crate) fn import_required_auth_profile_ref_label(owner: &str, field: &str) -> String {
     datatab_i18n::t!(
@@ -807,20 +774,12 @@ pub(crate) fn export_title_with_kind(kind: &str) -> String {
     datatab_i18n::t!("connection_manager.export.title_with_kind", kind = kind)
 }
 
-/// Formats the "Auth profile: <name>" or "Auth profile: <name> (reference)"
-/// export-summary line for a referenced auth profile.
-pub(crate) fn export_summary_auth_profile_line(name: &str, locked: bool) -> String {
-    if locked {
-        datatab_i18n::t!(
-            "connection_manager.export.summary.auth_profile_line_reference",
-            name = name
-        )
-    } else {
-        datatab_i18n::t!(
-            "connection_manager.export.summary.auth_profile_line",
-            name = name
-        )
-    }
+/// Formats the export-summary line for a referenced auth profile.
+pub(crate) fn export_summary_auth_profile_line(name: &str) -> String {
+    datatab_i18n::t!(
+        "connection_manager.export.summary.auth_profile_line",
+        name = name
+    )
 }
 
 /// Formats the "Proxy: <name>" export-summary line.
@@ -985,8 +944,7 @@ fn keybinding_category_slug(category: &str) -> &'static str {
 mod tests {
     use super::{
         access_proxy_disabled_label, audit_save_failed_copy, auth_login_failed,
-        auth_login_starting, auth_profiles_conflict_message, auth_profiles_login_completed,
-        auth_profiles_login_failed, auth_profiles_partial_saved_message,
+        auth_login_starting, auth_profiles_login_completed, auth_profiles_login_failed,
         auth_profiles_starting_login, auth_provider_unavailable, auth_session_status_valid_expires,
         hooks_create_dir_failed, hooks_delete_message, hooks_delete_unreadable_message,
         hooks_duplicate_id, hooks_env_pair_invalid, hooks_form_interpreter_hint,
@@ -1001,9 +959,9 @@ mod tests {
         import_preview_conflicts_banner, import_preview_count_auth_profiles,
         import_preview_count_connections, import_preview_count_proxies,
         import_preview_count_ssh_tunnels, import_preview_required_banner,
-        import_required_auth_profile_ref_label, import_required_aws_reference_label,
-        import_required_secret_label, import_status_imported_toast, proxies_delete_body,
-        rpc_services_delete_body, ssh_private_key_with_path, ssh_tunnels_delete_body,
+        import_required_auth_profile_ref_label, import_required_secret_label,
+        import_status_imported_toast, proxies_delete_body, rpc_services_delete_body,
+        ssh_private_key_with_path, ssh_tunnels_delete_body,
     };
     use super::{
         connection_manager_window_title_edit, connection_manager_window_title_new,
@@ -1012,8 +970,8 @@ mod tests {
     use super::{
         export_error_cannot_determine_output_path, export_error_failed, export_error_write_failed,
         export_result_omitted_fields, export_result_success_title, export_result_warning_line,
-        export_summary_auth_profile_line, export_summary_proxy_line, export_summary_ssh_line,
-        export_title_with_kind, export_toast_success,
+        export_summary_proxy_line, export_summary_ssh_line, export_title_with_kind,
+        export_toast_success,
     };
 
     /// Locale keys added or newly reused by the final windows-ui sweep (PR29):
@@ -1067,7 +1025,6 @@ mod tests {
         "settings.mcp_governance.persist_error",
         "settings.drivers.error.save_failed",
         "settings.auth_profiles.error.secret_store_failed",
-        "settings.auth_profiles.error.write_config_failed",
     ];
 
     #[test]
@@ -1324,22 +1281,6 @@ mod tests {
     }
 
     #[test]
-    fn auth_profiles_conflict_message_names_target_label() {
-        let message = auth_profiles_conflict_message("FAKE_TARGET_A");
-
-        assert!(message.contains("FAKE_TARGET_A"));
-        assert!(!message.contains("settings.auth_profiles.conflict_message"));
-    }
-
-    #[test]
-    fn auth_profiles_partial_saved_message_names_both_targets() {
-        let message = auth_profiles_partial_saved_message("FAKE_TARGET_A", "FAKE_TARGET_B");
-
-        assert!(message.contains("FAKE_TARGET_A"));
-        assert!(message.contains("FAKE_TARGET_B"));
-    }
-
-    #[test]
     fn auth_profiles_starting_login_embeds_profile_name() {
         let message = auth_profiles_starting_login("prod-mongo");
 
@@ -1506,15 +1447,6 @@ mod tests {
         assert!(import_required_secret_label("prod-mongo", "password").contains("prod-mongo"));
         assert!(import_required_secret_label("prod-mongo", "password").contains("password"));
 
-        let aws = import_required_aws_reference_label(
-            "prod-sso",
-            "aws-iam-identity-center",
-            "prod-mongo",
-        );
-        assert!(aws.contains("prod-sso"));
-        assert!(aws.contains("aws-iam-identity-center"));
-        assert!(aws.contains("prod-mongo"));
-
         let profile_ref = import_required_auth_profile_ref_label("prod-mongo", "auth_profile_id");
         assert!(profile_ref.contains("prod-mongo"));
         assert!(profile_ref.contains("auth_profile_id"));
@@ -1673,17 +1605,6 @@ mod tests {
         let message = export_title_with_kind("connection");
 
         assert!(message.contains("connection"));
-    }
-
-    #[test]
-    fn export_summary_auth_profile_line_marks_locked_profiles_as_reference() {
-        let unlocked = export_summary_auth_profile_line("prod-mongo", false);
-        let locked = export_summary_auth_profile_line("prod-mongo", true);
-
-        assert!(unlocked.contains("prod-mongo"));
-        assert!(!unlocked.to_lowercase().contains("reference"));
-        assert!(locked.contains("prod-mongo"));
-        assert_ne!(unlocked, locked);
     }
 
     #[test]

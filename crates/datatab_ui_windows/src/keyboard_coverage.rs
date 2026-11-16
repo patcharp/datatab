@@ -14,6 +14,13 @@ pub(crate) const SETTINGS: SurfaceRegistry = SurfaceRegistry {
     name: "settings window",
     contexts: &[ContextId::Settings, ContextId::FormNavigation],
     entries: &[
+        (
+            "shell-window-title-drag",
+            KeyboardPath::MouseOnly("window chrome"),
+        ),
+        ("csd-minimize", KeyboardPath::MouseOnly("window chrome")),
+        ("csd-maximize", KeyboardPath::MouseOnly("window chrome")),
+        ("csd-close", KeyboardPath::MouseOnly("window chrome")),
         ("settings-nav-*", KeyboardPath::Command(Command::SelectNext)),
         (
             "settings-close",
@@ -263,6 +270,13 @@ pub(crate) const CONNECTION_MANAGER: SurfaceRegistry = SurfaceRegistry {
     name: "connection manager",
     contexts: &[ContextId::ConnectionManager, ContextId::FormNavigation],
     entries: &[
+        (
+            "shell-window-title-drag",
+            KeyboardPath::MouseOnly("window chrome"),
+        ),
+        ("csd-minimize", KeyboardPath::MouseOnly("window chrome")),
+        ("csd-maximize", KeyboardPath::MouseOnly("window chrome")),
+        ("csd-close", KeyboardPath::MouseOnly("window chrome")),
         // The driver list: arrows, H, J, K, L move over the cards, Enter
         // configures the driver under the cursor, Escape closes the window,
         // I and Shift+I open the two imports.
@@ -311,7 +325,14 @@ pub(crate) const CONNECTION_MANAGER: SurfaceRegistry = SurfaceRegistry {
             "segmented-enter-as-*",
             KeyboardPath::Command(Command::FocusRight),
         ),
+        (
+            "segmented-cm-field-*",
+            KeyboardPath::Command(Command::FocusRight),
+        ),
         // Stops of the form ring: Enter works them.
+        ("cm-field-*", KeyboardPath::Command(Command::Execute)),
+        ("conn-schema-*", KeyboardPath::Command(Command::Execute)),
+        ("browse-file-path", KeyboardPath::Command(Command::Execute)),
         ("cm-host.*", KeyboardPath::Command(Command::Execute)),
         ("cm-database.*", KeyboardPath::Command(Command::Execute)),
         ("cm-user.*", KeyboardPath::Command(Command::Execute)),
@@ -337,18 +358,6 @@ pub(crate) const CONNECTION_MANAGER: SurfaceRegistry = SurfaceRegistry {
         ),
         (
             "auth-login-selected",
-            KeyboardPath::Command(Command::Execute),
-        ),
-        (
-            "ssm-auth-open-settings",
-            KeyboardPath::Command(Command::Execute),
-        ),
-        (
-            "ssm-auth-refresh-session",
-            KeyboardPath::Command(Command::Execute),
-        ),
-        (
-            "ssm-auth-login-selected",
             KeyboardPath::Command(Command::Execute),
         ),
         ("ssh-enabled", KeyboardPath::Command(Command::Execute)),

@@ -33,7 +33,7 @@ pub use axis_bar::{
 pub use column::ChartColumn;
 pub use decimate::{lttb, lttb_with_indices};
 pub use detect::{ChartDetection, detect_chart_columns};
-pub use format::{format_x_value, format_y_value};
+pub use format::{format_x_value, format_x_value_in, format_y_value};
 pub use legend::legend_element;
 pub use point_inspector::{
     DataPointRef, PointInspectorText, SourceRowRef, point_inspector_element,

@@ -13,10 +13,6 @@ impl Workspace {
                 self.open_login_modal(window, cx);
                 Some(true)
             }
-            Command::OpenSsoWizard => {
-                self.open_sso_wizard(window, cx);
-                Some(true)
-            }
             Command::OpenSettings => {
                 self.open_settings(cx);
                 Some(true)

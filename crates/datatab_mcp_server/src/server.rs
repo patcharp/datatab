@@ -1222,55 +1222,22 @@ async fn record_hook_executions(
     }
 }
 
-struct McpAccessManager {
-    #[cfg(feature = "aws")]
-    ssm_factory: Option<Arc<datatab_ssm::SsmTunnelFactory>>,
-}
+struct McpAccessManager {}
 
 impl McpAccessManager {
-    #[cfg(feature = "aws")]
-    fn new(ssm_factory: Option<Arc<datatab_ssm::SsmTunnelFactory>>) -> Self {
-        Self { ssm_factory }
-    }
-
-    #[cfg(not(feature = "aws"))]
     fn new() -> Self {
         Self {}
     }
 
     async fn open_managed(
         &self,
-        provider: &str,
-        params: &HashMap<String, String>,
-        remote_host: &str,
+        _provider: &str,
+        _params: &HashMap<String, String>,
+        _remote_host: &str,
     ) -> Result<AccessHandle, datatab_core::DbError> {
-        match provider {
-            #[cfg(feature = "aws")]
-            "aws-ssm" => {
-                let ssm = datatab_core::SsmAccessParams::from_params(params)?;
-
-                let factory = self.ssm_factory.as_ref().ok_or_else(|| {
-                    datatab_core::DbError::connection_failed("SSM tunnel factory not available")
-                })?;
-
-                let tunnel =
-                    factory.start(&ssm.instance_id, &ssm.region, remote_host, ssm.remote_port)?;
-                Ok(AccessHandle::tunnel(tunnel.local_port(), Box::new(tunnel)))
-            }
-            #[cfg(not(feature = "aws"))]
-            _ => {
-                let _ = params;
-                let _ = remote_host;
-                Err(datatab_core::DbError::connection_failed(
-                    "Managed access providers are not available in this build",
-                ))
-            }
-            #[cfg(feature = "aws")]
-            other => Err(datatab_core::DbError::connection_failed(format!(
-                "Unknown managed access provider: '{}'. No handler registered.",
-                other
-            ))),
-        }
+        Err(datatab_core::DbError::connection_failed(
+            "Managed access providers are not available in this build",
+        ))
     }
 }
 
@@ -1325,21 +1292,16 @@ impl McpConnectionFactory {
             .parse::<uuid::Uuid>()
             .map_err(|_| error_messages::invalid_connection_id(connection_id))?;
 
-        let (mut profile, profile_load_error) = {
+        let mut profile = {
             let profile_manager = self.state.profile_manager.read().await;
-            let profile = profile_manager
+            if let Some(error) = profile_manager.profile_load_error(profile_uuid) {
+                return Err(error.to_string());
+            }
+            profile_manager
                 .find_by_id(profile_uuid)
                 .cloned()
-                .ok_or_else(|| error_messages::connection_not_found(connection_id))?;
-            let load_error = profile_manager
-                .profile_load_error(profile_uuid)
-                .map(str::to_string);
-            (profile, load_error)
+                .ok_or_else(|| error_messages::connection_not_found(connection_id))?
         };
-
-        if let Some(error) = profile_load_error {
-            return Err(error);
-        }
 
         if let Some(driver_defaults) = self.state.driver_settings.get(&profile.driver_id()) {
             let mut merged_settings = driver_defaults.clone();
@@ -1367,6 +1329,10 @@ impl McpConnectionFactory {
             .get(&driver_id)
             .cloned()
             .ok_or_else(|| error_messages::driver_not_available(&driver_id, &available_drivers))?;
+
+        driver
+            .validate_profile(&profile)
+            .map_err(|error| error.to_string())?;
 
         let connection_key = database
             .map(|database| format!("{}:{}", connection_id, database))
@@ -1418,7 +1384,9 @@ impl McpConnectionFactory {
             driver.requires_password(),
         )?
         .password;
-        let pipeline_input = self.build_pipeline_input(profile).await?;
+        let pipeline_input = self
+            .build_pipeline_input(profile, Arc::clone(&driver))
+            .await?;
         let cancel = pipeline_input.cancel.clone();
         let (state_tx, state_rx) = datatab_core::pipeline_state_channel();
         let pipeline_output = run_with_stage_deadline(
@@ -1567,6 +1535,7 @@ impl McpConnectionFactory {
     async fn build_pipeline_input(
         &self,
         profile: datatab_core::ConnectionProfile,
+        driver: Arc<dyn datatab_core::DbDriver>,
     ) -> Result<PipelineInput, String> {
         let selected_auth_profile_id = profile
             .access_kind
@@ -1593,7 +1562,7 @@ impl McpConnectionFactory {
         let uses_managed_access = matches!(profile.access_kind, Some(AccessKind::Managed { .. }));
         if uses_managed_access && auth_profile.is_none() {
             return Err(
-                "Managed access requires an auth profile. Select one in Access > SSM Auth Profile."
+                "Managed access requires an auth profile. Select one in Access > Auth Profile."
                     .to_string(),
             );
         }
@@ -1608,7 +1577,7 @@ impl McpConnectionFactory {
         let uses_registered_auth_value_sources = profile.value_refs.values().any(|value_ref| {
             matches!(
                 value_ref,
-                ValueRef::Secret { provider, .. } | ValueRef::Parameter { provider, .. }
+                ValueRef::Secret { provider, .. }
                     if registered_auth_provider_ids.contains(provider.as_str())
             )
         });
@@ -1657,19 +1626,10 @@ impl McpConnectionFactory {
             resolver.register_secret_provider(Arc::clone(provider));
         }
 
-        #[cfg(feature = "aws")]
-        let aws_profile_name = auth_profile
-            .as_ref()
-            .and_then(|profile| profile.fields.get("profile_name").cloned());
-
-        let access_manager: Arc<dyn AccessManager> = Arc::new(McpAccessManager::new(
-            #[cfg(feature = "aws")]
-            Some(Arc::new(datatab_ssm::SsmTunnelFactory::new(
-                aws_profile_name,
-            ))),
-        ));
+        let access_manager: Arc<dyn AccessManager> = Arc::new(McpAccessManager::new());
 
         Ok(PipelineInput {
+            driver,
             profile,
             auth_provider,
             auth_profile,
@@ -2263,7 +2223,7 @@ impl ServerHandler for DataTabServer {
              \n\
              Supports multiple database types:\n\
              • PostgreSQL, MySQL/MariaDB\n\
-             • MongoDB, Redis, DynamoDB\n\
+             • MongoDB, Redis\n\
              • SQLite\n\
              \n\
              All operations are subject to role-based access control and audit logging.\n\
@@ -2285,9 +2245,9 @@ impl ServerHandler for DataTabServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod refusal;
 
-    #[cfg(feature = "aws")]
-    mod access;
+    mod managed_access;
     mod shutdown;
 
     use datatab_core::secrecy::{ExposeSecret, SecretString};
@@ -2314,6 +2274,7 @@ mod tests {
         invocations: Arc<Mutex<Vec<ConnectInvocation>>>,
         event_trace: Option<std::path::PathBuf>,
         connect_delay: Option<Duration>,
+        refuses_profile: bool,
     }
 
     impl RecordingDriver {
@@ -2323,6 +2284,7 @@ mod tests {
                 invocations: Arc::new(Mutex::new(Vec::new())),
                 event_trace: None,
                 connect_delay: None,
+                refuses_profile: false,
             }
         }
 
@@ -2361,6 +2323,14 @@ mod tests {
     }
 
     impl DbDriver for RecordingDriver {
+        fn validate_profile(&self, _: &ConnectionProfile) -> Result<(), DbError> {
+            if self.refuses_profile {
+                Err(DbError::InvalidProfile("fixture refusal".into()))
+            } else {
+                Ok(())
+            }
+        }
+
         fn kind(&self) -> DbKind {
             self.inner.kind()
         }
@@ -2604,6 +2574,10 @@ mod tests {
         let Ok(trace_path) = std::env::var("DATATAB_MCP_HOOK_TEST_TRACE") else {
             return;
         };
+        assert!(
+            std::env::var_os("DATATAB_MCP_HOOK_TEST_PANIC").is_none(),
+            "refused profile reached PreConnect hook"
+        );
         let phase = std::env::var("DATATAB_MCP_HOOK_TEST_PHASE").expect("hook phase");
         let mut trace = std::fs::OpenOptions::new()
             .create(true)
@@ -3907,8 +3881,8 @@ mod tests {
 
     #[tokio::test]
     async fn connect_omits_the_database_context_without_a_database_concept() {
-        let driver = FakeDriver::new(DbKind::DynamoDB);
-        let profile = ConnectionProfile::new("test-dynamodb", DbConfig::default_dynamodb());
+        let driver = FakeDriver::new(DbKind::Turso);
+        let profile = ConnectionProfile::new("test-turso", DbConfig::default_turso());
         let connection_id = profile.id.to_string();
         let state = test_state_with_driver(&profile.driver_id(), Arc::new(driver), profile);
 

@@ -14,13 +14,17 @@ Every driver exposes a `DriverMetadata` value (defined in
 adapts purely from this metadata. The relevant fields are:
 
 - **`DatabaseCategory`** — selects the view model and terminology. Values:
-  `Relational`, `Document`, `KeyValue`, `TimeSeries`, `LogStream`,
-  `ObjectStorage`, `SecretStore`. A category lands together with a driver that declares it.
+  `Relational`, `Document`, `KeyValue`, `TimeSeries`, `ObjectStorage`. No
+  built-in driver uses `ObjectStorage`; an RPC driver can.
 - **`QueryLanguage`** — drives editor mode, placeholder text, and query parsing.
   Values include `Sql`, `MongoQuery`, `RedisCommands`, `Cypher`, `InfluxQuery`,
-  `Flux`, `Cql`, `CloudWatchLogsInsightsQl`, `OpenSearchPpl`, `OpenSearchSql`,
-  the script languages `Lua` / `Python` / `Bash`, and `Custom(String)`.
-- **`DriverCapabilities`** — a `u64` bitflag set declaring supported features
+  `Flux`, `Cql`, the script languages `Lua` / `Python` / `Bash`, and
+  `Custom(String)`.
+- **Reserved slots** — `DbKind`, `Icon`, `QueryLanguage` and `DatabaseCategory`
+  also hold hidden `Reserved*` variants. They only keep the wire positions of
+  retired variants, and a driver must not declare them. See
+  [Reserved enum slots](DRIVER_RPC_PROTOCOL.md#reserved-enum-slots).
+- **`DriverCapabilities`** — a `u128` bitflag set declaring supported features
   (transactions, pagination, schemas, key-value operations, etc.). Convenience
   bases `RELATIONAL_BASE`, `DOCUMENT_BASE`, and `KEYVALUE_BASE` group the common
   flags for each category.
@@ -40,14 +44,10 @@ The capability flags listed below are exactly the ones each driver's
 | SQL Server | Relational | SQL | Relational base + schemas, SSH tunnel, SSL, auth, foreign keys, check/unique constraints, transactional DDL, routines, multi-statement | Built on `tiberius`; named-instance lookup unavailable through SSH tunnel; multi-result-set batches return the last set as primary. |
 | MongoDB | Document | MongoQuery | Document base + aggregation, SSH tunnel, indexes | MongoDB shell-style syntax only (no SQL); no query cancellation; parser scoped to supported command patterns. |
 | Redis | Key-Value | RedisCommands | Key-value base + multiple databases, TTL, key types, value size, rename, bulk get, stream range/add/delete, auth, SSH tunnel, SSL | Redis command syntax only (no SQL); no query cancellation; SSH tunneling unavailable in URI mode. |
-| DynamoDB | Document | Custom("DynamoDB") | Auth, pagination, filtering, insert/update/delete, nested documents, arrays | AWS-managed; native command envelope (`scan`/`query`/`put`/`update`/`delete`); no PartiQL/transactions; no query cancellation; `update many+upsert` unsupported. |
-| CloudWatch Logs | Log Stream | Sql (metadata default) | Auth | AWS-managed; executes Logs Insights QL, OpenSearch PPL, and OpenSearch SQL via editor-managed source context; no query cancellation yet. |
 | InfluxDB | Time Series | InfluxQuery | Auth, multiple databases, pagination, CSV/JSON export | v1 and v2 in one crate; InfluxQL on both, Flux on v2 only; read-only (no INSERT/UPDATE/DELETE); no transactions. |
 | ClickHouse | Relational | SQL | Multiple databases, views, auth, pagination, sorting, filtering, grouping, joins, CTEs, windows, CSV/JSON export | HTTP(S), including ClickHouse Cloud; read-oriented DataTab integration with no structured mutations, DDL, transactions, SSH tunneling, or query parameters. |
 | TursoDB | Relational | SQL | Auth token, views, indexes, foreign keys, check/unique constraints, prepared statements, insert/update/delete, pagination, sorting, filtering, CSV/JSON export, transactions, transactional DDL, multi-statement | Remote Turso / libSQL over HTTP (`libsql://`, or `http://` for a local `sqld`); interactive transactions run on per-document server streams; no query cancellation, SSH tunnel, replicas, or database switching. |
 | DuckDB | Relational | SQL | Multiple databases, schemas, views, indexes, foreign keys, check/unique constraints, prepared statements, insert/update/delete with RETURNING, pagination, sorting, filtering, CSV/JSON export, transactions, transactional DDL, query cancellation, row limits, read-only enforcement, multi-statement | Embedded file or in-memory database; attaches a DuckLake catalog on connect; only one process can hold a file for writing; no statement timeouts. |
-| Amazon S3 | Object Storage | Custom("S3") | Auth (profile/SSO or static credentials, custom endpoint), bucket browsing, paginated object navigation, preview, full CRUD, presigned URLs | S3-compatible (Cloudflare R2, MinIO); no multipart upload/transfers panel, no embedded PDF viewer, no lifecycle/ACL management or S3 Select. |
-| AWS Secrets | Secret Store | Custom("AWS Secrets") | Auth (profile/SSO or static credentials, custom endpoint), Secrets Manager and Parameter Store in one connection, paginated listing with name search, parameter path hierarchy, details, explicit value retrieval | Read only (no create, edit, delete, restore, versions or rotation); one region per connection; LocalStack does not honor Parameter Store page sizes. |
 
 ## Per-driver summary
 
@@ -105,24 +105,6 @@ logical databases. SQL is not supported and SSH tunneling is unavailable in URI
 mode. See
 [`crates/datatab_driver_redis/README.md`](../crates/datatab_driver_redis/README.md).
 
-### DynamoDB
-
-AWS NoSQL driver built on `aws-sdk-dynamodb` with region/profile/endpoint
-configuration. Table discovery maps PK/SK and GSI/LSI metadata; execution uses a
-native command envelope (`scan`, `query`, `put`, `update`, `delete`). PartiQL and
-DynamoDB transactions are not exposed. See
-[`crates/datatab_driver_dynamodb/README.md`](../crates/datatab_driver_dynamodb/README.md).
-
-### CloudWatch Logs
-
-AWS CloudWatch Logs driver executing queries through `StartQuery` with
-editor-managed time range and log-group source context. Query documents can run
-Logs Insights QL, OpenSearch PPL, and OpenSearch SQL; schema discovery enumerates
-log groups and exposes log streams as event-stream children. Its
-`DriverMetadata.query_language` is set to `Sql` as the default editor mode while
-the actual mode is chosen per query document. See
-[`crates/datatab_driver_cloudwatch/README.md`](../crates/datatab_driver_cloudwatch/README.md).
-
 ### InfluxDB
 
 Time-series driver supporting both InfluxDB v1 and v2 in one crate. InfluxQL runs
@@ -165,36 +147,6 @@ file and network reads through table functions named in the statement; views
 and macros created earlier, and scalar functions added by extensions, are not
 checked. Statement timeouts are not supported. See
 [`crates/datatab_driver_duckdb/README.md`](../crates/datatab_driver_duckdb/README.md).
-
-### Amazon S3
-
-Object-storage driver for AWS S3 and S3-compatible endpoints (Cloudflare R2,
-MinIO), authenticating via AWS profile/SSO or static credentials with endpoint
-override and path-style addressing. The connection root opens a buckets table;
-bucket browsing paginates per level (AWS-console style) with an optional
-non-paginated tree mode. Object preview covers images natively, text-like
-objects in an inline editable buffer with save-back, and metadata plus
-download/open-externally for PDF and other binary objects; archived storage
-classes (GLACIER, DEEP_ARCHIVE) skip body preview entirely. Supports upload,
-delete, type-to-confirm recursive prefix/bucket delete, folder/bucket
-creation, rename (copy-then-delete), and presigned URLs. It does not support
-multipart upload, a transfers panel, an embedded PDF viewer, lifecycle/ACL
-management, or S3 Select. See
-[`crates/datatab_driver_s3/README.md`](../crates/datatab_driver_s3/README.md).
-
-### AWS Secrets
-
-Secret-store driver for AWS Secrets Manager and Systems Manager Parameter
-Store, authenticating via AWS profile/SSO or static credentials with an
-optional endpoint override. One connection shows both stores in the sidebar.
-Listing is paginated on the server side with name search, and Parameter Store
-paths are browsed one level at a time. Listing and the details pane never
-fetch a value: a value is read only when the user runs Retrieve value, which
-records an audit event without the value. Key/value JSON secrets render as a
-table, other text as plaintext and binary secrets as base64, and secrets owned
-by another service are marked read only. A missing `kms:Decrypt` permission is
-reported as an error, never as an empty value. This release is read only. See
-[`crates/datatab_driver_aws_secrets/README.md`](../crates/datatab_driver_aws_secrets/README.md).
 
 ## External RPC drivers
 

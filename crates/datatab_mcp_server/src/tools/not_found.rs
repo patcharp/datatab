@@ -431,7 +431,7 @@ async fn hint(call: &FailedCall<'_>) -> Option<String> {
 
     let is_collection = matches!(
         call.connection.metadata().category,
-        DatabaseCategory::Document | DatabaseCategory::LogStream
+        DatabaseCategory::Document
     );
 
     let (scope, listing) = read_scope(call, is_collection, allowed.table_names).await?;

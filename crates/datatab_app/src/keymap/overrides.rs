@@ -456,6 +456,40 @@ mod tests {
     }
 
     #[test]
+    fn removed_sso_override_keeps_other_stored_bindings() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage");
+        let mut defaults = KeymapStack::new();
+        let mut global = KeymapLayer::new(ContextId::Global);
+        global.bind(chord("n", Modifiers::primary()), Command::NewQueryTab);
+        // These are the former Global default slot and the surviving query slot.
+        // Retired-command fixture: open_sso_wizard no longer matches a command.
+        if let Some(command) = Command::from_action_id("open_sso_wizard") {
+            global.bind(chord("o", Modifiers::primary_shift()), command);
+        }
+        defaults.add_layer(global);
+        let rows = [
+            ("open_sso_wizard", chord("o", Modifiers::primary_shift())),
+            ("new_query_tab", chord("n", Modifiers::primary())),
+        ]
+        .map(|(command_id, default_keys)| KeybindingOverrideDto {
+            context: "global".into(),
+            command_id: command_id.into(),
+            default_keys: keys(default_keys).to_storage_string(),
+            keys: Some("ctrl+alt+t".into()),
+            predicate: None,
+        });
+        runtime
+            .keybinding_overrides()
+            .replace_all(&rows)
+            .expect("store overrides");
+
+        let loaded = load_keymap_overrides(&runtime, &defaults).to_dtos();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].command_id, "new_query_tab");
+        assert_eq!(loaded[0].keys.as_deref(), Some("ctrl+alt+t"));
+    }
+
+    #[test]
     fn stored_rows_keep_the_persisted_identifier_texts() {
         let mut overrides = KeymapOverrides::new();
         overrides.set(new_query_tab(), Some(keys(chord("+", Modifiers::ctrl()))));

@@ -110,15 +110,7 @@ pub struct ConnectionEntry {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub required_refs: Vec<RequiredRef>,
 
-    /// AWS-reflected auth profile reference (kind = aws_reference).
-    ///
-    /// Present when the connection references a reflected (read-only) auth
-    /// profile. The reference carries `provider_id` + `name` only; no secret
-    /// material. Resolved on the target by calling `reflect_profiles()`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_ref: Option<AuthRef>,
-
-    /// Local ID of the referenced stored (non-reflected) auth profile, if any.
+    /// Local ID of the referenced stored auth profile, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_profile_local_id: Option<String>,
 
@@ -126,7 +118,7 @@ pub struct ConnectionEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access: Option<AccessEntry>,
 
-    /// Dynamic value references (SSM/Secrets Manager/env paths).
+    /// Dynamic value references (environment, dotenv and secret file paths).
     /// Included by default; may not resolve on the target (non-blocking).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub value_refs: HashMap<String, toml::Value>,
@@ -188,7 +180,7 @@ pub enum AccessEntry {
     },
 }
 
-/// A stored (non-reflected) auth profile entry.
+/// A stored auth profile entry.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AuthEntry {
     pub local_id: String,
@@ -292,27 +284,8 @@ pub struct RequiredRef {
 pub enum RequiredRefKind {
     /// A secret value (password, token, key) the exporter omitted.
     Secret,
-    /// A reference to an auth profile (e.g. AWS named profile) the recipient must supply.
+    /// A reference to an auth profile the recipient must supply.
     AuthProfile,
-}
-
-/// An AWS-reflected auth profile reference.
-///
-/// No secret material. The reference is resolved on the target by calling
-/// `reflect_profiles()` for the given provider; if not found, it enters
-/// the unified required-resolution step.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct AuthRef {
-    pub kind: AuthRefKind,
-    pub provider_id: String,
-    pub name: String,
-}
-
-/// Kind tag for an auth reference.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AuthRefKind {
-    AwsReference,
 }
 
 /// Secrets section of the bundle.
@@ -386,11 +359,6 @@ mod tests {
                     field: "password".to_string(),
                     kind: RequiredRefKind::Secret,
                 }],
-                auth_ref: Some(AuthRef {
-                    kind: AuthRefKind::AwsReference,
-                    provider_id: "aws-sso".to_string(),
-                    name: "My AWS SSO".to_string(),
-                }),
                 auth_profile_local_id: None,
                 access: Some(AccessEntry::Ssh {
                     ssh_local_id: "bbbbbbbb-0000-0000-0000-000000000002".to_string(),

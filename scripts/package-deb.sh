@@ -1,10 +1,11 @@
 #!/bin/sh
 # Build the stable Debian package from an already built release binary.
 # Usage: scripts/package-deb.sh <binary> <version> <output.deb>
-# Never runs cargo. Uses nfpm from PATH, else the pinned nfpm container.
+# Never runs cargo. Uses the pinned nfpm container unless DATATAB_NFPM_LOCAL=1.
 set -eu
 
-NFPM_IMAGE="goreleaser/nfpm:v2.49.0"
+# Re-read the digest: docker buildx imagetools inspect goreleaser/nfpm:v2.49.0
+NFPM_IMAGE="goreleaser/nfpm:v2.49.0@sha256:9ea46a59c4d055ef7071b22f3520b53e8dad98e18043b2f881b53bd7ffec634e"
 TARGET_TRIPLE="x86_64-unknown-linux-gnu"
 PACKAGE_NAME="datatab"
 APP_NAME="DataTab"
@@ -80,12 +81,17 @@ done
 for tool in envsubst sed grep cp chmod mkdir mktemp dirname basename readelf sort tail; do
     command -v "$tool" >/dev/null 2>&1 || fail "required tool not found: $tool"
 done
-if command -v nfpm >/dev/null 2>&1; then
+if [ "${DATATAB_NFPM_LOCAL:-}" = 1 ]; then
+    command -v nfpm >/dev/null 2>&1 ||
+        fail "DATATAB_NFPM_LOCAL=1 but nfpm is not on PATH; install nfpm or unset DATATAB_NFPM_LOCAL to use the pinned container"
     runner=nfpm
-elif command -v docker >/dev/null 2>&1; then
-    runner=docker
+    nfpm_version=$(nfpm --version) || fail "could not read the local nfpm version"
+    echo "package-deb: using local nfpm: $nfpm_version"
 else
-    fail "neither nfpm nor docker is on PATH; install one of them"
+    command -v docker >/dev/null 2>&1 ||
+        fail "docker is not on PATH; install Docker to use the pinned nfpm container or set DATATAB_NFPM_LOCAL=1 to use a local nfpm"
+    runner=docker
+    echo "package-deb: using pinned nfpm container: $NFPM_IMAGE"
 fi
 
 check_library_floor "$binary"

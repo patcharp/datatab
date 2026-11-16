@@ -125,13 +125,13 @@ impl TransactionVocab {
             // so no transaction vocabulary is needed.
             DbKind::MongoDB
             | DbKind::Redis
-            | DbKind::DynamoDB
-            | DbKind::CloudWatchLogs
             | DbKind::InfluxDB
             | DbKind::Redshift
-            | DbKind::S3
-            | DbKind::AwsSecrets
-            | DbKind::ClickHouse => None,
+            | DbKind::ClickHouse
+            | DbKind::ReservedDynamoDb
+            | DbKind::ReservedCloudWatchLogs
+            | DbKind::ReservedS3
+            | DbKind::ReservedAwsSecrets => None,
         }
     }
 
@@ -204,8 +204,6 @@ mod tests {
     fn non_sql_kinds_return_none() {
         assert!(TransactionVocab::for_kind(DbKind::MongoDB).is_none());
         assert!(TransactionVocab::for_kind(DbKind::Redis).is_none());
-        assert!(TransactionVocab::for_kind(DbKind::DynamoDB).is_none());
-        assert!(TransactionVocab::for_kind(DbKind::CloudWatchLogs).is_none());
         assert!(TransactionVocab::for_kind(DbKind::InfluxDB).is_none());
     }
 

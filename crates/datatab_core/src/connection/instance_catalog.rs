@@ -20,6 +20,16 @@ pub enum InstanceMetricUnit {
     Unknown,
 }
 
+/// How an instance metric value should be interpreted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InstanceMetricKind {
+    /// A value displayed as the server reports it.
+    #[default]
+    Gauge,
+    /// A cumulative value converted to a rate between samples.
+    Counter,
+}
+
 /// Definition of a chartable series exposed by a connection.
 ///
 /// Drivers return these from `InstanceCatalog::list_metrics()`. The UI uses
@@ -32,6 +42,8 @@ pub struct InstanceMetricDef {
     /// Logical grouping shown in the sidebar folder, e.g. "Throughput", "Cache".
     pub group: String,
     pub unit: InstanceMetricUnit,
+    #[serde(default)]
+    pub kind: InstanceMetricKind,
     pub description: Option<String>,
     /// Suggested refresh interval in seconds; always >= 10.
     pub default_refresh_secs: u32,
@@ -113,6 +125,12 @@ pub struct InspectorRowAction {
 /// Drivers MUST NOT return other column kinds from `fetch_metric_series`.
 #[async_trait]
 pub trait InstanceCatalog: Send + Sync {
+    /// Returns the static kind without probing the server.
+    /// Unknown metric IDs return `None`.
+    fn metric_kind(&self, _metric_id: &str) -> Option<InstanceMetricKind> {
+        None
+    }
+
     /// Lists the series-style metrics currently available on this connection.
     async fn list_metrics(&self) -> Result<Vec<InstanceMetricDef>, DbError>;
 
@@ -187,6 +205,7 @@ mod tests {
             display_name: "Commits / sec".to_string(),
             group: "Throughput".to_string(),
             unit: InstanceMetricUnit::PerSecond,
+            kind: InstanceMetricKind::Counter,
             description: Some("Transaction commit rate".to_string()),
             default_refresh_secs: 30,
         };
@@ -198,8 +217,16 @@ mod tests {
         assert_eq!(restored.display_name, def.display_name);
         assert_eq!(restored.group, def.group);
         assert_eq!(restored.unit, def.unit);
+        assert_eq!(restored.kind, def.kind);
         assert_eq!(restored.description, def.description);
         assert_eq!(restored.default_refresh_secs, def.default_refresh_secs);
+    }
+
+    #[test]
+    fn instance_metric_def_missing_kind_defaults_to_gauge() {
+        let json = r#"{"id":"example","display_name":"Example","group":"Group","unit":"Count","description":null,"default_refresh_secs":15}"#;
+        let metric: InstanceMetricDef = serde_json::from_str(json).unwrap();
+        assert_eq!(metric.kind, InstanceMetricKind::Gauge);
     }
 
     #[test]

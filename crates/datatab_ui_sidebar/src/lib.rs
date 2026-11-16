@@ -15,7 +15,6 @@ mod render_footer;
 mod render_overlays;
 mod render_tree;
 mod root_sections;
-mod secret_store;
 mod selection;
 mod style_guardrails;
 mod table_loading;
@@ -31,10 +30,9 @@ use datatab_components::tokens::{FontSizes, Radii, Spacing};
 use datatab_core::ConnectedProfile;
 use datatab_core::{
     AddEnumValueRequest, AddForeignKeyRequest, CodeGenCapabilities, CodeGenScope,
-    CollectionChildInfo, CollectionIndexInfo, CollectionPresentation, CollectionRef,
-    ConnectionTreeNode, ConnectionTreeNodeKind, ConstraintKind, CreateIndexRequest,
-    CreateTypeRequest, CustomTypeInfo, CustomTypeKind, DatabaseCategory, DriverCapabilities,
-    DropForeignKeyRequest, DropIndexRequest, DropTypeRequest, EventStreamTarget, IndexData,
+    CollectionIndexInfo, CollectionRef, ConnectionTreeNode, ConnectionTreeNodeKind, ConstraintKind,
+    CreateIndexRequest, CreateTypeRequest, CustomTypeInfo, CustomTypeKind, DatabaseCategory,
+    DriverCapabilities, DropForeignKeyRequest, DropIndexRequest, DropTypeRequest, IndexData,
     IndexDirection, QueryLanguage, ReindexRequest, RelationRef, RoutineInfo, SchemaCacheKey,
     SchemaForeignKeyInfo, SchemaIndexInfo, SchemaLoadingStrategy, SchemaNodeId, SchemaNodeKind,
     SchemaSnapshot, TableInfo, TableRef, TaskId, TypeDefinition, ViewInfo,
@@ -89,11 +87,6 @@ pub enum SidebarEvent {
         profile_id: Uuid,
         collection: CollectionRef,
     },
-    OpenCollectionChild {
-        profile_id: Uuid,
-        target: EventStreamTarget,
-        title: String,
-    },
     OpenKeyValueDatabase {
         profile_id: Uuid,
         database: String,
@@ -120,14 +113,6 @@ pub enum SidebarEvent {
         profile_id: Uuid,
         section_id: String,
         presentation: Option<datatab_core::RootSectionPresentation>,
-    },
-    /// A store of a secret-store connection, or one of its paths, was
-    /// activated. The workspace opens the store's document, at `path` when
-    /// one is given.
-    OpenSecretStore {
-        profile_id: Uuid,
-        store_id: String,
-        path: Option<String>,
     },
     /// Request to show SQL preview modal
     RequestSqlPreview {
@@ -201,29 +186,11 @@ pub enum SidebarEvent {
         schema_name: Option<String>,
         dependents: Vec<datatab_core::RelationRef>,
     },
-    /// Open a new metric chart pre-populated with the selected metric's defaults.
-    ///
-    /// Emitted when the user clicks a `MetricLeaf` node in the sidebar tree.
-    /// The workspace handler opens a `ChartDocument` with `MetricSource` defaults
-    /// (dimensions: [], period_s: 300, statistic: "Average") and auto-executes.
-    OpenMetricChart {
-        profile_id: Uuid,
-        namespace: String,
-        metric_name: String,
-    },
     /// Open or focus an existing dashboard tab.
     ///
     /// Emitted when the user clicks a `DashboardItem` node in the sidebar tree.
     OpenDashboard {
         dashboard_id: Uuid,
-    },
-
-    /// Open a dashboard fetched live from the connection's upstream source,
-    /// read-only. Emitted when the user clicks a `RemoteDashboardItem` node.
-    /// Nothing is persisted; the body is fetched on open.
-    OpenRemoteDashboard {
-        profile_id: Uuid,
-        name: String,
     },
 
     /// Open or focus an existing saved-chart tab.
@@ -239,11 +206,6 @@ pub enum SidebarEvent {
 
     /// Request to open the "New Dashboard" creation modal for a specific profile.
     RequestCreateDashboard {
-        profile_id: Uuid,
-    },
-
-    /// Request to open the "Import Dashboard from JSON" modal for a specific profile.
-    RequestImportDashboard {
         profile_id: Uuid,
     },
 
@@ -534,7 +496,6 @@ impl ContextMenuItem {
 #[derive(Clone)]
 pub enum ContextMenuAction {
     Open,
-    OpenChildPicker,
     ViewSchema,
     ViewRelationships,
     ViewSchemaDiagram,
@@ -592,12 +553,9 @@ pub enum ContextMenuAction {
     RemoveExternalScriptsFolder,
     // Dashboard actions
     NewDashboard,
-    ImportDashboard,
     RenameDashboard,
     DeleteDashboard,
     DuplicateDashboard,
-    /// Re-fetch the upstream dashboard listing for a `RemoteDashboardsFolder`.
-    RefreshRemoteDashboards,
     // Saved chart actions
     RenameSavedChart,
     DeleteSavedChart,
@@ -708,7 +666,6 @@ impl ContextMenuAction {
     fn icon(&self) -> Option<AppIcon> {
         match self {
             Self::Open => Some(AppIcon::Eye),
-            Self::OpenChildPicker => Some(AppIcon::ScrollText),
             Self::ViewSchema => Some(AppIcon::Table),
             Self::ViewRelationships => Some(AppIcon::Link2),
             Self::ViewSchemaDiagram => Some(AppIcon::Link2),
@@ -751,11 +708,9 @@ impl ContextMenuAction {
             Self::RemoveExternalScriptsFolder => Some(AppIcon::X),
             // Dashboard actions
             Self::NewDashboard => Some(AppIcon::Layers),
-            Self::ImportDashboard => Some(AppIcon::Download),
             Self::RenameDashboard => Some(AppIcon::Pencil),
             Self::DeleteDashboard => Some(AppIcon::Delete),
             Self::DuplicateDashboard => Some(AppIcon::Copy),
-            Self::RefreshRemoteDashboards => Some(AppIcon::RefreshCcw),
             // Saved chart actions
             Self::RenameSavedChart => Some(AppIcon::Pencil),
             Self::DeleteSavedChart => Some(AppIcon::Delete),
@@ -948,9 +903,6 @@ enum PendingAction {
     ExpandCollection {
         item_id: String,
     },
-    OpenChildPicker {
-        item_id: String,
-    },
 }
 
 impl PendingAction {
@@ -962,33 +914,9 @@ impl PendingAction {
             | Self::ExpandSchemaIndexesFolder { item_id }
             | Self::ExpandSchemaForeignKeysFolder { item_id }
             | Self::ExpandSchemaRoutinesFolder { item_id }
-            | Self::ExpandCollection { item_id }
-            | Self::OpenChildPicker { item_id } => item_id,
+            | Self::ExpandCollection { item_id } => item_id,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ChildPickerSortColumn {
-    Name,
-    LastEvent,
-}
-
-struct ChildPickerState {
-    profile_id: Uuid,
-    database: String,
-    collection: String,
-    title: String,
-    focus_handle: FocusHandle,
-    children: Vec<CollectionChildInfo>,
-    filter_input: Entity<InputState>,
-    filter_query: String,
-    page: usize,
-    page_size: usize,
-    sort_column: ChildPickerSortColumn,
-    sort_descending: bool,
-    selected_index: usize,
-    filter_focused: bool,
 }
 
 /// Result of checking whether table details are available.
@@ -1132,8 +1060,6 @@ pub struct Sidebar {
     delete_modal_focus: ModalFocus,
     /// Whether the add menu dropdown is open
     add_menu_open: bool,
-    child_picker: Option<ChildPickerState>,
-    pending_child_picker_item: Option<String>,
     scripts_drop_target: Option<DropTarget>,
     gutter_metadata: HashMap<String, GutterInfo>,
     scripts_gutter_metadata: HashMap<String, GutterInfo>,
@@ -1145,19 +1071,6 @@ pub struct Sidebar {
     /// Connection password of the attempt waiting for the SSH passphrase, so
     /// the retry does not ask for it again.
     pub(crate) pending_tunnel_auth_password: Option<datatab_core::secrecy::SecretString>,
-    /// In-flight metric catalog fetch tasks, keyed by profile_id.
-    ///
-    /// Dropping the task on collapse abandons the await; the underlying cache fetch
-    /// keeps running and writes through on completion (consistent with v1 design).
-    pending_metric_namespace_fetches: HashMap<Uuid, Task<()>>,
-    /// In-flight metric fetch tasks, keyed by (profile_id, namespace).
-    pending_metric_fetches: HashMap<(Uuid, String), Task<()>>,
-    /// In-flight remote-dashboard listing fetches, keyed by profile_id.
-    pending_remote_dashboard_fetches: HashMap<Uuid, Task<()>>,
-    /// Per-node metric fetch error messages for retry UI.
-    ///
-    /// Key is the parent node id string (MetricsFolder or MetricNamespaceFolder).
-    metric_fetch_errors: HashMap<String, String>,
     /// Session-scoped cache for `InstanceCatalog::list_metrics()` results.
     /// Populated on first expansion of `InstanceMetricsFolder`, keyed by profile_id.
     instance_metrics_cache: HashMap<Uuid, Vec<datatab_core::InstanceMetricDef>>,
@@ -1179,11 +1092,6 @@ pub struct Sidebar {
     /// declarations arrived; the section that opens on activation opens once
     /// they land.
     pending_root_section_activations: HashSet<Uuid>,
-    /// Session-scoped cache of the listed path levels of hierarchical secret
-    /// stores. Populated on first expansion of a store or path node.
-    secret_path_cache: secret_store::SecretPathCache,
-    /// In-flight path level listings, keyed like `secret_path_cache`.
-    pending_secret_path_fetches: secret_store::PendingSecretPathFetches,
     /// Round trip of one `ping` measured after each profile connected, shown
     /// after its status diamond. `None` records a probe that failed, so a
     /// failing connection is not pinged again on every state change.
@@ -1236,7 +1144,6 @@ impl Sidebar {
     pub fn has_transient_interaction(&self) -> bool {
         self.context_menu.is_some()
             || self.add_menu_open
-            || self.child_picker.is_some()
             || self.drag_hover_folder.is_some()
             || self.drop_target.is_some()
             || self.scripts_drop_target.is_some()
@@ -1481,26 +1388,18 @@ impl Sidebar {
             delete_confirm_modal: None,
             delete_modal_focus: ModalFocus::new(cx),
             add_menu_open: false,
-            child_picker: None,
-            pending_child_picker_item: None,
             scripts_drop_target: None,
             gutter_metadata,
             scripts_gutter_metadata,
             hovered_item_id: None,
             pending_tunnel_auth_profile_id: None,
             pending_tunnel_auth_password: None,
-            pending_metric_namespace_fetches: HashMap::new(),
-            pending_metric_fetches: HashMap::new(),
-            pending_remote_dashboard_fetches: HashMap::new(),
-            metric_fetch_errors: HashMap::new(),
             instance_metrics_cache: HashMap::new(),
             instance_inspectors_cache: HashMap::new(),
             pending_instance_catalog_fetches: HashMap::new(),
             root_section_cache: root_sections::RootSectionCache::default(),
             pending_root_section_fetches: HashMap::new(),
             pending_root_section_activations: HashSet::new(),
-            secret_path_cache: HashMap::new(),
-            pending_secret_path_fetches: HashMap::new(),
             connection_latencies: HashMap::new(),
             pending_latency_probes: HashMap::new(),
         }
@@ -1689,26 +1588,6 @@ impl Sidebar {
             return;
         }
 
-        // Retry sentinels for failed metric fetches have a non-parseable ID of the
-        // form "metrics-retry|<profile_id>|<database_name>".  Handle them before
-        // attempting to parse as a SchemaNodeId.
-        if let Some(rest) = item_id.strip_prefix("metrics-retry|") {
-            let parts: Vec<&str> = rest.splitn(2, '|').collect();
-            if let (Some(profile_id_str), Some(database)) = (parts.first(), parts.get(1))
-                && let Ok(profile_id) = profile_id_str.parse::<Uuid>()
-            {
-                // Clear the stale error so the fetch guard won't block.
-                let error_key = SchemaNodeId::MetricsFolder {
-                    profile_id,
-                    database: (*database).to_string(),
-                }
-                .to_string();
-                self.metric_fetch_errors.remove(&error_key);
-                self.spawn_fetch_metric_namespaces(profile_id, database, cx);
-            }
-            return;
-        }
-
         if let Some(table_item) = item_id.strip_prefix("object-retry|") {
             if let Some(SchemaNodeId::Profile { profile_id }) = parse_node_id(table_item) {
                 self.app_state.update(cx, |state, cx| {
@@ -1768,31 +1647,6 @@ impl Sidebar {
             SchemaNodeId::Collection { .. } => {
                 self.browse_collection(item_id, cx);
             }
-            SchemaNodeId::CollectionChild { .. } => {
-                self.browse_collection_child(item_id, cx);
-            }
-            SchemaNodeId::CollectionChildrenMore {
-                profile_id,
-                database,
-                collection,
-            } => {
-                let pending = PendingAction::ExpandCollection {
-                    item_id: SchemaNodeId::Collection {
-                        profile_id,
-                        database: database.clone(),
-                        name: collection.clone(),
-                    }
-                    .to_string(),
-                };
-
-                self.spawn_fetch_collection_children(
-                    profile_id,
-                    &database,
-                    &collection,
-                    pending,
-                    cx,
-                );
-            }
             SchemaNodeId::Profile { profile_id } => {
                 let is_connected = self
                     .app_state
@@ -1830,27 +1684,6 @@ impl Sidebar {
             } => {
                 self.load_more_root_section_items(profile_id, &section_id, cx);
             }
-            SchemaNodeId::SecretStore {
-                profile_id,
-                store_id,
-            } => {
-                cx.emit(SidebarEvent::OpenSecretStore {
-                    profile_id,
-                    store_id,
-                    path: None,
-                });
-            }
-            SchemaNodeId::SecretPath {
-                profile_id,
-                store_id,
-                path,
-            } => {
-                cx.emit(SidebarEvent::OpenSecretStore {
-                    profile_id,
-                    store_id,
-                    path: Some(path),
-                });
-            }
             SchemaNodeId::ScriptFile { path } => {
                 cx.emit(SidebarEvent::OpenScript {
                     path: std::path::PathBuf::from(path),
@@ -1866,18 +1699,6 @@ impl Sidebar {
                     title: specific_name.clone(),
                     schema,
                     specific_name,
-                });
-            }
-            SchemaNodeId::MetricLeaf {
-                profile_id,
-                namespace,
-                metric_name,
-                ..
-            } => {
-                cx.emit(SidebarEvent::OpenMetricChart {
-                    profile_id,
-                    namespace,
-                    metric_name,
                 });
             }
             SchemaNodeId::InstanceMetricLeaf {
@@ -1918,9 +1739,6 @@ impl Sidebar {
             }
             SchemaNodeId::DashboardItem { dashboard_id, .. } => {
                 cx.emit(SidebarEvent::OpenDashboard { dashboard_id });
-            }
-            SchemaNodeId::RemoteDashboardItem { profile_id, name } => {
-                cx.emit(SidebarEvent::OpenRemoteDashboard { profile_id, name });
             }
             SchemaNodeId::SavedChartItem { chart_id, .. } => {
                 cx.emit(SidebarEvent::OpenSavedChart { chart_id });
@@ -2022,11 +1840,7 @@ impl Sidebar {
 
         let node_kind = parse_node_kind(item_id);
 
-        if matches!(
-            node_kind,
-            SchemaNodeKind::CollectionChildrenMore | SchemaNodeKind::RootSectionLoadMore
-        ) && click_count == 1
-        {
+        if matches!(node_kind, SchemaNodeKind::RootSectionLoadMore) && click_count == 1 {
             self.execute_item(item_id, cx);
             cx.notify();
             return;
@@ -2044,9 +1858,7 @@ impl Sidebar {
                     self.profile_activation_section(profile_id).is_some()
                         || self.root_section_declarations_pending(profile_id, cx)
                 }
-                Some(SchemaNodeId::RootSection { .. })
-                | Some(SchemaNodeId::SecretStore { .. })
-                | Some(SchemaNodeId::SecretPath { .. }) => true,
+                Some(SchemaNodeId::RootSection { .. }) => true,
                 _ => false,
             };
 
@@ -2107,28 +1919,6 @@ impl Sidebar {
             cx.emit(SidebarEvent::OpenCollection {
                 profile_id,
                 collection,
-            });
-        }
-    }
-
-    fn browse_collection_child(&mut self, item_id: &str, cx: &mut Context<Self>) {
-        if let Some(SchemaNodeId::CollectionChild {
-            profile_id,
-            database,
-            collection,
-            child_id,
-            name,
-        }) = parse_node_id(item_id)
-        {
-            let target = EventStreamTarget {
-                collection: CollectionRef::new(database, collection),
-                child_id: Some(child_id),
-            };
-
-            cx.emit(SidebarEvent::OpenCollectionChild {
-                profile_id,
-                target,
-                title: name,
             });
         }
     }
@@ -2226,7 +2016,7 @@ mod tests {
         Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap()
     }
 
-    fn event_stream_collection_item(profile_id: Uuid, name: &str) -> TreeItem {
+    fn document_collection_item(profile_id: Uuid, name: &str) -> TreeItem {
         TreeItem::new(
             SchemaNodeId::Collection {
                 profile_id,
@@ -2238,10 +2028,10 @@ mod tests {
         )
     }
 
-    fn event_stream_profile_tree(profile_id: Uuid) -> TreeItem {
+    fn document_profile_tree(profile_id: Uuid) -> TreeItem {
         TreeItem::new(
             SchemaNodeId::Profile { profile_id }.to_string(),
-            "cloudwatch".to_string(),
+            "documents".to_string(),
         )
         .expanded(true)
         .children(vec![
@@ -2261,12 +2051,12 @@ mod tests {
                         database: "logs".into(),
                     }
                     .to_string(),
-                    "Log Groups (2)".to_string(),
+                    "Collections (2)".to_string(),
                 )
                 .expanded(false)
                 .children(vec![
-                    event_stream_collection_item(profile_id, "/aws/lambda/app"),
-                    event_stream_collection_item(profile_id, "/aws/ecs/api"),
+                    document_collection_item(profile_id, "events"),
+                    document_collection_item(profile_id, "activity"),
                 ]),
             ]),
         ])
@@ -2279,20 +2069,6 @@ mod tests {
             database: None,
             schema: "public".into(),
             name: "users".into(),
-        };
-        let s = id.to_string();
-        let parsed: SchemaNodeId = s.parse().unwrap();
-        assert_eq!(parsed, id);
-    }
-
-    #[test]
-    fn collection_child_id_roundtrip() {
-        let id = SchemaNodeId::CollectionChild {
-            profile_id: test_uuid(),
-            database: "logs".into(),
-            collection: "/aws/lambda/app".into(),
-            child_id: "stream-1".into(),
-            name: "2026/04/25/[$LATEST]abc".into(),
         };
         let s = id.to_string();
         let parsed: SchemaNodeId = s.parse().unwrap();
@@ -2658,95 +2434,24 @@ mod tests {
     }
 
     #[test]
-    fn metric_leaf_node_id_roundtrips() {
-        // Validates that MetricLeaf node IDs parse correctly so execute_item can
-        // route them to the OpenMetricChart event branch.
-        let profile_id = test_uuid();
-        let id = SchemaNodeId::MetricLeaf {
-            profile_id,
-            database: "default".into(),
-            namespace: "AWS/EC2".into(),
-            metric_name: "CPUUtilization".into(),
-        };
-        let s = id.to_string();
-        let parsed: SchemaNodeId = s.parse().expect("MetricLeaf must round-trip");
-        assert_eq!(parsed, id);
-
-        // Check that the kind is MetricLeaf
-        assert_eq!(parsed.kind(), SchemaNodeKind::MetricLeaf);
-    }
-
-    #[test]
-    fn open_metric_chart_event_carries_expected_fields() {
-        use super::SidebarEvent;
-        // Validates that the SidebarEvent::OpenMetricChart variant exists and carries
-        // the correct field types.  This is effectively a compile-time correctness check.
-        let profile_id = test_uuid();
-        let event = SidebarEvent::OpenMetricChart {
-            profile_id,
-            namespace: "AWS/EC2".to_string(),
-            metric_name: "CPUUtilization".to_string(),
-        };
-        match event {
-            SidebarEvent::OpenMetricChart {
-                profile_id: pid,
-                namespace,
-                metric_name,
-            } => {
-                assert_eq!(pid, profile_id);
-                assert_eq!(namespace, "AWS/EC2");
-                assert_eq!(metric_name, "CPUUtilization");
-            }
-            _ => panic!("Expected OpenMetricChart variant"),
-        }
-    }
-
-    #[test]
-    fn retry_sentinel_id_parses_correctly() {
-        // Validates that the metrics-retry sentinel format is understood:
-        // execute_item checks for the "metrics-retry|" prefix before attempting
-        // SchemaNodeId parsing, so the sentinel must survive a round-trip through
-        // the prefix-strip and UUID parse.
-        let profile_id = test_uuid();
-        let database = "default";
-        let sentinel = format!("metrics-retry|{}|{}", profile_id, database);
-
-        assert!(sentinel.starts_with("metrics-retry|"));
-        let rest = sentinel.strip_prefix("metrics-retry|").unwrap();
-        let parts: Vec<&str> = rest.splitn(2, '|').collect();
-        assert_eq!(parts.len(), 2);
-        let parsed_id: Uuid = parts[0].parse().expect("UUID in sentinel must parse");
-        assert_eq!(parsed_id, profile_id);
-        assert_eq!(parts[1], database);
-
-        // The sentinel must NOT parse as a valid SchemaNodeId.
-        let not_a_node: Result<SchemaNodeId, _> = sentinel.parse();
-        assert!(
-            not_a_node.is_err(),
-            "Retry sentinel must not parse as SchemaNodeId"
-        );
-    }
-
-    #[test]
     fn sidebar_tree_filter_keeps_matching_ancestors_visible() {
         let profile_id = Uuid::new_v4();
 
-        let filtered =
-            Sidebar::apply_tree_filter(vec![event_stream_profile_tree(profile_id)], "lambda");
+        let filtered = Sidebar::apply_tree_filter(vec![document_profile_tree(profile_id)], "event");
 
         let profile = &filtered[0];
         let database = &profile.children[0];
         let collections = &database.children[0];
 
-        assert_eq!(profile.label.as_ref(), "cloudwatch");
+        assert_eq!(profile.label.as_ref(), "documents");
         assert_eq!(database.label.as_ref(), "logs");
-        assert_eq!(collections.label.as_ref(), "Log Groups (2)");
+        assert_eq!(collections.label.as_ref(), "Collections (2)");
         assert_eq!(collections.children.len(), 1);
-        assert_eq!(collections.children[0].label.as_ref(), "/aws/lambda/app");
+        assert_eq!(collections.children[0].label.as_ref(), "events");
     }
 
     #[test]
-    fn sidebar_tree_filter_matches_non_cloudwatch_nodes() {
+    fn sidebar_tree_filter_matches_relational_nodes() {
         let postgres_profile_id = Uuid::new_v4();
         let items = vec![
             TreeItem::new(
@@ -2852,87 +2557,10 @@ mod tests {
         assert!(filtered[0].children[0].children[0].is_expanded());
     }
 
-    // ---- T18.1: tree filter works for metric node variants ----
-
-    /// T18.1: Verify that `apply_tree_filter` correctly includes/excludes
-    /// metric tree items by label.
-    ///
-    /// Since `gpui_component::tree` handles arbitrary `TreeItem`s, metric node
-    /// variants (MetricsFolder, MetricNamespaceFolder, MetricLeaf) work with the
-    /// existing tree infrastructure without special-casing.
-    #[test]
-    fn tree_nav_handles_metric_variants() {
-        let profile_id = test_uuid();
-        let database = "logs".to_string();
-
-        let metrics_folder_id = SchemaNodeId::MetricsFolder {
-            profile_id,
-            database: database.clone(),
-        }
-        .to_string();
-
-        let ns_folder_id = SchemaNodeId::MetricNamespaceFolder {
-            profile_id,
-            database: database.clone(),
-            namespace: "AWS/EC2".to_string(),
-        }
-        .to_string();
-
-        let leaf_id = SchemaNodeId::MetricLeaf {
-            profile_id,
-            database: database.clone(),
-            namespace: "AWS/EC2".to_string(),
-            metric_name: "CPUUtilization".to_string(),
-        }
-        .to_string();
-
-        let items = vec![
-            TreeItem::new(metrics_folder_id.clone(), "Metrics".to_string())
-                .expanded(true)
-                .children(vec![
-                    TreeItem::new(ns_folder_id.clone(), "AWS/EC2".to_string())
-                        .expanded(true)
-                        .children(vec![TreeItem::new(
-                            leaf_id.clone(),
-                            "CPUUtilization".to_string(),
-                        )]),
-                ]),
-        ];
-
-        // Filter for "cpu" — should find CPUUtilization and preserve ancestors.
-        let filtered = Sidebar::apply_tree_filter(items.clone(), "cpu");
-        assert_eq!(filtered.len(), 1, "Metrics folder must be preserved");
-        assert_eq!(
-            filtered[0].label.as_ref(),
-            "Metrics",
-            "root must be Metrics folder"
-        );
-        assert_eq!(filtered[0].children.len(), 1);
-        assert_eq!(filtered[0].children[0].label.as_ref(), "AWS/EC2");
-        assert_eq!(filtered[0].children[0].children.len(), 1);
-        assert_eq!(
-            filtered[0].children[0].children[0].label.as_ref(),
-            "CPUUtilization"
-        );
-
-        // Filter for "nonexistent" — should return empty.
-        let filtered_empty = Sidebar::apply_tree_filter(items, "nonexistent");
-        assert!(
-            filtered_empty.is_empty(),
-            "Non-matching filter must prune all items"
-        );
-
-        // Verify the metric leaf ID round-trips through SchemaNodeId.
-        let parsed_leaf: SchemaNodeId = leaf_id.parse().expect("MetricLeaf ID must parse");
-        assert_eq!(parsed_leaf.kind(), SchemaNodeKind::MetricLeaf);
-    }
-
     // --- Phase N.2 / N.3: context menu item content tests ---
     //
     // These tests use `build_context_menu_items` directly via the item_id + node_kind
-    // overload, bypassing GPUI and the connection map. The disconnected path means
-    // no capability lookup is possible for the DashboardsFolder import gate, so the
-    // Import item is absent (correct — no connected profile → no DASHBOARD_IMPORT).
+    // overload, bypassing GPUI and the connection map.
 
     fn dashboards_folder_id(profile_id: Uuid) -> String {
         SchemaNodeId::DashboardsFolder { profile_id }.to_string()

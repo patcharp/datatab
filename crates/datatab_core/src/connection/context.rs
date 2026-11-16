@@ -14,21 +14,9 @@ pub enum ExecutionSourceContext {
         #[serde(default)]
         query_mode: Option<String>,
     },
-    /// A CloudWatch GetMetricData request. Carries one or more metric series
-    /// batched into a single API call plus the shared time bounds. `start_ms`
-    /// and `end_ms` are epoch milliseconds.
-    ///
-    /// The driver returns one timestamp column plus one numeric column per
-    /// series in the same order as `series`. Series labels default to
-    /// `metric_name` when `label` is `None`.
-    MetricQuery {
-        /// Non-empty list of metric series to fetch in a single GetMetricData.
-        series: Vec<MetricQuerySeries>,
-        /// Query window start, epoch milliseconds (UTC).
-        start_ms: i64,
-        /// Query window end, epoch milliseconds (UTC).
-        end_ms: i64,
-    },
+    /// Holds postcard index 1 after the metric-query source retired in #311.
+    #[doc(hidden)]
+    ReservedMetricQuery,
 
     /// A per-driver instance metric series, fetched as time-bounded data points.
     ///
@@ -47,27 +35,6 @@ pub enum ExecutionSourceContext {
     /// Dispatches to `InstanceCatalog::fetch_inspector_snapshot`. Carries no
     /// time-window fields — inspectors always return a live snapshot.
     InstanceInspectorQuery { metric_id: String },
-}
-
-/// A single series inside a multi-series CloudWatch GetMetricData request.
-///
-/// Lives in `datatab_core` so the execution-context boundary stays the only
-/// driver/UI seam; `datatab_components::saved_chart::MetricSeries` is the
-/// persistence/runtime twin and converts into this type at plan-build time.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct MetricQuerySeries {
-    pub namespace: String,
-    pub metric_name: String,
-    /// Ordered (name, value) dimension pairs. May be empty for scalar metrics.
-    pub dimensions: Vec<(String, String)>,
-    /// Aggregation period in seconds. Must be > 0; validated by the driver.
-    pub period_s: u32,
-    /// AWS statistic name (e.g. "Average", "Sum", "p99"). Free-form string.
-    pub statistic: String,
-    /// Optional display label; falls back to `metric_name` in the result columns.
-    /// Always encoded; see `ExecutionSourceContext::CollectionWindow::query_mode`.
-    #[serde(default)]
-    pub label: Option<String>,
 }
 
 /// Per-document execution context (connection, database, schema).

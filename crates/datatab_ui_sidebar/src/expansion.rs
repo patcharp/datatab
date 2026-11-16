@@ -141,24 +141,12 @@ impl Sidebar {
             }
         }
 
-        if let Some(SchemaNodeId::Collection {
-            profile_id,
-            database,
-            name,
-        }) = &parsed
-        {
+        if let Some(SchemaNodeId::Collection { .. }) = &parsed {
             let pending = PendingAction::ExpandCollection {
                 item_id: item_id.to_string(),
             };
 
-            if self.collection_node_is_event_stream(*profile_id, database, name, cx) {
-                if matches!(
-                    self.ensure_collection_children(*profile_id, database, name, pending, cx),
-                    TableDetailsStatus::NotFound
-                ) {
-                    return false;
-                }
-            } else if matches!(
+            if matches!(
                 self.ensure_table_details(item_id, pending, cx),
                 TableDetailsStatus::NotFound
             ) {
@@ -270,27 +258,6 @@ impl Sidebar {
             }
         }
 
-        if let Some(SchemaNodeId::MetricsFolder {
-            profile_id,
-            database,
-        }) = &parsed
-        {
-            self.spawn_fetch_metric_namespaces(*profile_id, database, cx);
-        }
-
-        if let Some(SchemaNodeId::MetricNamespaceFolder {
-            profile_id,
-            database,
-            namespace,
-        }) = &parsed
-        {
-            self.spawn_fetch_metrics(*profile_id, database, namespace, cx);
-        }
-
-        if let Some(SchemaNodeId::RemoteDashboardsFolder { profile_id }) = &parsed {
-            self.spawn_fetch_remote_dashboards(*profile_id, cx);
-        }
-
         if let Some(SchemaNodeId::InstanceMetricsFolder { profile_id }) = &parsed {
             self.spawn_fetch_instance_catalog(*profile_id, cx);
         }
@@ -301,29 +268,6 @@ impl Sidebar {
 
         if let Some(SchemaNodeId::RootSection { profile_id, .. }) = &parsed {
             self.spawn_fetch_root_sections(*profile_id, cx);
-        }
-
-        if let Some(SchemaNodeId::SecretStore {
-            profile_id,
-            store_id,
-        }) = &parsed
-        {
-            self.spawn_fetch_secret_paths(
-                crate::secret_store::SecretPathKey::new(*profile_id, store_id, None),
-                cx,
-            );
-        }
-
-        if let Some(SchemaNodeId::SecretPath {
-            profile_id,
-            store_id,
-            path,
-        }) = &parsed
-        {
-            self.spawn_fetch_secret_paths(
-                crate::secret_store::SecretPathKey::new(*profile_id, store_id, Some(path)),
-                cx,
-            );
         }
 
         if let Some(SchemaNodeId::Profile { profile_id }) = &parsed {
@@ -349,261 +293,6 @@ impl Sidebar {
         }
 
         true
-    }
-
-    /// Fetch metric namespaces for a connection if the cache doesn't have them yet.
-    ///
-    /// Peeks the cache first; only spawns a background task on a miss. The task
-    /// writes through the cache and calls `cx.notify()` on completion so the tree
-    /// rebuilds and shows the namespace children.
-    pub(super) fn spawn_fetch_metric_namespaces(
-        &mut self,
-        profile_id: Uuid,
-        database: &str,
-        cx: &mut Context<Self>,
-    ) {
-        let cache = self.app_state.read(cx).metric_catalog_cache().clone();
-
-        // Cache hit — no fetch needed.
-        if cache.peek_namespaces(profile_id).is_some() {
-            return;
-        }
-
-        // Deduplicate in-flight fetches: don't spawn a second task if one is running.
-        if self
-            .pending_metric_namespace_fetches
-            .contains_key(&profile_id)
-        {
-            return;
-        }
-
-        let connection = match self
-            .app_state
-            .read(cx)
-            .connections()
-            .get(&profile_id)
-            .map(|c| c.connection.clone())
-        {
-            Some(c) => c,
-            None => return,
-        };
-
-        let parent_id = SchemaNodeId::MetricsFolder {
-            profile_id,
-            database: database.to_string(),
-        }
-        .to_string();
-
-        let sidebar = cx.entity().clone();
-        let db_str = database.to_string();
-        // Background task only fetches; the cache write happens on the
-        // foreground task below, after the await. If the foreground task is
-        // dropped (e.g. disconnect_profile evicts it), the cache write is
-        // never executed and stale data from a previous account cannot land
-        // in the cache.
-        let background_task = cx.background_executor().spawn(async move {
-            let catalog = match connection.metric_catalog() {
-                Some(c) => c,
-                None => return Err("driver does not support metric catalog".to_string()),
-            };
-            catalog.list_namespaces().map_err(|e| e.to_string())
-        });
-
-        let task = cx.spawn(async move |_this, cx| {
-            let result = background_task.await;
-            cx.update(|cx| {
-                sidebar.update(cx, |sidebar, cx| {
-                    sidebar.pending_metric_namespace_fetches.remove(&profile_id);
-                    match result {
-                        Ok(namespaces) => {
-                            cache.store_namespaces(profile_id, namespaces);
-                            sidebar.metric_fetch_errors.remove(&parent_id);
-                        }
-                        Err(msg) => {
-                            sidebar.metric_fetch_errors.insert(parent_id, msg.clone());
-                            log::warn!(
-                                "Failed to fetch metric namespaces for {}: {}",
-                                profile_id,
-                                msg
-                            );
-                        }
-                    }
-                    sidebar.rebuild_tree_with_overrides(cx);
-                });
-            });
-        });
-
-        self.pending_metric_namespace_fetches
-            .insert(profile_id, task);
-        let _ = db_str; // used via closure capture above
-    }
-
-    /// Fetch metrics for a specific namespace if the cache doesn't have them yet.
-    ///
-    /// Mirrors `spawn_fetch_metric_namespaces` but keyed by `(profile_id, namespace)`.
-    pub(super) fn spawn_fetch_metrics(
-        &mut self,
-        profile_id: Uuid,
-        database: &str,
-        namespace: &str,
-        cx: &mut Context<Self>,
-    ) {
-        let cache = self.app_state.read(cx).metric_catalog_cache().clone();
-        let ns: datatab_core::MetricNamespace = namespace.to_string();
-
-        // Cache hit — no fetch needed.
-        if cache.peek_metrics(profile_id, &ns).is_some() {
-            return;
-        }
-
-        let fetch_key = (profile_id, namespace.to_string());
-
-        // Deduplicate in-flight fetches.
-        if self.pending_metric_fetches.contains_key(&fetch_key) {
-            return;
-        }
-
-        let connection = match self
-            .app_state
-            .read(cx)
-            .connections()
-            .get(&profile_id)
-            .map(|c| c.connection.clone())
-        {
-            Some(c) => c,
-            None => return,
-        };
-
-        let parent_id = SchemaNodeId::MetricNamespaceFolder {
-            profile_id,
-            database: database.to_string(),
-            namespace: ns.clone(),
-        }
-        .to_string();
-
-        let sidebar = cx.entity().clone();
-        // Background task only fetches; the cache write happens on the
-        // foreground task below, after the await. Dropping the foreground task
-        // (e.g. on disconnect) prevents stale data from landing in the cache.
-        let background_task = cx.background_executor().spawn({
-            let ns_clone = ns.clone();
-            async move {
-                let catalog = match connection.metric_catalog() {
-                    Some(c) => c,
-                    None => return Err("driver does not support metric catalog".to_string()),
-                };
-                // Fetch first page only; pagination is not required for sidebar display.
-                catalog
-                    .list_metrics(&ns_clone, None)
-                    .map_err(|e| e.to_string())
-            }
-        });
-
-        let ns_key = fetch_key.clone();
-        let task = cx.spawn(async move |_this, cx| {
-            let result = background_task.await;
-            cx.update(|cx| {
-                sidebar.update(cx, |sidebar, cx| {
-                    sidebar.pending_metric_fetches.remove(&ns_key);
-                    match result {
-                        Ok(page) => {
-                            cache.store_metrics_page(
-                                profile_id,
-                                ns.clone(),
-                                page.metrics,
-                                page.next_token,
-                            );
-                            sidebar.metric_fetch_errors.remove(&parent_id);
-                        }
-                        Err(msg) => {
-                            sidebar.metric_fetch_errors.insert(parent_id, msg.clone());
-                            log::warn!(
-                                "Failed to fetch metrics for {}/{}: {}",
-                                profile_id,
-                                ns_key.1,
-                                msg
-                            );
-                        }
-                    }
-                    sidebar.rebuild_tree_with_overrides(cx);
-                });
-            });
-        });
-
-        self.pending_metric_fetches.insert(fetch_key, task);
-    }
-
-    /// Fetch the upstream dashboard listing for a connection if not cached.
-    ///
-    /// Mirrors `spawn_fetch_metric_namespaces`: peek the cache, dedup in-flight
-    /// fetches, run the async `DashboardSource::list_dashboards` call on the
-    /// background executor, then write the result through the cache and rebuild
-    /// the tree on the foreground. Nothing is persisted — the listing is
-    /// session-scoped.
-    pub(super) fn spawn_fetch_remote_dashboards(
-        &mut self,
-        profile_id: Uuid,
-        cx: &mut Context<Self>,
-    ) {
-        let cache = self.app_state.read(cx).remote_dashboard_cache().clone();
-
-        // Cache hit — no fetch needed.
-        if cache.peek(profile_id).is_some() {
-            return;
-        }
-
-        // Deduplicate in-flight fetches.
-        if self
-            .pending_remote_dashboard_fetches
-            .contains_key(&profile_id)
-        {
-            return;
-        }
-
-        let connection = match self
-            .app_state
-            .read(cx)
-            .connections()
-            .get(&profile_id)
-            .map(|c| c.connection.clone())
-        {
-            Some(c) => c,
-            None => return,
-        };
-
-        let parent_id = SchemaNodeId::RemoteDashboardsFolder { profile_id }.to_string();
-        let sidebar = cx.entity().clone();
-
-        let background_task = cx.background_executor().spawn(async move {
-            let source = match connection.dashboard_source() {
-                Some(s) => s,
-                None => return Err("driver does not support dashboard listing".to_string()),
-            };
-            source.list_dashboards().map_err(|e| e.to_string())
-        });
-
-        let task = cx.spawn(async move |_this, cx| {
-            let result = background_task.await;
-            cx.update(|cx| {
-                sidebar.update(cx, |sidebar, cx| {
-                    sidebar.pending_remote_dashboard_fetches.remove(&profile_id);
-                    match result {
-                        Ok(dashboards) => {
-                            cache.store(profile_id, dashboards);
-                            sidebar.metric_fetch_errors.remove(&parent_id);
-                        }
-                        Err(msg) => {
-                            sidebar.metric_fetch_errors.insert(parent_id, msg.clone());
-                            log::warn!("Failed to list dashboards for {}: {}", profile_id, msg);
-                        }
-                    }
-                    sidebar.rebuild_tree_with_overrides(cx);
-                });
-            });
-        });
-
-        self.pending_remote_dashboard_fetches
-            .insert(profile_id, task);
     }
 
     /// Fetch instance metric and inspector definitions for a connection if not cached.
@@ -702,27 +391,6 @@ impl Sidebar {
             .get(&node_id)
             .copied()
             .unwrap_or_else(|| self.app_state.read(cx).active_connection_id() == Some(profile_id))
-    }
-
-    fn collection_node_is_event_stream(
-        &self,
-        profile_id: Uuid,
-        database: &str,
-        collection: &str,
-        cx: &App,
-    ) -> bool {
-        self.app_state
-            .read(cx)
-            .connections()
-            .get(&profile_id)
-            .and_then(|connection| connection.schema_for_target_database(database))
-            .and_then(|schema| {
-                schema
-                    .collections()
-                    .iter()
-                    .find(|item| item.name == collection)
-            })
-            .is_some_and(|item| item.presentation == CollectionPresentation::EventStream)
     }
 
     /// Starts the fetch behind each visible routines or data-types loading row.
@@ -870,16 +538,6 @@ impl Sidebar {
             self.clear_root_section_cache(profile_id, cx);
         }
 
-        let stale_secret_path_ids: std::collections::HashSet<Uuid> = self
-            .secret_path_cache
-            .keys()
-            .map(|key| key.profile_id)
-            .filter(|id| !connected_profile_ids.contains(id))
-            .collect();
-        for profile_id in stale_secret_path_ids {
-            self.clear_secret_path_cache(profile_id);
-        }
-
         // A connection with root sections that finishes while its profile
         // node is already expanded (the active profile expands by default)
         // never re-fires the expand handler, so its sections would sit on the
@@ -957,7 +615,6 @@ impl Sidebar {
             state.invalidate_database_schema(profile_id, db_name);
             if let Some(conn) = state.connections_mut().get_mut(&profile_id) {
                 conn.table_details.retain(|(db, _, _), _| db != db_name);
-                conn.collection_children.retain(|(db, _), _| db != db_name);
                 conn.schema_types.retain(|key, _| key.database != db_name);
                 conn.schema_indexes.retain(|key, _| key.database != db_name);
                 conn.schema_foreign_keys
@@ -994,8 +651,6 @@ impl Sidebar {
                 // schema must not survive the invalidation.
                 conn.table_details
                     .retain(|(db, _, table), _| db != cache_db || table != &target.name);
-                conn.collection_children
-                    .remove(&(cache_db.to_string(), target.name.clone()));
 
                 if target.kind == SchemaObjectKind::Table {
                     let target_schema = target.schema.as_deref();

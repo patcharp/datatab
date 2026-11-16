@@ -1,11 +1,14 @@
 #!/bin/sh
-# Build DataTab.app on a Mac. The bundle is unsigned (ad-hoc signature only).
+# Build DataTab.app on a Mac. Set MACOS_SIGN_IDENTITY for project signing;
+# without it, local builds use an ad-hoc signature.
 #
 # Run from the root of a DataTab checkout:
 #   sh scripts/build-macos.sh                       # for this Mac, 4 build jobs
 #   JOBS=8 sh scripts/build-macos.sh
 #   sh scripts/build-macos.sh x86_64-apple-darwin   # Intel app, on any Mac
 #   sh scripts/build-macos.sh aarch64-apple-darwin  # Apple Silicon app, on any Mac
+#   sh scripts/build-macos.sh --dmg-only arm64   # package the existing app
+#   MACOS_SIGN_IDENTITY="PCPLab DataTab Code Signing" sh scripts/build-macos.sh --sign-only
 #
 # The optional argument is the target triple. Without it, cargo builds for this
 # Mac. Building for the other architecture needs its standard library first:
@@ -25,7 +28,53 @@ fail() {
     exit 1
 }
 
+bundle_id=me.pcplab.datatab
+target_dir=${CARGO_TARGET_DIR:-target}
+stage="$target_dir/macos-package"
+app="$stage/DataTab.app"
+
+sign_app() {
+    if [ -n "${MACOS_SIGN_IDENTITY:-}" ]; then
+        requirement='identifier "'"$bundle_id"'" and certificate leaf = H"83fab2cb8fc3a11aa870475c5022d0800ac605f6"'
+        # Keep nested code's own identifiers; pin only the outer bundle.
+        codesign --force --deep --sign "$MACOS_SIGN_IDENTITY" --timestamp=none "$app"
+        codesign --force --sign "$MACOS_SIGN_IDENTITY" --timestamp=none -r="designated => $requirement" "$app"
+        codesign --verify --deep --strict "$app" || fail "the project signature does not verify"
+        codesign --verify --strict -R="$requirement" "$app" || fail "the project certificate requirement does not verify"
+    else
+        echo "build-macos: warning: MACOS_SIGN_IDENTITY is unset; signing ad hoc" >&2
+        codesign --force --deep --sign - "$app"
+        codesign --verify --deep "$app" || fail "the ad-hoc signature does not verify"
+    fi
+}
+
 [ "$(uname -s)" = Darwin ] || fail "run this on macOS"
+repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$repo_root"
+if [ "${1:-}" = --sign-only ]; then
+    [ "$#" -eq 1 ] || fail "usage: sh scripts/build-macos.sh --sign-only"
+    [ -d "$app" ] || fail "build DataTab.app before signing it"
+    sign_app
+    exit 0
+fi
+if [ "${1:-}" = --dmg-only ]; then
+    [ "$#" -eq 2 ] || fail "usage: sh scripts/build-macos.sh --dmg-only arm64|x86_64"
+    case $2 in
+        arm64|x86_64) arch=$2 ;;
+        *) fail "unsupported architecture '$2'; use arm64 or x86_64" ;;
+    esac
+    [ -d "$app" ] || fail "build DataTab.app before creating the disk image"
+    binary_arch=$(lipo -archs "$app/Contents/MacOS/datatab") || fail "cannot read the app architecture"
+    [ "$binary_arch" = "$arch" ] || fail "app architecture '$binary_arch' does not match '$arch'"
+    image_dir="$stage/dmg-contents"
+    rm -rf "$image_dir"
+    mkdir -p "$image_dir" dist
+    trap 'rm -rf "$image_dir"' EXIT HUP INT TERM
+    ditto "$app" "$image_dir/DataTab.app"
+    ln -s /Applications "$image_dir/Applications"
+    hdiutil create -ov -volname DataTab -srcfolder "$image_dir" -format UDZO "dist/datatab-macos-$arch.dmg"
+    exit 0
+fi
 [ "$#" -le 1 ] || fail "usage: sh scripts/build-macos.sh [x86_64-apple-darwin|aarch64-apple-darwin]"
 target=${1:-}
 case $target in
@@ -34,8 +83,6 @@ case $target in
     aarch64-apple-darwin) expected_arch=arm64 ;;
     *) fail "unsupported target '$target'; use x86_64-apple-darwin or aarch64-apple-darwin" ;;
 esac
-repo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-cd "$repo_root"
 for required in Cargo.toml packaging/icons/512x512/apps/datatab.png LICENSE-MIT LICENSE-APACHE; do
     [ -e "$required" ] || fail "missing $required; is this a DataTab checkout?"
 done
@@ -68,7 +115,6 @@ jobs=${JOBS:-4}
 case $jobs in
     '' | *[!0-9]* | 0) fail "JOBS must be a positive whole number, got '$jobs'" ;;
 esac
-target_dir=${CARGO_TARGET_DIR:-target}
 build_command="cargo build -p datatab --release --locked --features vendored-openssl"
 if [ -n "$target" ]; then
     build_command="$build_command --target $target"
@@ -90,8 +136,6 @@ binary_arch=$(lipo -archs "$binary") || fail "lipo could not read $binary"
     fail "$binary is built for '$binary_arch', expected '$expected_arch'"
 
 # 2. Assemble the bundle.
-stage="$target_dir/macos-package"
-app="$stage/DataTab.app"
 rm -rf "$stage"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" "$stage/datatab.iconset"
 cp "$binary" "$app/Contents/MacOS/datatab"
@@ -120,7 +164,7 @@ cat >"$app/Contents/Info.plist" <<EOF
 <dict>
     <key>CFBundleName</key><string>DataTab</string>
     <key>CFBundleDisplayName</key><string>DataTab</string>
-    <key>CFBundleIdentifier</key><string>me.pcplab.datatab</string>
+    <key>CFBundleIdentifier</key><string>$bundle_id</string>
     <key>CFBundleExecutable</key><string>datatab</string>
     <key>CFBundleIconFile</key><string>datatab</string>
     <key>CFBundlePackageType</key><string>APPL</string>
@@ -136,10 +180,7 @@ cat >"$app/Contents/Info.plist" <<EOF
 EOF
 plutil -lint "$app/Contents/Info.plist" >/dev/null || fail "Info.plist is not valid"
 
-# Ad-hoc signature: Apple Silicon refuses to run an unsigned binary, and the
-# bundle changed after the linker signed it.
-codesign --force --deep --sign - "$app"
-codesign --verify --deep "$app" || fail "the ad-hoc signature does not verify"
+sign_app
 
 # 3. Report.
 hash_output=$(shasum -a 256 "$app/Contents/MacOS/datatab") || fail "shasum failed on the bundle binary"

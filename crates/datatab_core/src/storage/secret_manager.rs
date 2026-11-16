@@ -318,11 +318,7 @@ impl SecretManager {
                 ..
             } => (ssh_tunnel.as_ref(), *ssh_tunnel_profile_id),
             DbConfig::SQLite { .. }
-            | DbConfig::DynamoDB { .. }
-            | DbConfig::CloudWatchLogs { .. }
             | DbConfig::InfluxDB { .. }
-            | DbConfig::S3 { .. }
-            | DbConfig::AwsSecrets { .. }
             | DbConfig::ClickHouse { .. }
             | DbConfig::Turso { .. }
             | DbConfig::DuckDB { .. }

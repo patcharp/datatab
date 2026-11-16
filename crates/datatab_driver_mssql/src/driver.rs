@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -263,7 +263,7 @@ pub static METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverMetadata 
         },
         datatab_core::SslModeOption {
             id: "on",
-            label: "on (accept self-signed)",
+            label: "on (encrypted, server certificate not verified)",
         },
         datatab_core::SslModeOption {
             id: "required",
@@ -273,6 +273,8 @@ pub static METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverMetadata 
     ssl_cert_fields: Some(datatab_core::SslCertFields {
         root_cert: true,
         client_cert: false,
+        root_cert_modes: Some(&["required"]),
+        client_cert_modes: None,
     }),
     classification_override: None,
     default_chunk_size: None,
@@ -615,12 +617,29 @@ impl DbDriver for MssqlDriver {
         "builtin:mssql".into()
     }
 
+    fn validate_profile(&self, profile: &ConnectionProfile) -> Result<(), DbError> {
+        let config = extract_mssql_config(&profile.config)?;
+        if config.use_uri {
+            let uri = config.uri.as_deref().unwrap_or_default();
+            if uri.starts_with("sqlserver://") || uri.starts_with("mssql://") {
+                let parsed = split_mssql_uri(uri)
+                    .map_err(|error| DbError::InvalidProfile(error.to_string()))?;
+                parse_uri_query_params(parsed.params)
+                    .map_err(|error| DbError::InvalidProfile(error.to_string()))?;
+            }
+        } else {
+            encryption_for(&config.ssl_mode)?;
+        }
+        Ok(())
+    }
+
     fn connect_with_secrets(
         &self,
         profile: &ConnectionProfile,
         password: Option<&SecretString>,
         ssh_secret: Option<&SecretString>,
     ) -> Result<Box<dyn Connection>, DbError> {
+        self.validate_profile(profile)?;
         let config = extract_mssql_config(&profile.config)?;
 
         let password = password.map(|value| value.expose_secret());
@@ -705,7 +724,8 @@ impl DbDriver for MssqlDriver {
             .filter(|s| !s.is_empty())
             .cloned()
             .unwrap_or_else(|| "on".to_string());
-        let trust_server_certificate = !matches!(ssl_mode_value.as_str(), "required");
+        let encryption = encryption_for(&ssl_mode_value)?;
+        let trust_server_certificate = !matches!(encryption, EncryptionLevel::Required);
         let ssl_root_cert_path = values
             .get("ssl_root_cert_path")
             .filter(|s| !s.trim().is_empty())
@@ -956,16 +976,18 @@ fn extract_mssql_config(config: &DbConfig) -> Result<ExtractedMssqlConfig, DbErr
     }
 }
 
-fn encryption_for(ssl_mode: &str) -> EncryptionLevel {
+fn encryption_for(ssl_mode: &str) -> Result<EncryptionLevel, DbError> {
     match ssl_mode {
-        "off" | "disabled" => EncryptionLevel::Off,
-        "required" => EncryptionLevel::Required,
-        // "on" or unknown
-        _ => EncryptionLevel::On,
+        "off" | "disabled" => Ok(EncryptionLevel::Off),
+        "on" | "disable" | "allow" | "prefer" | "require" => Ok(EncryptionLevel::On),
+        "required" | "verify-ca" | "verify-full" => Ok(EncryptionLevel::Required),
+        _ => Err(DbError::InvalidProfile(format!(
+            "Unknown SQL Server SSL mode '{ssl_mode}'. Accepted values: off, disabled, on, required, disable, allow, prefer, require, verify-ca, verify-full"
+        ))),
     }
 }
 
-fn build_tiberius_config(params: &MssqlConnectParams) -> Config {
+fn build_tiberius_config(params: &MssqlConnectParams) -> Result<Config, DbError> {
     let mut config = Config::new();
     config.host(params.host);
 
@@ -986,11 +1008,12 @@ fn build_tiberius_config(params: &MssqlConnectParams) -> Config {
     }
 
     config.authentication(AuthMethod::sql_server(params.user, params.password));
-    config.encryption(encryption_for(params.ssl_mode));
+    config.encryption(encryption_for(params.ssl_mode)?);
 
     // tiberius panics when both trust_cert and trust_cert_ca are set, so the
     // CA only applies when the mode validates the chain.
-    if params.trust_server_certificate {
+    // Legacy verification names must still verify when an old profile trusts all certificates.
+    if params.trust_server_certificate && !matches!(params.ssl_mode, "verify-ca" | "verify-full") {
         config.trust_cert();
     } else if let Some(path) = params.ssl_root_cert_path {
         config.trust_cert_ca(path);
@@ -1001,7 +1024,7 @@ fn build_tiberius_config(params: &MssqlConnectParams) -> Config {
     // is no user-supplied value that could ever win.
     config.application_name(manual_mode_application_name());
 
-    config
+    Ok(config)
 }
 
 /// The `Application Name` reported for connections built from discrete
@@ -1070,6 +1093,72 @@ const TCP_KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
 fn enable_tcp_keepalive(tcp: &TcpStream) -> std::io::Result<()> {
     let keepalive = socket2::TcpKeepalive::new().with_time(TCP_KEEPALIVE_IDLE);
     socket2::SockRef::from(tcp).set_tcp_keepalive(&keepalive)
+}
+
+/// Whether an error means the session's socket is gone, so the client can
+/// never be used again and the session has to be re-established.
+fn is_transport_lost(error: &tiberius::error::Error) -> bool {
+    use std::io::ErrorKind;
+
+    match error {
+        tiberius::error::Error::Io { kind, .. } => matches!(
+            kind,
+            ErrorKind::BrokenPipe
+                | ErrorKind::ConnectionReset
+                | ErrorKind::ConnectionAborted
+                | ErrorKind::NotConnected
+                | ErrorKind::UnexpectedEof
+                | ErrorKind::TimedOut
+        ),
+        tiberius::error::Error::Server(token) => is_kill_code(token.code()),
+        _ => false,
+    }
+}
+
+/// Failure raised inside a [`MssqlConnection::with_client`] closure.
+///
+/// Tiberius errors stay unconverted until `with_client` has checked whether
+/// they mean the transport is gone.
+enum ClientError {
+    Tiberius(tiberius::error::Error),
+    Db(DbError),
+}
+
+/// Failure returned by [`MssqlConnection::with_client_checked`], preserving
+/// whether the call itself observed a lost transport.
+struct ClientCallError {
+    error: DbError,
+    transport_lost: bool,
+}
+
+impl From<DbError> for ClientCallError {
+    fn from(error: DbError) -> Self {
+        Self {
+            error,
+            transport_lost: false,
+        }
+    }
+}
+
+impl From<tiberius::error::Error> for ClientError {
+    fn from(error: tiberius::error::Error) -> Self {
+        Self::Tiberius(error)
+    }
+}
+
+impl From<DbError> for ClientError {
+    fn from(error: DbError) -> Self {
+        Self::Db(error)
+    }
+}
+
+impl From<ClientError> for DbError {
+    fn from(error: ClientError) -> Self {
+        match error {
+            ClientError::Tiberius(error) => format_mssql_query_error(&error),
+            ClientError::Db(error) => error,
+        }
+    }
 }
 
 /// Fetch the server-side session id (`@@SPID`) and the actual session
@@ -1167,9 +1256,14 @@ impl MssqlDriver {
             current_database: Mutex::new(database),
             ssh_tunnel: None,
             cancelled: Arc::new(AtomicBool::new(false)),
+            cancel_generation: Arc::new(AtomicU64::new(0)),
+            cancel_lock: Arc::new(Mutex::new(())),
             spid: Arc::new(AtomicI32::new(spid)),
             reconnect_config: Arc::new(reconnect_config),
             poisoned: Arc::new(AtomicBool::new(false)),
+            recovery: Mutex::new(()),
+            #[cfg(test)]
+            test_hooks: Mutex::new(MssqlTestHooks::default()),
         }))
     }
 
@@ -1207,7 +1301,7 @@ impl MssqlDriver {
             ssl_mode: &config.ssl_mode,
             trust_server_certificate: config.trust_server_certificate,
             ssl_root_cert_path: config.ssl_root_cert_path.as_deref(),
-        });
+        })?;
 
         let established = establish_mssql_session(tiberius_config, &config.host, config.port)?;
 
@@ -1254,7 +1348,7 @@ impl MssqlDriver {
             ssl_mode: &config.ssl_mode,
             trust_server_certificate: config.trust_server_certificate,
             ssl_root_cert_path: config.ssl_root_cert_path.as_deref(),
-        });
+        })?;
 
         // The reconnect config points at the same 127.0.0.1:<local_port> that
         // the SSH tunnel owns. As long as the `SshTunnel` value lives on
@@ -1342,10 +1436,28 @@ fn build_mssql_connection(
         current_database: Mutex::new(current_database),
         ssh_tunnel,
         cancelled: Arc::new(AtomicBool::new(false)),
+        cancel_generation: Arc::new(AtomicU64::new(0)),
+        cancel_lock: Arc::new(Mutex::new(())),
         spid: Arc::new(AtomicI32::new(session.spid)),
         reconnect_config: Arc::new(session.reconnect_config),
         poisoned: Arc::new(AtomicBool::new(false)),
+        recovery: Mutex::new(()),
+        #[cfg(test)]
+        test_hooks: Mutex::new(MssqlTestHooks::default()),
     }
+}
+
+#[cfg(test)]
+type MssqlTestHook = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(test)]
+#[derive(Default)]
+struct MssqlTestHooks {
+    on_cleanup_after_cancel_enter: Option<MssqlTestHook>,
+    before_cleanup_inner_lock: Option<MssqlTestHook>,
+    after_set_active_database_recover: Option<MssqlTestHook>,
+    before_metadata_retry_recovery: Option<MssqlTestHook>,
+    before_metadata_retry_attempt: Option<MssqlTestHook>,
 }
 
 // =============================================================================
@@ -1363,20 +1475,33 @@ pub struct MssqlConnection {
     #[allow(dead_code)]
     ssh_tunnel: Option<SshTunnel>,
     cancelled: Arc<AtomicBool>,
+    cancel_generation: Arc<AtomicU64>,
+    cancel_lock: Arc<Mutex<()>>,
 
     // Cancellation state. `spid` is the server-side session id captured at
     // connect time (and refreshed after each reconnect). `reconnect_config`
     // is a cloneable tiberius Config we can use to (a) open a side-channel
     // connection to send `KILL <spid>` and (b) rebuild the primary client
     // after the session is killed. `poisoned` is set true once KILL has been
-    // sent so `cleanup_after_cancel` knows it needs to reconnect.
+    // armed so `cleanup_after_cancel` knows it needs to reconnect.
     spid: Arc<AtomicI32>,
     reconnect_config: Arc<tiberius::Config>,
     poisoned: Arc<AtomicBool>,
+
+    // Serializes session recovery and database selection (`set_active_database`)
+    // so two callers cannot interleave reconnect/restore with a database switch
+    // or each reconnect and drop the session the other just restored.
+    // Lock order: `recovery`, then `current_database`, then `inner`, then `cancel_lock`.
+    recovery: Mutex<()>,
+
+    #[cfg(test)]
+    test_hooks: Mutex<MssqlTestHooks>,
 }
 
 struct MssqlCancelHandle {
     cancelled: Arc<AtomicBool>,
+    cancel_generation: Arc<AtomicU64>,
+    cancel_lock: Arc<Mutex<()>>,
     spid: Arc<AtomicI32>,
     reconnect_config: Arc<tiberius::Config>,
     poisoned: Arc<AtomicBool>,
@@ -1384,19 +1509,22 @@ struct MssqlCancelHandle {
 
 impl QueryCancelHandle for MssqlCancelHandle {
     fn cancel(&self) -> Result<(), DbError> {
-        // Mark cancellation requested first so `execute()` can translate the
-        // server's "session was killed" error to `DbError::Cancelled` even
-        // if the KILL itself races with the query completing normally.
-        self.cancelled.store(true, Ordering::SeqCst);
+        // Mark cancellation requested, arm `poisoned`, and advance
+        // `cancel_generation` atomically under `cancel_lock` so recovery and
+        // metadata retries observe the cancel immediately and cannot erase
+        // `cancelled` or overwrite `poisoned` after a concurrent recovery.
+        {
+            let _guard = self
+                .cancel_lock
+                .lock()
+                .unwrap_or_else(|poison_err| poison_err.into_inner());
+            self.cancelled.store(true, Ordering::SeqCst);
+            self.poisoned.store(true, Ordering::SeqCst);
+            self.cancel_generation.fetch_add(1, Ordering::SeqCst);
+        }
 
         let spid = self.spid.load(Ordering::SeqCst);
         if spid == 0 {
-            // No session id captured yet — nothing meaningful to kill. Mark
-            // the connection poisoned so the next `execute()` runs
-            // `cleanup_after_cancel`, which clears both flags. Without this
-            // the `cancelled` flag stays set forever and every subsequent
-            // query short-circuits to `DbError::Cancelled`.
-            self.poisoned.store(true, Ordering::SeqCst);
             return Ok(());
         }
 
@@ -1421,18 +1549,13 @@ impl QueryCancelHandle for MssqlCancelHandle {
             Ok(())
         });
 
-        // Mark as poisoned regardless of whether KILL succeeded: if it failed
-        // the primary connection may still be in an unknown state and
-        // forcing a reconnect on next use is safer than reusing it.
-        self.poisoned.store(true, Ordering::SeqCst);
-
         match result {
             Ok(()) => {
                 log::info!("[CANCEL] KILL {} sent successfully", spid);
                 Ok(())
             }
             Err(err) => {
-                // `poisoned == true` is already set above, so the next
+                // `poisoned == true` is already armed above, so the next
                 // `execute()` will run `cleanup_after_cancel` and reconnect.
                 // Surfacing this transport failure to the caller would show
                 // "cancel failed" in the UI even though recovery is armed,
@@ -1452,10 +1575,41 @@ impl QueryCancelHandle for MssqlCancelHandle {
     }
 }
 
+enum RecoveryOutcome {
+    AlreadyHealthy,
+    Recovered,
+    Cancelled,
+}
+
 impl MssqlConnection {
+    #[cfg(test)]
+    fn run_test_hook(&self, select: impl FnOnce(&MssqlTestHooks) -> Option<&MssqlTestHook>) {
+        let hook = self
+            .test_hooks
+            .lock()
+            .ok()
+            .and_then(|hooks| select(&hooks).cloned());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Run `f` against the session's client.
+    ///
+    /// When `f` fails because the socket is gone, the dead client is dropped
+    /// and the connection is marked `poisoned`, so the next call that goes
+    /// through `cleanup_after_cancel` opens a new session. Nothing is retried
+    /// here: `f` may have been a write the server already received.
     fn with_client<F, R>(&self, f: F) -> Result<R, DbError>
     where
-        F: FnOnce(&Runtime, &mut TiberiusClient) -> Result<R, DbError>,
+        F: FnOnce(&Runtime, &mut TiberiusClient) -> Result<R, ClientError>,
+    {
+        self.with_client_checked(f).map_err(|failure| failure.error)
+    }
+
+    fn with_client_checked<F, R>(&self, f: F) -> Result<R, ClientCallError>
+    where
+        F: FnOnce(&Runtime, &mut TiberiusClient) -> Result<R, ClientError>,
     {
         let mut guard = match self.inner.lock() {
             Ok(g) => g,
@@ -1463,15 +1617,260 @@ impl MssqlConnection {
         };
 
         let inner = &mut *guard;
-        let client = inner.client.as_mut().ok_or_else(|| {
-            DbError::ConnectionFailed("SQL Server connection has been closed".to_string().into())
-        })?;
+        let Some(client) = inner.client.as_mut() else {
+            return Err(ClientCallError {
+                error: DbError::ConnectionFailed(
+                    "SQL Server connection has been closed".to_string().into(),
+                ),
+                transport_lost: self.poisoned.load(Ordering::SeqCst),
+            });
+        };
 
-        f(&inner.runtime, client)
+        match f(&inner.runtime, client) {
+            Ok(value) => Ok(value),
+            Err(ClientError::Db(error)) => Err(ClientCallError::from(error)),
+            Err(ClientError::Tiberius(error)) => {
+                let transport_lost = is_transport_lost(&error);
+                if transport_lost {
+                    log::warn!(
+                        "[QUERY] SQL Server session transport lost; the next use opens a new session and any open transaction, temp table or SET option is gone: {}",
+                        error
+                    );
+                    inner.client = None;
+                    self.poisoned.store(true, Ordering::SeqCst);
+                }
+                Err(ClientCallError {
+                    error: format_mssql_query_error(&error),
+                    transport_lost,
+                })
+            }
+        }
+    }
+
+    /// Re-establish the session if a cancel or a lost transport left it dead.
+    fn recover_session(&self) -> Result<(), DbError> {
+        if self.poisoned.load(Ordering::SeqCst) {
+            self.cleanup_after_cancel()?;
+        }
+        Ok(())
+    }
+
+    fn is_cancelled_for_generation(&self, expected_gen: Option<u64>) -> bool {
+        let _guard = self
+            .cancel_lock
+            .lock()
+            .unwrap_or_else(|poison_err| poison_err.into_inner());
+        let cancelled_now = self.cancelled.load(Ordering::SeqCst);
+        let gen_now = self.cancel_generation.load(Ordering::SeqCst);
+        expected_gen.map_or(cancelled_now, |gen_before| {
+            cancelled_now || gen_now != gen_before
+        })
+    }
+
+    fn recover_for_metadata_retry(&self, cancel_gen_before: u64) -> Result<bool, DbError> {
+        #[cfg(test)]
+        self.run_test_hook(|hooks| hooks.on_cleanup_after_cancel_enter.as_ref());
+
+        let _recovery = self
+            .recovery
+            .lock()
+            .unwrap_or_else(|poison_err| poison_err.into_inner());
+
+        match self.cleanup_after_cancel_locked(Some(cancel_gen_before))? {
+            RecoveryOutcome::AlreadyHealthy | RecoveryOutcome::Recovered => Ok(true),
+            RecoveryOutcome::Cancelled => Ok(false),
+        }
+    }
+
+    fn reconnect_tiberius_session(
+        runtime: &Runtime,
+        config: tiberius::Config,
+        restore_statement: Option<String>,
+    ) -> Result<(TiberiusClient, i32, Option<String>), DbError> {
+        runtime.block_on(async move {
+            let mut client = establish_tiberius(config).await.map_err(|e| {
+                log::error!("[CLEANUP] Reconnect failed: {}", e);
+                format_mssql_connect_error(&e, "?", 0)
+            })?;
+            let (spid, database) = capture_session_info(&mut client)
+                .await
+                .map_err(|e| format_mssql_connect_error(&e, "?", 0))?;
+
+            if let Some(statement) = restore_statement {
+                client
+                    .simple_query(statement)
+                    .await
+                    .map_err(|e| format_mssql_query_error(&e))?
+                    .into_results()
+                    .await
+                    .map_err(|e| format_mssql_query_error(&e))?;
+            }
+
+            Ok((client, spid, database))
+        })
+    }
+
+    fn cleanup_after_cancel_locked(
+        &self,
+        expected_cancel_gen: Option<u64>,
+    ) -> Result<RecoveryOutcome, DbError> {
+        let (poisoned, cancelled, cancel_gen_at_start) = {
+            let _guard = self
+                .cancel_lock
+                .lock()
+                .unwrap_or_else(|poison_err| poison_err.into_inner());
+            (
+                self.poisoned.load(Ordering::SeqCst),
+                self.cancelled.load(Ordering::SeqCst),
+                self.cancel_generation.load(Ordering::SeqCst),
+            )
+        };
+
+        if expected_cancel_gen
+            .is_some_and(|gen_before| cancelled || cancel_gen_at_start != gen_before)
+        {
+            return Ok(RecoveryOutcome::Cancelled);
+        }
+
+        if !poisoned {
+            return Ok(RecoveryOutcome::AlreadyHealthy);
+        }
+
+        log::info!("[CLEANUP] Reconnecting SQL Server connection after KILL or lost transport");
+
+        let config = (*self.reconnect_config).clone();
+        let active_database = self
+            .current_database
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone());
+
+        // Restore the active database on the new client before publishing it
+        // so no other caller can issue an unqualified statement on the wrong DB.
+        let restore_statement = active_database
+            .as_ref()
+            .map(|db| format!("USE [{}]", db.replace(']', "]]")));
+
+        #[cfg(test)]
+        self.run_test_hook(|hooks| hooks.before_cleanup_inner_lock.as_ref());
+
+        let new_session: Result<Option<(i32, Option<String>)>, DbError> = {
+            let mut guard = match self.inner.lock() {
+                Ok(g) => g,
+                Err(poison_err) => poison_err.into_inner(),
+            };
+
+            // Drop the old client first so the underlying socket closes promptly.
+            guard.client = None;
+
+            Self::reconnect_tiberius_session(&guard.runtime, config, restore_statement).map(
+                |(client, spid, database)| {
+                    let _cancel_guard = self
+                        .cancel_lock
+                        .lock()
+                        .unwrap_or_else(|poison_err| poison_err.into_inner());
+                    let gen_now = self.cancel_generation.load(Ordering::SeqCst);
+                    let cancelled_now = self.cancelled.load(Ordering::SeqCst);
+                    let new_cancel_arrived = gen_now != cancel_gen_at_start
+                        || expected_cancel_gen
+                            .is_some_and(|gen_before| cancelled_now || gen_now != gen_before);
+                    if new_cancel_arrived {
+                        return None;
+                    }
+                    guard.client = Some(client);
+                    self.spid.store(spid, Ordering::SeqCst);
+                    self.poisoned.store(false, Ordering::SeqCst);
+                    self.cancelled.store(false, Ordering::SeqCst);
+                    Some((spid, database))
+                },
+            )
+        };
+
+        let Some((new_spid, new_database)) = new_session? else {
+            return Ok(RecoveryOutcome::Cancelled);
+        };
+
+        if active_database.is_none()
+            && let Some(db) = new_database
+            && let Ok(mut current) = self.current_database.lock()
+            && current.is_none()
+        {
+            *current = Some(db);
+        }
+
+        log::info!("[CLEANUP] Reconnect complete, new SPID = {}", new_spid);
+        Ok(RecoveryOutcome::Recovered)
+    }
+
+    /// Run a read-only metadata lookup, re-establishing a dropped session
+    /// and retrying the lookup once when the transport was lost under it.
+    ///
+    /// Only side-effect-free reads go through here; a user batch is never
+    /// replayed (see `with_client`).
+    fn read_metadata<R>(
+        &self,
+        read: impl Fn() -> Result<R, ClientCallError>,
+    ) -> Result<R, DbError> {
+        self.recover_session()?;
+
+        let cancel_gen_before = {
+            let _guard = self
+                .cancel_lock
+                .lock()
+                .unwrap_or_else(|poison_err| poison_err.into_inner());
+            if self.cancelled.load(Ordering::SeqCst) {
+                return Err(DbError::Cancelled);
+            }
+            self.cancel_generation.load(Ordering::SeqCst)
+        };
+
+        match read() {
+            Ok(value) => {
+                if self.is_cancelled_for_generation(Some(cancel_gen_before)) {
+                    Err(DbError::Cancelled)
+                } else {
+                    Ok(value)
+                }
+            }
+            Err(failure) if failure.transport_lost => {
+                if self.is_cancelled_for_generation(Some(cancel_gen_before)) {
+                    return Err(DbError::Cancelled);
+                }
+                #[cfg(test)]
+                self.run_test_hook(|hooks| hooks.before_metadata_retry_recovery.as_ref());
+                if !self.recover_for_metadata_retry(cancel_gen_before)? {
+                    return Err(DbError::Cancelled);
+                }
+                #[cfg(test)]
+                self.run_test_hook(|hooks| hooks.before_metadata_retry_attempt.as_ref());
+                if self.is_cancelled_for_generation(Some(cancel_gen_before)) {
+                    return Err(DbError::Cancelled);
+                }
+                log::info!(
+                    "[SCHEMA] Retrying metadata read on a new session after: {}",
+                    failure.error
+                );
+                let retry_result = read().map_err(|retry_failure| retry_failure.error);
+                if self.is_cancelled_for_generation(Some(cancel_gen_before)) {
+                    return Err(DbError::Cancelled);
+                }
+                retry_result
+            }
+            Err(failure) => Err(failure.error),
+        }
+    }
+
+    fn execute_metadata(&self, sql: &str) -> Result<QueryResult, DbError> {
+        self.read_metadata(|| self.execute_simple_checked(sql))
     }
 
     fn execute_simple(&self, sql: &str) -> Result<QueryResult, DbError> {
-        self.execute_simple_bounded(sql, None)
+        self.execute_simple_checked(sql)
+            .map_err(|failure| failure.error)
+    }
+
+    fn execute_simple_checked(&self, sql: &str) -> Result<QueryResult, ClientCallError> {
+        self.execute_simple_bounded_checked(sql, None)
     }
 
     /// Run a batch, retaining at most `limit` rows across all of its result
@@ -1481,6 +1880,15 @@ impl MssqlConnection {
         sql: &str,
         limit: Option<u32>,
     ) -> Result<QueryResult, DbError> {
+        self.execute_simple_bounded_checked(sql, limit)
+            .map_err(|failure| failure.error)
+    }
+
+    fn execute_simple_bounded_checked(
+        &self,
+        sql: &str,
+        limit: Option<u32>,
+    ) -> Result<QueryResult, ClientCallError> {
         let start = Instant::now();
         let sql_owned = sql.to_string();
 
@@ -1498,12 +1906,9 @@ impl MssqlConnection {
         // Under a row limit the stream is still drained to completion, so
         // every mutation and later statement finishes and late server errors
         // still surface.
-        let collected = self.with_client(|runtime, client| {
+        let collected = self.with_client_checked(|runtime, client| {
             runtime.block_on(async move {
-                let mut stream = client
-                    .simple_query(sql_owned)
-                    .await
-                    .map_err(|e| format_mssql_query_error(&e))?;
+                let mut stream = client.simple_query(sql_owned).await?;
 
                 let mut remaining = limit.map(|limit| limit as usize);
                 collect_result_sets(&mut stream, &mut remaining).await
@@ -1534,18 +1939,18 @@ impl MssqlConnection {
             runtime.block_on(async move {
                 let row = client
                     .simple_query("SELECT @@TRANCOUNT")
-                    .await
-                    .map_err(|e| format_mssql_query_error(&e))?
+                    .await?
                     .into_row()
-                    .await
-                    .map_err(|e| format_mssql_query_error(&e))?;
+                    .await?;
 
-                row.as_ref()
+                let count = row
+                    .as_ref()
                     .map(|row| row.try_get::<i32, _>(0))
-                    .transpose()
-                    .map_err(|e| format_mssql_query_error(&e))?
+                    .transpose()?
                     .flatten()
-                    .ok_or_else(|| DbError::query_failed("SELECT @@TRANCOUNT returned no value"))
+                    .ok_or_else(|| DbError::query_failed("SELECT @@TRANCOUNT returned no value"))?;
+
+                Ok(count)
             })
         })
     }
@@ -1574,11 +1979,9 @@ impl MssqlConnection {
             runtime.block_on(async move {
                 client
                     .simple_query("IF @@TRANCOUNT > 0 ROLLBACK TRANSACTION")
-                    .await
-                    .map_err(|e| format_mssql_query_error(&e))?
+                    .await?
                     .into_results()
-                    .await
-                    .map_err(|e| format_mssql_query_error(&e))?;
+                    .await?;
 
                 Ok(())
             })
@@ -1656,16 +2059,12 @@ struct CollectedSet {
 async fn collect_result_sets(
     stream: &mut tiberius::QueryStream<'_>,
     remaining: &mut Option<usize>,
-) -> Result<Vec<CollectedSet>, DbError> {
+) -> Result<Vec<CollectedSet>, ClientError> {
     use futures_util::TryStreamExt;
 
     let mut sets: Vec<CollectedSet> = Vec::new();
 
-    while let Some(item) = stream
-        .try_next()
-        .await
-        .map_err(|e| format_mssql_query_error(&e))?
-    {
+    while let Some(item) = stream.try_next().await? {
         if let Some(metadata) = item.as_metadata() {
             let columns = metadata
                 .columns()
@@ -1940,6 +2339,7 @@ impl Connection for MssqlConnection {
     }
 
     fn ping(&self) -> Result<(), DbError> {
+        self.recover_session()?;
         self.execute_simple("SELECT 1").map(|_| ())
     }
 
@@ -1988,12 +2388,9 @@ impl Connection for MssqlConnection {
 
         // Do not blanket-reset `cancelled` here — that would race with a
         // `cancel()` that fires between two executions and silently drop the
-        // signal. Instead, recover the connection if a previous cancel left
-        // it poisoned (which is what `cleanup_after_cancel` is for) before
-        // dispatching the new query.
-        if self.poisoned.load(Ordering::SeqCst) {
-            self.cleanup_after_cancel()?;
-        }
+        // signal. Instead, recover the connection if a previous cancel or lost
+        // transport left it poisoned before dispatching the new query.
+        self.recover_session()?;
 
         // Support explicit database override per query, mirroring postgres/mysql.
         if let Some(database) = req.database.as_deref() {
@@ -2069,6 +2466,8 @@ impl Connection for MssqlConnection {
     fn cancel_handle(&self) -> Arc<dyn QueryCancelHandle> {
         Arc::new(MssqlCancelHandle {
             cancelled: self.cancelled.clone(),
+            cancel_generation: self.cancel_generation.clone(),
+            cancel_lock: self.cancel_lock.clone(),
             spid: self.spid.clone(),
             reconnect_config: self.reconnect_config.clone(),
             poisoned: self.poisoned.clone(),
@@ -2076,82 +2475,18 @@ impl Connection for MssqlConnection {
     }
 
     fn cleanup_after_cancel(&self) -> Result<(), DbError> {
-        // Only reconnect if a previous `cancel()` poisoned the connection.
-        // For ordinary errors (no KILL involved) the existing client is still
-        // usable and this is a no-op.
-        if !self.poisoned.load(Ordering::SeqCst) {
-            self.cancelled.store(false, Ordering::SeqCst);
-            return Ok(());
-        }
+        #[cfg(test)]
+        self.run_test_hook(|hooks| hooks.on_cleanup_after_cancel_enter.as_ref());
 
-        log::info!("[CLEANUP] Reconnecting SQL Server connection after KILL");
-
-        let config = (*self.reconnect_config).clone();
-        let active_database = self
-            .current_database
+        let _recovery = self
+            .recovery
             .lock()
-            .ok()
-            .and_then(|guard| guard.clone());
+            .unwrap_or_else(|poison_err| poison_err.into_inner());
 
-        let new_session: Result<(TiberiusClient, i32, Option<String>), tiberius::error::Error> = {
-            let mut guard = match self.inner.lock() {
-                Ok(g) => g,
-                Err(poison_err) => poison_err.into_inner(),
-            };
-
-            // Drop the old client first so the underlying socket closes
-            // promptly; tiberius does not always tear down on KILL alone.
-            guard.client = None;
-
-            guard.runtime.block_on(async move {
-                let mut client = establish_tiberius(config).await?;
-                let (spid, database) = capture_session_info(&mut client).await?;
-                Ok((client, spid, database))
-            })
-        };
-
-        let (new_client, new_spid, new_database) = new_session.map_err(|e| {
-            log::error!("[CLEANUP] Reconnect failed: {}", e);
-            // Address fields aren't worth reconstructing here — the message
-            // from tiberius is already host-aware via Config::get_addr().
-            format_mssql_connect_error(&e, "?", 0)
-        })?;
-
-        {
-            let mut guard = match self.inner.lock() {
-                Ok(g) => g,
-                Err(poison_err) => poison_err.into_inner(),
-            };
-            guard.client = Some(new_client);
+        match self.cleanup_after_cancel_locked(None)? {
+            RecoveryOutcome::AlreadyHealthy | RecoveryOutcome::Recovered => Ok(()),
+            RecoveryOutcome::Cancelled => Err(DbError::Cancelled),
         }
-
-        self.spid.store(new_spid, Ordering::SeqCst);
-
-        // The new session starts in whatever the login defaults to. If the
-        // user was previously on a specific database, restore that selection
-        // before clearing the poisoned flag — otherwise a failing `USE [db]`
-        // would leave the connection alive on the login's default database
-        // while callers (with `poisoned == false`) assume recovery succeeded
-        // on the requested one. With the clear deferred, a USE failure leaves
-        // `poisoned == true`, so the next `execute()` triggers another
-        // recovery attempt instead of silently running on the wrong DB.
-        if let Some(db) = active_database {
-            let escaped = db.replace(']', "]]");
-            self.execute_simple(&format!("USE [{}]", escaped))?;
-        } else if let Some(db) = new_database {
-            // No previous selection to restore: the reconnect landed in the
-            // login's default database, so track that actual database rather
-            // than leaving the selection unknown.
-            if let Ok(mut current) = self.current_database.lock() {
-                *current = Some(db);
-            }
-        }
-
-        self.poisoned.store(false, Ordering::SeqCst);
-        self.cancelled.store(false, Ordering::SeqCst);
-
-        log::info!("[CLEANUP] Reconnect complete, new SPID = {}", new_spid);
-        Ok(())
     }
 
     fn schema_snapshot_authority(&self) -> datatab_core::SchemaSnapshotAuthority {
@@ -2190,7 +2525,7 @@ impl Connection for MssqlConnection {
                    WHERE name NOT IN ('master','tempdb','model','msdb') \
                    ORDER BY name";
 
-        let result = self.execute_simple(sql)?;
+        let result = self.execute_metadata(sql)?;
         let current = self
             .current_database
             .lock()
@@ -2229,7 +2564,7 @@ impl Connection for MssqlConnection {
             qualified = qualified
         );
 
-        let table_rows = self.execute_simple(&tables_sql)?;
+        let table_rows = self.execute_metadata(&tables_sql)?;
         let mut tables = Vec::new();
 
         for row in table_rows.rows {
@@ -2267,7 +2602,7 @@ impl Connection for MssqlConnection {
             qualified = qualified
         );
 
-        let view_rows = self.execute_simple(&views_sql)?;
+        let view_rows = self.execute_metadata(&views_sql)?;
         let mut views = Vec::new();
 
         for row in view_rows.rows {
@@ -2310,10 +2645,14 @@ impl Connection for MssqlConnection {
             table
         );
 
-        let columns = self.fetch_columns(database, schema_name, table)?;
-        let indexes = self.fetch_indexes(database, schema_name, table)?;
-        let foreign_keys = self.fetch_foreign_keys(database, schema_name, table)?;
-        let constraints = self.fetch_constraints(database, schema_name, table)?;
+        let (columns, indexes, foreign_keys, constraints) = self.read_metadata(|| {
+            Ok((
+                self.fetch_columns(database, schema_name, table)?,
+                self.fetch_indexes(database, schema_name, table)?,
+                self.fetch_foreign_keys(database, schema_name, table)?,
+                self.fetch_constraints(database, schema_name, table)?,
+            ))
+        })?;
 
         Ok(TableInfo {
             name: table.to_string(),
@@ -2336,40 +2675,42 @@ impl Connection for MssqlConnection {
         schema: Option<&str>,
         table: &str,
     ) -> Result<Option<TableCreationMetadata>, DbError> {
-        let schema_name = schema.unwrap_or("dbo");
-        let escaped_db = database.replace(']', "]]");
-        let qualified_db = format!("[{escaped_db}]");
-        let escaped_schema = schema_name.replace('\'', "''");
-        let escaped_table = table.replace('\'', "''");
-        let where_clause = format!("s.name = '{escaped_schema}' AND tbl.name = '{escaped_table}'");
+        self.read_metadata(|| {
+            let schema_name = schema.unwrap_or("dbo");
+            let escaped_db = database.replace(']', "]]");
+            let qualified_db = format!("[{escaped_db}]");
+            let escaped_schema = schema_name.replace('\'', "''");
+            let escaped_table = table.replace('\'', "''");
+            let where_clause =
+                format!("s.name = '{escaped_schema}' AND tbl.name = '{escaped_table}'");
 
-        // Table-level properties: memory-optimized and system-versioned
-        // temporal tables have creation semantics this generator cannot
-        // express; a table on a non-default filegroup would silently lose
-        // its storage placement when the ON clause is omitted.
-        let table_sql = format!(
-            "SELECT tbl.is_memory_optimized, tbl.temporal_type, \
-             CASE WHEN EXISTS(SELECT 1 FROM {qualified_db}.sys.key_constraints kc \
-                    WHERE kc.type = 'PK' AND kc.parent_object_id = tbl.object_id) \
-                  THEN 1 ELSE 0 END AS has_pk, \
-             ds.is_default, \
-             ISNULL((SELECT MAX(i.type) FROM {qualified_db}.sys.indexes i \
-                     WHERE i.object_id = tbl.object_id AND i.is_primary_key = 1), 0) AS pk_index_type, \
-             ISNULL((SELECT MAX(p.data_compression) FROM {qualified_db}.sys.partitions p \
-                     WHERE p.object_id = tbl.object_id AND p.index_id IN (0, 1)), 0) AS data_compression \
-             FROM {qualified_db}.sys.tables tbl \
-             JOIN {qualified_db}.sys.schemas s ON s.schema_id = tbl.schema_id \
-             JOIN {qualified_db}.sys.indexes ti ON ti.object_id = tbl.object_id \
-                   AND ti.index_id IN (0, 1) \
-             JOIN {qualified_db}.sys.data_spaces ds ON ds.data_space_id = ti.data_space_id \
-             WHERE {where_clause}"
-        );
-        let table_result = self.execute_simple(&table_sql)?;
-        let Some(table_row) = table_result.rows.into_iter().next() else {
-            // Table not found in the reference: metadata is unavailable, and
-            // callers must treat that as absent rather than as "no identity".
-            return Ok(None);
-        };
+            // Table-level properties: memory-optimized and system-versioned
+            // temporal tables have creation semantics this generator cannot
+            // express; a table on a non-default filegroup would silently lose
+            // its storage placement when the ON clause is omitted.
+            let table_sql = format!(
+                "SELECT tbl.is_memory_optimized, tbl.temporal_type, \
+                 CASE WHEN EXISTS(SELECT 1 FROM {qualified_db}.sys.key_constraints kc \
+                        WHERE kc.type = 'PK' AND kc.parent_object_id = tbl.object_id) \
+                      THEN 1 ELSE 0 END AS has_pk, \
+                 ds.is_default, \
+                 ISNULL((SELECT MAX(i.type) FROM {qualified_db}.sys.indexes i \
+                         WHERE i.object_id = tbl.object_id AND i.is_primary_key = 1), 0) AS pk_index_type, \
+                 ISNULL((SELECT MAX(p.data_compression) FROM {qualified_db}.sys.partitions p \
+                         WHERE p.object_id = tbl.object_id AND p.index_id IN (0, 1)), 0) AS data_compression \
+                 FROM {qualified_db}.sys.tables tbl \
+                 JOIN {qualified_db}.sys.schemas s ON s.schema_id = tbl.schema_id \
+                 JOIN {qualified_db}.sys.indexes ti ON ti.object_id = tbl.object_id \
+                       AND ti.index_id IN (0, 1) \
+                 JOIN {qualified_db}.sys.data_spaces ds ON ds.data_space_id = ti.data_space_id \
+                 WHERE {where_clause}"
+            );
+            let table_result = self.execute_simple_checked(&table_sql)?;
+            let Some(table_row) = table_result.rows.into_iter().next() else {
+                // Table not found in the reference: metadata is unavailable, and
+                // callers must treat that as absent rather than as "no identity".
+                return Ok(None);
+            };
 
         let mut table_iter = table_row.into_iter();
         let is_memory_optimized = value_is_truthy(table_iter.next());
@@ -2441,7 +2782,7 @@ impl Connection for MssqlConnection {
              JOIN {qualified_db}.sys.types t ON t.user_type_id = c.user_type_id \
              WHERE {where_clause} ORDER BY c.column_id"
         );
-        let column_result = self.execute_simple(&column_sql)?;
+        let column_result = self.execute_simple_checked(&column_sql)?;
         for row in column_result.rows {
             let mut iter = row.into_iter();
             let column_name = match iter.next() {
@@ -2535,7 +2876,7 @@ impl Connection for MssqlConnection {
              JOIN {qualified_db}.sys.schemas s ON s.schema_id = tbl.schema_id \
              WHERE {where_clause} ORDER BY c.column_id"
         );
-        let identity_result = self.execute_simple(&identity_sql)?;
+        let identity_result = self.execute_simple_checked(&identity_sql)?;
         let mut identity: Option<IdentitySpec> = None;
         for row in identity_result.rows {
             let mut iter = row.into_iter();
@@ -2588,7 +2929,7 @@ impl Connection for MssqlConnection {
              JOIN {qualified_db}.sys.schemas s ON s.schema_id = tbl.schema_id \
              WHERE kc.type = 'PK' AND {where_clause} ORDER BY ic.key_ordinal"
         );
-        let pk_result = self.execute_simple(&pk_sql)?;
+        let pk_result = self.execute_simple_checked(&pk_sql)?;
         let mut pk_columns = Vec::new();
         let mut descending_pk_key = false;
         for row in pk_result.rows {
@@ -2638,7 +2979,7 @@ impl Connection for MssqlConnection {
              JOIN {qualified_db}.sys.schemas s ON s.schema_id = tbl.schema_id \
              WHERE {where_clause}"
         );
-        let defaults_result = self.execute_simple(&defaults_sql)?;
+        let defaults_result = self.execute_simple_checked(&defaults_sql)?;
         let (defaults_total, defaults_unreadable) = defaults_result
             .rows
             .into_iter()
@@ -2676,6 +3017,7 @@ impl Connection for MssqlConnection {
             primary_key,
             blockers,
         }))
+        })
     }
 
     fn view_details(
@@ -2706,7 +3048,7 @@ impl Connection for MssqlConnection {
              JOIN {qualified_db}.sys.schemas s ON s.schema_id = v.schema_id \
              WHERE s.name = '{escaped_schema}' AND v.name = '{escaped_view}'",
         );
-        self.execute_simple(&sql)?;
+        self.execute_metadata(&sql)?;
 
         Ok(ViewInfo {
             name: view.to_string(),
@@ -2728,7 +3070,7 @@ impl Connection for MssqlConnection {
         schema: Option<&str>,
     ) -> Result<Vec<CustomTypeInfo>, DbError> {
         let schema_name = schema.unwrap_or("dbo");
-        self.fetch_custom_types(database, schema_name)
+        self.read_metadata(|| self.fetch_custom_types(database, schema_name))
     }
 
     fn schema_indexes(
@@ -2737,7 +3079,7 @@ impl Connection for MssqlConnection {
         schema: Option<&str>,
     ) -> Result<Vec<SchemaIndexInfo>, DbError> {
         let schema_name = schema.unwrap_or("dbo");
-        self.fetch_schema_indexes(database, schema_name)
+        self.read_metadata(|| self.fetch_schema_indexes(database, schema_name))
     }
 
     fn schema_foreign_keys(
@@ -2746,7 +3088,7 @@ impl Connection for MssqlConnection {
         schema: Option<&str>,
     ) -> Result<Vec<SchemaForeignKeyInfo>, DbError> {
         let schema_name = schema.unwrap_or("dbo");
-        self.fetch_schema_foreign_keys(database, schema_name)
+        self.read_metadata(|| self.fetch_schema_foreign_keys(database, schema_name))
     }
 
     fn schema_routines(
@@ -2755,7 +3097,7 @@ impl Connection for MssqlConnection {
         schema: Option<&str>,
     ) -> Result<Vec<RoutineInfo>, DbError> {
         let schema_name = schema.unwrap_or("dbo");
-        get_schema_routines(self, database, schema_name)
+        self.read_metadata(|| get_schema_routines(self, database, schema_name))
     }
 
     fn routine_definition(
@@ -2775,7 +3117,7 @@ impl Connection for MssqlConnection {
         })?;
 
         let sql = format!("SELECT OBJECT_DEFINITION({}) AS definition", object_id);
-        let rows = self.execute_simple(&sql)?;
+        let rows = self.execute_metadata(&sql)?;
 
         let definition = rows.rows.into_iter().next().and_then(|row| {
             row.into_iter().next().and_then(|v| match v {
@@ -2795,6 +3137,23 @@ impl Connection for MssqlConnection {
     }
 
     fn set_active_database(&self, database: Option<&str>) -> Result<(), DbError> {
+        #[cfg(test)]
+        self.run_test_hook(|hooks| hooks.after_set_active_database_recover.as_ref());
+
+        // Hold `recovery` across selection + `USE` so `cleanup_after_cancel`
+        // cannot copy a stale database before `current_database` updates.
+        let _recovery = self
+            .recovery
+            .lock()
+            .unwrap_or_else(|poison_err| poison_err.into_inner());
+
+        if self.poisoned.load(Ordering::SeqCst) {
+            match self.cleanup_after_cancel_locked(None)? {
+                RecoveryOutcome::AlreadyHealthy | RecoveryOutcome::Recovered => {}
+                RecoveryOutcome::Cancelled => return Err(DbError::Cancelled),
+            }
+        }
+
         let mut current = self
             .current_database
             .lock()
@@ -2928,34 +3287,35 @@ impl Connection for MssqlConnection {
         schema: Option<&str>,
         table: &str,
     ) -> Result<Vec<datatab_core::RelationRef>, DbError> {
-        let sql = dependents_sql(database);
-        let schema = schema.unwrap_or("dbo").to_string();
-        let table = table.to_string();
+        self.read_metadata(|| {
+            let sql = dependents_sql(database);
+            let schema = schema.unwrap_or("dbo").to_string();
+            let table = table.to_string();
 
-        let rows = self.with_client(|runtime, client| {
-            runtime.block_on(async move {
-                let rows = client
-                    .query(sql, &[&schema, &table])
-                    .await
-                    .map_err(|e| format_mssql_query_error(&e))?
-                    .into_first_result()
-                    .await
-                    .map_err(|e| format_mssql_query_error(&e))?;
+            let rows = self.with_client_checked(|runtime, client| {
+                runtime.block_on(async move {
+                    let rows = client
+                        .query(sql, &[&schema, &table])
+                        .await?
+                        .into_first_result()
+                        .await?;
 
-                rows.iter()
-                    .map(|row| {
-                        let column = |index: usize| {
-                            row.try_get::<&str, _>(index)
-                                .map_err(|e| format_mssql_query_error(&e))
-                                .map(|value| value.unwrap_or_default().to_string())
-                        };
-                        Ok((column(0)?, column(1)?, column(2)?))
-                    })
-                    .collect::<Result<Vec<_>, DbError>>()
-            })
-        })?;
+                    rows.iter()
+                        .map(|row| {
+                            let column = |index: usize| {
+                                row.try_get::<&str, _>(index)
+                                    .map_err(|e| format_mssql_query_error(&e))
+                                    .map(|value| value.unwrap_or_default().to_string())
+                            };
+                            Ok((column(0)?, column(1)?, column(2)?))
+                        })
+                        .collect::<Result<Vec<_>, DbError>>()
+                        .map_err(ClientError::from)
+                })
+            })?;
 
-        Ok(dependents_from_rows(rows))
+            Ok(dependents_from_rows(rows))
+        })
     }
 
     fn referenced_tables(&self, query: &str) -> Option<Vec<datatab_core::QueryTableRef>> {
@@ -3019,6 +3379,8 @@ impl Connection for MssqlConnection {
             ));
         }
 
+        self.recover_session()?;
+
         let sql = build_update_with_output(patch)?;
         log::debug!("[UPDATE] Executing: {}", sql);
 
@@ -3032,6 +3394,8 @@ impl Connection for MssqlConnection {
                 "Cannot insert row: no columns specified".to_string().into(),
             ));
         }
+
+        self.recover_session()?;
 
         let sql = build_insert_with_output(insert)?;
         log::debug!("[INSERT] Executing: {}", sql);
@@ -3048,6 +3412,8 @@ impl Connection for MssqlConnection {
                     .into(),
             ));
         }
+
+        self.recover_session()?;
 
         let sql = build_delete_with_output(delete)?;
         log::debug!("[DELETE] Executing: {}", sql);
@@ -3108,13 +3474,11 @@ impl Connection for MssqlConnection {
         // SHOWPLAN even if the middle batch fails so the session state
         // does not leak.
 
-        // Mirror `execute()`'s poison/cleanup pattern: a prior cancel may
-        // have left the underlying tiberius client dead. Without this an
-        // EXPLAIN issued after a cancel would hit a closed socket and
+        // Mirror `execute()`'s poison/cleanup pattern: a prior cancel or lost
+        // transport may have left the underlying tiberius client dead. Without
+        // this an EXPLAIN issued after a cancel would hit a closed socket and
         // surface a protocol-level error instead of triggering reconnect.
-        if self.poisoned.load(Ordering::SeqCst) {
-            self.cleanup_after_cancel()?;
-        }
+        self.recover_session()?;
 
         let query = match &request.query {
             Some(q) => q.clone(),
@@ -3195,7 +3559,7 @@ impl MssqlConnection {
         database: &str,
         schema: &str,
         table: &str,
-    ) -> Result<Vec<ColumnInfo>, DbError> {
+    ) -> Result<Vec<ColumnInfo>, ClientCallError> {
         let escaped_db = database.replace(']', "]]");
         let qualified_db = format!("[{}]", escaped_db);
         let escaped_schema = schema.replace('\'', "''");
@@ -3227,7 +3591,7 @@ impl MssqlConnection {
             escaped_table = escaped_table
         );
 
-        let result = self.execute_simple(&sql)?;
+        let result = self.execute_simple_checked(&sql)?;
         let mut columns = Vec::new();
 
         for row in result.rows {
@@ -3282,7 +3646,7 @@ impl MssqlConnection {
         database: &str,
         schema: &str,
         table: &str,
-    ) -> Result<Vec<IndexInfo>, DbError> {
+    ) -> Result<Vec<IndexInfo>, ClientCallError> {
         let escaped_db = database.replace(']', "]]");
         let qualified_db = format!("[{}]", escaped_db);
         let escaped_schema = schema.replace('\'', "''");
@@ -3308,7 +3672,7 @@ impl MssqlConnection {
             escaped_table = escaped_table
         );
 
-        let result = self.execute_simple(&sql)?;
+        let result = self.execute_simple_checked(&sql)?;
 
         let mut grouped: indexmap_for_indexes::IndexMap<String, IndexInfo> =
             indexmap_for_indexes::IndexMap::new();
@@ -3348,7 +3712,7 @@ impl MssqlConnection {
         database: &str,
         schema: &str,
         table: &str,
-    ) -> Result<Vec<ForeignKeyInfo>, DbError> {
+    ) -> Result<Vec<ForeignKeyInfo>, ClientCallError> {
         let escaped_db = database.replace(']', "]]");
         let qualified_db = format!("[{}]", escaped_db);
         let escaped_schema = schema.replace('\'', "''");
@@ -3378,7 +3742,7 @@ impl MssqlConnection {
             escaped_table = escaped_table
         );
 
-        let result = self.execute_simple(&sql)?;
+        let result = self.execute_simple_checked(&sql)?;
 
         let mut builder = ForeignKeyBuilder::new();
 
@@ -3433,7 +3797,7 @@ impl MssqlConnection {
         database: &str,
         schema: &str,
         table: &str,
-    ) -> Result<Vec<ConstraintInfo>, DbError> {
+    ) -> Result<Vec<ConstraintInfo>, ClientCallError> {
         let escaped_db = database.replace(']', "]]");
         let qualified_db = format!("[{}]", escaped_db);
         let escaped_schema = schema.replace('\'', "''");
@@ -3464,7 +3828,7 @@ impl MssqlConnection {
         escaped_schema: &str,
         escaped_table: &str,
         grouped: &mut indexmap_for_indexes::IndexMap<String, ConstraintInfo>,
-    ) -> Result<(), DbError> {
+    ) -> Result<(), ClientCallError> {
         let sql = format!(
             "SELECT \
                 cc.name AS constraint_name, \
@@ -3479,7 +3843,7 @@ impl MssqlConnection {
              ORDER BY cc.name"
         );
 
-        let rows = self.execute_simple(&sql)?;
+        let rows = self.execute_simple_checked(&sql)?;
         for row in rows.rows {
             let mut iter = row.into_iter();
             let name = match iter.next() {
@@ -3521,7 +3885,7 @@ impl MssqlConnection {
         escaped_schema: &str,
         escaped_table: &str,
         grouped: &mut indexmap_for_indexes::IndexMap<String, ConstraintInfo>,
-    ) -> Result<(), DbError> {
+    ) -> Result<(), ClientCallError> {
         let sql = format!(
             "SELECT \
                 i.name AS index_name, \
@@ -3539,7 +3903,7 @@ impl MssqlConnection {
              ORDER BY i.name, ic.key_ordinal"
         );
 
-        let rows = self.execute_simple(&sql)?;
+        let rows = self.execute_simple_checked(&sql)?;
         for row in rows.rows {
             let mut iter = row.into_iter();
             let name = match iter.next() {
@@ -3569,7 +3933,7 @@ impl MssqlConnection {
         &self,
         database: &str,
         schema: &str,
-    ) -> Result<Vec<CustomTypeInfo>, DbError> {
+    ) -> Result<Vec<CustomTypeInfo>, ClientCallError> {
         let escaped_db = database.replace(']', "]]");
         let qualified_db = format!("[{}]", escaped_db);
         let escaped_schema = schema.replace('\'', "''");
@@ -3590,7 +3954,7 @@ impl MssqlConnection {
              ORDER BY t.name"
         );
 
-        let rows = self.execute_simple(&sql)?;
+        let rows = self.execute_simple_checked(&sql)?;
         let mut types = Vec::new();
 
         for row in rows.rows {
@@ -3627,7 +3991,7 @@ impl MssqlConnection {
         &self,
         database: &str,
         schema: &str,
-    ) -> Result<Vec<SchemaIndexInfo>, DbError> {
+    ) -> Result<Vec<SchemaIndexInfo>, ClientCallError> {
         let escaped_db = database.replace(']', "]]");
         let qualified_db = format!("[{}]", escaped_db);
         let escaped_schema = schema.replace('\'', "''");
@@ -3651,7 +4015,7 @@ impl MssqlConnection {
              ORDER BY tbl.name, i.name, ic.key_ordinal"
         );
 
-        let rows = self.execute_simple(&sql)?;
+        let rows = self.execute_simple_checked(&sql)?;
         let mut builder = SchemaIndexBuilder::new();
 
         for row in rows.rows {
@@ -3685,7 +4049,7 @@ impl MssqlConnection {
         &self,
         database: &str,
         schema: &str,
-    ) -> Result<Vec<SchemaForeignKeyInfo>, DbError> {
+    ) -> Result<Vec<SchemaForeignKeyInfo>, ClientCallError> {
         let escaped_db = database.replace(']', "]]");
         let qualified_db = format!("[{}]", escaped_db);
         let escaped_schema = schema.replace('\'', "''");
@@ -3714,7 +4078,7 @@ impl MssqlConnection {
              ORDER BY pt.name, fk.name, fkc.constraint_column_id"
         );
 
-        let rows = self.execute_simple(&sql)?;
+        let rows = self.execute_simple_checked(&sql)?;
         let mut builder = SchemaForeignKeyBuilder::new();
 
         for row in rows.rows {
@@ -3791,7 +4155,7 @@ fn get_schema_routines(
     conn: &MssqlConnection,
     database: &str,
     schema: &str,
-) -> Result<Vec<RoutineInfo>, DbError> {
+) -> Result<Vec<RoutineInfo>, ClientCallError> {
     let escaped_db = database.replace(']', "]]");
     let qualified_db = format!("[{}]", escaped_db);
     let escaped_schema = schema.replace('\'', "''");
@@ -3809,7 +4173,7 @@ fn get_schema_routines(
          ORDER BY o.name",
     );
 
-    let rows = conn.execute_simple(&sql)?;
+    let rows = conn.execute_simple_checked(&sql)?;
     let mut routines = Vec::with_capacity(rows.rows.len());
 
     for row in rows.rows {
@@ -3881,8 +4245,16 @@ fn is_kill_error(err: &DbError) -> bool {
         | DbError::PermissionDenied(fe)
         | DbError::ObjectNotFound(fe)
         | DbError::ConnectionFailed(fe)
-        if matches!(fe.code.as_deref(), Some("596") | Some("233") | Some("6005"))
+        if fe
+            .code
+            .as_deref()
+            .and_then(|code| code.parse::<u32>().ok())
+            .is_some_and(is_kill_code)
     )
+}
+
+fn is_kill_code(code: u32) -> bool {
+    matches!(code, 596 | 233 | 6005)
 }
 
 // ---------------------------------------------------------------------------
@@ -4381,7 +4753,7 @@ fn ado_sets_application_name(s: &str) -> bool {
     })
 }
 
-fn parse_uri_query_params(params: &str) -> UriQueryParams {
+fn parse_uri_query_params(params: &str) -> Result<UriQueryParams, tiberius::error::Error> {
     // SSL Mode is the single user-facing knob; trust_cert is derived from
     // it unless the caller explicitly overrides via `?trust=` in the URI.
     //
@@ -4405,7 +4777,9 @@ fn parse_uri_query_params(params: &str) -> UriQueryParams {
                     "true" | "yes" | "on" | "1" => EncryptionLevel::On,
                     "false" | "no" | "off" | "0" => EncryptionLevel::Off,
                     "strict" | "required" => EncryptionLevel::Required,
-                    _ => EncryptionLevel::On,
+                    _ => return Err(tiberius::error::Error::Conversion(format!(
+                        "Unknown SQL Server encrypt value '{value}'. Accepted values: true, yes, on, 1, false, no, off, 0, strict, required"
+                    ).into())),
                 };
             }
             "trustservercertificate" | "trust_server_certificate" | "trust" => {
@@ -4430,7 +4804,7 @@ fn parse_uri_query_params(params: &str) -> UriQueryParams {
         }
     }
 
-    out
+    Ok(out)
 }
 
 fn apply_uri_credentials(config: &mut Config, credentials: &str) {
@@ -4452,7 +4826,7 @@ fn apply_uri_credentials(config: &mut Config, credentials: &str) {
 
 fn parse_mssql_url(uri: &str) -> Result<Config, tiberius::error::Error> {
     let parsed = split_mssql_uri(uri)?;
-    let query = parse_uri_query_params(parsed.params);
+    let query = parse_uri_query_params(parsed.params)?;
 
     // `?instance=` wins over the SSMS-style `host\instance` form.
     let instance = query
@@ -5296,6 +5670,9 @@ fn dependents_from_rows(rows: Vec<(String, String, String)>) -> Vec<datatab_core
 
 #[cfg(test)]
 mod tests {
+    mod sslmode;
+    mod tls_metadata;
+
     use super::*;
     use datatab_core::{DefaultSpec, OrderByColumn};
 
@@ -5616,6 +5993,57 @@ mod tests {
     }
 
     #[test]
+    fn transport_loss_is_recognized_only_for_dead_socket_errors() {
+        use std::io::ErrorKind;
+
+        let io = |kind: ErrorKind| tiberius::error::Error::Io {
+            kind,
+            message: kind.to_string(),
+        };
+
+        for kind in [
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::NotConnected,
+            ErrorKind::UnexpectedEof,
+            ErrorKind::TimedOut,
+        ] {
+            assert!(
+                is_transport_lost(&io(kind)),
+                "{kind:?} should mean a lost transport"
+            );
+        }
+
+        for error in [
+            io(ErrorKind::PermissionDenied),
+            io(ErrorKind::InvalidData),
+            tiberius::error::Error::Protocol("unexpected token".into()),
+            tiberius::error::Error::Conversion("bad value".into()),
+        ] {
+            assert!(
+                !is_transport_lost(&error),
+                "{error:?} should not mean a lost transport"
+            );
+        }
+    }
+
+    #[test]
+    fn kill_state_server_codes_mean_a_lost_session() {
+        // `TokenError` cannot be built outside tiberius, so the server-error
+        // arm of `is_transport_lost` is exercised through the shared code list.
+        for code in [596, 233, 6005] {
+            assert!(is_kill_code(code), "{code} should be a kill-state code");
+        }
+        for code in [547, 2627, 18456, 0] {
+            assert!(
+                !is_kill_code(code),
+                "{code} should not be a kill-state code"
+            );
+        }
+    }
+
+    #[test]
     fn classify_mssql_code_routes_known_codes() {
         assert_eq!(classify_mssql_code(18456), Some(MssqlErrorClass::Auth));
         assert_eq!(classify_mssql_code(547), Some(MssqlErrorClass::Constraint));
@@ -5894,6 +6322,7 @@ mod tests {
                 trust_server_certificate,
                 ssl_root_cert_path,
             })
+            .expect("known mode")
         )
     }
 
@@ -6023,13 +6452,13 @@ mod tests {
 
     #[test]
     fn parse_uri_query_params_captures_application_name() {
-        let query = parse_uri_query_params("applicationname=MyTool");
+        let query = parse_uri_query_params("applicationname=MyTool").expect("valid query");
         assert_eq!(query.application_name.as_deref(), Some("MyTool"));
     }
 
     #[test]
     fn parse_uri_query_params_leaves_application_name_absent_without_param() {
-        let query = parse_uri_query_params("instance=SQLEXPRESS");
+        let query = parse_uri_query_params("instance=SQLEXPRESS").expect("valid query");
         assert!(query.application_name.is_none());
     }
 
@@ -7257,13 +7686,13 @@ mod tests {
 #[cfg(test)]
 mod query_safety_tests {
     use super::{
-        MssqlConnection, MssqlConnectionInner, TiberiusClient, build_runtime, collect_result_sets,
-        establish_tiberius, parse_mssql_url,
+        MssqlConnection, MssqlConnectionInner, MssqlTestHooks, TiberiusClient, build_runtime,
+        collect_result_sets, establish_tiberius, parse_mssql_url,
     };
     use datatab_core::{
         Connection as _, DbError, ExecutionContext, ExecutionSourceContext, QueryRequest,
     };
-    use std::sync::atomic::{AtomicBool, AtomicI32};
+    use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::runtime::Runtime;
@@ -7353,9 +7782,14 @@ mod query_safety_tests {
             current_database: Mutex::new(None),
             ssh_tunnel: None,
             cancelled: Arc::new(AtomicBool::new(false)),
+            cancel_generation: Arc::new(AtomicU64::new(0)),
+            cancel_lock: Arc::new(Mutex::new(())),
             spid: Arc::new(AtomicI32::new(0)),
             reconnect_config: Arc::new(tiberius::Config::new()),
             poisoned: Arc::new(AtomicBool::new(false)),
+            recovery: Mutex::new(()),
+            #[cfg(test)]
+            test_hooks: Mutex::new(MssqlTestHooks::default()),
         }
     }
 
@@ -7544,7 +7978,9 @@ mod query_safety_tests {
                 let mut stream = runtime
                     .block_on(client.simple_query(sql))
                     .map_err(|e| DbError::query_failed(format!("batch dispatch failed: {e}")))?;
-                let outcome = runtime.block_on(collect_result_sets(&mut stream, &mut remaining));
+                let outcome = runtime
+                    .block_on(collect_result_sets(&mut stream, &mut remaining))
+                    .map_err(DbError::from);
 
                 match outcome {
                     Err(err) => {
@@ -7597,5 +8033,1253 @@ mod query_safety_tests {
 
             Ok(())
         })
+    }
+
+    #[derive(Clone, Debug)]
+    struct TdsBatchRequest {
+        conn_index: usize,
+        conn_batch_index: usize,
+        sql: Option<String>,
+    }
+
+    enum TdsBatchAction {
+        ReplyDone,
+        DropConnection,
+        ReplySessionInfo { spid: i16, database: Option<String> },
+        ReplyError { code: u32, message: String },
+    }
+
+    fn decode_sql_batch(payload: &[u8]) -> Option<String> {
+        if payload.len() < 4 {
+            return None;
+        }
+        let header_len =
+            u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+        let sql_bytes = payload.get(header_len..)?;
+        if sql_bytes.len() % 2 != 0 {
+            return None;
+        }
+        let units: Vec<u16> = sql_bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        Some(String::from_utf16_lossy(&units))
+    }
+
+    fn read_exact_or_stop(
+        stream: &mut std::net::TcpStream,
+        mut buf: &mut [u8],
+        stop: &AtomicBool,
+    ) -> std::io::Result<()> {
+        use std::io::{ErrorKind, Read};
+        use std::sync::atomic::Ordering;
+
+        while !buf.is_empty() {
+            match stream.read(buf) {
+                Ok(0) => return Err(std::io::Error::from(ErrorKind::UnexpectedEof)),
+                Ok(n) => buf = &mut buf[n..],
+                Err(err) if matches!(err.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    if stop.load(Ordering::SeqCst) {
+                        return Err(std::io::Error::from(ErrorKind::UnexpectedEof));
+                    }
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+
+    fn read_tds_message(
+        stream: &mut std::net::TcpStream,
+        stop: &AtomicBool,
+    ) -> std::io::Result<Option<String>> {
+        let mut full_payload = Vec::new();
+        loop {
+            let mut header = [0u8; 8];
+            read_exact_or_stop(stream, &mut header, stop)?;
+            let packet_type = header[0];
+            let status = header[1];
+            let length = u16::from_be_bytes([header[2], header[3]]) as usize;
+            let payload_len = length.saturating_sub(8);
+            let mut payload = vec![0u8; payload_len];
+            read_exact_or_stop(stream, &mut payload, stop)?;
+            full_payload.extend_from_slice(&payload);
+            if (status & 0x01) != 0 {
+                let sql = if packet_type == 0x01 {
+                    decode_sql_batch(&full_payload)
+                } else {
+                    None
+                };
+                return Ok(sql);
+            }
+        }
+    }
+
+    fn wrap_tds_reply(tokens: &[u8]) -> Vec<u8> {
+        let total_len = 8 + tokens.len();
+        let mut packet = Vec::with_capacity(total_len);
+        packet.push(0x04); // Tabular result
+        packet.push(0x01); // EOM
+        packet.extend_from_slice(&(total_len as u16).to_be_bytes());
+        packet.extend_from_slice(&[0x00, 0x00, 0x01, 0x00]);
+        packet.extend_from_slice(tokens);
+        packet
+    }
+
+    fn encode_session_info_reply(spid: i16, database: Option<&str>) -> Vec<u8> {
+        let mut tokens = Vec::new();
+        // COLMETADATA (0x81), 2 columns
+        tokens.push(0x81);
+        tokens.extend_from_slice(&2u16.to_le_bytes());
+
+        // Column 0: Int2 (0x34), non-nullable
+        tokens.extend_from_slice(&0u32.to_le_bytes());
+        tokens.extend_from_slice(&0u16.to_le_bytes());
+        tokens.push(0x34);
+        tokens.push(0x00); // empty column name
+
+        // Column 1: NVarchar(256) (0xE7), nullable
+        tokens.extend_from_slice(&0u32.to_le_bytes());
+        tokens.extend_from_slice(&0x0001u16.to_le_bytes());
+        tokens.push(0xE7);
+        tokens.extend_from_slice(&256u16.to_le_bytes());
+        tokens.extend_from_slice(&[0x09, 0x04, 0xD0, 0x00, 0x34]);
+        tokens.push(0x00); // empty column name
+
+        // ROW (0xD1)
+        tokens.push(0xD1);
+        tokens.extend_from_slice(&spid.to_le_bytes());
+        match database {
+            Some(db) => {
+                let units: Vec<u16> = db.encode_utf16().collect();
+                let byte_len = (units.len() * 2) as u16;
+                tokens.extend_from_slice(&byte_len.to_le_bytes());
+                for unit in units {
+                    tokens.extend_from_slice(&unit.to_le_bytes());
+                }
+            }
+            None => {
+                tokens.extend_from_slice(&0xFFFFu16.to_le_bytes());
+            }
+        }
+
+        // DONE (0xFD), final with row count = 1
+        tokens.push(0xFD);
+        tokens.extend_from_slice(&0x0010u16.to_le_bytes());
+        tokens.extend_from_slice(&0x00C1u16.to_le_bytes());
+        tokens.extend_from_slice(&1u64.to_le_bytes());
+
+        wrap_tds_reply(&tokens)
+    }
+
+    fn encode_error_reply(code: u32, message: &str) -> Vec<u8> {
+        let msg_units: Vec<u16> = message.encode_utf16().collect();
+        let body_len = 4 + 1 + 1 + 2 + (msg_units.len() * 2) + 1 + 1 + 4;
+
+        let mut tokens = Vec::new();
+        tokens.push(0xAA); // ERROR token
+        tokens.extend_from_slice(&(body_len as u16).to_le_bytes());
+        tokens.extend_from_slice(&code.to_le_bytes());
+        tokens.push(1); // state
+        tokens.push(16); // class (severity)
+        tokens.extend_from_slice(&(msg_units.len() as u16).to_le_bytes());
+        for unit in msg_units {
+            tokens.extend_from_slice(&unit.to_le_bytes());
+        }
+        tokens.push(0); // server name len
+        tokens.push(0); // procedure name len
+        tokens.extend_from_slice(&1u32.to_le_bytes()); // line
+
+        // DONE (0xFD) with Error bit (0x0002)
+        tokens.push(0xFD);
+        tokens.extend_from_slice(&0x0002u16.to_le_bytes());
+        tokens.extend_from_slice(&0x00C1u16.to_le_bytes());
+        tokens.extend_from_slice(&0u64.to_le_bytes());
+
+        wrap_tds_reply(&tokens)
+    }
+
+    struct FakeTdsServer {
+        port: u16,
+        connections_accepted: Arc<std::sync::atomic::AtomicUsize>,
+        batches_seen: Arc<std::sync::atomic::AtomicUsize>,
+        recorded_batches: Arc<Mutex<Vec<TdsBatchRequest>>>,
+        stop: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl FakeTdsServer {
+        fn start(drop_first_batch_on_first_connection: bool) -> Self {
+            Self::start_with_handler(move |req| {
+                if drop_first_batch_on_first_connection
+                    && req.conn_index == 0
+                    && req.conn_batch_index == 0
+                {
+                    TdsBatchAction::DropConnection
+                } else {
+                    TdsBatchAction::ReplyDone
+                }
+            })
+        }
+
+        fn start_with_handler<F>(handler: F) -> Self
+        where
+            F: Fn(TdsBatchRequest) -> TdsBatchAction + Send + Sync + 'static,
+        {
+            use std::io::Write;
+            use std::sync::atomic::Ordering;
+
+            const PRELOGIN_NOT_SUP_REPLY: [u8; 15] = [
+                0x04, 0x01, 0x00, 0x0F, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x06, 0x00, 0x01, 0xFF,
+                0x02,
+            ];
+            const TOKEN_DONE_REPLY: [u8; 21] = [
+                0x04, 0x01, 0x00, 0x15, 0x00, 0x00, 0x01, 0x00, 0xFD, 0x00, 0x00, 0xC1, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            ];
+
+            let listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback listener");
+            listener
+                .set_nonblocking(true)
+                .expect("nonblocking listener");
+            let port = listener.local_addr().expect("local addr").port();
+            let connections_accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let batches_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let recorded_batches = Arc::new(Mutex::new(Vec::new()));
+            let stop = Arc::new(AtomicBool::new(false));
+            let handler = Arc::new(handler);
+
+            let handle = std::thread::spawn({
+                let connections_accepted = Arc::clone(&connections_accepted);
+                let batches_seen = Arc::clone(&batches_seen);
+                let recorded_batches = Arc::clone(&recorded_batches);
+                let stop = Arc::clone(&stop);
+                move || {
+                    let mut conn_handles = Vec::new();
+                    while !stop.load(Ordering::SeqCst) {
+                        match listener.accept() {
+                            Ok((mut stream, _)) => {
+                                stream.set_nonblocking(false).expect("blocking stream");
+                                stream
+                                    .set_read_timeout(Some(Duration::from_millis(50)))
+                                    .expect("read timeout");
+                                let conn_index =
+                                    connections_accepted.fetch_add(1, Ordering::SeqCst);
+                                let batches_seen = Arc::clone(&batches_seen);
+                                let recorded_batches = Arc::clone(&recorded_batches);
+                                let stop = Arc::clone(&stop);
+                                let handler = Arc::clone(&handler);
+
+                                conn_handles.push(std::thread::spawn(move || {
+                                    if read_tds_message(&mut stream, &stop).is_err() {
+                                        return;
+                                    }
+                                    if stream.write_all(&PRELOGIN_NOT_SUP_REPLY).is_err() {
+                                        return;
+                                    }
+                                    if read_tds_message(&mut stream, &stop).is_err() {
+                                        return;
+                                    }
+                                    if stream.write_all(&TOKEN_DONE_REPLY).is_err() {
+                                        return;
+                                    }
+
+                                    let mut conn_batch_index = 0usize;
+                                    while let Ok(sql) = read_tds_message(&mut stream, &stop) {
+                                        batches_seen.fetch_add(1, Ordering::SeqCst);
+                                        let req = TdsBatchRequest {
+                                            conn_index,
+                                            conn_batch_index,
+                                            sql,
+                                        };
+                                        conn_batch_index += 1;
+                                        recorded_batches
+                                            .lock()
+                                            .expect("recorded batches lock")
+                                            .push(req.clone());
+
+                                        let reply = match handler(req) {
+                                            TdsBatchAction::ReplyDone => TOKEN_DONE_REPLY.to_vec(),
+                                            TdsBatchAction::DropConnection => {
+                                                drop(stream);
+                                                break;
+                                            }
+                                            TdsBatchAction::ReplySessionInfo { spid, database } => {
+                                                encode_session_info_reply(spid, database.as_deref())
+                                            }
+                                            TdsBatchAction::ReplyError { code, message } => {
+                                                encode_error_reply(code, &message)
+                                            }
+                                        };
+
+                                        if stream.write_all(&reply).is_err() {
+                                            break;
+                                        }
+                                    }
+                                }));
+                            }
+                            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(_) => break,
+                        }
+                    }
+
+                    for conn_handle in conn_handles {
+                        drop(conn_handle.join());
+                    }
+                }
+            });
+
+            Self {
+                port,
+                connections_accepted,
+                batches_seen,
+                recorded_batches,
+                stop,
+                handle: Some(handle),
+            }
+        }
+
+        fn connect(&self) -> MssqlConnection {
+            let mut config = tiberius::Config::new();
+            config.host("127.0.0.1");
+            config.port(self.port);
+            config.encryption(tiberius::EncryptionLevel::NotSupported);
+
+            let reconnect_config = config.clone();
+            let runtime = build_runtime().expect("test runtime must build");
+            let client = runtime
+                .block_on(establish_tiberius(config))
+                .expect("connect to loopback TDS peer");
+
+            MssqlConnection {
+                inner: Arc::new(Mutex::new(MssqlConnectionInner {
+                    client: Some(client),
+                    runtime,
+                })),
+                current_database: Mutex::new(None),
+                ssh_tunnel: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
+                cancel_generation: Arc::new(AtomicU64::new(0)),
+                cancel_lock: Arc::new(Mutex::new(())),
+                spid: Arc::new(AtomicI32::new(0)),
+                reconnect_config: Arc::new(reconnect_config),
+                poisoned: Arc::new(AtomicBool::new(false)),
+                recovery: Mutex::new(()),
+                #[cfg(test)]
+                test_hooks: Mutex::new(MssqlTestHooks::default()),
+            }
+        }
+    }
+
+    impl Drop for FakeTdsServer {
+        fn drop(&mut self) {
+            self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(handle) = self.handle.take() {
+                drop(handle.join());
+            }
+        }
+    }
+
+    #[test]
+    fn mssql_execute_never_retries_on_transport_loss_and_poisons_session() {
+        use std::sync::atomic::Ordering;
+
+        let server = FakeTdsServer::start(true);
+        let connection = server.connect();
+
+        let result = connection.execute(&QueryRequest::new("INSERT INTO dbo.t VALUES (1)"));
+        assert!(
+            result.is_err(),
+            "execute must surface the dropped-session error instead of retrying"
+        );
+        assert_eq!(
+            server.batches_seen.load(Ordering::SeqCst),
+            1,
+            "execute must send the user batch at most once"
+        );
+        assert_eq!(
+            server.connections_accepted.load(Ordering::SeqCst),
+            1,
+            "execute must not reconnect and replay inside the failed call"
+        );
+        assert!(
+            connection.poisoned.load(Ordering::SeqCst),
+            "transport loss during execute must poison the connection for the next call"
+        );
+        assert!(
+            connection
+                .inner
+                .lock()
+                .expect("inner lock")
+                .client
+                .is_none(),
+            "transport loss must drop the dead tiberius client"
+        );
+
+        // The next call (ping) recovers first and succeeds on a fresh session.
+        connection
+            .ping()
+            .expect("ping after transport loss should recover first and succeed");
+        assert_eq!(server.connections_accepted.load(Ordering::SeqCst), 2);
+        assert!(!connection.poisoned.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn mssql_metadata_read_recovers_and_retries_once_after_transport_loss() {
+        use std::sync::atomic::Ordering;
+
+        let server = FakeTdsServer::start(true);
+        let connection = server.connect();
+
+        let databases = connection
+            .list_databases()
+            .expect("metadata read should recover and retry once after transport loss");
+        assert!(databases.is_empty());
+        assert_eq!(server.connections_accepted.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            server.batches_seen.load(Ordering::SeqCst),
+            3,
+            "1 failed metadata batch + 1 capture_session_info + 1 retried metadata batch"
+        );
+        assert!(!connection.poisoned.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn mssql_recovery_publishes_client_and_clears_poisoned_atomically() {
+        use std::sync::atomic::Ordering;
+
+        let (capture_entered_tx, capture_entered_rx) = std::sync::mpsc::channel();
+        let allow_capture_gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+
+        let server = FakeTdsServer::start_with_handler({
+            let allow_capture_gate = Arc::clone(&allow_capture_gate);
+            move |req| match (req.conn_index, req.conn_batch_index) {
+                (1, 0) => {
+                    capture_entered_tx
+                        .send(())
+                        .expect("signal capture_session_info reached");
+                    let (lock, cvar) = &*allow_capture_gate;
+                    let mut allowed = lock.lock().expect("capture gate lock");
+                    while !*allowed {
+                        allowed = cvar.wait(allowed).expect("capture gate wait");
+                    }
+                    TdsBatchAction::ReplySessionInfo {
+                        spid: 42,
+                        database: Some("master".to_string()),
+                    }
+                }
+                (1, _) => TdsBatchAction::DropConnection,
+                _ => TdsBatchAction::ReplyDone,
+            }
+        });
+
+        let connection = server.connect();
+        connection.inner.lock().expect("inner lock").client = None;
+        connection.poisoned.store(true, Ordering::SeqCst);
+
+        std::thread::scope(|scope| {
+            let recovery_handle = scope.spawn(|| connection.cleanup_after_cancel());
+
+            capture_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("recovery must reach capture_session_info while holding inner");
+
+            // Recovery has already released the initial current_database read and
+            // holds `inner`. Holding `current_database` here pauses recovery after
+            // it releases `inner` in the buggy ordering, exposing the gap before
+            // `poisoned` is cleared.
+            let db_guard = connection
+                .current_database
+                .lock()
+                .expect("current_database lock");
+
+            let caller_handle = scope.spawn(|| connection.execute_simple("SELECT 1"));
+
+            {
+                let (lock, cvar) = &*allow_capture_gate;
+                *lock.lock().expect("capture gate lock") = true;
+                cvar.notify_all();
+            }
+
+            let caller_result = caller_handle.join().expect("caller thread must not panic");
+            assert!(
+                caller_result.is_err(),
+                "caller hitting dropped newly-published client must fail"
+            );
+
+            drop(db_guard);
+            recovery_handle
+                .join()
+                .expect("recovery thread must not panic")
+                .expect("recovery itself succeeded before caller dropped the new client");
+        });
+
+        assert!(
+            connection.poisoned.load(Ordering::SeqCst),
+            "recovery must not clear poisoned after a concurrent caller already lost transport on the new client"
+        );
+        connection
+            .ping()
+            .expect("subsequent call must recover instead of seeing a closed connection");
+        assert_eq!(server.connections_accepted.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn mssql_metadata_read_retries_when_concurrent_caller_already_recovered() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let server = FakeTdsServer::start(true);
+        let connection = server.connect();
+        let attempts = AtomicUsize::new(0);
+
+        let result = connection.read_metadata(|| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            let outcome = connection.execute_simple_checked("SELECT 1");
+            if attempt == 0 {
+                assert!(outcome.is_err(), "first read must fail on dropped socket");
+                // Another caller recovers and clears `poisoned` before this
+                // `read_metadata` evaluates its retry guard.
+                std::thread::scope(|scope| {
+                    scope
+                        .spawn(|| connection.recover_session())
+                        .join()
+                        .expect("concurrent recovery thread must not panic")
+                        .expect("concurrent recovery must succeed");
+                });
+                assert!(!connection.poisoned.load(Ordering::SeqCst));
+            }
+            outcome
+        });
+
+        assert!(
+            result.is_ok(),
+            "metadata read must still retry once based on its own transport loss even after another caller cleared poisoned: {result:?}"
+        );
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(server.connections_accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn mssql_metadata_read_does_not_retry_unrelated_error_when_concurrent_caller_poisons() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let server =
+            FakeTdsServer::start_with_handler(|req| match (req.conn_index, req.conn_batch_index) {
+                (0, 0) => TdsBatchAction::ReplyError {
+                    code: 50000,
+                    message: "unrelated metadata query error".to_string(),
+                },
+                (0, 1) => TdsBatchAction::DropConnection,
+                _ => TdsBatchAction::ReplyDone,
+            });
+        let connection = server.connect();
+        let attempts = AtomicUsize::new(0);
+
+        let result = connection.read_metadata(|| {
+            let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+            let outcome = connection.execute_simple_checked("SELECT 1");
+            if attempt == 0 {
+                assert!(
+                    outcome.is_err(),
+                    "first read must surface the unrelated SQL Server error"
+                );
+                assert!(
+                    !connection.poisoned.load(Ordering::SeqCst),
+                    "unrelated SQL error must not poison the connection"
+                );
+                // Another caller loses transport and sets `poisoned = true`
+                // before this `read_metadata` evaluates its retry guard.
+                std::thread::scope(|scope| {
+                    let concurrent = scope
+                        .spawn(|| connection.execute(&QueryRequest::new("SELECT 2")))
+                        .join()
+                        .expect("concurrent caller thread must not panic");
+                    assert!(concurrent.is_err());
+                });
+                assert!(connection.poisoned.load(Ordering::SeqCst));
+            }
+            outcome
+        });
+
+        assert!(
+            result.is_err(),
+            "unrelated error must be returned without retrying"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "metadata read must not retry an unrelated error when another caller set poisoned"
+        );
+        assert_eq!(server.connections_accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn mssql_table_creation_metadata_recovers_and_retries_once_after_transport_loss() {
+        use std::sync::atomic::Ordering;
+
+        let server = FakeTdsServer::start(true);
+        let connection = server.connect();
+
+        let metadata = connection
+            .table_creation_metadata("app_db", Some("dbo"), "users")
+            .expect("table_creation_metadata should recover and retry once after transport loss");
+        assert!(metadata.is_none());
+        assert_eq!(server.connections_accepted.load(Ordering::SeqCst), 2);
+        assert!(!connection.poisoned.load(Ordering::SeqCst));
+
+        // Bounded at one retry: if the recovered session also drops, it returns Err.
+        let always_drop_server = FakeTdsServer::start_with_handler(|req| {
+            if req.conn_index == 0 || req.conn_batch_index >= 1 {
+                TdsBatchAction::DropConnection
+            } else {
+                TdsBatchAction::ReplyDone
+            }
+        });
+        let always_drop_conn = always_drop_server.connect();
+        let err = always_drop_conn.table_creation_metadata("app_db", Some("dbo"), "users");
+        assert!(err.is_err());
+        assert_eq!(
+            always_drop_server
+                .connections_accepted
+                .load(Ordering::SeqCst),
+            2,
+            "table_creation_metadata must retry at most once"
+        );
+    }
+
+    #[test]
+    fn mssql_fetch_dependents_recovers_and_retries_once_after_transport_loss() {
+        use std::sync::atomic::Ordering;
+
+        let server = FakeTdsServer::start(true);
+        let connection = server.connect();
+
+        let dependents = connection
+            .fetch_dependents("app_db", Some("dbo"), "users")
+            .expect("fetch_dependents should recover and retry once after transport loss");
+        assert!(dependents.is_empty());
+        assert_eq!(server.connections_accepted.load(Ordering::SeqCst), 2);
+        assert!(!connection.poisoned.load(Ordering::SeqCst));
+
+        // Bounded at one retry: if the recovered session also drops, it returns Err.
+        let always_drop_server = FakeTdsServer::start_with_handler(|req| {
+            if req.conn_index == 0 || req.conn_batch_index >= 1 {
+                TdsBatchAction::DropConnection
+            } else {
+                TdsBatchAction::ReplyDone
+            }
+        });
+        let always_drop_conn = always_drop_server.connect();
+        let err = always_drop_conn.fetch_dependents("app_db", Some("dbo"), "users");
+        assert!(err.is_err());
+        assert_eq!(
+            always_drop_server
+                .connections_accepted
+                .load(Ordering::SeqCst),
+            2,
+            "fetch_dependents must retry at most once"
+        );
+    }
+
+    #[test]
+    fn mssql_concurrent_recovery_reconnects_and_restores_database_once() {
+        use std::sync::atomic::Ordering;
+
+        let (recovery_capture_entered_tx, recovery_capture_entered_rx) = std::sync::mpsc::channel();
+        let allow_recovery_capture_gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+
+        let server = FakeTdsServer::start_with_handler({
+            let allow_recovery_capture_gate = Arc::clone(&allow_recovery_capture_gate);
+            move |req| match (req.conn_index, req.conn_batch_index) {
+                // conn 0: USE [app_db] succeeds, then next batch drops the socket
+                (0, 0) => TdsBatchAction::ReplyDone,
+                (0, _) => TdsBatchAction::DropConnection,
+                // conn 1: hold capture_session_info until competing callers observe `poisoned`
+                (1, 0) => {
+                    recovery_capture_entered_tx
+                        .send(())
+                        .expect("signal recovery capture entered");
+                    let (lock, cvar) = &*allow_recovery_capture_gate;
+                    let mut allowed = lock.lock().expect("recovery capture gate lock");
+                    while !*allowed {
+                        allowed = cvar.wait(allowed).expect("recovery capture gate wait");
+                    }
+                    TdsBatchAction::ReplySessionInfo {
+                        spid: 21,
+                        database: Some("master".to_string()),
+                    }
+                }
+                _ => TdsBatchAction::ReplyDone,
+            }
+        });
+
+        let connection = server.connect();
+        connection
+            .set_active_database(Some("app_db"))
+            .expect("initial set_active_database must succeed");
+
+        // Trigger a dead-client detection first.
+        assert!(connection.execute(&QueryRequest::new("SELECT 1")).is_err());
+        assert!(connection.poisoned.load(Ordering::SeqCst));
+
+        let (cleanup_entered_tx, cleanup_entered_rx) = std::sync::mpsc::channel();
+        connection
+            .test_hooks
+            .lock()
+            .expect("test_hooks lock")
+            .on_cleanup_after_cancel_enter = Some(Arc::new(move || {
+            cleanup_entered_tx
+                .send(())
+                .expect("signal cleanup_after_cancel entered");
+        }));
+
+        std::thread::scope(|scope| {
+            let h1 = scope.spawn(|| connection.ping());
+
+            cleanup_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("caller 1 must enter cleanup_after_cancel");
+            recovery_capture_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("caller 1 must reach capture_session_info while holding recovery");
+            assert!(
+                connection.poisoned.load(Ordering::SeqCst),
+                "poisoned must stay true while caller 1 is mid-recovery"
+            );
+
+            // Spawn competing callers while caller 1 is parked inside recovery,
+            // and wait until both observe `poisoned` and enter cleanup_after_cancel.
+            let h2 = scope.spawn(|| connection.list_databases().map(|_| ()));
+            let h3 = scope.spawn(|| connection.ping());
+            for caller in 2..=3 {
+                cleanup_entered_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap_or_else(|err| {
+                        panic!("caller {caller} must observe poisoned and enter cleanup_after_cancel: {err}")
+                    });
+            }
+
+            {
+                let (lock, cvar) = &*allow_recovery_capture_gate;
+                *lock.lock().expect("recovery capture gate lock") = true;
+                cvar.notify_all();
+            }
+
+            h1.join().expect("thread 1").expect("caller 1 must succeed");
+            h2.join().expect("thread 2").expect("caller 2 must succeed");
+            h3.join().expect("thread 3").expect("caller 3 must succeed");
+        });
+
+        assert_eq!(
+            server.connections_accepted.load(Ordering::SeqCst),
+            2,
+            "concurrent callers hitting a dead client must trigger exactly one reconnect"
+        );
+        let use_batches_on_recovery = server
+            .recorded_batches
+            .lock()
+            .expect("recorded batches")
+            .iter()
+            .filter(|req| req.conn_index == 1 && req.sql.as_deref() == Some("USE [app_db]"))
+            .count();
+        assert_eq!(
+            use_batches_on_recovery, 1,
+            "active database must be restored once during concurrent recovery"
+        );
+        assert!(!connection.poisoned.load(Ordering::SeqCst));
+        assert_eq!(connection.spid.load(Ordering::SeqCst), 21);
+    }
+
+    #[test]
+    fn mssql_metadata_read_does_not_retry_when_cancelled_during_recovery() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (capture_entered_tx, capture_entered_rx) = std::sync::mpsc::channel();
+        let allow_capture_gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+
+        let server = FakeTdsServer::start_with_handler({
+            let allow_capture_gate = Arc::clone(&allow_capture_gate);
+            move |req| match (req.conn_index, req.conn_batch_index) {
+                (0, 0) => TdsBatchAction::DropConnection,
+                // conn 1: recovery session opened by read_metadata
+                (1, 0) => {
+                    capture_entered_tx
+                        .send(())
+                        .expect("signal recovery capture_session_info reached");
+                    let (lock, cvar) = &*allow_capture_gate;
+                    let mut allowed = lock.lock().expect("capture gate lock");
+                    while !*allowed {
+                        allowed = cvar.wait(allowed).expect("capture gate wait");
+                    }
+                    TdsBatchAction::ReplySessionInfo {
+                        spid: 43,
+                        database: Some("master".to_string()),
+                    }
+                }
+                // conn 2: KILL 42 from cancel()
+                (2, 0) => TdsBatchAction::ReplyDone,
+                // conn 3: post-cancel cleanup recovery
+                (3, 0) => TdsBatchAction::ReplySessionInfo {
+                    spid: 44,
+                    database: Some("master".to_string()),
+                },
+                _ => TdsBatchAction::ReplyDone,
+            }
+        });
+
+        let connection = server.connect();
+        connection.spid.store(42, Ordering::SeqCst);
+        let cancel_handle = connection.cancel_handle();
+        let read_attempts = AtomicUsize::new(0);
+
+        let result = std::thread::scope(|scope| {
+            let read_handle = scope.spawn(|| {
+                connection.read_metadata(|| {
+                    read_attempts.fetch_add(1, Ordering::SeqCst);
+                    connection.execute_simple_checked("SELECT 1")
+                })
+            });
+
+            capture_entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("read_metadata retry recovery must reach capture_session_info");
+
+            cancel_handle.cancel().expect("cancel must succeed");
+
+            {
+                let (lock, cvar) = &*allow_capture_gate;
+                *lock.lock().expect("capture gate lock") = true;
+                cvar.notify_all();
+            }
+
+            read_handle.join().expect("read thread must not panic")
+        });
+
+        assert!(
+            matches!(result, Err(DbError::Cancelled)),
+            "metadata read cancelled during retry recovery must surface DbError::Cancelled, got: {result:?}"
+        );
+        assert_eq!(
+            read_attempts.load(Ordering::SeqCst),
+            1,
+            "cancelled metadata read must not retry after recovery"
+        );
+        assert!(
+            connection.cancelled.load(Ordering::SeqCst),
+            "cancellation flag must remain set until post-cancel cleanup runs"
+        );
+        assert!(
+            connection.poisoned.load(Ordering::SeqCst),
+            "poisoned flag must remain set until post-cancel cleanup runs"
+        );
+        let retried_on_conn1 = server
+            .recorded_batches
+            .lock()
+            .expect("recorded batches")
+            .iter()
+            .any(|req| req.conn_index == 1 && req.sql.as_deref() == Some("SELECT 1"));
+        assert!(
+            !retried_on_conn1,
+            "metadata query must not be sent on recovery connection after cancel"
+        );
+
+        connection
+            .cleanup_after_cancel()
+            .expect("subsequent cleanup_after_cancel must recover cleanly");
+        assert!(!connection.cancelled.load(Ordering::SeqCst));
+        assert!(!connection.poisoned.load(Ordering::SeqCst));
+        assert_eq!(connection.spid.load(Ordering::SeqCst), 44);
+    }
+
+    #[test]
+    fn mssql_metadata_read_does_not_retry_when_cancelled_after_retry_guard() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Window A: cancel fires after the first attempt's transport loss and before
+        // retry recovery begins.
+        {
+            let server = FakeTdsServer::start(true);
+            let connection = server.connect();
+            let cancel_handle = connection.cancel_handle();
+            let attempts = AtomicUsize::new(0);
+
+            connection
+                .test_hooks
+                .lock()
+                .expect("test_hooks lock")
+                .before_metadata_retry_recovery = Some(Arc::new(move || {
+                cancel_handle.cancel().expect("cancel must succeed");
+            }));
+
+            let result = connection.read_metadata(|| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                connection.execute_simple_checked("SELECT 1")
+            });
+
+            assert!(
+                matches!(result, Err(DbError::Cancelled)),
+                "cancel before retry recovery must abort with DbError::Cancelled, got: {result:?}"
+            );
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                server.connections_accepted.load(Ordering::SeqCst),
+                1,
+                "cancelled retry must not open a recovery connection"
+            );
+            assert!(connection.cancelled.load(Ordering::SeqCst));
+            assert!(connection.poisoned.load(Ordering::SeqCst));
+        }
+
+        // Window B: cancel fires after retry recovery succeeds and before the retry
+        // read attempt starts.
+        {
+            let server = FakeTdsServer::start(true);
+            let connection = server.connect();
+            let cancel_handle = connection.cancel_handle();
+            let attempts = AtomicUsize::new(0);
+
+            connection
+                .test_hooks
+                .lock()
+                .expect("test_hooks lock")
+                .before_metadata_retry_attempt = Some(Arc::new(move || {
+                cancel_handle.cancel().expect("cancel must succeed");
+            }));
+
+            let result = connection.read_metadata(|| {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                connection.execute_simple_checked("SELECT 1")
+            });
+
+            assert!(
+                matches!(result, Err(DbError::Cancelled)),
+                "cancel before retry attempt must abort with DbError::Cancelled, got: {result:?}"
+            );
+            assert_eq!(attempts.load(Ordering::SeqCst), 1);
+            assert!(connection.cancelled.load(Ordering::SeqCst));
+            assert!(connection.poisoned.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn mssql_recovery_serializes_with_set_active_database() {
+        use std::sync::atomic::Ordering;
+
+        // Interleaving A: `set_active_database` is already past its initial recovery
+        // check while `cleanup_after_cancel` has copied `current_database` and is
+        // about to acquire `inner`.
+        {
+            let server = FakeTdsServer::start_with_handler(|req| {
+                match (req.conn_index, req.conn_batch_index) {
+                    (1, 0) => TdsBatchAction::ReplySessionInfo {
+                        spid: 21,
+                        database: Some("master".to_string()),
+                    },
+                    _ => TdsBatchAction::ReplyDone,
+                }
+            });
+            let connection = server.connect();
+            connection
+                .set_active_database(Some("db_old"))
+                .expect("initial set_active_database must succeed");
+
+            let (set_db_entered_tx, set_db_entered_rx) = std::sync::mpsc::channel();
+            let allow_set_db_gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+            let (recovery_before_inner_tx, recovery_before_inner_rx) = std::sync::mpsc::channel();
+            let allow_recovery_inner_gate =
+                Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+
+            {
+                let mut hooks = connection.test_hooks.lock().expect("test_hooks lock");
+                hooks.after_set_active_database_recover = Some(Arc::new({
+                    let allow_set_db_gate = Arc::clone(&allow_set_db_gate);
+                    move || {
+                        set_db_entered_tx
+                            .send(())
+                            .expect("signal set_active_database reached hook");
+                        let (lock, cvar) = &*allow_set_db_gate;
+                        let mut allowed = lock.lock().expect("set_db gate lock");
+                        while !*allowed {
+                            allowed = cvar.wait(allowed).expect("set_db gate wait");
+                        }
+                    }
+                }));
+                hooks.before_cleanup_inner_lock = Some(Arc::new({
+                    let allow_recovery_inner_gate = Arc::clone(&allow_recovery_inner_gate);
+                    move || {
+                        recovery_before_inner_tx
+                            .send(())
+                            .expect("signal cleanup_after_cancel before inner lock");
+                        let (lock, cvar) = &*allow_recovery_inner_gate;
+                        let mut allowed = lock.lock().expect("recovery gate lock");
+                        while !*allowed {
+                            allowed = cvar.wait(allowed).expect("recovery gate wait");
+                        }
+                    }
+                }));
+            }
+
+            let (set_db_done_tx, set_db_done_rx) = std::sync::mpsc::channel();
+            std::thread::scope(|scope| {
+                let set_db_handle = scope.spawn(|| {
+                    let outcome = connection.set_active_database(Some("db_new"));
+                    let _send_result = set_db_done_tx.send(());
+                    outcome
+                });
+
+                set_db_entered_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("set_active_database must reach hook");
+
+                // Simulate a concurrent cancel / SHOWPLAN failure poisoning the session
+                // while `conn 0` is still open.
+                connection.poisoned.store(true, Ordering::SeqCst);
+
+                let recovery_handle = scope.spawn(|| connection.cleanup_after_cancel());
+
+                recovery_before_inner_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("cleanup_after_cancel must reach before_cleanup_inner_lock");
+
+                {
+                    let (lock, cvar) = &*allow_set_db_gate;
+                    *lock.lock().expect("set_db gate lock") = true;
+                    cvar.notify_all();
+                }
+
+                // Wait briefly to allow an unserialized implementation to finish
+                // `USE [db_new]` in the gap before releasing recovery.
+                let _wait_result = set_db_done_rx.recv_timeout(Duration::from_millis(50));
+
+                {
+                    let (lock, cvar) = &*allow_recovery_inner_gate;
+                    *lock.lock().expect("recovery gate lock") = true;
+                    cvar.notify_all();
+                }
+
+                set_db_handle
+                    .join()
+                    .expect("set_db thread must not panic")
+                    .expect("set_active_database must succeed");
+                recovery_handle
+                    .join()
+                    .expect("recovery thread must not panic")
+                    .expect("cleanup_after_cancel must succeed");
+            });
+
+            assert_eq!(connection.active_database().as_deref(), Some("db_new"));
+            let conn1_uses: Vec<String> = server
+                .recorded_batches
+                .lock()
+                .expect("recorded batches")
+                .iter()
+                .filter(|req| req.conn_index == 1)
+                .filter_map(|req| req.sql.as_ref())
+                .filter(|sql| sql.starts_with("USE "))
+                .cloned()
+                .collect();
+            assert_eq!(
+                conn1_uses.last().map(String::as_str),
+                Some("USE [db_new]"),
+                "recovered session must end up on the latest active database, got: {conn1_uses:?}"
+            );
+        }
+
+        // Interleaving B: `set_active_database` has already sent `USE [db_v2]` on
+        // `conn 0` when recovery starts; recovery must wait and restore `db_v2`.
+        {
+            let (use_v2_entered_tx, use_v2_entered_rx) = std::sync::mpsc::channel();
+            let allow_use_v2_gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+
+            let server = FakeTdsServer::start_with_handler({
+                let allow_use_v2_gate = Arc::clone(&allow_use_v2_gate);
+                move |req| match (req.conn_index, req.conn_batch_index) {
+                    (0, _) if req.sql.as_deref() == Some("USE [db_v2]") => {
+                        use_v2_entered_tx
+                            .send(())
+                            .expect("signal USE [db_v2] in flight");
+                        let (lock, cvar) = &*allow_use_v2_gate;
+                        let mut allowed = lock.lock().expect("use_v2 gate lock");
+                        while !*allowed {
+                            allowed = cvar.wait(allowed).expect("use_v2 gate wait");
+                        }
+                        TdsBatchAction::ReplyDone
+                    }
+                    (1, 0) => TdsBatchAction::ReplySessionInfo {
+                        spid: 22,
+                        database: Some("master".to_string()),
+                    },
+                    _ => TdsBatchAction::ReplyDone,
+                }
+            });
+
+            let connection = server.connect();
+            connection
+                .set_active_database(Some("db_v1"))
+                .expect("initial set_active_database must succeed");
+
+            std::thread::scope(|scope| {
+                let set_db_handle = scope.spawn(|| connection.set_active_database(Some("db_v2")));
+
+                use_v2_entered_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("USE [db_v2] must reach fake server");
+
+                connection.poisoned.store(true, Ordering::SeqCst);
+                let recovery_handle = scope.spawn(|| connection.cleanup_after_cancel());
+
+                {
+                    let (lock, cvar) = &*allow_use_v2_gate;
+                    *lock.lock().expect("use_v2 gate lock") = true;
+                    cvar.notify_all();
+                }
+
+                set_db_handle
+                    .join()
+                    .expect("set_db thread must not panic")
+                    .expect("set_active_database must succeed");
+                recovery_handle
+                    .join()
+                    .expect("recovery thread must not panic")
+                    .expect("cleanup_after_cancel must succeed");
+            });
+
+            let conn1_uses: Vec<String> = server
+                .recorded_batches
+                .lock()
+                .expect("recorded batches")
+                .iter()
+                .filter(|req| req.conn_index == 1)
+                .filter_map(|req| req.sql.as_ref())
+                .filter(|sql| sql.starts_with("USE "))
+                .cloned()
+                .collect();
+            assert_eq!(
+                conn1_uses,
+                vec!["USE [db_v2]".to_string()],
+                "recovery must restore db_v2 once after in-flight selection completes"
+            );
+            assert_eq!(connection.active_database().as_deref(), Some("db_v2"));
+        }
+    }
+
+    #[test]
+    fn mssql_kill_cancel_596_recovers_once_with_no_retry_or_second_recovery() {
+        use std::sync::atomic::Ordering;
+
+        let (batch_in_flight_tx, batch_in_flight_rx) = std::sync::mpsc::channel();
+        let kill_gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+
+        let server = FakeTdsServer::start_with_handler({
+            let kill_gate = Arc::clone(&kill_gate);
+            move |req| match (req.conn_index, req.conn_batch_index) {
+                // conn 0: initial session; hold query until KILL arrives on conn 1, then send 596
+                (0, 0) => {
+                    batch_in_flight_tx.send(()).expect("signal batch in flight");
+                    let (lock, cvar) = &*kill_gate;
+                    let mut killed = lock.lock().expect("kill gate lock");
+                    while !*killed {
+                        killed = cvar.wait(killed).expect("kill gate wait");
+                    }
+                    TdsBatchAction::ReplyError {
+                        code: 596,
+                        message: "Cannot continue the execution because the session is in the kill state.".to_string(),
+                    }
+                }
+                // conn 1: side-channel KILL 42 connection
+                (1, 0) => {
+                    let (lock, cvar) = &*kill_gate;
+                    *lock.lock().expect("kill gate lock") = true;
+                    cvar.notify_all();
+                    TdsBatchAction::ReplyDone
+                }
+                // conn 2: single recovery connection
+                (2, 0) => TdsBatchAction::ReplySessionInfo {
+                    spid: 43,
+                    database: Some("master".to_string()),
+                },
+                _ => TdsBatchAction::ReplyDone,
+            }
+        });
+
+        let connection = server.connect();
+        connection.spid.store(42, Ordering::SeqCst);
+        *connection
+            .current_database
+            .lock()
+            .expect("current_database lock") = Some("app_db".to_string());
+        let cancel_handle = connection.cancel_handle();
+
+        std::thread::scope(|scope| {
+            let exec_handle = scope.spawn(|| connection.execute(&QueryRequest::new("SELECT 1")));
+
+            batch_in_flight_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("query must reach server before cancel");
+
+            cancel_handle
+                .cancel()
+                .expect("KILL-based cancel must succeed");
+
+            let exec_outcome = exec_handle.join().expect("exec thread must not panic");
+            assert!(
+                matches!(exec_outcome, Err(DbError::Cancelled)),
+                "596 after KILL-based cancel must surface DbError::Cancelled without retry, got: {exec_outcome:?}"
+            );
+        });
+
+        assert_eq!(
+            server.connections_accepted.load(Ordering::SeqCst),
+            2,
+            "execute must not reconnect itself (only initial + KILL connection)"
+        );
+        assert!(connection.poisoned.load(Ordering::SeqCst));
+        assert!(connection.cancelled.load(Ordering::SeqCst));
+
+        // Existing cancel cleanup runs once, reconnecting and restoring active DB.
+        connection
+            .cleanup_after_cancel()
+            .expect("cancel cleanup must recover the killed session");
+        assert_eq!(
+            server.connections_accepted.load(Ordering::SeqCst),
+            3,
+            "cleanup_after_cancel must open exactly one recovery connection"
+        );
+        assert_eq!(connection.spid.load(Ordering::SeqCst), 43);
+        assert!(!connection.poisoned.load(Ordering::SeqCst));
+        assert!(!connection.cancelled.load(Ordering::SeqCst));
+
+        // Subsequent cleanup and queries must not trigger a second recovery.
+        connection
+            .cleanup_after_cancel()
+            .expect("second cleanup must be a no-op");
+        connection
+            .ping()
+            .expect("ping after cancel cleanup must succeed on recovered session");
+        connection
+            .list_databases()
+            .expect("metadata read after cancel cleanup must succeed on recovered session");
+        assert_eq!(
+            server.connections_accepted.load(Ordering::SeqCst),
+            3,
+            "no second recovery connection should be opened"
+        );
+
+        let batches = server.recorded_batches.lock().expect("recorded batches");
+        let kill_count = batches
+            .iter()
+            .filter(|req| req.sql.as_deref() == Some("KILL 42"))
+            .count();
+        let conn0_queries = batches.iter().filter(|req| req.conn_index == 0).count();
+        let restore_count = batches
+            .iter()
+            .filter(|req| req.conn_index == 2 && req.sql.as_deref() == Some("USE [app_db]"))
+            .count();
+        assert_eq!(kill_count, 1, "KILL 42 must be sent once");
+        assert_eq!(conn0_queries, 1, "cancelled query must not be retried");
+        assert_eq!(restore_count, 1, "active database must be restored once");
     }
 }

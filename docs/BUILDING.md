@@ -23,7 +23,7 @@ Prerequisites on Ubuntu 24.04 or Debian 13:
 sudo apt-get install -y mold cmake pkg-config libssl-dev libdbus-1-dev libxkbcommon-dev libxkbcommon-x11-dev libpipewire-0.3-dev libgbm-dev libegl-dev libxcb-randr0-dev libclang-dev libfontconfig1-dev libvulkan-dev
 ```
 
-Other distributions need the same libraries under their own package names. `mold` is required: `.cargo/config.toml` links every Linux build with it. For the `.deb` you also need `readelf` (`sudo apt-get install -y binutils`), `envsubst` (`sudo apt-get install -y gettext-base`) and either `nfpm` or Docker. Install Docker with `sudo apt-get install -y docker.io` and add yourself to the `docker` group, or install `nfpm` from [nfpm.goreleaser.com/install](https://nfpm.goreleaser.com/install/). The package is amd64 only, so `--deb` fails on a binary that is not x86_64.
+Other distributions need the same libraries under their own package names. `mold` is required: `.cargo/config.toml` links every Linux build with it. For the `.deb` you also need `readelf` (`sudo apt-get install -y binutils`), `envsubst` (`sudo apt-get install -y gettext-base`) and Docker for the pinned nfpm container used by default. Install Docker with `sudo apt-get install -y docker.io` and add yourself to the `docker` group. To use a local `nfpm` instead, install it from [nfpm.goreleaser.com/install](https://nfpm.goreleaser.com/install/) and set `DATATAB_NFPM_LOCAL=1`. The package is amd64 only, so `--deb` fails on a binary that is not x86_64.
 
 Run one of these:
 
@@ -51,7 +51,7 @@ The package depends on `libc6 (>= 2.39)` and `libstdc++6 (>= 13)`, so build it o
 
 - **A tool is missing.** The script names the missing tools and prints the `apt-get` line above. Install them and run the script again. Install Rust with [rustup](https://rustup.rs) when `cargo` is missing.
 - **The build runs out of memory.** A full release build peaked at about 8 GB of RAM with 2 jobs. Run `JOBS=1 sh scripts/build-linux.sh`. It is slower and needs less memory. Closing other programs also helps.
-- **`--deb` finds neither `nfpm` nor Docker, or no `envsubst` or `readelf`.** Install `nfpm` or Docker as shown above, and `sudo apt-get install -y gettext-base binutils`.
+- **`--deb` cannot find its packaging tools.** Docker is required by default for the pinned nfpm container. A local `nfpm` is used only with `DATATAB_NFPM_LOCAL=1`. Install the selected tool as shown above, and `sudo apt-get install -y gettext-base binutils` for `envsubst` and `readelf`.
 - **`--deb` says the binary is not an x86_64 binary.** The package is amd64 only. Build on an x86_64 machine.
 - **The package script says the binary needs a newer `GLIBC`.** You built on a system newer than Ubuntu 24.04. Build on Ubuntu 24.04.
 
@@ -110,8 +110,8 @@ The scripts build the default feature set. To build with other features, call ca
 # Full default feature set
 cargo build -p datatab --release
 
-# Default drivers and Lua, without MCP
-cargo build -p datatab --release --no-default-features --features sqlite,postgres,mysql,mssql,mongodb,redis,dynamodb,cloudwatch,influxdb,redshift,s3,lua,aws
+# The default features with MCP turned off, and Lua kept
+cargo build -p datatab --release --no-default-features --features sqlite,postgres,mysql,mongodb,redis,influxdb,mssql,redshift,clickhouse,turso,duckdb,lua
 
 # Minimal relational drivers, without AI/MCP or Lua
 cargo build -p datatab --release --no-default-features --features sqlite,postgres,mysql
@@ -121,7 +121,7 @@ The binary is `target/release/datatab` on Linux and `target\release\datatab.exe`
 
 ## macOS
 
-macOS is supported on Intel and on Apple Silicon, and the release workflow builds a `DataTab.app` for each. `scripts/build-macos.sh` is the local macOS build. The bundle is unsigned (ad-hoc signature only).
+macOS is supported on Intel and on Apple Silicon, and the release workflow builds a `DataTab.app` for each. `scripts/build-macos.sh` is the local macOS build. Local builds use an ad-hoc signature by default. macOS releases use the self-signed PCPLab project certificate and are not notarized. Set `MACOS_SIGN_IDENTITY` to use an installed project signing identity. See [Installing DataTab](INSTALL.md#macos).
 
 Prerequisites: rustup, `cmake` (`brew install cmake`), and the full Xcode app from the App Store. The Command Line Tools are not enough: GPUI compiles its Metal shaders with `xcrun metal`. After installing Xcode:
 
@@ -149,8 +149,10 @@ The script builds OpenSSL from source (the `vendored-openssl` feature), so the a
 
 It writes:
 
-- `target/macos-package/DataTab.app`, with the icon, `Info.plist` and an ad-hoc signature;
+- `target/macos-package/DataTab.app`, with the icon, `Info.plist` and an ad-hoc signature by default, or the project signature when `MACOS_SIGN_IDENTITY` is set;
 - `target/macos-package/report.txt`: commit, macOS version, `rustc --version`, the cargo command and its exit code, the binary's architecture and its SHA-256.
+
+To also make the disk image the release ships, run `sh scripts/build-macos.sh --dmg-only arm64` (or `x86_64`) after the build. It writes `dist/datatab-macos-<arch>.dmg`, with `DataTab.app` and an `Applications` link, and replaces an existing image of the same name.
 
 Open it with `open target/macos-package/DataTab.app`, or drag it to `/Applications`. For a bundle you copied from another Mac, clear the quarantine flag first:
 

@@ -502,7 +502,7 @@ fn the_dashboard_tab_is_covered(cx: &mut TestAppContext) {
                 .iter()
                 .filter_map(|slot| match slot {
                     DashboardPanelSlot::Loaded { panel, .. } => {
-                        Some(panel.read(cx).embedded_pane_actions(cx))
+                        Some(panel.read(cx).embedded_pane_actions())
                     }
                     _ => None,
                 })

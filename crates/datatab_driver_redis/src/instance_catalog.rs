@@ -10,15 +10,26 @@ use datatab_core::{
 };
 /// Curated list of Redis INFO section field names mapped to chartable metrics.
 ///
-/// Each entry: `(section_field, metric_id, display_name, group, unit)`.
-/// `section_field` matches the key in the flat `INFO` output.
-pub const INFO_FIELDS: &[(&str, &str, &str, &str, InstanceMetricUnit)] = &[
+/// Each entry: `(section_field, metric_id, display_name, group, unit, kind)`.
+/// `section_field` matches the key in the flat `INFO` output. Fields that the
+/// server reports as a total since start (commands, keyspace hits and misses)
+/// are counters charted per second; `instantaneous_*` fields are already rates
+/// the server computed over its own window, so they stay gauges.
+pub const INFO_FIELDS: &[(
+    &str,
+    &str,
+    &str,
+    &str,
+    InstanceMetricUnit,
+    datatab_core::InstanceMetricKind,
+)] = &[
     (
         "connected_clients",
         "redis.connected_clients",
         "Connected clients",
         "Connections",
         InstanceMetricUnit::Count,
+        datatab_core::InstanceMetricKind::Gauge,
     ),
     (
         "blocked_clients",
@@ -26,6 +37,7 @@ pub const INFO_FIELDS: &[(&str, &str, &str, &str, InstanceMetricUnit)] = &[
         "Blocked clients",
         "Connections",
         InstanceMetricUnit::Count,
+        datatab_core::InstanceMetricKind::Gauge,
     ),
     (
         "used_memory",
@@ -33,6 +45,7 @@ pub const INFO_FIELDS: &[(&str, &str, &str, &str, InstanceMetricUnit)] = &[
         "Used memory (bytes)",
         "Memory",
         InstanceMetricUnit::Bytes,
+        datatab_core::InstanceMetricKind::Gauge,
     ),
     (
         "used_memory_rss",
@@ -40,6 +53,7 @@ pub const INFO_FIELDS: &[(&str, &str, &str, &str, InstanceMetricUnit)] = &[
         "Resident memory (bytes)",
         "Memory",
         InstanceMetricUnit::Bytes,
+        datatab_core::InstanceMetricKind::Gauge,
     ),
     (
         "mem_fragmentation_ratio",
@@ -47,6 +61,7 @@ pub const INFO_FIELDS: &[(&str, &str, &str, &str, InstanceMetricUnit)] = &[
         "Memory fragmentation ratio",
         "Memory",
         InstanceMetricUnit::Unknown,
+        datatab_core::InstanceMetricKind::Gauge,
     ),
     (
         "instantaneous_ops_per_sec",
@@ -54,6 +69,7 @@ pub const INFO_FIELDS: &[(&str, &str, &str, &str, InstanceMetricUnit)] = &[
         "Operations / sec",
         "Throughput",
         InstanceMetricUnit::PerSecond,
+        datatab_core::InstanceMetricKind::Gauge,
     ),
     (
         "instantaneous_input_kbps",
@@ -61,6 +77,7 @@ pub const INFO_FIELDS: &[(&str, &str, &str, &str, InstanceMetricUnit)] = &[
         "Input (kbps)",
         "Network",
         InstanceMetricUnit::PerSecond,
+        datatab_core::InstanceMetricKind::Gauge,
     ),
     (
         "instantaneous_output_kbps",
@@ -68,27 +85,31 @@ pub const INFO_FIELDS: &[(&str, &str, &str, &str, InstanceMetricUnit)] = &[
         "Output (kbps)",
         "Network",
         InstanceMetricUnit::PerSecond,
+        datatab_core::InstanceMetricKind::Gauge,
     ),
     (
         "total_commands_processed",
         "redis.total_commands",
-        "Total commands processed",
+        "Commands processed / sec",
         "Throughput",
-        InstanceMetricUnit::Count,
+        InstanceMetricUnit::PerSecond,
+        datatab_core::InstanceMetricKind::Counter,
     ),
     (
         "keyspace_hits",
         "redis.keyspace_hits",
-        "Keyspace hits",
+        "Keyspace hits / sec",
         "Cache",
-        InstanceMetricUnit::Count,
+        InstanceMetricUnit::PerSecond,
+        datatab_core::InstanceMetricKind::Counter,
     ),
     (
         "keyspace_misses",
         "redis.keyspace_misses",
-        "Keyspace misses",
+        "Keyspace misses / sec",
         "Cache",
-        InstanceMetricUnit::Count,
+        InstanceMetricUnit::PerSecond,
+        datatab_core::InstanceMetricKind::Counter,
     ),
     (
         "repl_backlog_size",
@@ -96,6 +117,7 @@ pub const INFO_FIELDS: &[(&str, &str, &str, &str, InstanceMetricUnit)] = &[
         "Replication backlog size",
         "Replication",
         InstanceMetricUnit::Bytes,
+        datatab_core::InstanceMetricKind::Gauge,
     ),
     (
         "connected_slaves",
@@ -103,6 +125,7 @@ pub const INFO_FIELDS: &[(&str, &str, &str, &str, InstanceMetricUnit)] = &[
         "Connected replicas",
         "Replication",
         InstanceMetricUnit::Count,
+        datatab_core::InstanceMetricKind::Gauge,
     ),
 ];
 
@@ -162,14 +185,17 @@ impl RedisInstanceCatalog {
     pub fn static_metrics() -> Vec<InstanceMetricDef> {
         INFO_FIELDS
             .iter()
-            .map(|(_, id, display_name, group, unit)| InstanceMetricDef {
-                id: id.to_string(),
-                display_name: display_name.to_string(),
-                group: group.to_string(),
-                unit: *unit,
-                description: None,
-                default_refresh_secs: 15,
-            })
+            .map(
+                |(_, id, display_name, group, unit, kind)| InstanceMetricDef {
+                    id: id.to_string(),
+                    display_name: display_name.to_string(),
+                    group: group.to_string(),
+                    unit: *unit,
+                    kind: *kind,
+                    description: None,
+                    default_refresh_secs: 15,
+                },
+            )
             .collect()
     }
 
@@ -319,6 +345,13 @@ fn redis_error(e: redis::RedisError) -> DbError {
 
 #[async_trait]
 impl InstanceCatalog for RedisInstanceCatalog {
+    fn metric_kind(&self, metric_id: &str) -> Option<datatab_core::InstanceMetricKind> {
+        Self::static_metrics()
+            .into_iter()
+            .find(|metric| metric.id == metric_id)
+            .map(|metric| metric.kind)
+    }
+
     async fn list_metrics(&self) -> Result<Vec<InstanceMetricDef>, DbError> {
         Ok(Self::static_metrics())
     }
@@ -408,10 +441,10 @@ pub(crate) fn dispatch_metric_series(
     conn: &mut redis::Connection,
     metric_id: &str,
 ) -> Result<QueryResult, DbError> {
-    let entry = INFO_FIELDS.iter().find(|(_, id, _, _, _)| *id == metric_id);
+    let entry = INFO_FIELDS.iter().find(|(_, id, ..)| *id == metric_id);
 
     match entry {
-        Some((field_name, _, display_name, _, _)) => {
+        Some((field_name, _, display_name, ..)) => {
             let info: String = redis::cmd("INFO").query(conn).map_err(redis_error)?;
 
             let fields = RedisInstanceCatalog::parse_info_output(&info);
@@ -552,6 +585,50 @@ pub fn redis_advertises_instance_capabilities() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counter_metric_kinds() {
+        let counters: Vec<_> = RedisInstanceCatalog::static_metrics()
+            .into_iter()
+            .filter(|metric| metric.kind == datatab_core::InstanceMetricKind::Counter)
+            .collect();
+
+        let actual: Vec<&str> = counters.iter().map(|metric| metric.id.as_str()).collect();
+        assert_eq!(
+            actual,
+            vec![
+                "redis.total_commands",
+                "redis.keyspace_hits",
+                "redis.keyspace_misses"
+            ]
+        );
+
+        for metric in counters {
+            assert_eq!(
+                metric.unit,
+                InstanceMetricUnit::PerSecond,
+                "counter {:?} must be charted per second",
+                metric.id
+            );
+        }
+    }
+
+    /// `instantaneous_*` fields are already rates the server computed over its
+    /// own window. Converting them again would divide by the refresh interval
+    /// a second time, so they stay gauges with their per-second unit.
+    #[test]
+    fn server_reported_rates_stay_gauges() {
+        let rates: Vec<_> = RedisInstanceCatalog::static_metrics()
+            .into_iter()
+            .filter(|metric| metric.unit == InstanceMetricUnit::PerSecond)
+            .filter(|metric| metric.kind == datatab_core::InstanceMetricKind::Gauge)
+            .map(|metric| metric.id)
+            .collect();
+        assert_eq!(
+            rates,
+            vec!["redis.ops_per_sec", "redis.input_kbps", "redis.output_kbps"]
+        );
+    }
 
     const FIXTURE_INFO: &str = r#"
 # Server

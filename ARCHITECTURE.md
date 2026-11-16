@@ -6,7 +6,7 @@ For the conceptual model and contract boundaries, begin with [Key Concepts](docs
 
 - DataTab is a keyboard-first database client built with Rust and GPUI, focused on fast workflows and a clean desktop UI (README.md).
 - The repo is a Rust workspace with a UI app crate plus shared core types, driver implementations, and supporting libraries (Cargo.toml, crates/).
-- Supports multiple database paradigms: relational (SQL), document (MongoDB, DynamoDB), key-value (Redis), time-series (InfluxDB), log-stream (CloudWatch Logs), graph, and wide-column stores.
+- Supports multiple database paradigms: relational (SQL), document (MongoDB), key-value (Redis) and time-series (InfluxDB), plus external RPC drivers.
 - This is the canonical top-level document for project structure, architecture overview, crate boundaries, key files, and the cross-crate map. Other top-level docs should link here instead of duplicating that material.
 
 ## Architecture at a Glance
@@ -25,7 +25,7 @@ flowchart TB
 
     subgraph UI["Presentation — 6 UI crates"]
         uicomp["datatab_components<br/>(theme, tokens, icons, primitives,<br/>composites, controls, data_table,<br/>document_tree, result_panel, charts,<br/>modals, saved_chart — no datatab_app dep)"]
-        uibase["datatab_ui_base<br/>(AppStateEntity, events, keymap helpers,<br/>toast + throttle, user_error,<br/>platform,<br/>sql_preview_modal, sso_wizard)"]
+        uibase["datatab_ui_base<br/>(AppStateEntity, events, keymap helpers,<br/>toast + throttle, user_error,<br/>platform,<br/>sql_preview_modal)"]
         uidoc["datatab_ui_document<br/>(tab/pane system, documents,<br/>data_grid_panel, governance)"]
         uisidebar["datatab_ui_sidebar<br/>(connections + scripts sidebar tree)"]
         uiwindows["datatab_ui_windows<br/>(connection_manager + settings windows)"]
@@ -42,11 +42,11 @@ flowchart TB
     end
 
     subgraph Drivers["Driver implementations"]
-        drv["postgres · mysql · sqlite · mssql · clickhouse<br/>mongodb · redis · dynamodb<br/>influxdb · cloudwatch · ipc (RPC)"]
+        drv["postgres · mysql · sqlite · mssql · clickhouse<br/>mongodb · redis · influxdb<br/>redshift · turso · duckdb · ipc (RPC)"]
     end
 
     subgraph Support["Supporting libraries"]
-        sup["storage · audit · approval<br/>mcp · export · lua · aws · ssm<br/>ssh · proxy · tunnel_core · ipc"]
+        sup["storage · audit · approval<br/>mcp · export · lua<br/>ssh · proxy · tunnel_core · ipc"]
     end
 
     subgraph Policy["Policy — datatab_policy"]
@@ -96,14 +96,14 @@ Connecting runs a provider-agnostic pre-connect pipeline before the driver opens
 ```mermaid
 flowchart TB
     start["Connect from<br/>Connection Manager / sidebar"] --> prep["AppState::prepare_pipeline_input<br/>(provider-agnostic input)"]
-    prep --> pre{{"PreConnect hooks"}}
-    pre --> auth["Pipeline: Authenticating<br/>(DynAuthProvider, e.g. AWS SSO)"]
-    auth --> values["Pipeline: ResolvingValues<br/>(ValueRef → env/dotenv/secret/param/auth)"]
+    prep --> validate["DbDriver::validate_profile<br/>(pure refusal before I/O)"]
+    validate --> pre{{"PreConnect hooks"}}
+    pre --> auth["Pipeline: Authenticating<br/>(DynAuthProvider, from an RPC service)"]
+    auth --> values["Pipeline: ResolvingValues<br/>(ValueRef → env/dotenv/file/secret/auth)"]
     values --> access["Pipeline: OpeningAccess"]
     access --> tunnel{"Access kind?"}
     tunnel -->|Direct| connect
     tunnel -->|SSH / Proxy| t1["datatab_tunnel_core::Tunnel<br/>(local port forward)"] --> connect
-    tunnel -->|Managed aws-ssm| t2["AccessManager<br/>(SSM tunnel)"] --> connect
     connect["DbDriver::connect → Connection"] --> schema["Lazy schema fetch<br/>(names first, details on expand)"]
     schema --> post{{"PostConnect hooks"}}
     post --> ready["Sidebar populated · ready to query"]
@@ -113,8 +113,7 @@ flowchart TB
 
 - Language: Rust 2024 edition (crates/datatab/Cargo.toml).
 - UI: `gpui`, `gpui-component` (Cargo.toml).
-- Databases: `tokio-postgres` (PostgreSQL), `rusqlite` (SQLite), `mysql` (MySQL/MariaDB), `mongodb` (MongoDB), `redis` (Redis), `aws-sdk-dynamodb` (DynamoDB), and HTTP via `reqwest` (ClickHouse) (Cargo.toml).
-- AWS auth/integration: `aws-config`, `aws-sdk-sso`, `aws-sdk-ssooidc`, `aws-sdk-sts`, `aws-sdk-secretsmanager`, `aws-sdk-ssm` (`datatab_aws`).
+- Databases: `tokio-postgres` (PostgreSQL), `rusqlite` (SQLite), `mysql` (MySQL/MariaDB), `mongodb` (MongoDB), `redis` (Redis), and HTTP via `reqwest` (ClickHouse) (Cargo.toml).
 - IPC/RPC: `interprocess` local sockets + `postcard` message framing (`datatab_ipc`, `datatab_driver_ipc`, `datatab_driver_host`).
 - SSH: `ssh2` via `datatab_ssh` (crates/datatab_ssh/src/lib.rs).
 - Export: `csv` + `hex` + `base64` + `serde_json` via `datatab_export` (crates/datatab_export/src/lib.rs).
@@ -182,7 +181,6 @@ crates/
                             # ErrorKind, report_error, report_error_async) + throttle
       platform.rs           # X11/Wayland detection, window options
       sql_preview_modal.rs  # SQL/query preview modal (dual-mode: SQL and generic)
-      sso_wizard.rs         # SSO account/role discovery wizard [cfg aws]
   datatab_ui_document/       # Tab/pane system, all document types, data_grid_panel, governance
     src/
       pane.rs               # PaneHandle: closure-erasing shell for typed Entity<T> documents
@@ -308,7 +306,7 @@ crates/
         mcp_section.rs      # MCP settings (trusted clients, roles, policies, audit; feature-gated)
       connection_manager/   # Connection manager window
         mod.rs
-        access_tab.rs       # Unified access mode editor (Direct/SSH/Proxy/SSM)
+        access_tab.rs       # Unified access mode editor (Direct/SSH/Proxy)
         form.rs             # Connection form state and field management
         navigation.rs       # Keyboard navigation within connection manager
         render.rs           # Top-level connection manager rendering
@@ -341,7 +339,7 @@ crates/
           sidebar_dock.rs   # Collapsible, resizable sidebar
         overlays/           # Remaining overlays that stay in datatab_ui
           command_palette.rs       # Fuzzy command palette
-          login_modal.rs           # SSO login waiting modal with timeout
+          login_modal.rs           # Auth provider login waiting modal with timeout
           shutdown_overlay.rs      # Graceful shutdown overlay
           # Shims at old overlay paths re-export from datatab_ui_base / datatab_components:
           sql_preview_modal.rs     # → datatab_ui_base::sql_preview_modal
@@ -459,11 +457,6 @@ crates/
   datatab_driver_redis/      # Redis driver implementation
     src/driver.rs           # Connection, key-value API, schema discovery
     src/command_generator.rs # Redis command generator (SET, HSET, SADD, etc.)
-  datatab_driver_dynamodb/   # DynamoDB driver implementation
-    src/driver.rs           # Connection, schema discovery, scan/query/put/update/delete
-    src/query_parser.rs     # JSON command envelope parser for DynamoDB operations
-    src/query_generator.rs  # Mutation -> DynamoDB command envelope generator
-    tests/live_integration.rs # Docker-backed integration tests (DynamoDB Local)
   datatab_driver_influxdb/   # InfluxDB driver (v1 + v2)
     src/driver.rs           # Connection, bucket/measurement discovery, query execution
     src/query_generator.rs  # InfluxQL (v1) and Flux (v2) query/template generation
@@ -481,18 +474,6 @@ crates/
     src/driver.rs           # Metadata, connection form, shared instance registry, DuckLake attach
     src/connection.rs       # Execution, read-only checks, catalog discovery, CRUD, execution sessions
     src/dialect.rs          # DuckDB dialect and value literals
-  datatab_driver_cloudwatch/ # AWS CloudWatch Logs driver (DatabaseCategory::LogStream)
-    src/driver.rs           # Log group/stream discovery, EventStreamTarget, CollectionPresentation::EventStream
-  datatab_driver_s3/         # AWS S3 object-storage driver (DatabaseCategory::ObjectStorage)
-    src/driver.rs           # Bucket/object discovery, ObjectStoreConnection impl, presign/copy/versions
-  datatab_driver_aws_secrets/ # AWS Secrets Manager + Parameter Store driver (DatabaseCategory::SecretStore)
-    src/secrets_manager/    # SecretStoreSource over ListSecrets/DescribeSecret/GetSecretValue
-    src/parameter_store/    # SecretStoreSource over DescribeParameters/GetParameter, client-side path grouping
-  datatab_aws/               # AWS auth providers + Secrets Manager/SSM value providers
-    src/auth.rs             # AWS SSO/shared/static providers and SSO login flow
-    src/config.rs           # ~/.aws/config parser/cache and profile write-back helpers
-    src/accounts.rs         # AWS SSO account and role discovery
-  datatab_ssm/               # AWS SSM tunnel factory for managed access
   datatab_lua/               # Embedded Lua runtime for in-process hooks
     src/executor.rs         # Lua HookExecutor implementation
     src/engine.rs           # Lua VM creation and shared runtime state
@@ -563,7 +544,7 @@ crates/
     src/dbml.rs             # DBML export (3 scopes: FocalTable, Subgraph, FullSchema)
     src/sql.rs              # SQL DDL export: CREATE TABLE + ALTER TABLE ADD CONSTRAINT (same 3 scopes)
   datatab_test_support/       # Docker containers and fixtures for integration tests
-    src/containers.rs       # Docker container lifecycle (Postgres, MySQL, MongoDB, Redis, DynamoDB Local)
+    src/containers.rs       # Docker container lifecycle (Postgres, MySQL, MongoDB, Redis)
     src/fixtures.rs         # Test fixture helpers
     src/fake_driver.rs      # FakeDriver for unit tests
 ```
@@ -622,8 +603,7 @@ A document lists the actions it otherwise offers only to the pointer (its toolba
 - `chart/` (`crates/datatab_ui_document/src/chart/`) — the `ChartShell` host (`shell.rs`, `host.rs`) plus metric picker (`metric_picker*.rs`) and `toolbar.rs`, distinct from `chart_document/`; it backs metric/instance charts.
 - `BucketsTableDocument` (`crates/datatab_ui_document/src/buckets_table/`) — connection-root object-storage view (name, region, object count, size, versioning, created), reusing `datatab_components::data_table` rather than `DataGridPanel`; keyed by `DocumentKey::ObjectStoreBucketsRoot`.
 - `ObjectBrowserDocument` (`crates/datatab_ui_document/src/object_browser/`) — split tree/preview object-storage browser with paginated and lazy-tree navigation, preview, metadata, upload, delete, rename, and presign; keyed by `DocumentKey::ObjectBrowser`.
-- `ObjectEditorDocument` (`crates/datatab_ui_document/src/object_editor/`) — standalone "open in editor" tab for S3 text objects, sharing the `object_text` module (line-ending detection, language highlighting, save audit) with `ObjectBrowserDocument`'s inline editor; keyed by `DocumentKey::ObjectEditor`.
-- `SecretStoreDocument` (`crates/datatab_ui_document/src/secret_store/`) — paginated secret listing with name search, a details pane, and explicit, audited value retrieval for one `SecretStoreSource`; values are held as `secrecy` types and rendered only through secret inputs, so they never reach the UI automation tree; keyed by `DocumentKey::SecretStore`.
+- `ObjectEditorDocument` (`crates/datatab_ui_document/src/object_editor/`) — standalone "open in editor" tab for text objects in an object store, sharing the `object_text` module (line-ending detection, language highlighting, save audit) with `ObjectBrowserDocument`'s inline editor; keyed by `DocumentKey::ObjectEditor`.
 
 **Adding a new document type** (no changes required outside the new module):
 1. Create `crates/datatab_ui_document/src/<name>/mod.rs` with the entity.
@@ -689,13 +669,9 @@ DataTab persists chart configurations as **Saved Charts** and groups them into *
 
 - **Storage**: `viz_*` tables in `~/.local/share/datatab/datatab.db`. Repositories live in `crates/datatab_storage/src/repositories/viz_dashboards.rs`, `viz_dashboard_panels.rs`, and `viz_saved_charts.rs`. `SavedChartDto` is an aggregate root that writes across three tables atomically.
 - **Managers** (in-memory caches over repositories): `DashboardManager` (`crates/datatab_ui_base/src/dashboard_manager.rs`) with `Dashboard`, `DashboardPanel`, `DashboardPanelKind { Chart { saved_chart_id } | Divider { markdown } | Inspector { metric_id } }`, `DashboardPanelDraft`; `SavedChartManager` (`crates/datatab_ui_base/src/saved_chart_manager.rs`) owns `SavedChart` lifecycle and `SavedChartRefreshPolicy` (`Off` | `Interval { every_secs }`).
-- **Session cache for remote listings**: `RemoteDashboardCache` (`crates/datatab_app/src/remote_dashboard_cache.rs`) — not persisted across restart.
 - **Documents**: `ChartDocument` (`crates/datatab_ui_document/src/chart_document/`) keyed by `DocumentKey::Chart`; `DashboardDocument` (`crates/datatab_ui_document/src/dashboard/`) keyed by `DocumentKey::Dashboard`. Dashboard panels embed `ChartDocument` entities (`Loaded` / `Orphan`); the shared `TimeRangePanel` propagates window changes to every loaded panel via subscriptions.
 - **Driver seams**:
-  - `DashboardImporter` (`crates/datatab_core/src/connection/dashboard_import.rs`) — drivers parse upstream dashboard JSON into `WidgetImportSpec`s. Carries `MetricView { TimeSeries | StackedArea | SingleValue }`, `ImportedMetricSeries`, and native `WidgetLayout` coordinates. Gated by `DriverCapabilities::DASHBOARD_IMPORT`.
-  - `DashboardSource` (`crates/datatab_core/src/connection/dashboard_source.rs`) — drivers list upstream dashboards with `RemoteDashboard` / `DashboardRef` (optional ISO8601 `last_modified`). Gated by `DriverCapabilities::DASHBOARD_SYNC`.
-  - `CloudWatchDashboardSource` + `CloudWatchDashboardImporter` in `crates/datatab_driver_cloudwatch/` implement both for read-only browse + import. DataTab never writes back to CloudWatch dashboards.
-  - `InstanceCatalog` (`crates/datatab_core/src/connection/instance_catalog.rs`) — drivers publish live server metrics (time series), tabular inspectors (sessions, processlist, currentOp, CLIENT LIST), a default **Instance Overview** descriptor, and optional inspector row actions gated by per-driver privilege probes. Gated by `DriverCapabilities::INSTANCE_METRICS` (time-series) and `INSTANCE_INSPECTOR` (tabular). PostgreSQL, MySQL/MariaDB, MongoDB, Redis, and SQL Server implement it.
+  - `InstanceCatalog` (`crates/datatab_core/src/connection/instance_catalog.rs`) — drivers publish live server metrics (time series), tabular inspectors (sessions, processlist, currentOp, CLIENT LIST), a default **Instance Overview** descriptor, and optional inspector row actions gated by per-driver privilege probes. Gated by `DriverCapabilities::INSTANCE_METRICS` (time-series) and `INSTANCE_INSPECTOR` (tabular). PostgreSQL, MySQL/MariaDB, MongoDB, Redis, SQL Server, ClickHouse and InfluxDB (v2) implement it.
 - **Instance Overview**: an auto-generated read-only dashboard keyed by `DocumentKey::InstanceOverview { profile_id }`, composed from the driver's `InstanceCatalog` descriptor. "Save as editable" clones it into a persisted user-owned `Dashboard`. The `Inspector` `DashboardPanelKind` hosts the tabular inspectors and is persisted via `viz_dashboard_panels.panel_kind`.
 
 See `docs/DASHBOARDS.md` for the full reference (including instance metrics and inspectors) and `docs/CHARTS.md` for the chart engine.
@@ -706,48 +682,44 @@ See `docs/DASHBOARDS.md` for the full reference (including instance metrics and 
 - Driver-owned child resources under collections/containers are published through generic `CollectionChildInfo` metadata. The sidebar must not infer driver-specific children from names, field types, or driver IDs.
 - Routines (functions, procedures, aggregates, window functions) appear as a per-schema "Routines" folder when the driver sets the `ROUTINES` capability and populates the `schema_routines` seam. The UI renders the folder generically; it does not special-case any driver.
 - Sidebar dock: `crates/datatab_ui/src/ui/dock/sidebar_dock.rs` remains collapsible and resizable with ToggleSidebar (Ctrl+B), and manages transient reveal separately from the explicit collapse choice.
-- The connection tree walks one projection: `SchemaSnapshot::database_layout` (`crates/datatab_core/src/schema/listing.rs`) says whether each database groups tables and views under schemas, lists its objects in one `ObjectFolder` (collections or measurements), or is a keyspace. The sidebar (`tree_builder/object_folder.rs`) builds each database's content from that description, and its context menu reads object facets and the same layout. Object kinds a driver shows at the connection root, such as S3 buckets, are not in the snapshot; they come from the driver's root sections (see Driver System).
+- The connection tree walks one projection: `SchemaSnapshot::database_layout` (`crates/datatab_core/src/schema/listing.rs`) says whether each database groups tables and views under schemas, lists its objects in one `ObjectFolder` (collections or measurements), or is a keyspace. The sidebar (`tree_builder/object_folder.rs`) builds each database's content from that description, and its context menu reads object facets and the same layout. Object kinds a driver shows at the connection root, such as the buckets of an object store, are not in the snapshot; they come from the driver's root sections (see Driver System).
 - `datatab_ui_base::object_tree` provides a generic lazy hierarchy with one coordinator per `AppStateEntity`. Core/app boundaries fence session and target-slot application; sidebar and wizard adapters retain compatible IDs while keeping interaction state local to each consumer. This does not cover every sidebar-specific family.
 - Connection tree: `crates/datatab_core/src/connection/tree.rs` models folders and connections as a tree structure; `tree_manager.rs` handles in-memory management.
 
 ### Driver System
 
 - **Driver capabilities**: `crates/datatab_core/src/driver/capabilities.rs` defines:
-  - `DatabaseCategory`: Relational, Document, KeyValue, TimeSeries, LogStream, ObjectStorage, SecretStore
-  - `QueryLanguage`: Sql, CloudWatchLogsInsightsQl, OpenSearchPpl, OpenSearchSql, MongoQuery, RedisCommands, Cypher, InfluxQuery, Flux, Cql, Lua, Python, Bash (each carries editor mode, placeholder, comment prefix)
-  - `DriverCapabilities`: `u128` bitflags for features like PAGINATION, TRANSACTIONS, NESTED_DOCUMENTS, MULTI_STATEMENT, ROUTINES, STORED_PROCEDURES, DASHBOARD_IMPORT, DASHBOARD_SYNC, etc.
+  - `DatabaseCategory`: Relational, Document, KeyValue, TimeSeries, ObjectStorage (no built-in driver uses `ObjectStorage`)
+  - `QueryLanguage`: Sql, MongoQuery, RedisCommands, Cypher, InfluxQuery, Flux, Cql, Lua, Python, Bash, Custom (each carries editor mode, placeholder, comment prefix)
+  - `DriverCapabilities`: `u128` bitflags for features like PAGINATION, TRANSACTIONS, NESTED_DOCUMENTS, MULTI_STATEMENT, ROUTINES, STORED_PROCEDURES, etc. Bits retired in #311 stay defined as `RESERVED_*` so wire peers decode; never reuse them
   - `DriverMetadata`: static driver info (id, name, category, query_language, capabilities, icon)
-- **Driver-owned connection forms**: each `DbDriver` returns its `&DriverFormDef` from `form_definition()`. Form definitions live in the driver crate (e.g. `datatab_driver_cloudwatch::driver::CLOUDWATCH_FORM`), not in core. `DriverFormDef` carries tabs → sections → fields, where `FormFieldKind` covers `Text`, `Password`, `WriteOnly` (secrets), `FilePath`, `Select`, `DynamicSelect` (runtime-fetched options, `depends_on` + `RefreshTrigger`), and `AuthProfileRef { provider_id }`.
+- **Driver-owned connection forms**: each `DbDriver` returns its `&DriverFormDef` from `form_definition()`. Form definitions live in the driver crate, not in core. `DriverFormDef` carries tabs → sections → fields, where `FormFieldKind` covers `Text`, `Password`, `WriteOnly` (secrets), `FilePath`, `Select`, `DynamicSelect` (runtime-fetched options, `depends_on` + `RefreshTrigger`), and `AuthProfileRef { provider_id }`.
 - **Error formatting**: `crates/datatab_core/src/core/error_formatter.rs` provides `ErrorFormatter` trait for driver-specific error messages with context (detail, hint, column, table, constraint).
-- Core domain API: `crates/datatab_core/src/core/traits.rs` defines `DbDriver`, `Connection`, SQL generation, cancellation contracts, and generic driver-to-UI seams such as `EventStreamTarget` and `SourceContextSpec`.
-- **Query generation**: `crates/datatab_core/src/query/generator.rs` defines `QueryGenerator` as the driver-owned source of truth for mutation text plus read/query templates. SQL drivers use `SqlMutationGenerator`; MongoDB, Redis, and DynamoDB expose their own native generators. The UI and MCP access generators through `Connection::query_generator()` so previews and copied queries come from the driver rather than a UI-local formatter.
+- Core domain API: `crates/datatab_core/src/core/traits.rs` defines `DbDriver`, `Connection`, SQL generation, cancellation contracts, and a generic driver-to-UI seam such as `SourceContextSpec`.
+- **Query generation**: `crates/datatab_core/src/query/generator.rs` defines `QueryGenerator` as the driver-owned source of truth for mutation text plus read/query templates. SQL drivers use `SqlMutationGenerator`; MongoDB and Redis expose their own native generators. The UI and MCP access generators through `Connection::query_generator()` so previews and copied queries come from the driver rather than a UI-local formatter.
 - Driver forms: `crates/datatab_core/src/driver/form.rs` defines dynamic form schemas that drivers provide for connection configuration. Supports both form-based and URI connection modes.
 - **Driver/UI decoupling**: The UI and app orchestration layers must never branch on concrete driver IDs or embed driver-specific routing. The core exposes the seams, and drivers fill them.
   - `DriverMetadata` covers broad adaptation (`DatabaseCategory`, `QueryLanguage`, `DriverCapabilities`).
-  - `CollectionPresentation` tells the UI how a collection/container opens (for example data grid vs event stream).
-  - `ObjectFacet` (`crates/datatab_core/src/schema/facet.rs`) names the paradigms one object exposes: `Tabular`, `Document`, `Vector`, `TimeSeries`. `CollectionPresentation` picks which document opens; facets pick the view modes, the gates and the filter wording inside the data document. `Connection::object_facets` (tables) and `Connection::collection_facets` (collections) default to `[Tabular]` and drivers override them: PostgreSQL adds `Document` for a `json`/`jsonb` column, `TimeSeries` for a TimescaleDB hypertable and one `Vector` per `vector(n)` column; MongoDB and DynamoDB declare `[Document, Tabular]`; InfluxDB declares `TimeSeries` on `time`. Only the RPC adapter derives facets from the declared category (`category_collection_facets`), since the wire carries none. `TimeSeries` opens the chart over its time column next to the rows; `Document` on a table opens a read-only document tree with JSON values expanded. The enum is exhaustive, so a new facet does not compile until `DataViewMode::for_facet` (`crates/datatab_ui_document/src/data_view.rs`) handles it. Nearest-neighbor SQL stays driver-owned through `QueryGenerator::generate_nearest_neighbors`, defaulted to unsupported.
+  - `CollectionPresentation` tells the UI how a collection/container opens (data grid or object browser).
+  - `ObjectFacet` (`crates/datatab_core/src/schema/facet.rs`) names the paradigms one object exposes: `Tabular`, `Document`, `Vector`, `TimeSeries`. `CollectionPresentation` picks which document opens; facets pick the view modes, the gates and the filter wording inside the data document. `Connection::object_facets` (tables) and `Connection::collection_facets` (collections) default to `[Tabular]` and drivers override them: PostgreSQL adds `Document` for a `json`/`jsonb` column, `TimeSeries` for a TimescaleDB hypertable and one `Vector` per `vector(n)` column; MongoDB declares `[Document, Tabular]`; InfluxDB declares `TimeSeries` on `time`. Only the RPC adapter derives facets from the declared category (`category_collection_facets`), since the wire carries none. `TimeSeries` opens the chart over its time column next to the rows; `Document` on a table opens a read-only document tree with JSON values expanded. The enum is exhaustive, so a new facet does not compile until `DataViewMode::for_facet` (`crates/datatab_ui_document/src/data_view.rs`) handles it. Nearest-neighbor SQL stays driver-owned through `QueryGenerator::generate_nearest_neighbors`, defaulted to unsupported.
   - `category_presentation` (`crates/datatab_components/src/category.rs`) is the one table of per-category fallback icons, tones and schema-tree container labels; a new `DatabaseCategory` adds one arm there instead of a match in each UI crate.
-  - `DataStructure::ReservedGraph` and `ReservedWideColumn` only hold postcard wire indices 3 and 4, and `DatabaseCategory::ReservedGraph` and `ReservedWideColumn` hold indices 3 and 5, so the variants after them keep their indices for driver RPC peers; `crates/datatab_ipc/tests/driver_wire_roundtrip.rs` pins the indices of both enums. Do not remove or reorder their variants.
+  - Reserved wire slots: the enums that driver RPC frames carry by postcard index (`DbKind`, `Icon`, `QueryLanguage`, `DatabaseCategory`, `DataStructure`, `ExecutionSourceContext`, `CollectionPresentation`) keep every retired variant as a hidden `Reserved*` variant, so the variants after it keep their indices for driver RPC peers. `crates/datatab_ipc/tests/driver_wire_roundtrip.rs` pins the indices. Do not remove or reorder their variants. A reserved slot takes the generic fallback in every match, and a profile whose `DbKind` is reserved is refused at save and at bundle import. The table of slots is in `docs/DRIVER_RPC_PROTOCOL.md` § Reserved enum slots.
   - `CollectionChildInfo` lets drivers publish child sources under a collection/container without UI heuristics.
-  - `EventStreamTarget` gives workspace/audit a generic identifier for driver-backed event streams.
   - `SourceContextSpec` lets drivers declare extra query-context controls without hardcoding driver names in `datatab_ui`.
   - `ObjectStoreConnection` (`crates/datatab_core/src/core/traits.rs`), reached via `Connection::object_store_api()`, is the object-storage seam (bucket/object listing, CRUD, presign, copy, versions); `CollectionPresentation::ObjectBrowser` and `PaneHandle::status_segments()` let the UI open and chrome object-storage documents without branching on driver ID.
-  - `RootSectionSource` (`crates/datatab_core/src/connection/root_section/mod.rs`), reached via `Connection::root_section_source()` and gated by `DriverCapabilities::ROOT_SECTIONS`, declares the object kinds shown at the root of a connection in the sidebar. Each `RootSectionDef` carries a stable id, a label, an empty-state label, an optional folder `RootSectionPresentation`, the `RootItemPresentation` its items open in, whether activating the connection row opens the section, and its item actions. `list_items` returns `RootSectionPage`s of `RootSectionItem`s with a `next_page_token`. Node ids `SchemaNodeId::RootSection`, `RootSectionItem` and `RootSectionLoadMore` carry the section id, so a new object kind needs no `SchemaNodeKind` variant. One generic renderer (`crates/datatab_ui_sidebar/src/root_sections/`) builds the folders, caches listings per profile and loads further pages on demand. A failed declaration fetch or first page shows a retry row and is never cached as empty. A section id must not contain `|`, because node ids embed it; the sidebar rejects and reports such a declaration. A section whose folder or item presentation needs `Connection::object_store_api` is hidden on a connection without one. The workspace routes activation by the declared presentation (`ObjectContainerTable` opens the containers table, `ObjectBrowser` the object browser). Labels are `LocalizedText`: an optional key from the host's i18n catalog plus a mandatory English fallback, resolved with `datatab_i18n::try_translate`. Each `RootSectionAction` carries an `ExecutionClassification`: `Destructive`, `Admin` and `AdminDestructive` ask for confirmation, and every run, successful or not, records a `Governance` audit row. An action runs only on the connection it was requested on, and the profile's `MutationPolicy` gates every action above `Read`: `ReadOnly` refuses it, and so does `ApprovalRequired` until approval routing covers these actions. A successful action lists the section again and reloads the open document that shows it. External drivers reach the seam over driver RPC 1.9 (`RootSections`, `RootSectionItems`, `ExecuteRootSectionAction`). S3 is the reference implementation: one `buckets` section whose items open in the object browser, with a Delete bucket action classified `AdminDestructive`.
+  - `RootSectionSource` (`crates/datatab_core/src/connection/root_section/mod.rs`), reached via `Connection::root_section_source()` and gated by `DriverCapabilities::ROOT_SECTIONS`, declares the object kinds shown at the root of a connection in the sidebar. Each `RootSectionDef` carries a stable id, a label, an empty-state label, an optional folder `RootSectionPresentation`, the `RootItemPresentation` its items open in, whether activating the connection row opens the section, and its item actions. `list_items` returns `RootSectionPage`s of `RootSectionItem`s with a `next_page_token`. Node ids `SchemaNodeId::RootSection`, `RootSectionItem` and `RootSectionLoadMore` carry the section id, so a new object kind needs no `SchemaNodeKind` variant. One generic renderer (`crates/datatab_ui_sidebar/src/root_sections/`) builds the folders, caches listings per profile and loads further pages on demand. A failed declaration fetch or first page shows a retry row and is never cached as empty. A section id must not contain `|`, because node ids embed it; the sidebar rejects and reports such a declaration. A section whose folder or item presentation needs `Connection::object_store_api` is hidden on a connection without one. The workspace routes activation by the declared presentation (`ObjectContainerTable` opens the containers table, `ObjectBrowser` the object browser). Labels are `LocalizedText`: an optional key from the host's i18n catalog plus a mandatory English fallback, resolved with `datatab_i18n::try_translate`. Each `RootSectionAction` carries an `ExecutionClassification`: `Destructive`, `Admin` and `AdminDestructive` ask for confirmation, and every run, successful or not, records a `Governance` audit row. An action runs only on the connection it was requested on, and the profile's `MutationPolicy` gates every action above `Read`: `ReadOnly` refuses it, and so does `ApprovalRequired` until approval routing covers these actions. A successful action lists the section again and reloads the open document that shows it. External drivers reach the seam over driver RPC 1.9 (`RootSections`, `RootSectionItems`, `ExecuteRootSectionAction`). No built-in driver declares root sections since the S3 driver was removed (#311); an RPC driver can.
   - `TableViewFeatures` (`crates/datatab_core/src/data/column_profile.rs`), reported by `Connection::table_view_features()`, gates a table's Columns and Partitions views, read estimate, sample profile and column picker. The data come from `table_profile`, `table_partitions`, `estimate_table_read` and `sample_table_profile`, and `TableBrowseRequest::columns` carries the projection. The UI (`crates/datatab_ui_document/src/data_grid_panel/table_views.rs`) renders them with the shared `ColumnProfileView`, `PartitionListView`, `ColumnProjectionPicker` and `ReadEstimateBar` from `datatab_components`. The Parquet document uses the same profile view, picker and estimate bar, and the CSV document uses the profile view.
   - If the UI needs new behavior, add a generic core abstraction first; do not add `if driver_id == ...` in `datatab_ui` or app-facing workflow code.
 
 ### Auth & Access Pipeline
 
-- `crates/datatab_app/src/auth_provider_registry.rs` maintains runtime `DynAuthProvider` registration in the app crate and avoids hardcoding AWS provider logic in connection UI flows.
-- `crates/datatab_core/src/auth/` defines provider contracts (`AuthFormDef`, `DynAuthProvider`, `ImportableProfile`, `after_profile_saved`) and serializable auth profile/session types.
-- `AuthProfile` uses a flat provider-agnostic `fields: HashMap<String, String>` (migrated from nested `config` payloads, with compatibility deserialization for legacy entries). Two extra flags model the live-reflection layer:
-  - `read_only: bool` — set when the profile is reflected from an external source of truth (e.g. `~/.aws/config`); DataTab does not edit reflected profiles.
-  - `dangling_origin: Option<String>` — marks stored profiles that lost their backing source. Values: `"keyring-only"` (only the keyring secret remains), `"file-gone"` (the file entry disappeared).
-- **AWS live profile reflection**: `datatab_aws/src/config.rs` reads `~/.aws/config` and `~/.aws/credentials` as the source of truth via `CachedAwsConfig` (mtime-keyed dual cache, one per file). `AwsProfileInfo` carries `is_sso`, `is_sso_session`, `sso_session` (named reference), `sso_start_url`, `sso_region`, `sso_account_id`, `sso_role_name`. AWS SSO sessions appear as first-class auth profile entries (`[sso-session <name>]`); profiles that reference them are expanded before login/validation.
-- `crates/datatab_core/src/access/mod.rs` introduces provider-agnostic `AccessKind::Managed { provider, params }` with transparent migration from legacy `method = "ssm"` profile JSON.
+- `crates/datatab_app/src/auth_provider_registry.rs` maintains runtime `DynAuthProvider` registration in the app crate and keeps connection UI flows provider-agnostic. DataTab ships no built-in auth provider; the registry holds RPC-backed providers only (`AppState::build_auth_provider_registry`).
+- `crates/datatab_core/src/auth/` defines provider contracts (`AuthProvider`, `DynAuthProvider`, `AuthFormDef`) and serializable auth profile/session types.
+- `AuthProfile` uses a flat provider-agnostic `fields: HashMap<String, String>` (migrated from nested `config` payloads, with compatibility deserialization for legacy entries).
+- `crates/datatab_core/src/access/mod.rs` introduces provider-agnostic `AccessKind::Managed { provider, params }` with transparent migration from legacy `method = "ssm"` profile JSON. The SSM provider was removed (#311), so a managed access fails with an unknown-provider error.
 - `crates/datatab_core/src/pipeline/mod.rs` runs pre-connect stages (`Authenticating` -> `ResolvingValues` -> `OpeningAccess`) and publishes `PipelineState` updates to UI watchers.
-- `crates/datatab_app/src/access_manager.rs` provides the app-side `AccessManager` implementation for direct and managed access providers (currently `aws-ssm`).
-- **Auth-profile dropdown decoupling (DEC-1)**: the connection manager renders its auth-profile picker from the generic `FormFieldKind::AuthProfileRef { provider_id: Option<String> }` form-field seam, never by matching driver ids. Drivers that want the picker (e.g. DynamoDB, CloudWatch) declare a `profile` field as `AuthProfileRef { provider_id: None }`; a `None` filter enumerates profiles provider-agnostically, so built-in and external RPC-backed providers both appear. The form-field kind is not persisted, so adding/removing it needs no storage migration.
+- `crates/datatab_app/src/access_manager.rs` provides the app-side `AccessManager` implementation for direct, SSH and proxy access. It registers no managed access provider, so `open_managed` always fails with an unknown-provider error.
+- **Auth-profile dropdown decoupling (DEC-1)**: the connection manager renders its auth-profile picker from the generic `FormFieldKind::AuthProfileRef { provider_id: Option<String> }` form-field seam, never by matching driver ids. Drivers that want the picker (for example an external RPC driver) declare a `profile` field as `AuthProfileRef { provider_id: None }`; a `None` filter enumerates profiles provider-agnostically, so built-in and external RPC-backed providers both appear. The form-field kind is not persisted, so adding/removing it needs no storage migration.
 
 ### Tunnel Infrastructure
 
@@ -776,7 +748,7 @@ See `docs/DASHBOARDS.md` for the full reference (including instance metrics and 
 - Settings is organized into the following sections: General, Keybindings, Auth Profiles, Proxies, SSH Tunnels, Services, Hooks, Drivers, Audit, and About. MCP sections (trusted clients, roles, policies) are feature-gated under the `mcp` feature.
 - Sidebar uses `TreeNav` component with collapsible Network/Connection categories.
 - `UiStateStore` persists sidebar collapse state to `st_ui_state` table in `~/.local/share/datatab/datatab.db`.
-- Auth Profiles section is provider-driven (`DynAuthProvider::form_def`) and supports importing provider-discovered profiles (for AWS, from `~/.aws/config`).
+- Auth Profiles section is provider-driven (`DynAuthProvider::form_def`).
 - Proxy and SSH tunnel forms use `FormGridNav<F>` for keyboard-driven 2D grid navigation.
 - Drivers section shows per-driver settings overrides filtered by `DatabaseCategory`.
 
@@ -868,12 +840,6 @@ The channel/branding model is a runtime seam: UI and app code read `ReleaseChann
   - Keyspace (database index) support
   - Key scanning, TTL management, rename, type discovery
   - Command generator (`RedisCommandGenerator`) for all key-value mutation types
-- **DynamoDB**: `crates/datatab_driver_dynamodb/` — `aws-sdk-dynamodb` driver with:
-  - Native table discovery (`ListTables`, `DescribeTable`) with PK/SK + GSI/LSI key metadata mapped to DataTab document abstractions
-  - Read path planning (`Scan` vs `Query`) with read options (`index`, `consistent_read`) and server-filter translation/fallback controls
-  - Mutation support for single and multi-item paths (`put`, `update`, `delete`), with single-item upsert and bounded retry handling for unprocessed batch writes
-  - JSON command-envelope parser for execute mode (`scan`, `query`, `put`, `update`, `delete`) and mutation query generation (`DynamoQueryGenerator`)
-  - Current limits: no query cancellation, no PartiQL/transaction API surface, and no `update many + upsert` combination
 - **InfluxDB**: `crates/datatab_driver_influxdb/` — `DatabaseCategory::TimeSeries` driver covering both InfluxDB v1 and v2:
   - v1 speaks InfluxQL; v2 exposes Flux in addition to InfluxQL (`QueryGenerator` emits Flux only when `version == V2`)
   - Bucket/database and measurement discovery mapped to the schema model, with pagination and CSV/JSON export
@@ -891,20 +857,6 @@ The channel/branding model is a runtime seam: UI and app code read `ReleaseChann
   - Attaches the profile's DuckLake catalog as `lake` on connect; each attached catalog is a database under `SchemaLoadingStrategy::LazyPerDatabase`, discovered from `duckdb_databases()`, `duckdb_tables()`, and `duckdb_columns()`
   - Implements `ExecutionSessionFactory` on the root connection: every session is its own DuckDB connection to the shared instance, so an editor transaction never captures grid, sidebar, or MCP requests
   - Read-only enforcement accepts only text DuckDB's parser serializes as SELECT statements (`json_serialize_sql`) and runs it inside `BEGIN TRANSACTION READ ONLY`; because such a transaction still reads files and URLs, table functions outside an allow-list and table names DuckDB would read as files are refused
-- **CloudWatch Logs**: `crates/datatab_driver_cloudwatch/` — `DatabaseCategory::LogStream` driver for AWS CloudWatch Logs:
-  - Log group/stream discovery exposed as collections; log groups open as event streams via `CollectionPresentation::EventStream` and a generic `EventStreamTarget`, consumed by the `AuditDocument`/log-stream viewer without any driver-specific UI branch
-  - Query modes (Logs Insights QL, OpenSearch PPL/SQL) are surfaced through `SourceContextSpec`; `DriverMetadata.query_language` defaults to `Sql` for editor behavior
-  - Authentication through the AWS auth stack; no query cancellation yet
-- **Amazon S3**: `crates/datatab_driver_s3/` — `aws-sdk-s3` driver (`DatabaseCategory::ObjectStorage`):
-  - Authentication via AWS profile/SSO (`AuthProfileRef`) or static access-key credentials, with endpoint override and path-style addressing for S3-compatible endpoints (Cloudflare R2, MinIO)
-  - Bucket discovery (`BucketsTableDocument` at the connection root) and per-level paginated object navigation (`ObjectBrowserDocument`), with an optional non-paginated tree mode
-  - `ObjectStoreConnection` implementation covers upload, delete, recursive prefix/bucket delete (batched `DeleteObjects`), copy, presign, bucket details/versioning, and object versions
-  - Full CRUD from the UI: upload, type-to-confirm recursive delete, folder/bucket creation with per-endpoint graceful degradation, rename (copy-then-delete), presigned URLs
-  - Every mutation made from the buckets table or the object browser is audited under `EventCategory::ObjectStorage` when auditing is enabled; a failed audit write is logged as a warning and the mutation still stands, with no fallback record; the sidebar Delete bucket action is a root section action and is audited under `EventCategory::Governance`. Credentials and presigned URLs are never logged or persisted
-- **AWS Secrets**: `crates/datatab_driver_aws_secrets/` — `aws-sdk-secretsmanager` + `aws-sdk-ssm` driver (`DatabaseCategory::SecretStore`):
-  - Exposes two stores through `Connection::secret_stores()` and the provider-neutral `SecretStoreSource` seam (`datatab_core/src/connection/secret_store/`), gated by `DriverCapabilities::SECRET_STORE`; per-store `SecretStoreCapabilities` gate UI behavior
-  - Listing (`ListSecrets`, `DescribeParameters`) never fetches values; Parameter Store paths are grouped client-side into direct entries and child paths
-  - Values are read only by an explicit retrieval, audited under `EventCategory::SecretStore` without the value; a denied `kms:Decrypt` maps to `DbError::PermissionDenied`
 
 ### Driver README policy
 
@@ -918,7 +870,7 @@ The channel/branding model is a runtime seam: UI and app code read `ReleaseChann
 - Proxy tunneling: `crates/datatab_proxy/` implements SOCKS5 and HTTP CONNECT proxy tunnels via `TunnelConnector`.
 - SSH tunneling: `crates/datatab_ssh/src/lib.rs` implements SSH tunnel via `TunnelConnector`, all operations serialized to one thread for libssh2 safety.
 - Export: `crates/datatab_export/` provides shape-based export (CSV, JSON pretty/compact, Text, Binary/Hex/Base64). Format availability is determined by `QueryResultShape`, not by driver. Each format has its own module (`binary.rs`, `csv.rs`, `json.rs`, `text.rs`). File-dialog availability is probed at runtime via `datatab_ui_base/src/file_dialog.rs::is_native_file_dialog_available()` (on Linux: checks `PATH` for `xdg-desktop-portal`, `zenity`, `kdialog`); when no backend is available, exports fall back to `fallback_export_dir()` (`~/.local/share/datatab/exports/`) with `unique_path_in()` deconfliction. A clipboard export path is also available as an alternative target.
-- Test support: `crates/datatab_test_support/` provides Docker container management and fixtures for live integration tests across all drivers. DynamoDB Local is used only for integration tests and local validation; production usage targets remote AWS DynamoDB endpoints.
+- Test support: `crates/datatab_test_support/` provides Docker container management and fixtures for live integration tests across all drivers.
 - Icon system: `AppIcon` enum defined in `crates/datatab_components/src/icons/mod.rs`; embedded SVG bytes and the `ALL_ICONS` list remain at `crates/datatab_ui/src/ui/icons/mod.rs` (resources live under `crates/datatab_ui/resources/`), loaded via `assets.rs`.
 - Platform detection: `crates/datatab_ui_base/src/platform.rs` handles X11/Wayland differences with `is_x11()`, `apply_main_window_options()` for the main window, `floating_window_kind()` / `apply_window_options()` for the secondary windows, and the window min size hints. (Shim at `crates/datatab_ui/src/platform.rs`.)
 
@@ -974,17 +926,17 @@ DataTab supports the Model Context Protocol (MCP) for AI client integration with
 **UI Integration**:
 - `McpApprovalsView` (`crates/datatab_ui_document/src/governance/`) document tab for reviewing pending executions
 - `mcp_section.rs` (`crates/datatab_ui_windows/src/settings/mcp_section.rs`) in Settings for trusted clients, roles, and policies
-- `AuditDocument` (`crates/datatab_ui_document/src/audit/`) as the unified event viewer for both internal audit records and driver-backed external event streams exposed through generic `EventStreamTarget`s (no driver-specific audit document path in the UI)
-- `LoginModal` (`crates/datatab_ui/src/ui/overlays/login_modal.rs`) and `SsoWizard` (`crates/datatab_ui_base/src/sso_wizard.rs`, shim at old overlay path) for AWS SSO authentication flow
+- `AuditDocument` (`crates/datatab_ui_document/src/audit/`) as the unified event viewer for internal audit records (no driver-specific audit document path in the UI)
+- `LoginModal` (`crates/datatab_ui/src/ui/overlays/login_modal.rs`) for the auth provider login flow
 
 ## Data Flow
 
 - Startup: `main` creates `AppState` and `Workspace`, restores the previous session (tabs from the session manifest in `datatab.db`), and opens the main window. If no tabs are restored, focus defaults to the sidebar (`crates/datatab/src/main.rs`, `crates/datatab_ui/src/ui/views/workspace/`).
 - External driver bootstrap: at startup, DataTab reads `cfg_services` from `~/.local/share/datatab/datatab.db`, probes each service, and only registers services that complete the RPC handshake (`Hello`) successfully.
-- Connect flow: `AppState::prepare_pipeline_input` builds a provider-agnostic pre-connect pipeline input. The pipeline runs auth/session validation, dynamic value resolution, and managed/direct access setup before driver connect + schema fetch. Supports form-based configuration, direct URI input, optional proxy/SSH, and managed access (`aws-ssm`). Connection hooks still run at each phase (PreConnect, PostConnect, PreDisconnect, PostDisconnect).
+- Connect flow: `AppState::prepare_pipeline_input` builds a provider-agnostic pre-connect pipeline input. The pipeline runs auth/session validation, dynamic value resolution, and direct, SSH or proxy access setup before driver connect + schema fetch. Supports form-based configuration, direct URI input, and optional proxy/SSH. Connection hooks still run at each phase (PreConnect, PostConnect, PreDisconnect, PostDisconnect).
 - Query flow: `CodeDocument` submits database queries to a `Connection` implementation when the active `QueryLanguage` supports connection context. The query language (SQL/MongoDB/etc) is determined by driver metadata. Results are rendered in result tabs within the document. Dangerous queries (DELETE without WHERE, DROP, TRUNCATE) trigger confirmation dialogs (handled in `code/execution.rs`). When the driver advertises the `MULTI_STATEMENT` capability, a script containing several statements separated by `;` is executed as a batch, producing one result set per statement.
 - Script flow: `CodeDocument` executes Lua, Python, and Bash documents as script hooks rather than database queries. Script runs create a local output channel, stream live text into a document-owned buffer, and keep the final output as a text result when execution completes.
-- View mode selection: `DataGridPanel` (in `crates/datatab_ui_document/src/data_grid_panel/`) automatically selects appropriate view mode based on database category—Table view for relational databases, Document tree view for document databases like MongoDB and DynamoDB, key-value view for Redis. Event-stream-like document containers are opened through `CollectionPresentation::EventStream` rather than UI-side driver checks. Context menus include "Copy as Query" for generating driver-specific mutation statements/envelopes via `QueryGenerator`.
+- View mode selection: `DataGridPanel` (in `crates/datatab_ui_document/src/data_grid_panel/`) automatically selects appropriate view mode based on database category—Table view for relational databases, Document tree view for document databases like MongoDB, key-value view for Redis. Context menus include "Copy as Query" for generating driver-specific mutation statements/envelopes via `QueryGenerator`.
 - Query preview: `SqlPreviewModal` (in `crates/datatab_ui_base/src/sql_preview_modal.rs`, shim at the old overlay path) routes relational read/DML previews through `QueryGenerator` for row, table, and view previews, while DDL stays on `CodeGenerator`. Non-SQL languages (MongoDB, Redis) still use generic preview mode with static text and language-specific syntax highlighting.
 - Schema refresh: `Workspace::refresh_schema` runs `Connection::schema` on a background executor and updates `AppState` (`crates/datatab_ui/src/ui/views/workspace/`).
 - Lazy loading: Drivers fetch table/collection metadata (columns, indexes) on-demand when items are expanded in sidebar, not during initial connection (performance optimization for large databases).
@@ -1010,13 +962,9 @@ DataTab supports the Model Context Protocol (MCP) for AI client integration with
 - Microsoft SQL Server: `tiberius` TDS client with TLS modes (`off`/`on`/`required`), SSH tunneling, SQL Browser named-instance lookup, multi-database/multi-schema introspection via qualified `sys.*` catalog queries, CRUD with `OUTPUT INSERTED.*` / `OUTPUT DELETED.*`, and cooperative cancellation via side-channel `KILL <spid>` with automatic session restore (crates/datatab_driver_mssql/src/driver.rs).
 - MongoDB: `mongodb` async driver with BSON handling, query parser for `db.collection.method()` syntax, collection/index discovery, document CRUD, shell query generation, and collection description support for MCP/UI metadata workflows (crates/datatab_driver_mongodb/src/driver.rs).
 - Redis: `redis` driver with key-value API for all Redis types, variadic commands, keyspace support, key scanning, and command generation (crates/datatab_driver_redis/src/driver.rs).
-- DynamoDB: `aws-sdk-dynamodb` driver with AWS profile/region support for remote DynamoDB, plus optional endpoint override for local emulators and tests (crates/datatab_driver_dynamodb/src/driver.rs).
 - ClickHouse: HTTP(S) driver using `reqwest` with dynamic JSON decoding, database/table discovery, and read-oriented SQL support for self-hosted ClickHouse and ClickHouse Cloud (crates/datatab_driver_clickhouse/src/driver.rs).
 - TursoDB: `turso_serverless` driver over Hrana HTTP with per-profile Tokio bridging, PRAGMA-based schema discovery, typed CRUD, and per-stream execution sessions for interactive transactions (crates/datatab_driver_turso/src/connection.rs).
 - DuckDB: bundled `duckdb` driver for files, in-memory databases, and DuckLake catalogs, with one shared instance per file, catalog-per-database discovery, query cancellation, and read-only transactions (crates/datatab_driver_duckdb/src/connection.rs).
-- Amazon S3: `aws-sdk-s3` driver with AWS profile/SSO or static credentials, endpoint override and path-style addressing for S3-compatible endpoints (Cloudflare R2, MinIO), bucket/object CRUD, presigned URLs, and copy/versions support (crates/datatab_driver_s3/src/driver.rs).
-- AWS Secrets: `aws-sdk-secretsmanager` and `aws-sdk-ssm` driver with AWS profile/SSO or static credentials and endpoint override, paginated secret and parameter listing, details, and explicit value retrieval (crates/datatab_driver_aws_secrets/src/driver/mod.rs).
-- AWS auth stack: `datatab_aws` provides AWS SSO/shared/static auth providers, SSO login orchestration, account/role discovery, and `~/.aws/config` profile write-back for newly saved auth profiles.
 - Local IPC/RPC: `interprocess` sockets + versioned envelopes for app control and RPC service communication (`crates/datatab_ipc/`, `crates/datatab_driver_ipc/`, `crates/datatab_driver_host/`). `datatab_app::rpc_services` discovers persisted service descriptors, adapts `RpcServiceKind::Driver` into runtime `DbDriver`s, wires `RpcServiceKind::AuthProvider` into `RpcAuthProvider` (which implements `DynAuthProvider`), and wires `RpcServiceKind::SecretProvider` into `RpcSecretProvider` (which implements `DynSecretProvider`; see [Secret Provider RPC Protocol](docs/SECRET_PROVIDER_RPC_PROTOCOL.md)). Preserves `rpc:<socket_id>` compatibility. Auth-provider IPC protocol is at v1.2: adds `FetchDynamicOptions` / `DynamicOptions` variants and the `secret_dependency_opt_in` manifest flag. Auth tokens are managed by `datatab_ipc/src/auth.rs`.
 - Proxy: SOCKS5/HTTP CONNECT tunnels via `datatab_tunnel_core::Tunnel` (crates/datatab_proxy/src/lib.rs).
 - SSH: `ssh2` sessions with local TCP forwarding via `datatab_tunnel_core::Tunnel` (crates/datatab_ssh/src/lib.rs).
@@ -1026,7 +974,7 @@ DataTab supports the Model Context Protocol (MCP) for AI client integration with
 ## Configuration
 
 - Workspace settings: `Cargo.toml` defines workspace members and shared dependencies.
-- App features: `crates/datatab/Cargo.toml` gates `sqlite`, `postgres`, `mysql`, `mongodb`, `redis`, `dynamodb`, `cloudwatch`, `influxdb`, `mssql`, `redshift`, `clickhouse`, `s3`, `aws_secrets`, `lua`, `aws`, and `mcp` (enabled by default in this branch).
+- App features: `crates/datatab/Cargo.toml` gates `sqlite`, `postgres`, `mysql`, `mongodb`, `redis`, `influxdb`, `mssql`, `redshift`, `clickhouse`, `turso`, `duckdb`, `lua`, and `mcp` (enabled by default in this branch).
 - Runtime data: All runtime configuration is stored in `~/.local/share/datatab/datatab.db` (single SQLite file).
   - `cfg_connection_profiles` + child tables (auth, proxy, SSH bindings)
   - `cfg_auth_profiles` (provider-agnostic auth profile storage)

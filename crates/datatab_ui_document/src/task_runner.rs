@@ -42,6 +42,17 @@ impl MutationCancelHandle {
     }
 }
 
+/// Outcome of checking whether a completing primary task is still active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimaryCompletion {
+    /// The task matched the current primary slot and was not cancelled.
+    Completed,
+    /// The task matched the current primary slot, but had already been cancelled.
+    Cancelled,
+    /// The task did not match the current primary slot (an older or cleared task).
+    Stale,
+}
+
 pub struct DocumentTaskRunner {
     primary: TaskSlot,
     app_state: Entity<AppStateEntity>,
@@ -111,6 +122,26 @@ impl DocumentTaskRunner {
                 cx.emit(AppStateChanged);
             });
         }
+    }
+
+    /// Complete the primary task if `task_id` is still the active, uncancelled
+    /// primary task, distinguishing a cancelled current task from a stale one.
+    pub fn complete_primary_if_active(
+        &mut self,
+        task_id: TaskId,
+        cx: &mut App,
+    ) -> PrimaryCompletion {
+        let Some((_, token)) = self.primary.take_if(task_id) else {
+            return PrimaryCompletion::Stale;
+        };
+        if token.is_cancelled() {
+            return PrimaryCompletion::Cancelled;
+        }
+        self.app_state.update(cx, |state, cx| {
+            state.complete_task(task_id);
+            cx.emit(AppStateChanged);
+        });
+        PrimaryCompletion::Completed
     }
 
     pub fn fail_primary(&mut self, task_id: TaskId, error: impl Into<String>, cx: &mut App) {

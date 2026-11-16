@@ -17,9 +17,6 @@ For chart engine internals (rendering, axes, decimation, palette), see
   (inline markdown header strip — no chart, no toolbar).
 - Dashboards own a shared **time range** and **refresh policy** that propagate
   to every loaded chart panel via subscriptions.
-- Remote dashboards (e.g. CloudWatch) can be **browsed** in the sidebar and
-  **imported** into a local Dashboard when the driver advertises the right
-  capabilities.
 
 ## Saved charts
 
@@ -110,22 +107,6 @@ The header has:
 > is closed, its refresh tick is skipped — the timer stays alive and resumes
 > automatically when you reconnect, with no need to re-open the dashboard.
 
-## Remote dashboards (CloudWatch)
-
-When a driver supports it (CloudWatch is the reference implementation), DataTab can
-**browse** and **import** upstream dashboards.
-
-- **Browse**: upstream dashboards appear in the sidebar. Opening one fetches and
-  renders it as an **in-memory, read-only** dashboard — nothing is written back to
-  the source, and nothing is saved locally. A **Refresh** action re-fetches the
-  listing. The listing is session-scoped and is **not** kept across restarts.
-- **Import**: the **Import dashboard from JSON…** command (palette or sidebar) parses the
-  upstream definition into a new **local** dashboard with imported charts. It's
-  only available when the active connection's driver supports import — otherwise
-  you'll see *"The active connection does not support dashboard import."*
-
-Remote dashboards are read-only browsing/import; DataTab never modifies the source.
-
 ## Storage Layer
 
 All dashboard and saved-chart data lives in `~/.local/share/datatab/datatab.db`
@@ -138,8 +119,8 @@ under the `viz_*` table prefix:
 | `viz_saved_charts` | Saved chart root (`SavedChartDto`) |
 | `viz_saved_chart_series` | Per-series settings |
 | `viz_saved_chart_binding_y` | Y-axis bindings |
-| `viz_saved_chart_source_metric_dimensions` | CloudWatch metric dimensions |
-| `viz_saved_chart_source_metric_series` | CloudWatch metric series spec |
+| `viz_saved_chart_source_metric_dimensions` | Legacy CloudWatch metric dimensions, kept in the database; the app no longer reads them |
+| `viz_saved_chart_source_metric_series` | Legacy CloudWatch metric series spec, kept in the database; the app no longer reads it |
 
 Repositories live in `crates/datatab_storage/src/repositories/viz_*.rs` and
 implement the standard `Repository` trait
@@ -160,9 +141,6 @@ success.
 - **`SavedChartManager`** (`crates/datatab_ui_base/src/saved_chart_manager.rs`)
   — owns the `SavedChart` lifecycle, including `SavedChartRefreshPolicy`
   (`Off` / `Interval { every_secs }`).
-- **`RemoteDashboardCache`** (`crates/datatab_app/src/remote_dashboard_cache.rs`)
-  — session-scoped in-memory cache for upstream dashboard listings.
-  Not persisted across restart.
 
 ## Document System Integration
 
@@ -218,6 +196,11 @@ earlier part of the seven-day window means no sample was collected yet, not
 that historical data exists, and **Refresh** fetches the current sample rather
 than reconstructing the past; saving an editable overview saves the layout and
 chart configuration, not the collected metric history.
+
+Counter metrics show the change per second between samples. The first sample
+and the interval after a counter reset have no point. After a long gap, such as
+refreshes skipped while disconnected, the next point is the average rate over
+the gap. Metrics already reported as rates are shown as supplied by the server.
 
 ### Opening the Instance Overview
 
@@ -317,33 +300,6 @@ exposes; this document does not duplicate them.
 Drivers opt into dashboard interop through generic core seams — the UI never
 branches on driver IDs.
 
-### Importing dashboards (JSON → local Dashboard)
-
-- **Trait**: `DashboardImporter`
-  (`crates/datatab_core/src/connection/dashboard_import.rs`)
-- **Capability**: `DriverCapabilities::DASHBOARD_IMPORT`
-- **Value types**:
-  - `WidgetImportSpec` — parsed widget spec
-  - `MetricView::{TimeSeries, StackedArea, SingleValue}`
-  - `ImportedMetricSeries` — series + dimensions
-  - `WidgetLayout` — native layout coordinates carried through to the local
-    grid
-
-Drivers parse dashboard JSON into a normalized set of widgets that the UI
-imports as `SavedChart`s and lays out on a new `Dashboard`.
-
-### Browsing remote dashboards (sidebar)
-
-- **Trait**: `DashboardSource`
-  (`crates/datatab_core/src/connection/dashboard_source.rs`)
-- **Capability**: `DriverCapabilities::DASHBOARD_SYNC`
-- **Value types**: `RemoteDashboard`, `DashboardRef`
-  (optional `last_modified: ISO8601`)
-
-The sidebar lists upstream dashboards through this seam; results are cached in
-`RemoteDashboardCache`. Selecting a remote dashboard triggers `DashboardImporter`
-to materialize it locally.
-
 ### Instance metrics and inspectors
 
 - **Trait**: `InstanceCatalog`
@@ -382,32 +338,9 @@ opens, *Save as editable*, inspector panels and row actions), see
 [Instance Overview and inspectors](#instance-overview-and-inspectors)
 above.
 
-### CloudWatch implementation
+## Retired capability bits
 
-`crates/datatab_driver_cloudwatch/src/` provides:
-
-- `CloudWatchDashboardSource` — lists CloudWatch dashboards via the AWS SDK
-- `CloudWatchDashboardImporter` — parses CloudWatch dashboard JSON into
-  `WidgetImportSpec`s with metric series, dimensions, and stat aggregations
-
-This is **read-only browsing and import**, not a sync feature. DataTab never
-writes back to CloudWatch dashboards.
-
-## Capability Matrix
-
-| Capability bit | Meaning |
-|---|---|
-| `DASHBOARD_IMPORT` (51) | Driver can parse dashboard JSON into widget specs |
-| `DASHBOARD_SYNC` (52) | Driver can list upstream dashboards |
-
-Both capabilities are independent: a driver can advertise sync without import
-or vice versa.
-
-## Adding a New Dashboard-Capable Driver
-
-1. Implement `DashboardSource` on the driver `Connection` to list upstream
-   dashboards. Add `DASHBOARD_SYNC` to `DriverMetadata.capabilities`.
-2. Implement `DashboardImporter` on the driver `Connection` to parse a
-   dashboard payload into `WidgetImportSpec`s. Add `DASHBOARD_IMPORT`.
-3. The UI will surface the dashboard tree in the sidebar and route imports
-   without any driver-specific branching.
+`DriverCapabilities` bits 51 and 52 (`RESERVED_DASHBOARD_IMPORT`,
+`RESERVED_DASHBOARD_SYNC`) belonged to the removed remote-dashboard browse and
+import seams (#311). They stay defined only so a peer that still sets them
+decodes cleanly. Never reuse them.

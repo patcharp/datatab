@@ -1,4 +1,3 @@
-use datatab_core::chrono;
 use datatab_core::secrecy::SecretString;
 use datatab_core::{
     Connection, ConnectionProfile, CrudResult, DatabaseCategory, DbConfig, DbDriver, DbError,
@@ -9,12 +8,6 @@ use datatab_core::{
     TransactionCapabilities, TransferFamily, field, field_required,
 };
 use datatab_core::{DatabaseInfo, DefaultSqlDialect};
-use datatab_core::{
-    SecretDetails, SecretListPage, SecretListRequest, SecretRotation, SecretStoreCapabilities,
-    SecretStoreDescriptor, SecretStoreSource, SecretSummary, SecretTag, SecretValue,
-};
-use datatab_driver_cloudwatch::CLOUDWATCH_FORM;
-use datatab_driver_dynamodb::DYNAMODB_FORM;
 use datatab_driver_influxdb::INFLUXDB_FORM;
 use datatab_driver_mongodb::MONGODB_FORM;
 use datatab_driver_mssql::SQLSERVER_FORM;
@@ -83,11 +76,6 @@ struct FakeDriverState {
     connect_error: RwLock<Option<String>>,
     refuse_read_only: AtomicBool,
     delete_row_errors: RwLock<Vec<(datatab_core::Value, String)>>,
-    secret_store_calls: Mutex<FakeSecretStoreCalls>,
-    region_switch_enabled: AtomicBool,
-    available_regions: RwLock<Vec<String>>,
-    region_list_error: RwLock<Option<String>>,
-    available_regions_calls: AtomicUsize,
 }
 
 #[derive(Clone)]
@@ -111,9 +99,11 @@ impl FakeDriver {
 
     /// Declares `supports_read_only` and runs requests that require read-only
     /// enforcement. The fake enforces nothing: it only lets callers observe
-    /// that the flag reached the connection.
+    /// that the flag reached the connection. It clears an earlier
+    /// `with_read_only_refusal`, so the last call of the two wins.
     pub fn with_read_only_enforcement(mut self) -> Self {
         self.set_read_only_capability(true);
+        self.state.refuse_read_only.store(false, Ordering::Relaxed);
         self
     }
 
@@ -132,42 +122,6 @@ impl FakeDriver {
             .transactions
             .get_or_insert_with(TransactionCapabilities::default);
         transactions.supports_read_only = supported;
-    }
-
-    /// Opts a fake into the live region-switch seam: it advertises
-    /// `DriverCapabilities::REGION_SWITCH`, answers `available_regions` with
-    /// the fixed list and rewrites the region of an `AwsSecrets` config. The
-    /// current region comes from the profile each connection was built with,
-    /// so a switch that reconnects with a rewritten config reports the new
-    /// region. Without this opt-in the fake has no region hook and existing
-    /// metadata assertions stay as they are.
-    pub fn with_region_switch(mut self, regions: &[&str]) -> Self {
-        let metadata = Arc::make_mut(&mut self.metadata);
-        metadata.capabilities |= DriverCapabilities::REGION_SWITCH;
-        *rwlock_write(&self.state.available_regions) =
-            regions.iter().map(|region| region.to_string()).collect();
-        self.state
-            .region_switch_enabled
-            .store(true, Ordering::Relaxed);
-        self
-    }
-
-    /// Replaces the region-list answer: `Some` fails the next
-    /// `available_regions` calls with that message, `None` restores the
-    /// fixed list.
-    pub fn set_region_list_error(&self, message: Option<String>) {
-        *rwlock_write(&self.state.region_list_error) = message;
-    }
-
-    /// Replaces the connect outcome for later connects, the way a region
-    /// switch fails when the reconnect cannot be established.
-    pub fn set_connect_error(&self, message: Option<String>) {
-        *rwlock_write(&self.state.connect_error) = message;
-    }
-
-    /// How many times a connection answered `available_regions`.
-    pub fn available_regions_calls(&self) -> usize {
-        self.state.available_regions_calls.load(Ordering::Relaxed)
     }
 
     pub fn with_schema(self, schema: SchemaSnapshot) -> Self {
@@ -230,12 +184,6 @@ impl FakeDriver {
             cancel_active_calls: self.state.cancel_active_calls.load(Ordering::Relaxed),
             close_calls: self.state.close_calls.load(Ordering::Relaxed),
         }
-    }
-
-    /// Every call the fake secret stores of a `DbKind::AwsSecrets` connection
-    /// received, in order.
-    pub fn secret_store_calls(&self) -> FakeSecretStoreCalls {
-        mutex_lock(&self.state.secret_store_calls).clone()
     }
 
     pub fn as_driver_arc(self) -> Arc<dyn DbDriver> {
@@ -344,17 +292,6 @@ impl DbDriver for FakeDriver {
                 sentinel_master_name: None,
                 additional_nodes: None,
             },
-            DbKind::DynamoDB => DbConfig::DynamoDB {
-                region: get_string(values, "region", "us-east-1"),
-                profile: get_optional_string(values, "profile"),
-                endpoint: get_optional_string(values, "endpoint"),
-                table: get_optional_string(values, "table"),
-            },
-            DbKind::CloudWatchLogs => DbConfig::CloudWatchLogs {
-                region: get_string(values, "region", "us-east-1"),
-                profile: get_optional_string(values, "profile"),
-                endpoint: get_optional_string(values, "endpoint"),
-            },
             DbKind::InfluxDB => DbConfig::InfluxDB {
                 version: datatab_core::InfluxVersion::V2,
                 url: get_string(values, "url", "http://localhost:8086"),
@@ -393,18 +330,14 @@ impl DbDriver for FakeDriver {
                 ssh_tunnel: None,
                 ssh_tunnel_profile_id: None,
             },
-            DbKind::S3 => DbConfig::S3 {
-                region: get_string(values, "region", "us-east-1"),
-                profile: get_optional_string(values, "profile"),
-                access_key_id: get_optional_string(values, "access_key_id"),
-                endpoint: get_optional_string(values, "endpoint"),
-                path_style: false,
-            },
-            DbKind::AwsSecrets => DbConfig::AwsSecrets {
-                region: get_string(values, "region", "us-east-1"),
-                profile: get_optional_string(values, "profile"),
-                access_key_id: get_optional_string(values, "access_key_id"),
-                endpoint: get_optional_string(values, "endpoint"),
+            // A reserved wire slot has no config of its own. Like an RPC
+            // driver that declares one, the fake passes the form values on.
+            DbKind::ReservedDynamoDb
+            | DbKind::ReservedCloudWatchLogs
+            | DbKind::ReservedS3
+            | DbKind::ReservedAwsSecrets => DbConfig::External {
+                kind: self.kind,
+                values: values.clone(),
             },
             DbKind::ClickHouse => DbConfig::ClickHouse {
                 url: get_string(values, "url", "http://localhost:8123"),
@@ -494,26 +427,6 @@ impl DbDriver for FakeDriver {
                     database.map(|value| value.to_string()).unwrap_or_default(),
                 );
             }
-            DbConfig::DynamoDB {
-                region,
-                profile,
-                endpoint,
-                table,
-            } => {
-                values.insert("region".to_string(), region.clone());
-                values.insert("profile".to_string(), profile.clone().unwrap_or_default());
-                values.insert("endpoint".to_string(), endpoint.clone().unwrap_or_default());
-                values.insert("table".to_string(), table.clone().unwrap_or_default());
-            }
-            DbConfig::CloudWatchLogs {
-                region,
-                profile,
-                endpoint,
-            } => {
-                values.insert("region".to_string(), region.clone());
-                values.insert("profile".to_string(), profile.clone().unwrap_or_default());
-                values.insert("endpoint".to_string(), endpoint.clone().unwrap_or_default());
-            }
             DbConfig::InfluxDB {
                 url,
                 org,
@@ -557,27 +470,6 @@ impl DbDriver for FakeDriver {
                 values.insert("port".to_string(), port.to_string());
                 values.insert("user".to_string(), user.clone());
                 values.insert("database".to_string(), database.clone());
-            }
-            DbConfig::S3 {
-                region,
-                profile,
-                access_key_id,
-                endpoint,
-                ..
-            }
-            | DbConfig::AwsSecrets {
-                region,
-                profile,
-                access_key_id,
-                endpoint,
-            } => {
-                values.insert("region".to_string(), region.clone());
-                values.insert("profile".to_string(), profile.clone().unwrap_or_default());
-                values.insert(
-                    "access_key_id".to_string(),
-                    access_key_id.clone().unwrap_or_default(),
-                );
-                values.insert("endpoint".to_string(), endpoint.clone().unwrap_or_default());
             }
             DbConfig::ClickHouse {
                 url,
@@ -638,29 +530,6 @@ impl DbDriver for FakeDriver {
 
         Ok(())
     }
-
-    fn with_region(&self, config: &DbConfig, region: &str) -> Option<DbConfig> {
-        if !self.state.region_switch_enabled.load(Ordering::Relaxed) {
-            return None;
-        }
-
-        let DbConfig::AwsSecrets {
-            profile,
-            access_key_id,
-            endpoint,
-            ..
-        } = config
-        else {
-            return None;
-        };
-
-        Some(DbConfig::AwsSecrets {
-            region: region.to_string(),
-            profile: profile.clone(),
-            access_key_id: access_key_id.clone(),
-            endpoint: endpoint.clone(),
-        })
-    }
 }
 
 struct FakeConnection {
@@ -668,8 +537,6 @@ struct FakeConnection {
     state: Arc<FakeDriverState>,
     metadata: Arc<DriverMetadata>,
     active_database: RwLock<Option<String>>,
-    current_region: Option<String>,
-    secret_stores: Vec<FakeSecretStore>,
 }
 
 impl FakeConnection {
@@ -679,23 +546,11 @@ impl FakeConnection {
         state: Arc<FakeDriverState>,
         metadata: Arc<DriverMetadata>,
     ) -> Self {
-        let secret_stores = match kind {
-            DbKind::AwsSecrets => fake_secret_stores(&state),
-            _ => Vec::new(),
-        };
-
-        let current_region = match &profile.config {
-            DbConfig::AwsSecrets { region, .. } => Some(region.clone()),
-            _ => None,
-        };
-
         Self {
             kind,
             state,
             metadata,
             active_database: RwLock::new(active_database_from_profile(profile)),
-            current_region,
-            secret_stores,
         }
     }
 
@@ -788,28 +643,6 @@ impl Connection for FakeConnection {
         rwlock_read(&self.active_database).clone()
     }
 
-    fn current_region(&self) -> Option<String> {
-        self.current_region.clone()
-    }
-
-    fn available_regions(&self) -> Result<Vec<String>, DbError> {
-        if !self.state.region_switch_enabled.load(Ordering::Relaxed) {
-            return Err(DbError::NotSupported(
-                "region listing not supported".to_string(),
-            ));
-        }
-
-        self.state
-            .available_regions_calls
-            .fetch_add(1, Ordering::Relaxed);
-
-        if let Some(message) = rwlock_read(&self.state.region_list_error).clone() {
-            return Err(DbError::PermissionDenied(message.into()));
-        }
-
-        Ok(rwlock_read(&self.state.available_regions).clone())
-    }
-
     fn kind(&self) -> DbKind {
         self.kind
     }
@@ -820,12 +653,13 @@ impl Connection for FakeConnection {
                 SchemaLoadingStrategy::LazyPerDatabase
             }
             DbKind::Postgres | DbKind::Redshift => SchemaLoadingStrategy::ConnectionPerDatabase,
-            DbKind::SQLite | DbKind::MongoDB | DbKind::Redis => {
-                SchemaLoadingStrategy::SingleDatabase
-            }
-            DbKind::DynamoDB | DbKind::CloudWatchLogs | DbKind::S3 | DbKind::AwsSecrets => {
-                SchemaLoadingStrategy::SingleDatabase
-            }
+            DbKind::SQLite
+            | DbKind::MongoDB
+            | DbKind::Redis
+            | DbKind::ReservedDynamoDb
+            | DbKind::ReservedCloudWatchLogs
+            | DbKind::ReservedS3
+            | DbKind::ReservedAwsSecrets => SchemaLoadingStrategy::SingleDatabase,
             DbKind::ClickHouse | DbKind::DuckDB | DbKind::InfluxDB => {
                 SchemaLoadingStrategy::LazyPerDatabase
             }
@@ -866,13 +700,6 @@ impl Connection for FakeConnection {
     fn dialect(&self) -> &dyn SqlDialect {
         &DEFAULT_SQL_DIALECT
     }
-
-    fn secret_stores(&self) -> Vec<&dyn SecretStoreSource> {
-        self.secret_stores
-            .iter()
-            .map(|store| store as &dyn SecretStoreSource)
-            .collect()
-    }
 }
 
 fn active_database_from_profile(profile: &ConnectionProfile) -> Option<String> {
@@ -884,12 +711,9 @@ fn active_database_from_profile(profile: &ConnectionProfile) -> Option<String> {
         DbConfig::MySQL { database, .. } => database.clone(),
         DbConfig::MongoDB { database, .. } => database.clone(),
         DbConfig::Redis { database, .. } => database.map(|value| value.to_string()),
-        DbConfig::DynamoDB { table, .. } => table.clone(),
-        DbConfig::CloudWatchLogs { .. } => None,
         DbConfig::InfluxDB { default_bucket, .. } => default_bucket.clone(),
         DbConfig::SqlServer { database, .. } => database.clone(),
         DbConfig::Redshift { database, .. } => Some(database.clone()),
-        DbConfig::S3 { .. } | DbConfig::AwsSecrets { .. } => None,
         DbConfig::ClickHouse { database, .. } => Some(database.clone()),
         DbConfig::Turso { .. } => None,
         DbConfig::External { values, .. } => values.get("database").cloned(),
@@ -904,8 +728,6 @@ fn metadata_for_kind(kind: DbKind) -> &'static DriverMetadata {
         DbKind::MariaDB => &FAKE_MARIADB_METADATA,
         DbKind::MongoDB => &FAKE_MONGODB_METADATA,
         DbKind::Redis => &FAKE_REDIS_METADATA,
-        DbKind::DynamoDB => &FAKE_DYNAMODB_METADATA,
-        DbKind::CloudWatchLogs => &FAKE_CLOUDWATCH_METADATA,
         DbKind::InfluxDB => &FAKE_INFLUXDB_METADATA,
         // Tests treat SQL Server like a relational driver — reuse postgres metadata.
         DbKind::SqlServer => &FAKE_POSTGRES_METADATA,
@@ -913,30 +735,33 @@ fn metadata_for_kind(kind: DbKind) -> &'static DriverMetadata {
         // postgres (no write/DDL flags), so tests exercise the real driver
         // metadata instead of a hand-rolled fake.
         DbKind::Redshift => &REDSHIFT_METADATA,
-        DbKind::S3 => &FAKE_S3_METADATA,
-        DbKind::AwsSecrets => &FAKE_AWS_SECRETS_METADATA,
         DbKind::ClickHouse => &FAKE_CLICKHOUSE_METADATA,
         DbKind::Turso => &FAKE_TURSO_METADATA,
-        // DuckDB is an embedded SQL engine; the SQLite fake covers it.
-        DbKind::DuckDB => &FAKE_SQLITE_METADATA,
+        // DuckDB is an embedded SQL engine; the SQLite fake covers it. The
+        // reserved wire slots have no fake and share it.
+        DbKind::DuckDB
+        | DbKind::ReservedDynamoDb
+        | DbKind::ReservedCloudWatchLogs
+        | DbKind::ReservedS3
+        | DbKind::ReservedAwsSecrets => &FAKE_SQLITE_METADATA,
     }
 }
 
 fn form_for_kind(kind: DbKind) -> &'static DriverFormDef {
     match kind {
         DbKind::Postgres => &POSTGRES_FORM,
-        DbKind::SQLite | DbKind::DuckDB => &SQLITE_FORM,
+        DbKind::SQLite
+        | DbKind::DuckDB
+        | DbKind::ReservedDynamoDb
+        | DbKind::ReservedCloudWatchLogs
+        | DbKind::ReservedS3
+        | DbKind::ReservedAwsSecrets => &SQLITE_FORM,
         DbKind::MySQL | DbKind::MariaDB => &MYSQL_FORM,
         DbKind::MongoDB => &MONGODB_FORM,
         DbKind::Redis => &REDIS_FORM,
-        DbKind::DynamoDB => &DYNAMODB_FORM,
-        DbKind::CloudWatchLogs => &CLOUDWATCH_FORM,
         DbKind::InfluxDB => &INFLUXDB_FORM,
         DbKind::SqlServer => &SQLSERVER_FORM,
         DbKind::Redshift => &REDSHIFT_FORM,
-        // The AWS secrets driver asks for the same region, profile and
-        // static-credential fields as S3.
-        DbKind::S3 | DbKind::AwsSecrets => &S3_FORM,
         DbKind::ClickHouse => &CLICKHOUSE_FORM,
         DbKind::Turso => &TURSO_FORM,
     }
@@ -1459,135 +1284,6 @@ static FAKE_REDIS_METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverMe
     editor_profile: None,
 });
 
-static FAKE_DYNAMODB_METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverMetadata {
-    id: "fake-dynamodb".into(),
-    display_name: "Fake DynamoDB".into(),
-    description: "Deterministic fake driver for tests".into(),
-    category: DatabaseCategory::Document,
-    transfer_family: TransferFamily::Incompatible,
-    deployment_class: None,
-    query_language: QueryLanguage::Custom("DynamoDB".into()),
-    capabilities: DriverCapabilities::DOCUMENT_BASE,
-    default_port: None,
-    uri_scheme: "dynamodb".into(),
-    icon: Icon::Dynamodb,
-    syntax: None,
-    query: None,
-    mutation: None,
-    ddl: None,
-    transactions: Some(TransactionCapabilities {
-        supports_transactions: false,
-        supported_isolation_levels: vec![],
-        default_isolation_level: None,
-        supports_savepoints: false,
-        supports_nested_transactions: false,
-        supports_read_only: false,
-        supports_deferrable: false,
-    }),
-    limits: None,
-    ssl_modes: None,
-    ssl_cert_fields: None,
-    classification_override: None,
-    default_chunk_size: None,
-    supports_lock_timeout: false,
-    editor_profile: None,
-});
-
-static FAKE_S3_METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverMetadata {
-    id: "fake-s3".into(),
-    display_name: "Fake S3".into(),
-    description: "Deterministic fake driver for tests".into(),
-    category: DatabaseCategory::ObjectStorage,
-    transfer_family: TransferFamily::Incompatible,
-    deployment_class: None,
-    query_language: QueryLanguage::Custom("S3".into()),
-    capabilities: DriverCapabilities::OBJECT_STORAGE | DriverCapabilities::OBJECT_PREFIX_DELETE,
-    default_port: None,
-    uri_scheme: "s3".into(),
-    icon: Icon::S3,
-    syntax: None,
-    query: None,
-    mutation: None,
-    ddl: None,
-    transactions: Some(TransactionCapabilities {
-        supports_transactions: false,
-        supported_isolation_levels: vec![],
-        default_isolation_level: None,
-        supports_savepoints: false,
-        supports_nested_transactions: false,
-        supports_read_only: false,
-        supports_deferrable: false,
-    }),
-    limits: None,
-    ssl_modes: None,
-    ssl_cert_fields: None,
-    classification_override: None,
-    default_chunk_size: None,
-    supports_lock_timeout: false,
-    editor_profile: None,
-});
-
-static FAKE_AWS_SECRETS_METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverMetadata {
-    id: "fake-aws-secrets".into(),
-    display_name: "Fake AWS Secrets".into(),
-    description: "Deterministic fake driver for tests".into(),
-    category: DatabaseCategory::SecretStore,
-    transfer_family: TransferFamily::Incompatible,
-    deployment_class: None,
-    query_language: QueryLanguage::Custom("Secrets".into()),
-    capabilities: DriverCapabilities::SECRET_STORE,
-    default_port: None,
-    uri_scheme: "aws-secrets".into(),
-    icon: Icon::Database,
-    syntax: None,
-    query: None,
-    mutation: None,
-    ddl: None,
-    transactions: None,
-    limits: None,
-    ssl_modes: None,
-    ssl_cert_fields: None,
-    classification_override: None,
-    default_chunk_size: None,
-    supports_lock_timeout: false,
-    editor_profile: None,
-});
-
-/// Minimal placeholder form for tests — the real `S3_FORM` (with the full
-/// static-credentials/endpoint/path-style field set) is defined in
-/// `datatab_driver_s3` once the driver itself is implemented.
-static S3_FORM: LazyLock<DriverFormDef> = LazyLock::new(|| DriverFormDef {
-    tabs: vec![FormTab {
-        id: "main".into(),
-        label: "Main".into(),
-        sections: vec![FormSection {
-            title: "AWS".into(),
-            icon: None,
-            fields: vec![
-                field_required("region", "Region", FormFieldKind::Text, "us-east-1"),
-                field(
-                    "profile",
-                    "Profile",
-                    FormFieldKind::AuthProfileRef { provider_id: None },
-                    "",
-                ),
-                field(
-                    "access_key_id",
-                    "Access Key ID",
-                    FormFieldKind::Text,
-                    "optional",
-                ),
-                field(
-                    "endpoint",
-                    "Endpoint Override",
-                    FormFieldKind::Text,
-                    "optional",
-                ),
-            ],
-        }],
-    }],
-});
-
 static TURSO_FORM: LazyLock<DriverFormDef> = LazyLock::new(|| DriverFormDef {
     tabs: vec![FormTab {
         id: "main".into(),
@@ -1601,40 +1297,6 @@ static TURSO_FORM: LazyLock<DriverFormDef> = LazyLock::new(|| DriverFormDef {
             ],
         }],
     }],
-});
-
-static FAKE_CLOUDWATCH_METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverMetadata {
-    id: "fake-cloudwatch".into(),
-    display_name: "Fake CloudWatch Logs".into(),
-    description: "Deterministic fake driver for tests".into(),
-    category: DatabaseCategory::Document,
-    transfer_family: TransferFamily::Incompatible,
-    deployment_class: None,
-    query_language: QueryLanguage::Sql,
-    capabilities: DriverCapabilities::AUTHENTICATION,
-    default_port: None,
-    uri_scheme: "cloudwatch".into(),
-    icon: Icon::Dynamodb,
-    syntax: None,
-    query: None,
-    mutation: None,
-    ddl: None,
-    transactions: Some(TransactionCapabilities {
-        supports_transactions: false,
-        supported_isolation_levels: vec![],
-        default_isolation_level: None,
-        supports_savepoints: false,
-        supports_nested_transactions: false,
-        supports_read_only: false,
-        supports_deferrable: false,
-    }),
-    limits: None,
-    ssl_modes: None,
-    ssl_cert_fields: None,
-    classification_override: None,
-    default_chunk_size: None,
-    supports_lock_timeout: false,
-    editor_profile: None,
 });
 
 static FAKE_INFLUXDB_METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverMetadata {
@@ -1860,12 +1522,7 @@ mod tests {
             (DbKind::MongoDB, SchemaLoadingStrategy::SingleDatabase),
             (DbKind::Redis, SchemaLoadingStrategy::SingleDatabase),
             (DbKind::ClickHouse, SchemaLoadingStrategy::LazyPerDatabase),
-            (DbKind::DynamoDB, SchemaLoadingStrategy::SingleDatabase),
             (DbKind::InfluxDB, SchemaLoadingStrategy::LazyPerDatabase),
-            (
-                DbKind::CloudWatchLogs,
-                SchemaLoadingStrategy::SingleDatabase,
-            ),
             (DbKind::SqlServer, SchemaLoadingStrategy::LazyPerDatabase),
             (
                 DbKind::Redshift,
@@ -1898,16 +1555,17 @@ mod tests {
                 },
                 DbKind::MongoDB => DbConfig::default_mongodb(),
                 DbKind::Redis => DbConfig::default_redis(),
-                DbKind::DynamoDB => DbConfig::default_dynamodb(),
-                DbKind::CloudWatchLogs => DbConfig::default_cloudwatch_logs(),
                 DbKind::InfluxDB => DbConfig::default_influxdb(),
                 DbKind::SqlServer => DbConfig::default_sqlserver(),
                 DbKind::Redshift => DbConfig::default_redshift(),
-                DbKind::S3 => DbConfig::default_s3(),
-                DbKind::AwsSecrets => DbConfig::default_aws_secrets(),
                 DbKind::ClickHouse => DbConfig::default_clickhouse(),
                 DbKind::Turso => DbConfig::default_turso(),
                 DbKind::DuckDB => DbConfig::default_duckdb(),
+                // No case above uses a reserved wire slot.
+                DbKind::ReservedDynamoDb
+                | DbKind::ReservedCloudWatchLogs
+                | DbKind::ReservedS3
+                | DbKind::ReservedAwsSecrets => DbConfig::default_sqlite(),
             };
 
             let profile = ConnectionProfile::new("fake", config);
@@ -1983,6 +1641,30 @@ mod tests {
     }
 
     #[test]
+    fn enforcement_after_refusal_clears_the_refusal() {
+        let driver = FakeDriver::new(DbKind::Postgres)
+            .with_read_only_refusal()
+            .with_read_only_enforcement();
+        let connection = connect_postgres(&driver);
+
+        assert!(connection.metadata().enforces_read_only());
+        assert!(connection.execute(&read_only_request()).is_ok());
+    }
+
+    #[test]
+    fn refusal_after_enforcement_refuses() {
+        let driver = FakeDriver::new(DbKind::Postgres)
+            .with_read_only_enforcement()
+            .with_read_only_refusal();
+        let connection = connect_postgres(&driver);
+
+        assert!(matches!(
+            connection.execute(&read_only_request()),
+            Err(DbError::NotSupported(_))
+        ));
+    }
+
+    #[test]
     fn fake_with_read_only_refusal_declares_enforcement_but_refuses_at_execution() {
         let driver = FakeDriver::new(DbKind::Postgres).with_read_only_refusal();
         let connection = connect_postgres(&driver);
@@ -1994,416 +1676,4 @@ mod tests {
         ));
         assert!(connection.execute(&QueryRequest::new("SELECT 1")).is_ok());
     }
-}
-
-// ---------------------------------------------------------------------------
-// Fake secret stores
-// ---------------------------------------------------------------------------
-
-/// The calls the fake secret stores received, as `(store_id, argument)`.
-#[derive(Debug, Clone, Default)]
-pub struct FakeSecretStoreCalls {
-    pub list_requests: Vec<(String, SecretListRequest)>,
-    pub described: Vec<(String, String)>,
-    pub value_requests: Vec<(String, String)>,
-}
-
-/// Id of the fake flat store, shaped like AWS Secrets Manager.
-pub const FAKE_SECRETS_STORE_ID: &str = "secrets-manager";
-
-/// Id of the fake hierarchical store, shaped like SSM Parameter Store.
-pub const FAKE_PARAMETER_STORE_ID: &str = "parameter-store";
-
-/// Value the fake flat store returns for its key/value secret's `password`.
-pub const FAKE_SECRET_PASSWORD: &str = "fake-password-7f3a";
-
-/// Value the fake flat store returns for its plaintext secret.
-pub const FAKE_SECRET_PLAINTEXT: &str = "fake plaintext token 91c2";
-
-/// Bytes the fake flat store returns for its binary secret.
-pub const FAKE_SECRET_BINARY: &[u8] = &[0xde, 0xad, 0xbe, 0xef, 0x00, 0x42];
-
-/// Error the fake parameter store returns for its `SecureString`.
-pub const FAKE_KMS_DENIED_MESSAGE: &str =
-    "User is not authorized to perform kms:Decrypt on key alias/app-prod";
-
-enum FakeSecretPayload {
-    Text(String),
-    Binary(Vec<u8>),
-    Denied(&'static str),
-    Unavailable(&'static str),
-}
-
-struct FakeSecret {
-    details: SecretDetails,
-    payload: FakeSecretPayload,
-}
-
-/// A deterministic in-memory secret store. A flat store matches its name
-/// filter as a prefix, a hierarchical one as a substring of the full name.
-struct FakeSecretStore {
-    descriptor: SecretStoreDescriptor,
-    secrets: Vec<FakeSecret>,
-    default_page_size: usize,
-    state: Arc<FakeDriverState>,
-}
-
-impl FakeSecretStore {
-    fn record_list(&self, request: &SecretListRequest) {
-        mutex_lock(&self.state.secret_store_calls)
-            .list_requests
-            .push((self.descriptor.id.clone(), request.clone()));
-    }
-
-    fn hierarchical(&self) -> bool {
-        self.descriptor
-            .supports(SecretStoreCapabilities::HIERARCHICAL)
-    }
-
-    fn matches_filter(&self, name: &str, filter: Option<&str>) -> bool {
-        match filter.map(str::trim).filter(|filter| !filter.is_empty()) {
-            None => true,
-            Some(filter) if self.hierarchical() => name.contains(filter),
-            Some(filter) => name.starts_with(filter),
-        }
-    }
-
-    /// Entries of one listing before paging, and the sub-paths found under
-    /// the requested path.
-    fn listing(&self, request: &SecretListRequest) -> (Vec<&FakeSecret>, Vec<String>) {
-        let filter = request.name_filter.as_deref();
-
-        if !self.hierarchical() {
-            let entries = self
-                .secrets
-                .iter()
-                .filter(|secret| self.matches_filter(&secret.details.summary.name, filter))
-                .collect();
-            return (entries, Vec::new());
-        }
-
-        let path = request.path.clone().unwrap_or_else(|| "/".to_string());
-        let mut entries = Vec::new();
-        let mut child_paths = Vec::new();
-
-        for secret in &self.secrets {
-            let name = &secret.details.summary.name;
-            let Some(rest) = name.strip_prefix(path.as_str()) else {
-                continue;
-            };
-
-            match rest.split_once('/') {
-                Some((segment, _)) if !request.recursive => {
-                    let child = format!("{path}{segment}/");
-                    if !child_paths.contains(&child) {
-                        child_paths.push(child);
-                    }
-                }
-                _ => {
-                    if self.matches_filter(name, filter) {
-                        entries.push(secret);
-                    }
-                }
-            }
-        }
-
-        (entries, child_paths)
-    }
-
-    fn find(&self, name: &str) -> Result<&FakeSecret, DbError> {
-        self.secrets
-            .iter()
-            .find(|secret| secret.details.summary.name == name)
-            .ok_or_else(|| DbError::object_not_found(format!("Secret {name} not found")))
-    }
-}
-
-impl SecretStoreSource for FakeSecretStore {
-    fn descriptor(&self) -> &SecretStoreDescriptor {
-        &self.descriptor
-    }
-
-    /// Pages by offset: the page token is the index of the first entry of
-    /// the next page. Every page repeats the full set of sub-paths, which is
-    /// what a real store may do, so callers must merge them.
-    fn list(&self, request: &SecretListRequest) -> Result<SecretListPage, DbError> {
-        self.record_list(request);
-
-        let (entries, child_paths) = self.listing(request);
-        let start = match request.page_token.as_deref() {
-            Some(token) => token
-                .parse::<usize>()
-                .map_err(|_| DbError::query_failed(format!("Invalid page token {token}")))?,
-            None => 0,
-        };
-        // `default_page_size` stands in for the service's own maximum, so a
-        // request for a larger page is clamped instead of honored: that is
-        // what a real store does with `max_results`.
-        let page_size = request
-            .page_size
-            .map_or(self.default_page_size, |size| size as usize)
-            .clamp(1, self.default_page_size);
-
-        let end = (start + page_size).min(entries.len());
-        let page: Vec<SecretSummary> = entries
-            .get(start..end)
-            .unwrap_or_default()
-            .iter()
-            .map(|secret| secret.details.summary.clone())
-            .collect();
-
-        Ok(SecretListPage {
-            entries: page,
-            child_paths,
-            next_page_token: (end < entries.len()).then(|| end.to_string()),
-        })
-    }
-
-    fn describe(&self, name: &str) -> Result<SecretDetails, DbError> {
-        mutex_lock(&self.state.secret_store_calls)
-            .described
-            .push((self.descriptor.id.clone(), name.to_string()));
-
-        self.find(name).map(|secret| secret.details.clone())
-    }
-
-    fn get_value(&self, name: &str, _version: Option<&str>) -> Result<SecretValue, DbError> {
-        mutex_lock(&self.state.secret_store_calls)
-            .value_requests
-            .push((self.descriptor.id.clone(), name.to_string()));
-
-        let secret = self.find(name)?;
-        let version = secret.details.summary.version.clone();
-
-        match &secret.payload {
-            FakeSecretPayload::Text(text) => Ok(SecretValue::text(version, text.clone())),
-            FakeSecretPayload::Binary(bytes) => Ok(SecretValue::binary(version, bytes.clone())),
-            FakeSecretPayload::Denied(message) => Err(DbError::permission_denied(*message)),
-            FakeSecretPayload::Unavailable(message) => Err(DbError::query_failed(*message)),
-        }
-    }
-}
-
-fn fake_time(month: u32, day: u32, hour: u32) -> Option<chrono::DateTime<chrono::Utc>> {
-    use chrono::TimeZone as _;
-
-    chrono::Utc
-        .with_ymd_and_hms(2026, month, day, hour, 0, 0)
-        .single()
-}
-
-fn fake_secret(
-    summary: SecretSummary,
-    details: impl FnOnce(SecretDetails) -> SecretDetails,
-    payload: FakeSecretPayload,
-) -> FakeSecret {
-    let base = SecretDetails {
-        resource_id: Some(format!("arn:fake:secret:{}", summary.name)),
-        created: fake_time(1, 10, 8),
-        summary,
-        ..SecretDetails::default()
-    };
-
-    FakeSecret {
-        details: details(base),
-        payload,
-    }
-}
-
-fn fake_secret_stores(state: &Arc<FakeDriverState>) -> Vec<FakeSecretStore> {
-    vec![
-        FakeSecretStore {
-            descriptor: SecretStoreDescriptor::new(
-                FAKE_SECRETS_STORE_ID,
-                "Secrets Manager",
-                SecretStoreCapabilities::VERSIONS
-                    | SecretStoreCapabilities::VERSION_LABELS
-                    | SecretStoreCapabilities::ROTATION
-                    | SecretStoreCapabilities::SOFT_DELETE,
-            ),
-            secrets: fake_flat_secrets(),
-            default_page_size: 4,
-            state: state.clone(),
-        },
-        FakeSecretStore {
-            descriptor: SecretStoreDescriptor::new(
-                FAKE_PARAMETER_STORE_ID,
-                "Parameter Store",
-                SecretStoreCapabilities::VERSIONS
-                    | SecretStoreCapabilities::HIERARCHICAL
-                    | SecretStoreCapabilities::TYPED_VALUES,
-            ),
-            secrets: fake_parameters(),
-            default_page_size: 2,
-            state: state.clone(),
-        },
-    ]
-}
-
-/// Six secrets, so the default page of four leaves a second page: a
-/// key/value secret with rotation, a secret managed by another service, a
-/// plaintext one, a binary one, one pending deletion and one more key/value.
-fn fake_flat_secrets() -> Vec<FakeSecret> {
-    let rotation = SecretRotation {
-        enabled: true,
-        schedule: Some("rate(30 days)".to_string()),
-        window: Some("4h".to_string()),
-        function: Some("rotate-api-credentials".to_string()),
-        last_rotated: fake_time(9, 20, 3),
-        next_rotation: fake_time(10, 20, 3),
-    };
-
-    vec![
-        fake_secret(
-            SecretSummary {
-                description: Some("Payments API credentials".to_string()),
-                version: Some("v-current".to_string()),
-                last_changed: fake_time(9, 20, 3),
-                rotation: Some(rotation),
-                ..SecretSummary::new("prod/api/credentials")
-            },
-            |details| SecretDetails {
-                encryption_key: Some("alias/secrets".to_string()),
-                last_accessed: fake_time(10, 1, 0),
-                version_count: Some(4),
-                version_labels: vec!["AWSCURRENT".to_string(), "AWSPREVIOUS".to_string()],
-                tags: vec![
-                    SecretTag::new("team", "payments"),
-                    SecretTag::new("env", "prod"),
-                ],
-                ..details
-            },
-            FakeSecretPayload::Text(format!(
-                r#"{{"username":"api-user","password":"{FAKE_SECRET_PASSWORD}","port":5432}}"#
-            )),
-        ),
-        fake_secret(
-            SecretSummary {
-                description: Some("Master password of the orders database".to_string()),
-                last_changed: fake_time(8, 2, 12),
-                owning_service: Some("rds".to_string()),
-                ..SecretSummary::new("prod/db/master")
-            },
-            |details| SecretDetails {
-                version_count: Some(1),
-                version_labels: vec!["AWSCURRENT".to_string()],
-                ..details
-            },
-            FakeSecretPayload::Text(r#"{"username":"admin","password":"managed-pass"}"#.into()),
-        ),
-        fake_secret(
-            SecretSummary {
-                description: Some("Legacy deploy token".to_string()),
-                last_changed: fake_time(7, 15, 9),
-                deletion_scheduled_for: fake_time(11, 1, 0),
-                ..SecretSummary::new("prod/deploy/legacy-token")
-            },
-            |details| SecretDetails {
-                deleted_at: fake_time(10, 2, 0),
-                ..details
-            },
-            FakeSecretPayload::Unavailable("The secret is scheduled for deletion"),
-        ),
-        fake_secret(
-            SecretSummary {
-                description: Some("Webhook signing token".to_string()),
-                last_changed: fake_time(6, 5, 11),
-                ..SecretSummary::new("prod/notify/webhook-token")
-            },
-            |details| details,
-            FakeSecretPayload::Text(FAKE_SECRET_PLAINTEXT.to_string()),
-        ),
-        fake_secret(
-            SecretSummary {
-                description: Some("Signing key in DER form".to_string()),
-                last_changed: fake_time(5, 3, 14),
-                ..SecretSummary::new("prod/tls/signing-key")
-            },
-            |details| details,
-            FakeSecretPayload::Binary(FAKE_SECRET_BINARY.to_vec()),
-        ),
-        fake_secret(
-            SecretSummary {
-                description: Some("Staging API credentials".to_string()),
-                last_changed: fake_time(4, 8, 16),
-                ..SecretSummary::new("staging/api/credentials")
-            },
-            |details| details,
-            FakeSecretPayload::Text(r#"{"username":"staging","password":"staging-pass"}"#.into()),
-        ),
-    ]
-}
-
-fn fake_parameter(
-    name: &str,
-    value_type: &str,
-    tier: &str,
-    payload: FakeSecretPayload,
-) -> FakeSecret {
-    fake_secret(
-        SecretSummary {
-            value_type: Some(value_type.to_string()),
-            tier: Some(tier.to_string()),
-            version: Some("3".to_string()),
-            last_changed: fake_time(9, 1, 10),
-            ..SecretSummary::new(name)
-        },
-        |details| SecretDetails {
-            data_type: Some("text".to_string()),
-            last_changed_by: Some("arn:fake:user/deployer".to_string()),
-            encryption_key: (value_type == "SecureString").then(|| "alias/app-prod".to_string()),
-            tags: vec![SecretTag::new("app", "shop")],
-            ..details
-        },
-        payload,
-    )
-}
-
-/// A path tree `/app/prod/{db,feature-flags}/…`, `/app/staging/db/…` and
-/// `/shared/…`, with a `SecureString` the caller may not decrypt.
-fn fake_parameters() -> Vec<FakeSecret> {
-    vec![
-        fake_parameter(
-            "/app/prod/db/host",
-            "String",
-            "Standard",
-            FakeSecretPayload::Text("db.prod.internal".to_string()),
-        ),
-        fake_parameter(
-            "/app/prod/db/password",
-            "SecureString",
-            "Standard",
-            FakeSecretPayload::Denied(FAKE_KMS_DENIED_MESSAGE),
-        ),
-        fake_parameter(
-            "/app/prod/db/port",
-            "String",
-            "Standard",
-            FakeSecretPayload::Text("5432".to_string()),
-        ),
-        fake_parameter(
-            "/app/prod/feature-flags/checkout",
-            "String",
-            "Advanced",
-            FakeSecretPayload::Text("enabled".to_string()),
-        ),
-        fake_parameter(
-            "/app/prod/region",
-            "String",
-            "Standard",
-            FakeSecretPayload::Text("eu-west-1".to_string()),
-        ),
-        fake_parameter(
-            "/app/staging/db/host",
-            "String",
-            "Standard",
-            FakeSecretPayload::Text("db.staging.internal".to_string()),
-        ),
-        fake_parameter(
-            "/shared/endpoint",
-            "String",
-            "Standard",
-            FakeSecretPayload::Text("https://api.example.test".to_string()),
-        ),
-    ]
 }

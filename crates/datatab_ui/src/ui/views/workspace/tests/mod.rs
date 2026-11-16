@@ -1535,3 +1535,123 @@ fn refresh_schema_from_the_sidebar_reloads_only_the_connection_schema(cx: &mut T
         Some(crate::ui::labels::connections_no_active_connection_message()),
     );
 }
+
+#[gpui::test]
+fn title_bar_keeps_drag_gaps_at_narrow_window_width(cx: &mut TestAppContext) {
+    let (_, _, window) = new_workspace(cx);
+    window.simulate_resize(gpui::size(gpui::px(400.0), gpui::px(600.0)));
+    window.run_until_parked();
+    for selector in ["title-bar-drag-area", "title-bar-drag-area-end"] {
+        let bounds = window
+            .debug_bounds(selector)
+            .expect("drag area is rendered");
+        assert!(
+            bounds.size.width >= gpui::px(48.0),
+            "{selector}: {:?}",
+            bounds.size.width
+        );
+    }
+}
+
+fn seed_dashboard_with_missing_chart(
+    window: &mut VisualTestContext,
+    app_state: &Entity<AppStateEntity>,
+) -> (uuid::Uuid, uuid::Uuid) {
+    use datatab_components::chart::{
+        AxisKind, AxisSpec, BindingSpec, ChartKind, ChartSpec, YScale,
+    };
+    use datatab_components::{SavedChart, SavedChartRefreshPolicy};
+    use datatab_ui_base::DashboardPanelDraft;
+
+    let missing_chart_id = uuid::Uuid::new_v4();
+    let dashboard_id = window.update(|_, cx| {
+        app_state.update(cx, |state, _| {
+            let profile = datatab_core::ConnectionProfile::new(
+                "Dashboard test",
+                datatab_core::DbConfig::default_sqlite(),
+            );
+            let profile_id = profile.id;
+            state.add_profile_in_folder(profile, None);
+            let chart = SavedChart::new_query(
+                "Retained chart".to_string(),
+                profile_id,
+                "SELECT 1".to_string(),
+                ChartSpec {
+                    kind: ChartKind::Line,
+                    x_axis: AxisSpec {
+                        column_index: 0,
+                        label: "value".to_string(),
+                        kind: AxisKind::Numeric,
+                        unit: None,
+                    },
+                    series: Vec::new(),
+                    legend_visible: false,
+                    decimation_threshold: 500,
+                    binding: BindingSpec::default(),
+                    track_source_indices: false,
+                    y_scale: YScale::Linear,
+                },
+                BindingSpec::default(),
+            );
+            let retained_chart_id = chart.id;
+            state.saved_charts.upsert(chart).expect("persist chart");
+            let dashboard_id = state
+                .dashboards
+                .create_dashboard(
+                    "Mixed charts".to_string(),
+                    None,
+                    profile_id,
+                    None,
+                    SavedChartRefreshPolicy::Off,
+                )
+                .expect("persist dashboard");
+            state
+                .dashboards
+                .append_panels(
+                    dashboard_id,
+                    vec![
+                        DashboardPanelDraft::Chart {
+                            saved_chart_id: missing_chart_id,
+                            layout: None,
+                        },
+                        DashboardPanelDraft::Chart {
+                            saved_chart_id: retained_chart_id,
+                            layout: None,
+                        },
+                    ],
+                )
+                .expect("persist panels");
+            dashboard_id
+        })
+    });
+    (dashboard_id, missing_chart_id)
+}
+
+#[gpui::test]
+fn dashboard_opens_other_panels_when_a_saved_chart_is_missing(cx: &mut TestAppContext) {
+    use crate::ui::document::{DashboardDocument, DashboardPanelSlot};
+
+    let (workspace, app_state, window) = new_workspace(cx);
+    let (dashboard_id, missing_chart_id) = seed_dashboard_with_missing_chart(window, &app_state);
+    let opened = Rc::new(RefCell::new(None));
+    let subscription = window.update(|_, cx| {
+        let opened = opened.clone();
+        cx.observe_new::<DashboardDocument>(move |_, _, cx| {
+            opened.replace(Some(cx.entity()));
+        })
+    });
+    window.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_dashboard(dashboard_id, window, cx);
+        });
+    });
+    window.run_until_parked();
+    let document = opened.borrow().clone().expect("dashboard opened");
+    window.update(|_, cx| {
+        let slots = document.read(cx).panel_slots();
+        assert_eq!(slots.len(), 2);
+        assert!(matches!(slots.first(), Some(DashboardPanelSlot::Orphan { saved_chart_id, .. }) if *saved_chart_id == missing_chart_id));
+        assert!(matches!(slots.get(1), Some(DashboardPanelSlot::Loaded { .. })));
+    });
+    drop(subscription);
+}

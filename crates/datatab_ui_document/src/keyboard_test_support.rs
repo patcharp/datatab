@@ -164,7 +164,6 @@ pub(crate) fn connected_app_state(
                     read_only_reason: None,
                     database_schemas: Default::default(),
                     table_details: Default::default(),
-                    collection_children: Default::default(),
                     schema_types: Default::default(),
                     schema_columns: Default::default(),
                     schema_indexes: Default::default(),

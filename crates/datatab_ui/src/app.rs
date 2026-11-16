@@ -12,4 +12,4 @@ pub use datatab_core::ConnectedProfile;
 // Re-export event types from datatab_ui_base
 #[cfg(feature = "mcp")]
 pub use datatab_ui_base::McpRuntimeEventRaised;
-pub use datatab_ui_base::{AppStateChanged, AppStateEntity, AuthProfileCreated};
+pub use datatab_ui_base::{AppStateChanged, AppStateEntity};

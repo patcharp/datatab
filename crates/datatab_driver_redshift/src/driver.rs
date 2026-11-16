@@ -1,3 +1,5 @@
+mod keyword;
+
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
@@ -130,15 +132,15 @@ pub static METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverMetadata 
         },
         datatab_core::SslModeOption {
             id: "allow",
-            label: "allow",
+            label: "allow (unverified)",
         },
         datatab_core::SslModeOption {
             id: "prefer",
-            label: "prefer",
+            label: "prefer (unverified)",
         },
         datatab_core::SslModeOption {
             id: "require",
-            label: "require",
+            label: "require (unverified)",
         },
         datatab_core::SslModeOption {
             id: "verify-ca",
@@ -152,6 +154,8 @@ pub static METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverMetadata 
     ssl_cert_fields: Some(datatab_core::SslCertFields {
         root_cert: true,
         client_cert: true,
+        root_cert_modes: Some(&["verify-ca", "verify-full"]),
+        client_cert_modes: Some(&["allow", "prefer", "require", "verify-ca", "verify-full"]),
     }),
     classification_override: None,
     default_chunk_size: None,
@@ -380,12 +384,23 @@ impl DbDriver for RedshiftDriver {
         values
     }
 
+    fn validate_profile(&self, profile: &ConnectionProfile) -> Result<(), DbError> {
+        let config = extract_redshift_config(&profile.config)?;
+        if config.use_uri {
+            redshift_uri_sslmode(config.uri.as_deref().unwrap_or_default())?;
+        } else {
+            RedshiftSslMode::parse(&config.ssl_mode)?;
+        }
+        Ok(())
+    }
+
     fn connect_with_secrets(
         &self,
         profile: &ConnectionProfile,
         password: Option<&SecretString>,
         ssh_secret: Option<&SecretString>,
     ) -> Result<Box<dyn Connection>, DbError> {
+        self.validate_profile(profile)?;
         let config = extract_redshift_config(&profile.config)?;
 
         let password = password.map(|value| value.expose_secret());
@@ -500,20 +515,73 @@ fn normalize_redshift_uri_scheme(uri: &str) -> String {
     }
 }
 
-/// Resolves the effective [`RedshiftSslMode`] from a URI's `sslmode` query
-/// parameter, defaulting to `prefer` when the parameter is absent.
-fn redshift_uri_sslmode(uri: &str) -> RedshiftSslMode {
-    let Some(query_start) = uri.find('?') else {
-        return RedshiftSslMode::Prefer;
+fn is_connection_url(input: &str) -> bool {
+    input.starts_with("postgres://")
+        || input.starts_with("postgresql://")
+        || input.starts_with("redshift://")
+}
+
+/// Masks the secrets of a connection string, in URL or keyword form, for an
+/// error or a log line.
+pub(crate) fn sanitize_connection_string(input: &str) -> String {
+    if is_connection_url(input) {
+        return datatab_core::sanitize_uri(input);
+    }
+    // A keyword string may still carry a URL with credentials.
+    datatab_core::sanitize_uri(&keyword::redacted(input))
+}
+
+fn redshift_uri_sslmode(uri: &str) -> Result<RedshiftSslMode, DbError> {
+    let values: Vec<String> = if is_connection_url(uri) {
+        // The wire parser consumes credentials through the first `@` before
+        // looking for a query. Refuse ambiguous raw delimiters; `%3F` is safe.
+        if uri
+            .split_once('@')
+            .is_some_and(|(credentials, _)| credentials.contains('?'))
+        {
+            return Err(DbError::InvalidProfile(
+                "URL credentials must percent-encode question marks".to_string(),
+            ));
+        }
+        let query = uri
+            .split_once('?')
+            .map(|(_, query)| query)
+            .unwrap_or_default();
+        // The wire parser decodes keys before applying them. Reject encoded
+        // keys so they cannot hide an sslmode or override a checked value.
+        if query.split('&').any(|pair| {
+            let key = pair.split_once('=').map(|(key, _)| key).unwrap_or(pair);
+            key.contains('%')
+        }) {
+            return Err(DbError::InvalidProfile(
+                "Percent-encoded URL query keys are not allowed".to_string(),
+            ));
+        }
+        query
+            .split('&')
+            .filter_map(|pair| {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                key.eq_ignore_ascii_case("sslmode")
+                    .then(|| value.to_string())
+            })
+            .collect()
+    } else {
+        keyword::parameters(uri)?
+            .into_iter()
+            .filter(|parameter| parameter.key.eq_ignore_ascii_case("sslmode"))
+            .map(|parameter| parameter.value)
+            .collect()
     };
-
-    let query = &uri[query_start + 1..];
-
-    query
-        .split('&')
-        .find_map(|pair| pair.split_once('=').filter(|(key, _)| *key == "sslmode"))
-        .map(|(_, value)| RedshiftSslMode::parse(value))
-        .unwrap_or(RedshiftSslMode::Prefer)
+    let mut modes = values.iter().map(String::as_str);
+    let value = modes.next();
+    if modes.next().is_some() {
+        return Err(DbError::InvalidProfile(
+            "Multiple sslmode keys are not allowed".to_string(),
+        ));
+    }
+    value
+        .map(RedshiftSslMode::parse)
+        .unwrap_or(Ok(RedshiftSslMode::Prefer))
 }
 
 /// Removes the `sslmode` query parameter from a URI.
@@ -558,8 +626,17 @@ fn build_uri_config(
     let normalized = normalize_redshift_uri_scheme(base_uri);
     let uri = inject_password_into_uri(&normalized, password);
 
-    let ssl_mode = redshift_uri_sslmode(&uri);
-    let stripped = strip_sslmode_query_param(&uri);
+    let ssl_mode = redshift_uri_sslmode(&uri)?;
+    let stripped = if is_connection_url(&uri) {
+        strip_sslmode_query_param(&uri)
+    } else {
+        keyword::parameters(&uri)?
+            .iter()
+            .filter(|parameter| !parameter.key.eq_ignore_ascii_case("sslmode"))
+            .map(|parameter| parameter.raw)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
 
     let mut config = stripped
         .parse::<Config>()
@@ -720,6 +797,10 @@ impl RedshiftDriver {
 
 #[cfg(test)]
 mod tests {
+    mod sslmode;
+    mod tls_metadata;
+    mod uri_error_redaction;
+
     use super::{METADATA, RedshiftDriver};
     use datatab_core::{
         DatabaseCategory, DbConfig, DbDriver, DbError, DriverCapabilities, FormValues,
@@ -1000,7 +1081,8 @@ mod tests {
         #[test]
         fn parse_sslmode_defaults_to_prefer_when_absent() {
             assert_eq!(
-                redshift_uri_sslmode("postgresql://cluster.example.com:5439/dev"),
+                redshift_uri_sslmode("postgresql://cluster.example.com:5439/dev")
+                    .expect("known mode"),
                 RedshiftSslMode::Prefer
             );
         }
@@ -1008,17 +1090,20 @@ mod tests {
         #[test]
         fn parse_sslmode_reads_query_parameter() {
             assert_eq!(
-                redshift_uri_sslmode("postgresql://cluster.example.com:5439/dev?sslmode=require"),
+                redshift_uri_sslmode("postgresql://cluster.example.com:5439/dev?sslmode=require")
+                    .expect("known mode"),
                 RedshiftSslMode::Require
             );
             assert_eq!(
-                redshift_uri_sslmode("postgresql://cluster.example.com:5439/dev?sslmode=disable"),
+                redshift_uri_sslmode("postgresql://cluster.example.com:5439/dev?sslmode=disable")
+                    .expect("known mode"),
                 RedshiftSslMode::Disable
             );
             assert_eq!(
                 redshift_uri_sslmode(
                     "postgresql://cluster.example.com:5439/dev?sslmode=verify-full"
-                ),
+                )
+                .expect("known mode"),
                 RedshiftSslMode::VerifyFull
             );
         }

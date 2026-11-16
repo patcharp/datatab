@@ -1,5 +1,3 @@
-mod edit;
-mod identity;
 mod refs;
 mod types;
 
@@ -11,13 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::DbError;
 use crate::driver::form::DriverFormDef;
-use crate::values::CompositeValueResolver;
 
-pub use edit::{AuthEditSnapshot, AuthEditTarget, AuthSaveOutcome};
-pub use identity::{AWS_AUTH_NAMESPACE, aws_profile_uuid};
 pub use refs::{AuthProfileLookup, expand_auth_profile_refs};
 pub use types::*;
-pub use types::{AuthEditCapabilities, DanglingMessage};
 
 /// Request to fetch the available options for a `DynamicSelect` field.
 ///
@@ -62,14 +56,6 @@ pub enum FetchOptionsError {
 /// Auth providers reuse the same form definition type as drivers, allowing the
 /// generic settings renderer to handle both without additional abstractions.
 pub type AuthFormDef = DriverFormDef;
-
-/// A profile discovered from an external source (e.g., `~/.aws/config`) that
-/// can be imported into DataTab as an `AuthProfile`.
-pub struct ImportableProfile {
-    pub display_name: String,
-    pub provider_id: String,
-    pub fields: HashMap<String, String>,
-}
 
 pub trait AuthProvider: Send + Sync {
     fn provider_id(&self) -> &'static str;
@@ -120,7 +106,7 @@ pub trait DynAuthProvider: Send + Sync {
     /// Perform the login flow.
     ///
     /// `url_callback` is called once the provider has determined the
-    /// verification URL the user should visit (e.g. the AWS device-auth URL).
+    /// verification URL the user should visit (a device-auth URL).
     /// Providers that cannot surface a URL call the callback with `None`.
     /// The default implementation calls the callback immediately with `None`.
     async fn login(
@@ -134,95 +120,12 @@ pub trait DynAuthProvider: Send + Sync {
         profile: &AuthProfile,
     ) -> Result<ResolvedCredentials, DbError>;
 
-    /// Register provider-specific secret and parameter value providers into
-    /// the connection resolver.
-    ///
-    /// Called after authentication succeeds, before value refs are resolved.
-    /// The default is a no-op; providers that integrate with secrets backends
-    /// (e.g. AWS Secrets Manager, SSM Parameter Store) override this.
-    fn register_value_providers(
-        &self,
-        _profile: &AuthProfile,
-        _session: Option<&AuthSession>,
-        _resolver: &mut CompositeValueResolver,
-    ) -> Result<(), DbError> {
-        Ok(())
-    }
-
-    /// Return profiles discovered from external configuration files
-    /// that have not yet been imported into DataTab.
-    ///
-    /// The default returns an empty list.
-    fn detect_importable_profiles(&self) -> Vec<ImportableProfile> {
-        vec![]
-    }
-
-    /// Called after a profile using this provider is saved.
-    ///
-    /// File-backed providers can use this hook to write back data to external
-    /// configuration files. The default is a no-op.
-    fn after_profile_saved(&self, _profile: &AuthProfile) {}
-
-    /// Synthesize virtual `AuthProfile` records by reading external configuration
-    /// files without storing anything.
-    ///
-    /// Returned profiles carry `read_only = true`. The default returns an empty
-    /// list; file-backed providers override this to enumerate their profile types.
-    fn reflect_profiles(&self) -> Vec<AuthProfile> {
-        vec![]
-    }
-
-    /// Write a newly created profile to an external configuration file instead
-    /// of DataTab's SQLite store.
-    ///
-    /// Returns `Some(Ok(()))` on a successful file write. Returns `Some(Err(msg))`
-    /// when the write failed. Returns `None` for providers that store profiles
-    /// normally in DataTab (the UI then falls back to `add_auth_profile`).
-    ///
-    /// File-backed providers override this. The Settings UI calls this before
-    /// `add_auth_profile` so it can skip SQLite storage for file-backed providers
-    /// and let reflection pick up the new profile on the next read.
-    fn write_new_profile_to_config(&self, _profile: &AuthProfile) -> Option<Result<(), String>> {
-        None
-    }
-
     /// Abort any in-flight login for `profile` if the provider tracks one.
     ///
     /// Returns `true` if an in-flight login was found and signalled to stop.
     /// The default returns `false` (no abort capability).
     fn abort_login(&self, _profile: &AuthProfile) -> bool {
         false
-    }
-
-    /// Capture a provider-internal snapshot at the moment the edit form opens.
-    ///
-    /// The returned `AuthEditSnapshot` wraps an opaque provider-specific token
-    /// (e.g. section hashes for file-backed providers).  The UI passes it
-    /// back to `save_edit` unchanged.
-    ///
-    /// The default returns a unit snapshot, meaning the provider does not
-    /// support file-backed editing.  Providers that write to external files
-    /// override this to capture their conflict-detection state.
-    fn open_edit_snapshot(&self, _name: &str) -> AuthEditSnapshot {
-        AuthEditSnapshot::new(())
-    }
-
-    /// Persist the user's edited fields to the provider's backing store.
-    ///
-    /// Providers that support file-backed editing compare the current on-disk
-    /// state against the `snapshot` captured at `open_edit_snapshot` time.
-    /// They return `Conflict` or `PartialSaved` when a concurrent external
-    /// change is detected.
-    ///
-    /// The default returns `AuthSaveOutcome::Saved` without writing anything —
-    /// a safe no-op for providers that store profiles in DataTab's SQLite store.
-    fn save_edit(
-        &self,
-        _name: &str,
-        _fields: &HashMap<String, String>,
-        _snapshot: &AuthEditSnapshot,
-    ) -> AuthSaveOutcome {
-        AuthSaveOutcome::Saved
     }
 
     /// Fetch the available options for a `DynamicSelect` field declared in this
@@ -340,32 +243,6 @@ impl DynAuthProvider for SharedDynAuthProvider {
         self.provider.resolve_credentials(profile).await
     }
 
-    fn register_value_providers(
-        &self,
-        profile: &AuthProfile,
-        session: Option<&AuthSession>,
-        resolver: &mut CompositeValueResolver,
-    ) -> Result<(), DbError> {
-        self.provider
-            .register_value_providers(profile, session, resolver)
-    }
-
-    fn detect_importable_profiles(&self) -> Vec<ImportableProfile> {
-        self.provider.detect_importable_profiles()
-    }
-
-    fn reflect_profiles(&self) -> Vec<AuthProfile> {
-        self.provider.reflect_profiles()
-    }
-
-    fn after_profile_saved(&self, profile: &AuthProfile) {
-        self.provider.after_profile_saved(profile);
-    }
-
-    fn write_new_profile_to_config(&self, profile: &AuthProfile) -> Option<Result<(), String>> {
-        self.provider.write_new_profile_to_config(profile)
-    }
-
     fn abort_login(&self, profile: &AuthProfile) -> bool {
         self.provider.abort_login(profile)
     }
@@ -376,19 +253,6 @@ impl DynAuthProvider for SharedDynAuthProvider {
         request: FetchOptionsRequest,
     ) -> Result<FetchOptionsResponse, FetchOptionsError> {
         self.provider.fetch_dynamic_options(profile, request).await
-    }
-
-    fn open_edit_snapshot(&self, name: &str) -> AuthEditSnapshot {
-        self.provider.open_edit_snapshot(name)
-    }
-
-    fn save_edit(
-        &self,
-        name: &str,
-        fields: &HashMap<String, String>,
-        snapshot: &AuthEditSnapshot,
-    ) -> AuthSaveOutcome {
-        self.provider.save_edit(name, fields, snapshot)
     }
 }
 
@@ -429,32 +293,6 @@ impl DynAuthProvider for std::sync::Arc<dyn DynAuthProvider> {
         self.as_ref().resolve_credentials(profile).await
     }
 
-    fn register_value_providers(
-        &self,
-        profile: &AuthProfile,
-        session: Option<&AuthSession>,
-        resolver: &mut CompositeValueResolver,
-    ) -> Result<(), DbError> {
-        self.as_ref()
-            .register_value_providers(profile, session, resolver)
-    }
-
-    fn detect_importable_profiles(&self) -> Vec<ImportableProfile> {
-        self.as_ref().detect_importable_profiles()
-    }
-
-    fn reflect_profiles(&self) -> Vec<AuthProfile> {
-        self.as_ref().reflect_profiles()
-    }
-
-    fn after_profile_saved(&self, profile: &AuthProfile) {
-        self.as_ref().after_profile_saved(profile);
-    }
-
-    fn write_new_profile_to_config(&self, profile: &AuthProfile) -> Option<Result<(), String>> {
-        self.as_ref().write_new_profile_to_config(profile)
-    }
-
     fn abort_login(&self, profile: &AuthProfile) -> bool {
         self.as_ref().abort_login(profile)
     }
@@ -465,19 +303,6 @@ impl DynAuthProvider for std::sync::Arc<dyn DynAuthProvider> {
         request: FetchOptionsRequest,
     ) -> Result<FetchOptionsResponse, FetchOptionsError> {
         self.as_ref().fetch_dynamic_options(profile, request).await
-    }
-
-    fn open_edit_snapshot(&self, name: &str) -> AuthEditSnapshot {
-        self.as_ref().open_edit_snapshot(name)
-    }
-
-    fn save_edit(
-        &self,
-        name: &str,
-        fields: &HashMap<String, String>,
-        snapshot: &AuthEditSnapshot,
-    ) -> AuthSaveOutcome {
-        self.as_ref().save_edit(name, fields, snapshot)
     }
 }
 
@@ -538,7 +363,6 @@ mod tests {
                     supported: true,
                     verification_url_progress: true,
                 },
-                edit: None,
             };
 
             &CAPABILITIES
@@ -594,7 +418,6 @@ mod tests {
                     supported: true,
                     verification_url_progress: false,
                 },
-                edit: None,
             };
 
             &CAPABILITIES

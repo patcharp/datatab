@@ -16,7 +16,6 @@
 use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
-use datatab_components::saved_chart::MetricSeries;
 use datatab_components::{
     SavedChart, SavedChartRefreshPolicy, TimeRangePreset,
     chart::{AggKind, AxisKind, AxisSpec, BindingSpec, ChartKind, ChartSpec, SeriesSpec, YScale},
@@ -27,8 +26,6 @@ use datatab_storage::{
     error::StorageError,
     repositories::viz_saved_chart_binding_y::BindingYDto,
     repositories::viz_saved_chart_series::SeriesDto,
-    repositories::viz_saved_chart_source_metric_dimensions::MetricDimensionDto,
-    repositories::viz_saved_chart_source_metric_series::MetricSeriesDto,
     repositories::viz_saved_charts::{SavedChartDto, SavedChartsRepository},
 };
 use uuid::Uuid;
@@ -131,40 +128,12 @@ fn dto_to_chart(dto: SavedChartDto) -> Result<SavedChart, StorageError> {
             }
         }
         "metric" => {
-            // Disambiguate: CloudWatch metric (has metric_series rows) vs.
-            // per-driver instance metric (has a row in viz_saved_chart_source_instance_metric).
             if let Some(metric_id) = dto.instance_metric_id {
                 SavedChartSource::InstanceMetric { metric_id }
             } else {
-                // An empty series list is kept rather than rejected: the chart
-                // still loads and renders an empty board with a placeholder,
-                // instead of silently disappearing from the dashboard.
-
-                // Group dimensions by series_index for stable per-series ordering.
-                let mut dims_by_series: std::collections::HashMap<i64, Vec<(String, String)>> =
-                    std::collections::HashMap::new();
-                for d in &dto.metric_dimensions {
-                    dims_by_series
-                        .entry(d.series_index)
-                        .or_default()
-                        .push((d.dim_key.clone(), d.dim_value.clone()));
-                }
-
-                let series: Vec<MetricSeries> = dto
-                    .metric_series
-                    .iter()
-                    .map(|s| MetricSeries {
-                        namespace: s.namespace.clone(),
-                        metric_name: s.metric_name.clone(),
-                        dimensions: dims_by_series.remove(&s.series_index).unwrap_or_default(),
-                        period_seconds: s.period_seconds as u32,
-                        statistic: s.statistic.clone(),
-                        region: s.region.clone(),
-                        label: s.label.clone(),
-                    })
-                    .collect();
-
-                SavedChartSource::Metric { series }
+                return Err(StorageError::Data(format!(
+                    "saved chart '{id}' uses a removed metric source"
+                )));
             }
         }
         other => {
@@ -203,10 +172,6 @@ fn chart_to_dto(
     series: Vec<SeriesDto>,
     binding_y: Vec<BindingYDto>,
 ) -> SavedChartDto {
-    // Decompose source variant into flat columns + series/dimension child rows.
-    let mut metric_series: Vec<MetricSeriesDto> = Vec::new();
-    let mut metric_dimensions: Vec<MetricDimensionDto> = Vec::new();
-
     let instance_metric_id: Option<String> =
         if let SavedChartSource::InstanceMetric { metric_id } = &chart.source {
             Some(metric_id.clone())
@@ -254,33 +219,6 @@ fn chart_to_dto(
                 lang,
             )
         }
-        SavedChartSource::Metric {
-            series: series_list,
-        } => {
-            for (s_idx, s) in series_list.iter().enumerate() {
-                metric_series.push(MetricSeriesDto {
-                    chart_id: chart.id.to_string(),
-                    series_index: s_idx as i64,
-                    namespace: s.namespace.clone(),
-                    metric_name: s.metric_name.clone(),
-                    period_seconds: s.period_seconds as i64,
-                    statistic: s.statistic.clone(),
-                    region: s.region.clone(),
-                    label: s.label.clone(),
-                });
-                for (d_idx, (k, v)) in s.dimensions.iter().enumerate() {
-                    metric_dimensions.push(MetricDimensionDto {
-                        chart_id: chart.id.to_string(),
-                        series_index: s_idx as i64,
-                        dim_index: d_idx as i64,
-                        dim_key: k.clone(),
-                        dim_value: v.clone(),
-                    });
-                }
-            }
-
-            ("metric".to_string(), None, None, None, None, None, None)
-        }
         SavedChartSource::InstanceMetric { .. } => {
             ("metric".to_string(), None, None, None, None, None, None)
         }
@@ -326,8 +264,8 @@ fn chart_to_dto(
 
         series,
         binding_y,
-        metric_series,
-        metric_dimensions,
+        metric_series: Vec::new(),
+        metric_dimensions: Vec::new(),
         instance_metric_id,
     }
 }
@@ -477,9 +415,6 @@ fn refresh_policy_kind_to_str(p: SavedChartRefreshPolicy) -> String {
 fn parse_query_language(s: &str) -> Result<QueryLanguage, StorageError> {
     match s {
         "Sql" => Ok(QueryLanguage::Sql),
-        "CloudWatchLogsInsightsQl" => Ok(QueryLanguage::CloudWatchLogsInsightsQl),
-        "OpenSearchPpl" => Ok(QueryLanguage::OpenSearchPpl),
-        "OpenSearchSql" => Ok(QueryLanguage::OpenSearchSql),
         "MongoQuery" => Ok(QueryLanguage::MongoQuery),
         "RedisCommands" => Ok(QueryLanguage::RedisCommands),
         "Cypher" => Ok(QueryLanguage::Cypher),
@@ -501,9 +436,6 @@ fn parse_query_language(s: &str) -> Result<QueryLanguage, StorageError> {
 fn query_language_to_str(l: QueryLanguage) -> String {
     match l {
         QueryLanguage::Sql => "Sql".to_string(),
-        QueryLanguage::CloudWatchLogsInsightsQl => "CloudWatchLogsInsightsQl".to_string(),
-        QueryLanguage::OpenSearchPpl => "OpenSearchPpl".to_string(),
-        QueryLanguage::OpenSearchSql => "OpenSearchSql".to_string(),
         QueryLanguage::MongoQuery => "MongoQuery".to_string(),
         QueryLanguage::RedisCommands => "RedisCommands".to_string(),
         QueryLanguage::Cypher => "Cypher".to_string(),
@@ -516,6 +448,11 @@ fn query_language_to_str(l: QueryLanguage) -> String {
         QueryLanguage::Python => "Python".to_string(),
         QueryLanguage::Bash => "Bash".to_string(),
         QueryLanguage::Custom(name) => format!("Custom:{name}"),
+        // A reserved wire slot has no stored name; `parse_query_language`
+        // does not parse this one.
+        QueryLanguage::ReservedCloudWatchLogsInsightsQl
+        | QueryLanguage::ReservedOpenSearchPpl
+        | QueryLanguage::ReservedOpenSearchSql => "Reserved".to_string(),
     }
 }
 
@@ -751,6 +688,10 @@ mod tests {
         AggKind, AxisKind, AxisSpec, BindingSpec, ChartKind, ChartSpec, SeriesSpec, YScale,
     };
     use datatab_storage::bootstrap::StorageRuntime;
+    use datatab_storage::repositories::{
+        viz_saved_chart_source_metric_dimensions::MetricDimensionDto,
+        viz_saved_chart_source_metric_series::MetricSeriesDto,
+    };
     use std::sync::Arc;
 
     fn temp_storage() -> StorageRuntime {
@@ -871,46 +812,140 @@ mod tests {
         );
     }
 
-    fn sample_metric_chart(name: &str, profile_id: Uuid) -> SavedChart {
-        let now = Utc::now();
-        SavedChart {
-            id: Uuid::new_v4(),
-            name: name.to_string(),
-            profile_id,
-            source: SavedChartSource::Metric {
-                series: vec![MetricSeries {
-                    namespace: "AWS/EC2".to_string(),
-                    metric_name: "CPUUtilization".to_string(),
-                    dimensions: vec![
-                        ("InstanceId".to_string(), "i-12345".to_string()),
-                        ("Region".to_string(), "us-east-1".to_string()),
-                    ],
-                    period_seconds: 300,
-                    statistic: "Average".to_string(),
-                    region: Some("us-east-1".to_string()),
-                    label: None,
-                }],
-            },
-            chart_spec: ChartSpec {
-                kind: ChartKind::Line,
-                x_axis: AxisSpec {
-                    column_index: 0,
-                    label: "ts".to_string(),
-                    kind: AxisKind::Time,
-                    unit: None,
-                },
-                series: vec![],
-                legend_visible: false,
-                decimation_threshold: 10_000,
-                binding: BindingSpec::default(),
-                track_source_indices: false,
-                y_scale: YScale::Linear,
-            },
-            bindings: BindingSpec::default(),
-            time_range_preset: None,
-            refresh_policy: SavedChartRefreshPolicy::Off,
-            created_at: now,
-            updated_at: now,
+    #[test]
+    fn test_mixed_load_skips_removed_metric_source_and_keeps_instance_metric() {
+        let runtime = temp_storage();
+        let connection = runtime.viz_connection().expect("open viz connection");
+        let repository = Arc::new(SavedChartsRepository::new(Arc::clone(&connection)));
+        let profile_id = Uuid::new_v4();
+        insert_test_profile(&connection, profile_id);
+
+        let query_chart = sample_chart("query", profile_id);
+        let mut instance_chart = sample_chart("instance", profile_id);
+        instance_chart.source = SavedChartSource::InstanceMetric {
+            metric_id: "pg.cache_hit_ratio".to_string(),
+        };
+        for chart in [&query_chart, &instance_chart] {
+            repository
+                .upsert(&chart_to_dto(
+                    chart,
+                    chart_to_series_dtos(chart),
+                    chart_to_binding_y_dtos(chart),
+                ))
+                .expect("insert supported chart directly");
+        }
+        let retired_chart = sample_chart("retired", profile_id);
+        let mut retired_dto = chart_to_dto(&retired_chart, vec![], vec![]);
+        retired_dto.source_kind = "metric".to_string();
+        retired_dto.source_query = None;
+        retired_dto.metric_series = vec![MetricSeriesDto {
+            chart_id: retired_chart.id.to_string(),
+            series_index: 0,
+            namespace: "retired".to_string(),
+            metric_name: "cpu".to_string(),
+            period_seconds: 60,
+            statistic: "Average".to_string(),
+            region: None,
+            label: None,
+        }];
+        retired_dto.metric_dimensions = vec![MetricDimensionDto {
+            chart_id: retired_chart.id.to_string(),
+            series_index: 0,
+            dim_index: 0,
+            dim_key: "instance".to_string(),
+            dim_value: "local-test".to_string(),
+        }];
+        repository
+            .upsert(&retired_dto)
+            .expect("insert retired chart directly");
+
+        let manager = SavedChartManager::new(Arc::clone(&repository));
+        assert!(
+            matches!(manager.chart_by_id(query_chart.id).map(|chart| &chart.source),
+            Some(SavedChartSource::Query { query }) if query == "SELECT 1")
+        );
+        assert!(
+            matches!(manager.chart_by_id(instance_chart.id).map(|chart| &chart.source),
+            Some(SavedChartSource::InstanceMetric { metric_id }) if metric_id == "pg.cache_hit_ratio")
+        );
+        assert!(
+            manager.chart_by_id(retired_chart.id).is_none(),
+            "removed metric chart must be skipped"
+        );
+        assert_eq!(manager.all_charts().len(), 2);
+        assert_eq!(
+            repository
+                .list()
+                .expect("stored rows remain readable")
+                .len(),
+            3
+        );
+    }
+
+    /// A collection chart stored with a time-window language of the removed
+    /// AWS drivers (#311) is skipped alone; the charts beside it still load
+    /// and the stored row stays.
+    #[test]
+    fn collection_chart_with_retired_window_language_is_skipped_alone() {
+        for retired_language in ["CloudWatchLogsInsightsQl", "OpenSearchPpl", "OpenSearchSql"] {
+            let runtime = temp_storage();
+            let connection = runtime.viz_connection().expect("open viz connection");
+            let repository = Arc::new(SavedChartsRepository::new(Arc::clone(&connection)));
+            let profile_id = Uuid::new_v4();
+            insert_test_profile(&connection, profile_id);
+
+            let query_chart = sample_chart("query", profile_id);
+            let mut flux_chart = sample_chart("flux window", profile_id);
+            flux_chart.source = SavedChartSource::Collection {
+                collection_ref: CollectionRef::new("metrics", "cpu"),
+                time_window: Some(ResolvedWindow {
+                    start_ms: 1_000,
+                    end_ms: 2_000,
+                    language: QueryLanguage::Flux,
+                }),
+            };
+            let mut retired_chart = sample_chart("retired window", profile_id);
+            retired_chart.source = flux_chart.source.clone();
+            let mut retired_dto = chart_to_dto(
+                &retired_chart,
+                chart_to_series_dtos(&retired_chart),
+                chart_to_binding_y_dtos(&retired_chart),
+            );
+            retired_dto.source_time_window_language = Some(retired_language.to_string());
+
+            for chart in [&query_chart, &flux_chart] {
+                repository
+                    .upsert(&chart_to_dto(
+                        chart,
+                        chart_to_series_dtos(chart),
+                        chart_to_binding_y_dtos(chart),
+                    ))
+                    .expect("insert supported chart directly");
+            }
+            repository
+                .upsert(&retired_dto)
+                .expect("insert retired chart directly");
+
+            let manager = SavedChartManager::new(Arc::clone(&repository));
+            assert!(
+                manager.chart_by_id(retired_chart.id).is_none(),
+                "a {retired_language} window chart must be skipped"
+            );
+            assert!(manager.chart_by_id(query_chart.id).is_some());
+            assert!(matches!(
+                manager
+                    .chart_by_id(flux_chart.id)
+                    .map(|chart| &chart.source),
+                Some(SavedChartSource::Collection {
+                    time_window: Some(ResolvedWindow {
+                        language: QueryLanguage::Flux,
+                        ..
+                    }),
+                    ..
+                })
+            ));
+            assert_eq!(manager.all_charts().len(), 2);
+            assert_eq!(repository.list().expect("stored rows").len(), 3);
         }
     }
 
@@ -1019,56 +1054,6 @@ mod tests {
         let mut mgr = SavedChartManager::new(repo);
         let result = mgr.duplicate_chart(Uuid::new_v4());
         assert!(result.is_err());
-    }
-
-    /// End-to-end integration: metric source upsert → reload → verify all fields
-    /// including dimensions order.
-    #[test]
-    fn test_metric_source_roundtrip_via_manager() {
-        let rt = temp_storage();
-        let conn = rt
-            .viz_connection()
-            .expect("viz connection should open in test");
-        let repo = Arc::new(SavedChartsRepository::new(Arc::clone(&conn)));
-
-        let profile_id = Uuid::new_v4();
-        insert_test_profile(&conn, profile_id);
-
-        let chart = sample_metric_chart("my-metric", profile_id);
-        let chart_id = chart.id;
-
-        let mut manager = SavedChartManager::new(Arc::clone(&repo));
-        manager
-            .upsert(chart)
-            .expect("upsert should persist the chart");
-
-        // Reload from storage.
-        let manager2 = SavedChartManager::new(Arc::clone(&repo));
-        assert_eq!(manager2.all_charts().len(), 1);
-        let loaded = &manager2.all_charts()[0];
-        assert_eq!(loaded.id, chart_id);
-        assert!(loaded.is_metric_source());
-
-        if let SavedChartSource::Metric { series } = &loaded.source {
-            assert_eq!(series.len(), 1);
-            let s = &series[0];
-            assert_eq!(s.namespace, "AWS/EC2");
-            assert_eq!(s.metric_name, "CPUUtilization");
-            assert_eq!(s.dimensions.len(), 2);
-            assert_eq!(
-                s.dimensions[0],
-                ("InstanceId".to_string(), "i-12345".to_string())
-            );
-            assert_eq!(
-                s.dimensions[1],
-                ("Region".to_string(), "us-east-1".to_string())
-            );
-            assert_eq!(s.period_seconds, 300);
-            assert_eq!(s.statistic, "Average");
-            assert_eq!(s.region.as_deref(), Some("us-east-1"));
-        } else {
-            panic!("expected Metric variant after reload");
-        }
     }
 
     #[test]

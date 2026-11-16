@@ -945,10 +945,6 @@ fn workspace_command_chords() -> Vec<(Command, KeyChord)> {
             KeyChord::new("l", Modifiers::primary_shift()),
         ),
         (
-            Command::OpenSsoWizard,
-            KeyChord::new("o", Modifiers::primary_shift()),
-        ),
-        (
             Command::OpenSavedChart,
             KeyChord::new("c", Modifiers::primary_shift()),
         ),
@@ -1109,7 +1105,6 @@ fn global_chords_stop_at_dialogs_menus_and_pickers() {
         ContextId::HistoryModal,
         ContextId::ConfirmModal,
         ContextId::Dropdown,
-        ContextId::EventStreamsPicker,
         ContextId::SqlPreviewModal,
         ContextId::FormNavigation,
         ContextId::ContextMenu,
@@ -1885,6 +1880,99 @@ fn gpui_overlap_follows_the_context_tree_and_vim_modes() {
         ContextId::DataTable.default_predicate(),
         ContextId::Results.default_predicate()
     ));
+}
+
+/// Rebinding a Results binding onto a bare letter of the Results layer must
+/// report the collision. The letter carries the `!Input` predicate that keeps
+/// it out of a focused text field, which is narrower than the predicate of the
+/// binding the user moves onto it.
+#[test]
+fn a_rebind_onto_a_guarded_results_letter_reports_a_conflict() {
+    assert_rebind_onto_a_guarded_letter_conflicts(
+        ContextId::Results,
+        BindingSlot::new(
+            ContextId::Results,
+            Command::FocusLeft,
+            KeyChord::new("h", Modifiers::ctrl()),
+        ),
+        KeyChord::new("j", Modifiers::none()),
+        Command::SelectNext,
+    );
+}
+
+/// Rebinds `slot` onto a bare letter of its own layer and expects the
+/// binding that letter already runs. The letter carries the layer's `!Input`
+/// predicate, which keeps it out of a focused text field and is narrower than
+/// the predicate of the binding the user moves onto it, so a plain comparison
+/// of the two predicates would miss the collision.
+fn assert_rebind_onto_a_guarded_letter_conflicts(
+    context: ContextId,
+    slot: BindingSlot,
+    letter: KeyChord,
+    letter_command: Command,
+) {
+    use datatab_app::keymap::{KeybindingRecorder, RecordingOutcome};
+
+    let defaults = default_keymap();
+    let overrides = KeymapOverrides::new();
+    let overlap = GpuiPredicateOverlap::new();
+
+    let predicate = overrides.effective_predicate(&slot).into_owned();
+    let keys = KeySequence::from(letter.clone());
+
+    let conflicts = overrides.conflicts_for(defaults, &slot, &keys, &predicate, &overlap);
+    assert!(
+        conflicts
+            .iter()
+            .any(|other| other.context == context && other.command == letter_command),
+        "the bare `{letter:?}` of the {context:?} layer collides, got {conflicts:?}"
+    );
+
+    let mut recorder = KeybindingRecorder::new();
+    recorder.start(slot, predicate);
+    assert_eq!(
+        recorder.handle_chord(letter, defaults, &overrides, &overlap),
+        RecordingOutcome::Captured
+    );
+    assert_eq!(
+        recorder.finish(defaults, &overrides, &overlap),
+        RecordingOutcome::ConflictFound,
+        "the recording waits for a decision instead of saving"
+    );
+}
+
+/// The Audit viewer's bare `f` focuses its filter toolbar under
+/// `Audit && !Modal && !Input`, so moving the layer's `Ctrl+H` focus command
+/// onto it is a collision.
+#[test]
+fn a_rebind_onto_a_guarded_audit_letter_reports_a_conflict() {
+    assert_rebind_onto_a_guarded_letter_conflicts(
+        ContextId::Audit,
+        BindingSlot::new(
+            ContextId::Audit,
+            Command::FocusLeft,
+            KeyChord::new("h", Modifiers::ctrl()),
+        ),
+        KeyChord::new("f", Modifiers::none()),
+        Command::FocusToolbar,
+    );
+}
+
+/// The Inspector's bare `m` opens its context menu under
+/// `Inspector && !Modal && !Input`, so moving the layer's `Ctrl+D` page-down
+/// command onto it is a collision.
+#[test]
+fn a_rebind_onto_a_guarded_inspector_letter_reports_a_conflict() {
+    assert_rebind_onto_a_guarded_letter_conflicts(
+        ContextId::Inspector,
+        BindingSlot::new(
+            ContextId::Inspector,
+            Command::PageDown,
+            KeyChord::new("d", Modifiers::ctrl()),
+        ),
+        KeyChord::new("m", Modifiers::none()),
+        Command::OpenContextMenu,
+    );
 }
 
 #[test]
@@ -2695,7 +2783,7 @@ fn the_configure_popover_takes_the_chart_keys() {
 /// tabs from anywhere in it (the text fields too, except on macOS), and the
 /// list letters work outside its text fields.
 #[test]
-fn add_panel_picker_keys_switch_tabs_and_move_the_lists() {
+fn add_panel_picker_keys_switch_tabs_and_move_the_saved_list() {
     let keymap = native_keymap();
     let root = root_key_context(WORKSPACE_KEY_CONTEXT, ContextId::TextInput, &[]);
     let list = element_stack(root.clone(), &["Modal AddPanelPicker"]);
@@ -2706,8 +2794,6 @@ fn add_panel_picker_keys_switch_tabs_and_move_the_lists() {
         ("k", Command::SelectPrev),
         ("g", Command::SelectFirst),
         ("shift-g", Command::SelectLast),
-        ("h", Command::ColumnLeft),
-        ("l", Command::ColumnRight),
         ("space", Command::ExpandCollapse),
         ("/", Command::FocusSearch),
         ("alt-l", Command::NextPanelTab),

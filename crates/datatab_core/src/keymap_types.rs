@@ -157,7 +157,6 @@ pub enum Command {
     ResetInterfaceSize,
     OpenSettings,
     OpenLoginModal,
-    OpenSsoWizard,
     OpenAuditViewer,
     /// Open the audit viewer filtered to the most recent user-facing error,
     /// the same target as the error toast's "View in Audit".
@@ -193,10 +192,6 @@ pub enum Command {
     // === Charts / Dashboards ===
     /// Open the saved-chart fuzzy overlay (lists all SavedCharts for the current profile).
     OpenSavedChart,
-    /// Open the "Import Dashboard from JSON" paste modal.
-    ///
-    /// Only available when the active connection has `DASHBOARD_IMPORT` capability.
-    ImportDashboard,
     /// Open the "New dashboard…" creation modal (profile picker then name input).
     NewDashboard,
     /// Selects the next time-range preset of a chart or dashboard.
@@ -324,7 +319,6 @@ impl Command {
             "clear_finished_tasks" => Some(Command::ClearFinishedTasks),
             "open_settings" => Some(Command::OpenSettings),
             "open_login_modal" => Some(Command::OpenLoginModal),
-            "open_sso_wizard" => Some(Command::OpenSsoWizard),
             "open_audit_viewer" => Some(Command::OpenAuditViewer),
             "open_last_error_in_audit" => Some(Command::OpenLastErrorInAudit),
             "open_toast_actions" => Some(Command::OpenToastActions),
@@ -338,7 +332,6 @@ impl Command {
             #[cfg(feature = "mcp")]
             "refresh_mcp_governance" => Some(Command::RefreshMcpGovernance),
             "open_saved_chart" => Some(Command::OpenSavedChart),
-            "import_dashboard" => Some(Command::ImportDashboard),
             "new_dashboard" => Some(Command::NewDashboard),
             "open_pane_actions" => Some(Command::OpenPaneActions),
             "quit" => Some(Command::Quit),
@@ -462,7 +455,6 @@ impl Command {
             Command::ResetInterfaceSize => "Reset interface size",
             Command::OpenSettings => "Open settings",
             Command::OpenLoginModal => "Open auth profile login",
-            Command::OpenSsoWizard => "Open AWS SSO wizard",
             Command::OpenAuditViewer => "Open audit viewer",
             Command::OpenLastErrorInAudit => "Open last error in audit",
             Command::OpenToastActions => "Open toast actions",
@@ -482,7 +474,6 @@ impl Command {
             #[cfg(feature = "mcp")]
             Command::RefreshMcpGovernance => "Refresh MCP governance",
             Command::OpenSavedChart => "Open chart…",
-            Command::ImportDashboard => "Import dashboard from JSON…",
             Command::NewDashboard => "New dashboard…",
             Command::NextTimeRange => "Next time range",
             Command::PrevTimeRange => "Previous time range",
@@ -666,7 +657,6 @@ impl Command {
             Command::ResetInterfaceSize => "reset_interface_size",
             Command::OpenSettings => "open_settings",
             Command::OpenLoginModal => "open_login_modal",
-            Command::OpenSsoWizard => "open_sso_wizard",
             Command::OpenAuditViewer => "open_audit_viewer",
             Command::OpenLastErrorInAudit => "open_last_error_in_audit",
             Command::OpenToastActions => "open_toast_actions",
@@ -687,7 +677,6 @@ impl Command {
             Command::RefreshMcpGovernance => "refresh_mcp_governance",
 
             Command::OpenSavedChart => "open_saved_chart",
-            Command::ImportDashboard => "import_dashboard",
             Command::NewDashboard => "new_dashboard",
             Command::NextTimeRange => "next_time_range",
             Command::PrevTimeRange => "prev_time_range",
@@ -885,7 +874,6 @@ impl Command {
             Command::ResetInterfaceSize,
             Command::OpenSettings,
             Command::OpenLoginModal,
-            Command::OpenSsoWizard,
             Command::OpenAuditViewer,
             Command::OpenLastErrorInAudit,
             Command::OpenToastActions,
@@ -897,7 +885,6 @@ impl Command {
             Command::ShowScriptsView,
             Command::ShowDashboardsView,
             Command::OpenSavedChart,
-            Command::ImportDashboard,
             Command::NewDashboard,
             Command::NextTimeRange,
             Command::PrevTimeRange,
@@ -1083,7 +1070,6 @@ impl Command {
             | Command::TogglePanel
             | Command::OpenSettings
             | Command::OpenLoginModal
-            | Command::OpenSsoWizard
             | Command::OpenAuditViewer
             | Command::OpenLastErrorInAudit
             | Command::OpenToastActions
@@ -1101,9 +1087,7 @@ impl Command {
             #[cfg(feature = "mcp")]
             Command::ApproveExecution | Command::RejectExecution => "Actions",
 
-            Command::OpenSavedChart | Command::ImportDashboard | Command::NewDashboard => {
-                "Dashboards"
-            }
+            Command::OpenSavedChart | Command::NewDashboard => "Dashboards",
 
             Command::NextTimeRange | Command::PrevTimeRange => "View",
 
@@ -1209,7 +1193,6 @@ impl Command {
                 | Command::DecreaseInterfaceSize
                 | Command::ResetInterfaceSize
                 | Command::OpenLoginModal
-                | Command::OpenSsoWizard
                 | Command::OpenAuditViewer
                 | Command::OpenLastErrorInAudit
                 | Command::OpenToastActions
@@ -1296,9 +1279,6 @@ pub enum ContextId {
     /// Audit event viewer row list.
     Audit,
 
-    /// Event-stream picker modal (collection child picker).
-    EventStreamsPicker,
-
     /// Schema visualization document.
     SchemaViz,
 
@@ -1373,7 +1353,6 @@ impl ContextId {
             ContextId::ConfirmModal => None,
             ContextId::FormNavigation => None,
             ContextId::ContextBar => None,
-            ContextId::EventStreamsPicker => None,
             ContextId::Sidebar => Some(ContextId::Global),
             ContextId::Editor => Some(ContextId::Global),
             ContextId::Results => Some(ContextId::Global),
@@ -1439,7 +1418,6 @@ impl ContextId {
                 | ContextId::ConfirmModal
                 | ContextId::FormNavigation
                 | ContextId::ContextBar
-                | ContextId::EventStreamsPicker
         )
     }
 
@@ -1470,7 +1448,6 @@ impl ContextId {
             ContextId::FormNavigation => "Form Navigation",
             ContextId::ContextBar => "Context Bar",
             ContextId::Audit => "Audit Viewer",
-            ContextId::EventStreamsPicker => "Event Streams Picker",
             ContextId::SchemaViz => "Schema Viz",
             ContextId::DocumentTree => "Document Tree",
             ContextId::DataTable => "Data Table",
@@ -1512,7 +1489,6 @@ impl ContextId {
             ContextId::FormNavigation => "form_navigation",
             ContextId::ContextBar => "context_bar",
             ContextId::Audit => "audit",
-            ContextId::EventStreamsPicker => "event_streams_picker",
             ContextId::SchemaViz => "schema_viz",
             ContextId::DocumentTree => "document_tree",
             ContextId::DataTable => "data_table",
@@ -1554,7 +1530,6 @@ impl ContextId {
             ContextId::FormNavigation,
             ContextId::ContextBar,
             ContextId::Audit,
-            ContextId::EventStreamsPicker,
             ContextId::SchemaViz,
             ContextId::DocumentTree,
             ContextId::DataTable,
@@ -1596,7 +1571,6 @@ impl ContextId {
             ContextId::FormNavigation => "FormNavigation",
             ContextId::ContextBar => "ContextBar",
             ContextId::Audit => "Audit",
-            ContextId::EventStreamsPicker => "EventStreamsPicker",
             ContextId::SchemaViz => "SchemaViz",
             ContextId::DocumentTree => "DocumentTree",
             ContextId::DataTable => "DataTable",
@@ -1773,10 +1747,8 @@ mod tests {
             "toggle_tasks",
             "open_settings",
             "open_login_modal",
-            "open_sso_wizard",
             "open_audit_viewer",
             "open_saved_chart",
-            "import_dashboard",
             "new_dashboard",
         ];
 

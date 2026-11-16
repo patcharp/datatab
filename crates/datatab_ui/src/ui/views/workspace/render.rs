@@ -296,10 +296,8 @@ impl Render for Workspace {
         }
 
         // Open the login modal on behalf of a settings-window auth-profile login.
-        if let Some((provider_name, profile_name, url)) = self.pending_login_modal_open.take() {
-            self.login_modal.update(cx, |modal, cx| {
-                modal.open_manual(provider_name, profile_name, url, window, cx);
-            });
+        if let Some(pending) = self.pending_login_modal_open.take() {
+            self.show_settings_login(pending, window, cx);
         }
 
         let sidebar_dock = self.sidebar_dock.clone();
@@ -314,7 +312,6 @@ impl Render for Workspace {
         });
         let command_palette = self.command_palette.clone();
         let login_modal = self.login_modal.clone();
-        let sso_wizard = self.sso_wizard.clone();
 
         let has_tabs = !self.tab_manager.read(cx).is_empty();
         let active_doc_element = self.render_active_document(window, cx);
@@ -343,7 +340,6 @@ impl Render for Workspace {
         let sidebar_collapsed = self.is_sidebar_collapsed(cx);
         let sidebar_context_menu = self.sidebar.read(cx).context_menu_state().cloned();
         let tab_context_menu = self.tab_bar.read(cx).context_menu_state().cloned();
-        let child_picker_open = self.sidebar.read(cx).has_child_picker_open();
 
         let title_bar = self.render_title_bar(window, cx).into_any_element();
         let rail = self.render_rail(cx).into_any_element();
@@ -726,7 +722,6 @@ impl Render for Workspace {
             .child(command_palette)
             .child(self.sql_preview_modal.clone())
             .child(login_modal)
-            .child(sso_wizard)
             // S8 modals — rendered as full-screen overlays using the shared `Modal` chrome.
             .when(self.modal_delete_connection.read(cx).is_visible(), |root| {
                 root.child(self.modal_delete_connection.clone())
@@ -739,9 +734,6 @@ impl Render for Workspace {
             })
             .when(self.modal_tunnel_auth.read(cx).is_visible(), |root| {
                 root.child(self.modal_tunnel_auth.clone())
-            })
-            .when(self.modal_import_dashboard.read(cx).is_visible(), |root| {
-                root.child(self.modal_import_dashboard.clone())
             })
             .when(self.import_wizard.read(cx).is_visible(), |root| {
                 root.child(self.import_wizard.clone())
@@ -806,38 +798,6 @@ impl Render for Workspace {
             })
             // Shutdown overlay (rendered above everything during shutdown)
             .child(self.shutdown_overlay.clone())
-            .when(child_picker_open, |root| {
-                let sidebar_entity = self.sidebar.clone();
-                let focus_handle = self
-                    .sidebar
-                    .read(cx)
-                    .child_picker_focus_handle()
-                    .unwrap_or_else(|| self.focus_handle.clone());
-                let content = self.sidebar.update(cx, |sidebar, cx| {
-                    sidebar.render_child_picker_content(cx).into_any_element()
-                });
-
-                root.child(
-                    Modal::new(datatab_i18n::t!("workspace.event_streams"))
-                        .id("event-stream-child-picker")
-                        .focus_handle(&focus_handle)
-                        .on_close(move |_window, cx| {
-                            sidebar_entity.update(cx, |sidebar, cx| {
-                                sidebar.close_child_picker(cx);
-                            });
-                        })
-                        // The workspace answers the picker's Escape and Enter:
-                        // Escape in the filter returns to the list first.
-                        .defer_keys_to_owner()
-                        .icon(AppIcon::ScrollText)
-                        .width(px(1000.0))
-                        .height(px(720.0))
-                        .top_offset(px(60.0))
-                        .block_scroll()
-                        .child(content)
-                        .into_any_element(),
-                )
-            })
             // Context menu rendered at workspace level for proper positioning
             .when_some(sidebar_context_menu, |this, menu| {
                 use crate::ui::components::context_menu as ctx;

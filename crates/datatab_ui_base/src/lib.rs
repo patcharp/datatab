@@ -8,6 +8,7 @@
 
 pub mod app_state_entity;
 pub mod async_ext;
+pub mod connection_session;
 pub mod dashboard_manager;
 pub mod file_dialog;
 pub mod hook_phase_runner;
@@ -26,7 +27,6 @@ pub mod saved_query_manager;
 pub mod schema_snapshot_manager;
 pub mod settings_writer;
 pub mod sql_preview_modal;
-pub mod sso_wizard;
 pub mod toast;
 pub mod ui_automation;
 pub mod updates;
@@ -38,11 +38,11 @@ mod style_guardrails;
 #[cfg(feature = "mcp")]
 pub use app_state_entity::McpRuntimeEventRaised;
 pub use app_state_entity::{
-    AppStateChanged, AppStateEntity, AppStateGlobal, AuthProfileCreated, OpenAuditRequested,
-    SaveTargetOutcome, SaveTargetProvider, SaveTargetRequest, UserErrorReported,
-    drain_hook_load_diagnostics,
+    AppStateChanged, AppStateEntity, AppStateGlobal, OpenAuditRequested, SaveTargetOutcome,
+    SaveTargetProvider, SaveTargetRequest, UserErrorReported, drain_hook_load_diagnostics,
 };
 pub use async_ext::AsyncUpdateResultExt;
+pub use connection_session::ConnectionSession;
 pub use dashboard_manager::{
     Dashboard, DashboardManager, DashboardPanel, DashboardPanelDraft, DashboardPanelKind,
     DraftGridLayout,

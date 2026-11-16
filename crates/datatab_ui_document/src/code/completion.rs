@@ -71,7 +71,7 @@ impl QueryCompletionProvider {
     ///
     /// This keys completion-style routing off a generic capability signal rather
     /// than a driver id: any driver whose editor mode is `"sql"` (relational SQL
-    /// drivers and DynamoDB's PartiQL surface alike) gets SQL-style completion.
+    /// drivers and SQL-style document drivers alike) gets SQL-style completion.
     /// Falls back to deriving the mode from the provider's `QueryLanguage` when
     /// the connection is absent or its language no longer matches (a
     /// source-context query-mode override).
@@ -104,17 +104,8 @@ impl QueryCompletionProvider {
     fn keyword_candidates(&self) -> &'static [&'static str] {
         match self.query_language {
             datatab_core::QueryLanguage::Sql
-            | datatab_core::QueryLanguage::OpenSearchSql
             | datatab_core::QueryLanguage::Cql
             | datatab_core::QueryLanguage::InfluxQuery => sql_keyword_candidates(),
-            datatab_core::QueryLanguage::CloudWatchLogsInsightsQl => &[
-                "fields", "filter", "parse", "stats", "sort", "limit", "display", "dedup",
-                "pattern", "diff", "anomaly", "unnest", "unmask", "SOURCE",
-            ],
-            datatab_core::QueryLanguage::OpenSearchPpl => &[
-                "source", "where", "fields", "stats", "sort", "head", "eval", "parse", "dedup",
-                "top", "rare", "join", "flatten", "fillnull", "rename",
-            ],
             datatab_core::QueryLanguage::MongoQuery => &[
                 "db",
                 "find",
@@ -190,7 +181,10 @@ impl QueryCompletionProvider {
             datatab_core::QueryLanguage::Lua
             | datatab_core::QueryLanguage::Python
             | datatab_core::QueryLanguage::Bash
-            | datatab_core::QueryLanguage::Custom(_) => &[],
+            | datatab_core::QueryLanguage::Custom(_)
+            | datatab_core::QueryLanguage::ReservedCloudWatchLogsInsightsQl
+            | datatab_core::QueryLanguage::ReservedOpenSearchPpl
+            | datatab_core::QueryLanguage::ReservedOpenSearchSql => &[],
         }
     }
 
@@ -724,13 +718,8 @@ fn tables_needing_details(
 ///
 /// The first clause preserves main's behavior exactly: `Sql`, `Cql`, and
 /// `InfluxQuery` always took the SQL path and fold their catalogs. The second
-/// clause is the generic DynamoDB case — a Document-category driver whose editor
-/// surface is SQL-style (PartiQL) — without any driver-id branching.
-///
-/// `OpenSearchSql` (CloudWatch's source-context query mode) is deliberately
-/// absent: CloudWatch is `DatabaseCategory::LogStream`, not `Document`, so it
-/// falls through to the keyword-only path exactly as on main, and its log-group
-/// names never fold as SQL table candidates.
+/// clause is the generic case of a Document-category driver whose editor
+/// surface is SQL-style, without any driver-id branching.
 fn should_use_sql_completion(
     query_language: &datatab_core::QueryLanguage,
     is_sql_style_editor: bool,
@@ -1629,12 +1618,12 @@ impl SqlCompletionMetadata {
     }
 
     /// Folds a document-store collection into the SQL completion metadata so an
-    /// SQL-style editor over a Document-category driver (e.g. DynamoDB PartiQL)
+    /// SQL-style editor over a Document-category driver (a PartiQL-style driver)
     /// suggests the collection NAME as a table.
     ///
     /// The collection name is the real source of the table-after-`FROM`
     /// completion. The `sample_fields` loop is correct but dormant for drivers
-    /// whose schema snapshot leaves `sample_fields` empty (DynamoDB emits
+    /// whose schema snapshot leaves `sample_fields` empty (such a driver emits
     /// `None` here); for those drivers the per-attribute completion arrives
     /// instead through the lazily-fetched `table_details` `TableInfo`, whose
     /// key-schema `sample_fields` are folded by `add_table`.
@@ -2390,7 +2379,7 @@ mod tests {
         }
     }
 
-    /// Mirrors the collection DynamoDB's `schema()` actually emits: a named
+    /// Mirrors a collection such a driver's `schema()` emits: a named
     /// collection with `sample_fields: None`. Per-attribute data is NOT carried
     /// here; it arrives via the lazily-fetched `table_details` `TableInfo`.
     fn dynamo_schema_collection() -> CollectionInfo {
@@ -2419,7 +2408,7 @@ mod tests {
         })
     }
 
-    /// Mirrors the `TableInfo` DynamoDB's `table_details()` builds: `columns:
+    /// Mirrors the `TableInfo` such a driver's `table_details()` builds: `columns:
     /// None` with the key-schema attributes carried in `sample_fields`.
     fn dynamo_table_details() -> TableInfo {
         TableInfo {
@@ -2464,7 +2453,7 @@ mod tests {
 
     #[test]
     fn dynamo_key_schema_attributes_complete_in_where_position() {
-        // Real DynamoDB path: the document snapshot collection has no
+        // Document-driver path: the document snapshot collection has no
         // `sample_fields`; the WHERE-position attributes (pk/sk) come from the
         // lazily-fetched `table_details` `TableInfo` folded by `add_table`.
         let snapshot = dynamo_document_snapshot();
@@ -3582,14 +3571,6 @@ mod tests {
             &QueryLanguage::Custom("DynamoDB".to_string()),
             true,
             Some(DatabaseCategory::Document),
-        ));
-
-        // Regression guard: CloudWatch's OpenSearchSql source-context mode is
-        // SQL-style but LogStream-category — must NOT route to the SQL catalog.
-        assert!(!should_use_sql_completion(
-            &QueryLanguage::OpenSearchSql,
-            true,
-            Some(DatabaseCategory::LogStream),
         ));
 
         // A document driver without an SQL-style editor stays off the SQL path.

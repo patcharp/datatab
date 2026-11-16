@@ -116,11 +116,6 @@ pub fn decrypt(
 /// Runs the conflict-identity predicates against `dest` for each referenced
 /// auth/proxy/ssh entry. Collects omitted-secret `required_refs` from connections,
 /// ssh entries, proxy entries, and auth entries into `required_resolutions`.
-///
-/// AWS references are checked against the destination snapshot:
-/// - Present (by deterministic `aws_profile_uuid`): auto-resolved, NOT surfaced
-///   as a resolution item.
-/// - Absent: emitted as a `RequiredResolution` of kind `AwsReference`.
 pub fn plan(parsed: &ParsedBundle, dest: &DestSnapshot<'_>) -> ImportPlan {
     let mut conflicts: Vec<ProfileConflict> = Vec::new();
     let mut required_resolutions: Vec<RequiredResolution> = Vec::new();
@@ -243,14 +238,14 @@ pub fn plan(parsed: &ParsedBundle, dest: &DestSnapshot<'_>) -> ImportPlan {
         }
     }
 
-    // Connection-level required_refs and AWS reference resolution.
+    // Connection-level required references.
     for conn in &parsed.bundle.connections {
         // Omitted required_refs recorded by the exporter.
         // C2 / ADR-2: Map RequiredRefKind faithfully to RequiredResolutionKind.
         // Suppression rule: skip an AuthProfile required_ref when the connection
-        // already carries auth_ref or auth_profile_local_id — the auth binding is
+        // already carries auth_profile_local_id — the auth binding is
         // already satisfied and surfacing a second resolution would confuse the wizard.
-        let has_auth_binding = conn.auth_ref.is_some() || conn.auth_profile_local_id.is_some();
+        let has_auth_binding = conn.auth_profile_local_id.is_some();
 
         for rref in &conn.required_refs {
             let kind = match rref.kind {
@@ -271,28 +266,6 @@ pub fn plan(parsed: &ParsedBundle, dest: &DestSnapshot<'_>) -> ImportPlan {
                 kind,
             });
         }
-
-        // AWS reflected auth references: auto-resolve when the deterministic UUID
-        // matches an existing destination auth profile; otherwise surface as a
-        // RequiredResolution so the user can create or select a profile.
-        if let Some(auth_ref) = &conn.auth_ref {
-            use datatab_core::auth::aws_profile_uuid;
-
-            let resolved_id = aws_profile_uuid(&auth_ref.provider_id, &auth_ref.name);
-            let already_present = dest.auth_profiles.iter().any(|a| a.id == resolved_id);
-
-            if !already_present {
-                required_resolutions.push(RequiredResolution {
-                    owner_local_id: conn.local_id.clone(),
-                    owner_name: conn.name.clone(),
-                    field: "auth_profile".to_string(),
-                    kind: RequiredResolutionKind::AwsReference {
-                        provider_id: auth_ref.provider_id.clone(),
-                        name: auth_ref.name.clone(),
-                    },
-                });
-            }
-        }
     }
 
     ImportPlan {
@@ -309,9 +282,7 @@ pub fn plan(parsed: &ParsedBundle, dest: &DestSnapshot<'_>) -> ImportPlan {
 ///
 /// Every new entity receives a fresh `Uuid::new_v4()`. All intra-bundle references
 /// (auth_profile_id, access_kind, secret keys) are rewritten to the newly minted
-/// UUIDs before being returned. AWS references resolve to the deterministic
-/// `aws_profile_uuid(provider_id, name)` UUID, NOT a minted UUID, so they bind to
-/// the reflected profile on the target.
+/// UUIDs before being returned.
 ///
 /// When `choices` specifies `Reuse` or `MapTo` for a conflict, the destination UUID
 /// is used instead of minting a new one, and no new entity is emitted for that entry.
@@ -392,6 +363,7 @@ pub fn apply(
     let mut secret_writes: Vec<(String, SecretString)> = Vec::new();
     let mut kind_failures: Vec<(String, String)> = Vec::new();
     let mut unresolved_ref_connections: Vec<String> = Vec::new();
+    let mut value_ref_failures: Vec<(String, Vec<String>)> = Vec::new();
 
     // Auth profiles.
     for auth_entry in &parsed.bundle.auth_profiles {
@@ -447,8 +419,6 @@ pub fn apply(
             fields,
             secret_fields,
             enabled: auth_entry.enabled,
-            read_only: false,
-            dangling_origin: None,
         });
     }
 
@@ -571,7 +541,7 @@ pub fn apply(
         }
 
         // Rewrite auth_profile_id to the new (or reused/mapped) destination id.
-        let auth_profile_id = resolve_auth_id(conn_entry, &id_map, plan, choices);
+        let auth_profile_id = resolve_auth_id(conn_entry, &id_map);
 
         // Rewrite access_kind to point at the remapped ssh/proxy ids.
         // M3 / ADR-8: When the referenced local_id is absent from id_map (dangling ref),
@@ -580,6 +550,17 @@ pub fn apply(
             AccessRewrite::Resolved(ak) => ak,
             AccessRewrite::Dangling => {
                 unresolved_ref_connections.push(conn_entry.name.clone());
+                continue;
+            }
+        };
+
+        // A value ref that cannot be read fails this connection, before any of its
+        // secrets is staged. Importing without the ref would leave the field with the
+        // bundle's plain text, and connect would use it.
+        let value_refs = match restore_value_refs(conn_entry) {
+            Ok(value_refs) => value_refs,
+            Err(unreadable_fields) => {
+                value_ref_failures.push((conn_entry.name.clone(), unreadable_fields));
                 continue;
             }
         };
@@ -650,10 +631,7 @@ pub fn apply(
             profile.proxy_profile_id = Some(*proxy_profile_id);
         }
 
-        // Restore value_refs: deserialize from toml::Value -> serde_json::Value -> ValueRef.
-        // Conversion failures are silently skipped — a single unresolvable ref must not
-        // block the entire import; the user can add missing refs manually after import.
-        profile.value_refs = restore_value_refs(conn_entry);
+        profile.value_refs = value_refs;
 
         // Restore hooks when the bundle included them.
         // Pass decrypted_secrets so hook env entries can be reconstructed from
@@ -684,6 +662,7 @@ pub fn apply(
         secret_writes,
         kind_failures,
         unresolved_ref_connections,
+        value_ref_failures,
     })
 }
 
@@ -696,6 +675,8 @@ pub fn apply(
 /// Derives `DbKind` exclusively from the serialized `kind` field written by the exporter.
 /// An absent or unparseable `kind` returns `None`; the caller must record this as a
 /// per-connection failure rather than silently defaulting (R-KIND-1 / M6 / ADR-9).
+/// A reserved wire slot (`DbKind::is_reserved`) is refused the same way: a
+/// profile with that kind could not be saved.
 ///
 /// The driver-id string-branching fallback has been removed. Bundles that predate
 /// the `kind` field are rejected rather than silently imported as the wrong driver.
@@ -704,25 +685,42 @@ fn db_kind_from_bundle(conn: &crate::bundle::ConnectionEntry) -> Option<datatab_
 
     let kind_str = conn.kind.as_deref()?;
     let jv = serde_json::Value::String(kind_str.to_string());
-    serde_json::from_value::<DbKind>(jv).ok()
+    serde_json::from_value::<DbKind>(jv)
+        .ok()
+        .filter(|kind| !kind.is_reserved())
 }
 
 /// Deserialize the `value_refs` map from `toml::Value` entries to `ValueRef`.
 ///
-/// Conversion is best-effort: entries that cannot be round-tripped through
-/// serde_json are silently skipped so a single unresolvable ref does not
-/// abort the import.
+/// Every entry must be readable. When one is not, for example a source kind
+/// this build does not have, the error holds the names of the unreadable
+/// fields, sorted, and nothing of their content. The caller then skips the
+/// whole connection instead of importing it without the reference.
 fn restore_value_refs(
     conn: &crate::bundle::ConnectionEntry,
-) -> std::collections::HashMap<String, datatab_core::values::ValueRef> {
-    conn.value_refs
-        .iter()
-        .filter_map(|(field, tv)| {
-            let jv = serde_json::to_value(tv).ok()?;
-            let vref: datatab_core::values::ValueRef = serde_json::from_value(jv).ok()?;
-            Some((field.clone(), vref))
-        })
-        .collect()
+) -> Result<std::collections::HashMap<String, datatab_core::values::ValueRef>, Vec<String>> {
+    let mut value_refs = std::collections::HashMap::with_capacity(conn.value_refs.len());
+    let mut unreadable_fields = Vec::new();
+
+    for (field, toml_value) in &conn.value_refs {
+        let value_ref = serde_json::to_value(toml_value)
+            .ok()
+            .and_then(|json| serde_json::from_value::<datatab_core::values::ValueRef>(json).ok());
+
+        match value_ref {
+            Some(value_ref) => {
+                value_refs.insert(field.clone(), value_ref);
+            }
+            None => unreadable_fields.push(field.clone()),
+        }
+    }
+
+    if unreadable_fields.is_empty() {
+        Ok(value_refs)
+    } else {
+        unreadable_fields.sort();
+        Err(unreadable_fields)
+    }
 }
 
 /// Deserialize the `hooks_payload` toml::Value into `ConnectionHooks` and
@@ -899,49 +897,14 @@ fn build_proxy_auth(
     }
 }
 
-/// Resolve the destination auth profile id for a connection entry.
-///
-/// - Stored auth profile: look up the new id from `id_map` via `auth_profile_local_id`.
-/// - AWS reflected reference:
-///   - When the reference was auto-resolved (i.e., NOT present in `plan.required_resolutions`),
-///     the profile exists at the destination; return the deterministic `aws_profile_uuid`.
-///   - When the reference was NOT auto-resolved (present in `plan.required_resolutions`),
-///     return the user's explicit choice, or `None` if no choice was made — never bind a
-///     dangling deterministic UUID to a profile that does not exist at the destination.
-/// - No auth: return `None`.
+/// Resolves a stored auth profile through its bundle-local id.
 fn resolve_auth_id(
     conn: &crate::bundle::ConnectionEntry,
     id_map: &HashMap<String, Uuid>,
-    plan: &ImportPlan,
-    choices: &ResolutionChoices,
 ) -> Option<Uuid> {
-    if let Some(auth_ref) = &conn.auth_ref {
-        use datatab_core::auth::aws_profile_uuid;
-
-        let key = (conn.local_id.clone(), "auth_profile".to_string());
-        let chosen = choices.auth_profile_choices.get(&key).copied();
-
-        // Determine whether this reference required a user resolution (not in dest).
-        let requires_resolution = plan.required_resolutions.iter().any(|r| {
-            r.owner_local_id == conn.local_id
-                && r.field == "auth_profile"
-                && matches!(&r.kind, RequiredResolutionKind::AwsReference { .. })
-        });
-
-        if requires_resolution {
-            // Not present at destination: bind only if the user explicitly chose a profile.
-            chosen
-        } else {
-            // Present at destination: auto-resolve to the deterministic UUID, unless
-            // the user overrode it.
-            let deterministic = aws_profile_uuid(&auth_ref.provider_id, &auth_ref.name);
-            Some(chosen.unwrap_or(deterministic))
-        }
-    } else if let Some(ref local_auth_id) = conn.auth_profile_local_id {
-        id_map.get(local_auth_id).copied()
-    } else {
-        None
-    }
+    conn.auth_profile_local_id
+        .as_ref()
+        .and_then(|id| id_map.get(id).copied())
 }
 
 /// Result of rewriting a connection's access binding.
@@ -1040,9 +1003,8 @@ mod tests {
     use crate::{
         ConflictChoice, DestSnapshot, PortabilityError, ResolutionChoices,
         bundle::{
-            AuthEntry, AuthRef, AuthRefKind, Bundle, BundleMeta, CURRENT_FORMAT_VERSION,
-            ConnectionEntry, EncryptionMode, ProxyEntry, RequiredRef, RequiredRefKind,
-            SecretsSection, SshAuthMethodKind, SshEntry,
+            AuthEntry, Bundle, BundleMeta, CURRENT_FORMAT_VERSION, ConnectionEntry, EncryptionMode,
+            ProxyEntry, RequiredRef, RequiredRefKind, SecretsSection, SshAuthMethodKind, SshEntry,
         },
     };
 
@@ -1133,7 +1095,6 @@ mod tests {
             },
             local_path_fields: Default::default(),
             required_refs: vec![],
-            auth_ref: None,
             auth_profile_local_id: None,
             access: None,
             value_refs: Default::default(),
@@ -1156,8 +1117,6 @@ mod tests {
             fields: Default::default(),
             secret_fields: Default::default(),
             enabled: true,
-            read_only: false,
-            dangling_origin: None,
         }
     }
 
@@ -1574,83 +1533,45 @@ encryption = "none"
     }
 
     #[test]
-    fn plan_aws_reference_not_in_dest_becomes_required_resolution() {
-        let mut bundle = empty_bundle(EncryptionMode::None);
-        let mut conn = make_connection_entry("conn-aws-1");
-        conn.auth_ref = Some(AuthRef {
-            kind: AuthRefKind::AwsReference,
-            provider_id: "aws-sso".to_string(),
-            name: "My AWS SSO".to_string(),
-        });
-        bundle.connections.push(conn);
+    fn legacy_auth_reference_imports_connections_without_auth_resolution() {
+        let text = r#"
+[bundle]
+format_version = 1
+created_at = "2026-11-14T00:00:00Z"
+datatab_version = "0.1.3"
+encryption = "none"
 
-        let parsed = crate::ParsedBundle {
-            bundle,
-            decrypted_secrets: None,
-        };
+[[connections]]
+local_id = "legacy"
+name = "Legacy reference"
+driver_id = "postgres"
+kind = "Postgres"
+[connections.auth_ref]
+kind = "aws_reference"
+provider_id = "aws-sso"
+name = "Old profile"
 
+[[connections]]
+local_id = "plain"
+name = "Plain PostgreSQL"
+driver_id = "postgres"
+kind = "Postgres"
+"#;
+        let parsed = parse(text.as_bytes()).expect("parse legacy bundle");
         let import_plan = plan(&parsed, &empty_dest());
-
-        let aws_resolution = import_plan.required_resolutions.iter().find(|r| {
-            matches!(
-                &r.kind,
-                crate::RequiredResolutionKind::AwsReference { provider_id, name }
-                if provider_id == "aws-sso" && name == "My AWS SSO"
-            )
-        });
-
         assert!(
-            aws_resolution.is_some(),
-            "AWS reference not in dest must produce a RequiredResolution"
+            import_plan.required_resolutions.is_empty(),
+            "{:?}",
+            import_plan.required_resolutions
         );
-    }
-
-    #[test]
-    fn plan_aws_reference_in_dest_is_not_a_required_resolution() {
-        use datatab_core::auth::{AuthProfile, aws_profile_uuid};
-
-        let aws_auth = AuthProfile {
-            id: aws_profile_uuid("aws-sso", "My AWS SSO"),
-            name: "My AWS SSO".to_string(),
-            provider_id: "aws-sso".to_string(),
-            fields: Default::default(),
-            secret_fields: Default::default(),
-            enabled: true,
-            read_only: true,
-            dangling_origin: None,
-        };
-
-        let mut bundle = empty_bundle(EncryptionMode::None);
-        let mut conn = make_connection_entry("conn-aws-2");
-        conn.auth_ref = Some(AuthRef {
-            kind: AuthRefKind::AwsReference,
-            provider_id: "aws-sso".to_string(),
-            name: "My AWS SSO".to_string(),
-        });
-        bundle.connections.push(conn);
-
-        let parsed = crate::ParsedBundle {
-            bundle,
-            decrypted_secrets: None,
-        };
-
-        let dest = DestSnapshot {
-            auth_profiles: vec![&aws_auth],
-            ssh_tunnels: vec![],
-            proxies: vec![],
-            connections: vec![],
-        };
-
-        let import_plan = plan(&parsed, &dest);
-
-        let aws_resolution = import_plan
-            .required_resolutions
-            .iter()
-            .find(|r| matches!(&r.kind, crate::RequiredResolutionKind::AwsReference { .. }));
-
+        let actions = apply(&parsed, &import_plan, &ResolutionChoices::default())
+            .expect("import connections");
+        assert_eq!(actions.connections.len(), 2);
         assert!(
-            aws_resolution.is_none(),
-            "AWS reference already present in dest must NOT produce a RequiredResolution"
+            actions
+                .connections
+                .iter()
+                .all(|connection| connection.auth_profile_id.is_none())
         );
     }
 
@@ -1769,65 +1690,6 @@ encryption = "none"
             actions.ssh_tunnels.len(),
             1,
             "CreateNew must produce a new SSH entity"
-        );
-    }
-
-    /// When an AWS reference IS present at the destination (auto-resolved), apply() must
-    /// bind the connection to the deterministic UUID of that profile.
-    #[test]
-    fn apply_aws_reference_present_in_dest_gets_deterministic_uuid() {
-        use datatab_core::auth::{AuthProfile as CoreAuth, aws_profile_uuid};
-
-        let local_conn_id = "conn-aws-apply";
-        let mut bundle = empty_bundle(EncryptionMode::None);
-        let mut conn = make_connection_entry(local_conn_id);
-        conn.auth_ref = Some(AuthRef {
-            kind: AuthRefKind::AwsReference,
-            provider_id: "aws-sso".to_string(),
-            name: "My AWS SSO".to_string(),
-        });
-        bundle.connections.push(conn);
-
-        let parsed = crate::ParsedBundle {
-            bundle,
-            decrypted_secrets: None,
-        };
-
-        // Put the profile at the destination so it auto-resolves.
-        let dest_auth = CoreAuth {
-            id: aws_profile_uuid("aws-sso", "My AWS SSO"),
-            name: "My AWS SSO".to_string(),
-            provider_id: "aws-sso".to_string(),
-            fields: Default::default(),
-            secret_fields: Default::default(),
-            enabled: true,
-            read_only: true,
-            dangling_origin: None,
-        };
-
-        let dest = DestSnapshot {
-            auth_profiles: vec![&dest_auth],
-            ssh_tunnels: vec![],
-            proxies: vec![],
-            connections: vec![],
-        };
-
-        let import_plan = plan(&parsed, &dest);
-        let choices = ResolutionChoices::default();
-
-        let actions = apply(&parsed, &import_plan, &choices).expect("apply");
-
-        let expected_auth_id = aws_profile_uuid("aws-sso", "My AWS SSO");
-        let actual_auth_id = actions
-            .connections
-            .first()
-            .expect("connection")
-            .auth_profile_id;
-
-        assert_eq!(
-            actual_auth_id,
-            Some(expected_auth_id),
-            "AWS reference present at dest must resolve to the deterministic UUID"
         );
     }
 
@@ -2212,12 +2074,9 @@ encryption = "none"
             (DbKind::MariaDB, "MariaDB", "mariadb"),
             (DbKind::MongoDB, "MongoDB", "mongodb"),
             (DbKind::Redis, "Redis", "redis"),
-            (DbKind::DynamoDB, "DynamoDB", "dynamodb"),
-            (DbKind::CloudWatchLogs, "CloudWatchLogs", "cloudwatch"),
             (DbKind::InfluxDB, "InfluxDB", "influxdb"),
             (DbKind::SqlServer, "SqlServer", "mssql"),
             (DbKind::Redshift, "Redshift", "redshift"),
-            (DbKind::S3, "S3", "s3"),
             (DbKind::ClickHouse, "ClickHouse", "clickhouse"),
             (DbKind::Turso, "Turso", "turso"),
         ];
@@ -2271,6 +2130,62 @@ encryption = "none"
         );
     }
 
+    /// The kinds of the removed AWS drivers (#311) and the reserved wire slots
+    /// that took their place (#364) are not kinds a profile can have. A
+    /// connection that names one fails alone; the PostgreSQL connection
+    /// beside it is imported.
+    #[test]
+    fn apply_removed_or_reserved_kind_fails_only_its_connection() {
+        const REFUSED_KINDS: [&str; 8] = [
+            "DynamoDB",
+            "CloudWatchLogs",
+            "S3",
+            "AwsSecrets",
+            "ReservedDynamoDb",
+            "ReservedCloudWatchLogs",
+            "ReservedS3",
+            "ReservedAwsSecrets",
+        ];
+
+        let mut bundle = empty_bundle(EncryptionMode::None);
+        for kind in REFUSED_KINDS {
+            let mut refused = make_connection_entry(&format!("conn-{kind}"));
+            refused.name = format!("Refused {kind}");
+            refused.driver_id = "removed-driver".to_string();
+            refused.kind = Some(kind.to_string());
+            bundle.connections.push(refused);
+        }
+        let mut postgres = make_connection_entry("conn-postgres");
+        postgres.name = "Unaffected PostgreSQL".to_string();
+        bundle.connections.push(postgres);
+        let parsed = crate::ParsedBundle {
+            bundle,
+            decrypted_secrets: Some(HashMap::from([(
+                "conn:conn-ReservedS3:password".to_string(),
+                "staged fixture".to_string(),
+            )])),
+        };
+
+        let import_plan = plan(&parsed, &empty_dest());
+        let actions = apply(&parsed, &import_plan, &ResolutionChoices::default()).expect("apply");
+
+        let imported: Vec<&str> = actions
+            .connections
+            .iter()
+            .map(|connection| connection.name.as_str())
+            .collect();
+        assert_eq!(imported, ["Unaffected PostgreSQL"]);
+        let refused: Vec<(String, String)> = REFUSED_KINDS
+            .iter()
+            .map(|kind| (format!("Refused {kind}"), "removed-driver".to_string()))
+            .collect();
+        assert_eq!(actions.kind_failures, refused);
+        assert!(
+            actions.secret_writes.is_empty(),
+            "no secret is staged for a connection that is not imported"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // apply() — value_refs preserved on import (#1)
     // -----------------------------------------------------------------------
@@ -2321,6 +2236,70 @@ encryption = "none"
             "value_ref for 'host' must be Env{{key: DB_HOST}}, got: {:?}",
             vref
         );
+    }
+
+    fn value_ref_table(entries: &[(&str, &str)]) -> toml::Value {
+        toml::Value::Table(
+            entries
+                .iter()
+                .map(|(key, value)| (key.to_string(), toml::Value::String(value.to_string())))
+                .collect(),
+        )
+    }
+
+    /// A value ref the importer cannot read fails its own connection and names
+    /// the field. Dropping only the ref would import the connection with the
+    /// bundle's plain field text, which connect would then use (#350).
+    #[test]
+    fn apply_unreadable_value_ref_fails_only_its_connection_and_names_the_field() {
+        let mut removed_source = make_connection_entry("conn-removed-source");
+        removed_source.name = "Removed source".to_string();
+        removed_source.value_refs.insert(
+            "host".to_string(),
+            value_ref_table(&[
+                ("source", "parameter"),
+                ("provider", "aws-ssm"),
+                ("name", "/db/host"),
+            ]),
+        );
+        removed_source.value_refs.insert(
+            "user".to_string(),
+            value_ref_table(&[("source", "env"), ("key", "DB_USER")]),
+        );
+
+        let mut postgres = make_connection_entry("conn-postgres");
+        postgres.name = "Unaffected PostgreSQL".to_string();
+
+        let mut bundle = empty_bundle(EncryptionMode::None);
+        bundle.connections.push(removed_source);
+        bundle.connections.push(postgres);
+        let parsed = crate::ParsedBundle {
+            bundle,
+            decrypted_secrets: Some(HashMap::from([(
+                "conn:conn-removed-source:password".to_string(),
+                "staged fixture".to_string(),
+            )])),
+        };
+
+        let import_plan = plan(&parsed, &empty_dest());
+        let actions = apply(&parsed, &import_plan, &ResolutionChoices::default()).expect("apply");
+
+        let imported: Vec<&str> = actions
+            .connections
+            .iter()
+            .map(|connection| connection.name.as_str())
+            .collect();
+        assert_eq!(imported, ["Unaffected PostgreSQL"]);
+        assert_eq!(
+            actions.value_ref_failures,
+            [("Removed source".to_string(), vec!["host".to_string()])]
+        );
+        assert!(
+            actions.secret_writes.is_empty(),
+            "no secret is staged for a connection that is not imported"
+        );
+        assert!(actions.kind_failures.is_empty());
+        assert!(actions.unresolved_ref_connections.is_empty());
     }
 
     /// A bundle with no value_refs must produce a profile with an empty value_refs map.
@@ -2587,126 +2566,6 @@ encryption = "none"
                 "External config kind must be MySQL"
             );
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // apply() — AWS ref not in dest returns None auth_profile_id (#6)
-    // -----------------------------------------------------------------------
-
-    /// When an AWS reference is NOT present at the destination and the user made
-    /// no choice, the imported connection must have auth_profile_id = None —
-    /// not a dangling deterministic UUID pointing to a non-existent profile.
-    #[test]
-    fn apply_aws_reference_absent_from_dest_and_no_choice_yields_none_auth_id() {
-        let local_conn_id = "conn-aws-absent";
-        let mut bundle = empty_bundle(EncryptionMode::None);
-        let mut conn = make_connection_entry(local_conn_id);
-        conn.auth_ref = Some(AuthRef {
-            kind: AuthRefKind::AwsReference,
-            provider_id: "aws-sso".to_string(),
-            name: "Missing Profile".to_string(),
-        });
-        bundle.connections.push(conn);
-
-        let parsed = crate::ParsedBundle {
-            bundle,
-            decrypted_secrets: None,
-        };
-
-        // Dest has NO profiles — the AWS reference can't be auto-resolved.
-        let import_plan = plan(&parsed, &empty_dest());
-
-        // Verify that the plan emitted a RequiredResolution for this ref.
-        assert!(
-            import_plan
-                .required_resolutions
-                .iter()
-                .any(|r| matches!(&r.kind, crate::RequiredResolutionKind::AwsReference { .. })),
-            "AWS reference absent from dest must produce a RequiredResolution"
-        );
-
-        // No user choice provided.
-        let choices = ResolutionChoices::default();
-        let actions = apply(&parsed, &import_plan, &choices).expect("apply");
-
-        let actual_auth_id = actions
-            .connections
-            .first()
-            .expect("connection")
-            .auth_profile_id;
-
-        assert_eq!(
-            actual_auth_id, None,
-            "unresolved AWS reference with no user choice must yield auth_profile_id = None, \
-             not a dangling deterministic UUID"
-        );
-    }
-
-    /// When an AWS reference IS present at the destination, auto-resolving to the
-    /// deterministic UUID must still work as before.
-    #[test]
-    fn apply_aws_reference_present_at_dest_still_auto_resolves() {
-        use datatab_core::auth::{AuthProfile as CoreAuth, aws_profile_uuid};
-
-        let dest_auth = CoreAuth {
-            id: aws_profile_uuid("aws-sso", "Present Profile"),
-            name: "Present Profile".to_string(),
-            provider_id: "aws-sso".to_string(),
-            fields: Default::default(),
-            secret_fields: Default::default(),
-            enabled: true,
-            read_only: true,
-            dangling_origin: None,
-        };
-
-        let local_conn_id = "conn-aws-present";
-        let mut bundle = empty_bundle(EncryptionMode::None);
-        let mut conn = make_connection_entry(local_conn_id);
-        conn.auth_ref = Some(AuthRef {
-            kind: AuthRefKind::AwsReference,
-            provider_id: "aws-sso".to_string(),
-            name: "Present Profile".to_string(),
-        });
-        bundle.connections.push(conn);
-
-        let parsed = crate::ParsedBundle {
-            bundle,
-            decrypted_secrets: None,
-        };
-
-        let dest = DestSnapshot {
-            auth_profiles: vec![&dest_auth],
-            ssh_tunnels: vec![],
-            proxies: vec![],
-            connections: vec![],
-        };
-
-        let import_plan = plan(&parsed, &dest);
-
-        // Verify the plan did NOT emit a RequiredResolution for this ref.
-        assert!(
-            !import_plan
-                .required_resolutions
-                .iter()
-                .any(|r| matches!(&r.kind, crate::RequiredResolutionKind::AwsReference { .. })),
-            "AWS reference present in dest must NOT produce a RequiredResolution"
-        );
-
-        let choices = ResolutionChoices::default();
-        let actions = apply(&parsed, &import_plan, &choices).expect("apply");
-
-        let expected = aws_profile_uuid("aws-sso", "Present Profile");
-        let actual = actions
-            .connections
-            .first()
-            .expect("connection")
-            .auth_profile_id;
-
-        assert_eq!(
-            actual,
-            Some(expected),
-            "AWS reference present in dest must resolve to the deterministic UUID"
-        );
     }
 
     // -----------------------------------------------------------------------

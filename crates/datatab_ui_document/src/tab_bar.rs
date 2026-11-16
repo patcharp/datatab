@@ -999,7 +999,6 @@ fn tab_icon(icon: super::types::DocumentIcon) -> AppIcon {
         DocumentIcon::DumpAnalysis => AppIcon::HardDrive,
         DocumentIcon::McpApprovals => AppIcon::Bot,
         DocumentIcon::Migrate => AppIcon::ArrowUpDown,
-        DocumentIcon::SecretStore => AppIcon::Lock,
     }
 }
 

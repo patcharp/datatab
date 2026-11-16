@@ -66,7 +66,6 @@ pub(crate) fn node_kind_has_context_menu(kind: SchemaNodeKind) -> bool {
         | SchemaNodeKind::ScriptsRoot
         | SchemaNodeKind::DashboardsFolder
         | SchemaNodeKind::DashboardItem
-        | SchemaNodeKind::RemoteDashboardsFolder
         | SchemaNodeKind::SavedChartItem
         | SchemaNodeKind::InstanceMetricsFolder
         | SchemaNodeKind::InstanceMetricLeaf
@@ -89,13 +88,7 @@ pub(crate) fn node_kind_has_context_menu(kind: SchemaNodeKind) -> bool {
         | SchemaNodeKind::RoutinesFolder
         | SchemaNodeKind::RoutinesLoadingFolder
         | SchemaNodeKind::CollectionsFolder
-        | SchemaNodeKind::MetricsFolder
-        | SchemaNodeKind::MetricNamespaceFolder
-        | SchemaNodeKind::MetricLeaf
-        | SchemaNodeKind::RemoteDashboardItem
         | SchemaNodeKind::SavedChartsFolder
-        | SchemaNodeKind::CollectionChild
-        | SchemaNodeKind::CollectionChildrenMore
         | SchemaNodeKind::ColumnsFolder
         | SchemaNodeKind::IndexesFolder
         | SchemaNodeKind::ForeignKeysFolder
@@ -117,8 +110,6 @@ pub(crate) fn node_kind_has_context_menu(kind: SchemaNodeKind) -> bool {
         | SchemaNodeKind::DependentItem
         | SchemaNodeKind::RootSection
         | SchemaNodeKind::RootSectionLoadMore
-        | SchemaNodeKind::SecretStore
-        | SchemaNodeKind::SecretPath
         | SchemaNodeKind::InstanceFolder => false,
     }
 }
@@ -497,13 +488,6 @@ impl Sidebar {
                     ContextMenuAction::Open,
                 )];
 
-                if self.collection_supports_child_picker(item_id, cx) {
-                    open_section.push(ContextMenuItem::item(
-                        datatab_i18n::t!("sidebar.menu.browse_event_streams"),
-                        ContextMenuAction::OpenChildPicker,
-                    ));
-                }
-
                 open_section.push(ContextMenuItem::item(
                     datatab_i18n::t!("sidebar.menu.view_schema"),
                     ContextMenuAction::ViewSchema,
@@ -603,16 +587,6 @@ impl Sidebar {
                     )],
                 );
 
-                if self.collection_supports_child_picker(item_id, cx) {
-                    Self::append_menu_section(
-                        &mut items,
-                        [ContextMenuItem::item(
-                            datatab_i18n::t!("sidebar.menu.browse_event_streams"),
-                            ContextMenuAction::OpenChildPicker,
-                        )],
-                    );
-                }
-
                 Self::append_menu_section(
                     &mut items,
                     [ContextMenuItem::item(
@@ -640,9 +614,7 @@ impl Sidebar {
                 // The Generate Query submenu contains MongoDB-specific operation names.
                 // Time-series measurements share the Collection node kind but do not use
                 // this submenu — their query model is Flux/InfluxQL, not MQL.
-                if !self.collection_is_event_stream(item_id, cx)
-                    && !self.collection_is_time_series(item_id, cx)
-                {
+                if !self.collection_is_time_series(item_id, cx) {
                     Self::append_menu_section(
                         &mut items,
                         [ContextMenuItem::item(
@@ -1245,45 +1217,7 @@ impl Sidebar {
                     )],
                 );
 
-                // "Import Dashboard from JSON..." is gated on the driver's
-                // DASHBOARD_IMPORT capability — only drivers that vend
-                // importable dashboard JSON (CloudWatch-style metric dashboards)
-                // advertise this bit.
-                let can_import = parse_node_id(item_id)
-                    .and_then(|node_id| {
-                        if let SchemaNodeId::DashboardsFolder { profile_id } = node_id {
-                            Some(profile_id)
-                        } else {
-                            None
-                        }
-                    })
-                    .and_then(|profile_id| {
-                        let state = self.app_state.read(cx);
-                        let conn = state.connections().get(&profile_id)?;
-                        Some(conn.connection.metadata().capabilities)
-                    })
-                    .is_some_and(|caps| {
-                        caps.contains(datatab_core::DriverCapabilities::DASHBOARD_IMPORT)
-                    });
-
-                if can_import {
-                    Self::append_menu_section(
-                        &mut items,
-                        [ContextMenuItem::item(
-                            datatab_i18n::t!("sidebar.menu.import_dashboard"),
-                            ContextMenuAction::ImportDashboard,
-                        )],
-                    );
-                }
-
                 items
-            }
-
-            SchemaNodeKind::RemoteDashboardsFolder => {
-                vec![ContextMenuItem::item(
-                    datatab_i18n::t!("sidebar.menu.refresh"),
-                    ContextMenuAction::RefreshRemoteDashboards,
-                )]
             }
 
             SchemaNodeKind::DashboardItem => {
@@ -1549,79 +1483,6 @@ impl Sidebar {
         conn.connection.metadata().ddl.clone()
     }
 
-    pub(super) fn collection_info_for_item(&self, item_id: &str, cx: &App) -> Option<TableInfo> {
-        let SchemaNodeId::Collection {
-            profile_id,
-            database,
-            name,
-        } = parse_node_id(item_id)?
-        else {
-            return None;
-        };
-
-        let state = self.app_state.read(cx);
-        let conn = state.connections().get(&profile_id)?;
-        let cache_key = (database.clone(), Some(database.clone()), name.clone());
-
-        if let Some(details) = conn.table_details.get(&cache_key) {
-            return Some(details.clone());
-        }
-
-        conn.database_schemas
-            .get(&database)
-            .and_then(|schema| schema.tables.iter().find(|table| table.name == name))
-            .cloned()
-            .or_else(|| {
-                conn.schema.as_ref().and_then(|schema| {
-                    schema.collections().iter().find_map(|collection| {
-                        if collection.name != name {
-                            return None;
-                        }
-
-                        if collection
-                            .database
-                            .as_deref()
-                            .is_some_and(|db| db != database)
-                        {
-                            return None;
-                        }
-
-                        Some(TableInfo {
-                            name: collection.name.clone(),
-                            schema: Some(database.clone()),
-                            columns: None,
-                            indexes: collection.indexes.clone().map(IndexData::Document),
-                            foreign_keys: None,
-                            constraints: None,
-                            sample_fields: collection.sample_fields.clone(),
-                            presentation: collection.presentation,
-                            child_items: collection.child_items.clone(),
-                            storage_hints: None,
-                            pseudo_columns: Box::default(),
-                        })
-                    })
-                })
-            })
-    }
-
-    fn collection_supports_child_picker(&self, item_id: &str, cx: &App) -> bool {
-        self.collection_info_for_item(item_id, cx)
-            .is_some_and(|collection| {
-                collection.presentation == CollectionPresentation::EventStream
-                    || collection
-                        .child_items
-                        .as_ref()
-                        .is_some_and(|items| !items.is_empty())
-            })
-    }
-
-    fn collection_is_event_stream(&self, item_id: &str, cx: &App) -> bool {
-        self.collection_info_for_item(item_id, cx)
-            .is_some_and(|collection| {
-                collection.presentation == CollectionPresentation::EventStream
-            })
-    }
-
     /// Returns true when the collection node declares the time-series facet.
     ///
     /// Used to suppress document-database-specific menu items (e.g. MongoDB generate
@@ -1701,41 +1562,6 @@ impl Sidebar {
             .connections()
             .get(&profile_id)
             .is_some_and(lists_measurements)
-    }
-
-    fn open_child_picker(&mut self, item_id: &str, cx: &mut Context<Self>) {
-        let pending = PendingAction::OpenChildPicker {
-            item_id: item_id.to_string(),
-        };
-
-        let status = match parse_node_id(item_id) {
-            Some(SchemaNodeId::Collection {
-                profile_id,
-                database,
-                name,
-            }) if self.collection_is_event_stream(item_id, cx) => {
-                self.ensure_collection_children(profile_id, &database, &name, pending, cx)
-            }
-            _ => self.ensure_table_details(item_id, pending, cx),
-        };
-
-        match status {
-            TableDetailsStatus::Ready => {
-                self.pending_child_picker_item = Some(item_id.to_string());
-            }
-            TableDetailsStatus::Loading => {
-                self.pending_toast = Some(PendingToast {
-                    message: crate::labels::loading_event_streams_toast_label(),
-                    is_error: false,
-                });
-            }
-            TableDetailsStatus::NotFound => {
-                self.pending_toast = Some(PendingToast {
-                    message: datatab_i18n::t!("sidebar.overlay.child_picker.unsupported"),
-                    is_error: true,
-                });
-            }
-        }
     }
 
     pub fn context_menu_select_next(&mut self, cx: &mut Context<Self>) {
@@ -1847,9 +1673,6 @@ impl Sidebar {
                         self.browse_table(&item_id, cx);
                     }
                 }
-            }
-            ContextMenuAction::OpenChildPicker => {
-                self.open_child_picker(&item_id, cx);
             }
             ContextMenuAction::ViewSchema => {
                 self.set_expanded(&item_id, true, cx);
@@ -2026,26 +1849,6 @@ impl Sidebar {
                 if let Some(SchemaNodeId::DashboardsFolder { profile_id }) = parse_node_id(&item_id)
                 {
                     cx.emit(SidebarEvent::RequestCreateDashboard { profile_id });
-                }
-            }
-            ContextMenuAction::ImportDashboard => {
-                if let Some(SchemaNodeId::DashboardsFolder { profile_id }) = parse_node_id(&item_id)
-                {
-                    cx.emit(SidebarEvent::RequestImportDashboard { profile_id });
-                }
-            }
-            ContextMenuAction::RefreshRemoteDashboards => {
-                if let Some(SchemaNodeId::RemoteDashboardsFolder { profile_id }) =
-                    parse_node_id(&item_id)
-                {
-                    // Drop the cached listing and re-fetch so the next render
-                    // shows the current upstream set.
-                    self.app_state
-                        .read(cx)
-                        .remote_dashboard_cache()
-                        .invalidate(profile_id);
-                    self.spawn_fetch_remote_dashboards(profile_id, cx);
-                    self.rebuild_tree_with_overrides(cx);
                 }
             }
             ContextMenuAction::RenameDashboard => {
@@ -2322,9 +2125,8 @@ mod parent_hover_tests {
 
 #[cfg(test)]
 mod menu_i18n_tests {
-    const B1_KEYS: [&str; 14] = [
+    const B1_KEYS: [&str; 13] = [
         "sidebar.menu.open",
-        "sidebar.menu.browse_event_streams",
         "sidebar.menu.view_schema",
         "sidebar.menu.refresh",
         "sidebar.menu.generate_sql",
@@ -2406,9 +2208,8 @@ mod menu_i18n_tests {
         assert_eq!(english, "Connect");
     }
 
-    const B3_KEYS: [&str; 6] = [
+    const B3_KEYS: [&str; 5] = [
         "sidebar.menu.new_dashboard",
-        "sidebar.menu.import_dashboard",
         "sidebar.menu.rename_ellipsis",
         "sidebar.menu.delete",
         "sidebar.menu.copy_metric_id",
@@ -2457,7 +2258,7 @@ mod menu_availability_tests {
     use uuid::Uuid;
 
     /// Every `SchemaNodeKind`, in declaration order.
-    const ALL_KINDS: [SchemaNodeKind; 65] = [
+    const ALL_KINDS: [SchemaNodeKind; 58] = [
         SchemaNodeKind::ConnectionFolder,
         SchemaNodeKind::Profile,
         SchemaNodeKind::DatabasesFolder,
@@ -2476,20 +2277,13 @@ mod menu_availability_tests {
         SchemaNodeKind::RoutinesFolder,
         SchemaNodeKind::RoutinesLoadingFolder,
         SchemaNodeKind::CollectionsFolder,
-        SchemaNodeKind::MetricsFolder,
-        SchemaNodeKind::MetricNamespaceFolder,
-        SchemaNodeKind::MetricLeaf,
         SchemaNodeKind::DashboardsFolder,
         SchemaNodeKind::DashboardItem,
-        SchemaNodeKind::RemoteDashboardsFolder,
-        SchemaNodeKind::RemoteDashboardItem,
         SchemaNodeKind::SavedChartsFolder,
         SchemaNodeKind::SavedChartItem,
         SchemaNodeKind::Table,
         SchemaNodeKind::View,
         SchemaNodeKind::Collection,
-        SchemaNodeKind::CollectionChild,
-        SchemaNodeKind::CollectionChildrenMore,
         SchemaNodeKind::CustomType,
         SchemaNodeKind::ColumnsFolder,
         SchemaNodeKind::IndexesFolder,
@@ -2526,7 +2320,7 @@ mod menu_availability_tests {
     ];
 
     /// Kinds whose rows open a context menu.
-    const KINDS_WITH_MENU: [SchemaNodeKind; 25] = [
+    const KINDS_WITH_MENU: [SchemaNodeKind; 24] = [
         SchemaNodeKind::ConnectionFolder,
         SchemaNodeKind::Profile,
         SchemaNodeKind::DatabasesFolder,
@@ -2544,7 +2338,6 @@ mod menu_availability_tests {
         SchemaNodeKind::ScriptsRoot,
         SchemaNodeKind::DashboardsFolder,
         SchemaNodeKind::DashboardItem,
-        SchemaNodeKind::RemoteDashboardsFolder,
         SchemaNodeKind::SavedChartItem,
         SchemaNodeKind::InstanceMetricsFolder,
         SchemaNodeKind::InstanceMetricLeaf,
@@ -2560,11 +2353,9 @@ mod menu_availability_tests {
         all_kinds.push(SchemaNodeKind::RootSection);
         all_kinds.push(SchemaNodeKind::RootSectionItem);
         all_kinds.push(SchemaNodeKind::RootSectionLoadMore);
-        all_kinds.push(SchemaNodeKind::SecretStore);
-        all_kinds.push(SchemaNodeKind::SecretPath);
 
         let discriminants: Vec<usize> = all_kinds.iter().map(|kind| *kind as usize).collect();
-        let expected: Vec<usize> = (0..=SchemaNodeKind::SecretPath as usize).collect();
+        let expected: Vec<usize> = (0..=SchemaNodeKind::RootSectionLoadMore as usize).collect();
         assert_eq!(
             discriminants, expected,
             "ALL_KINDS must list every SchemaNodeKind variant in declaration order"
@@ -2921,7 +2712,6 @@ mod menu_availability_tests {
                 profile_id,
                 dashboard_id: Uuid::new_v4(),
             },
-            SchemaNodeId::RemoteDashboardsFolder { profile_id },
             SchemaNodeId::SavedChartItem {
                 profile_id,
                 chart_id: Uuid::new_v4(),

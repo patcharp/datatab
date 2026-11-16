@@ -24,24 +24,18 @@ datatab_driver_postgres = { workspace = true, optional = true }
 datatab_driver_mysql = { workspace = true, optional = true }
 datatab_driver_mongodb = { workspace = true, optional = true }
 datatab_driver_redis = { workspace = true, optional = true }
-datatab_driver_dynamodb = { workspace = true, optional = true }
-datatab_driver_cloudwatch = { workspace = true, optional = true }
 datatab_driver_influxdb = { workspace = true, optional = true }
 datatab_driver_mssql = { workspace = true, optional = true }
 datatab_driver_redshift = { workspace = true, optional = true }
 datatab_driver_clickhouse = { workspace = true, optional = true }
 datatab_driver_turso = { workspace = true, optional = true }
 datatab_driver_duckdb = { workspace = true, optional = true }
-datatab_driver_s3 = { workspace = true, optional = true }
-datatab_driver_aws_secrets = { workspace = true, optional = true }
 datatab_portability.workspace = true
 datatab_lua = { workspace = true, optional = true }
 datatab_approval = { workspace = true, optional = true }
 datatab_mcp = { workspace = true, optional = true }
 datatab_mcp_server = { workspace = true, optional = true }
 datatab_policy = { workspace = true, optional = true }
-datatab_aws = { workspace = true, optional = true }
-datatab_ssm = { workspace = true, optional = true }
 chrono.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -52,7 +46,8 @@ async-trait = { workspace = true }
 semver.workspace = true
 
 [features]
-default = ["sqlite", "postgres", "mysql", "mongodb", "redis", "dynamodb", "cloudwatch", "mssql"]
+test-support = []
+default = ["sqlite", "postgres", "mysql", "mongodb", "redis", "mssql"]
 # Per-driver features enable the driver crate (for registration here) and, when
 # the MCP server is compiled in, forward the matching driver feature to it. This
 # relay used to live in datatab_ui; it belongs here because datatab_app owns both
@@ -62,18 +57,13 @@ postgres = ["datatab_driver_postgres", "datatab_mcp_server?/postgres"]
 mysql = ["datatab_driver_mysql", "datatab_mcp_server?/mysql"]
 mongodb = ["datatab_driver_mongodb", "datatab_mcp_server?/mongodb"]
 redis = ["datatab_driver_redis", "datatab_mcp_server?/redis"]
-dynamodb = ["datatab_driver_dynamodb", "datatab_mcp_server?/dynamodb"]
-cloudwatch = ["datatab_driver_cloudwatch"]
 influxdb = ["dep:datatab_driver_influxdb"]
 mssql = ["dep:datatab_driver_mssql"]
 redshift = ["datatab_driver_redshift", "datatab_mcp_server?/redshift"]
 clickhouse = ["datatab_driver_clickhouse", "datatab_mcp_server?/clickhouse"]
 turso = ["datatab_driver_turso", "datatab_mcp_server?/turso"]
 duckdb = ["datatab_driver_duckdb", "datatab_mcp_server?/duckdb"]
-s3 = ["dep:datatab_driver_s3"]
-aws_secrets = ["dep:datatab_driver_aws_secrets"]
 lua = ["datatab_lua"]
-aws = ["datatab_aws", "datatab_ssm", "datatab_mcp_server?/aws"]
 mcp = ["datatab_approval", "datatab_mcp", "datatab_mcp_server", "datatab_policy", "datatab_core/mcp"]
 
 [lints]

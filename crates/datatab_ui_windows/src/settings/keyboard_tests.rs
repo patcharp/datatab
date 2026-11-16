@@ -690,3 +690,26 @@ fn every_settings_section_is_covered(cx: &mut TestAppContext) {
         );
     }
 }
+
+#[test]
+fn window_controls_are_registered_as_chrome() {
+    use crate::keyboard_coverage::{CONNECTION_MANAGER, SETTINGS};
+    use datatab_ui_base::keyboard_coverage::KeyboardPath;
+
+    for registry in [SETTINGS, CONNECTION_MANAGER] {
+        for id in [
+            "shell-window-title-drag",
+            "csd-minimize",
+            "csd-maximize",
+            "csd-close",
+        ] {
+            assert!(
+                registry.entries.iter().any(|(entry, path)| {
+                    *entry == id && matches!(path, KeyboardPath::MouseOnly("window chrome"))
+                }),
+                "{}: missing window chrome entry for {id}",
+                registry.name
+            );
+        }
+    }
+}

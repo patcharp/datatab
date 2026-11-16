@@ -101,27 +101,14 @@ impl BucketsTableDocument {
     }
 
     /// Consumes the toolbar's "New bucket" intent on the next render pass and
-    /// builds the modal's inputs, pre-filling the region from the connection's
-    /// own configuration.
+    /// builds the modal's inputs with an empty region.
     pub(super) fn drain_pending_new_bucket(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.take_pending_new_bucket() {
             return;
         }
 
-        let region = self
-            .app_state
-            .read(cx)
-            .connections()
-            .get(&self.profile_id)
-            .and_then(|connected| connected.profile.config.region().map(str::to_string))
-            .unwrap_or_default();
-
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("my-bucket-name"));
-        let region_input = cx.new(|cx| {
-            let mut state = InputState::new(window, cx).placeholder("us-east-1");
-            state.set_value(&region, window, cx);
-            state
-        });
+        let region_input = cx.new(|cx| InputState::new(window, cx).placeholder("us-east-1"));
 
         // Both inputs feed validation and the submitted options, so every
         // keystroke has to reach the next render.
@@ -606,6 +593,61 @@ mod tests {
     use super::{BucketEncryptionChoice, bucket_name_error};
     use crate::buckets_table::data::tests::new_test_entity;
     use datatab_core::BucketEncryption;
+
+    #[gpui::test]
+    fn new_bucket_region_starts_empty_for_a_connected_profile(cx: &mut gpui::TestAppContext) {
+        use datatab_core::{ConnectedProfile, ConnectionProfile, DbConfig, DbKind, MutationPolicy};
+        use datatab_test_support::fake_driver::FakeDriver;
+
+        let doc = new_test_entity(cx);
+        let profile = ConnectionProfile::new(
+            "test object store",
+            DbConfig::External {
+                kind: DbKind::Postgres,
+                values: [("region".to_string(), "eu-west-1".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+        );
+        let connection = FakeDriver::new(DbKind::Postgres)
+            .connect_arc(&profile)
+            .expect("fake connection");
+        cx.update(|cx| {
+            let (profile_id, app_state) = {
+                let doc = doc.read(cx);
+                (doc.profile_id, doc.app_state.clone())
+            };
+            app_state.update(cx, |state, _| {
+                state.connections_mut().insert(
+                    profile_id,
+                    ConnectedProfile {
+                        profile,
+                        connection,
+                        schema: None,
+                        mutation_policy: MutationPolicy::default(),
+                        read_only_reason: None,
+                        database_schemas: Default::default(),
+                        table_details: Default::default(),
+                        schema_types: Default::default(),
+                        schema_columns: Default::default(),
+                        schema_indexes: Default::default(),
+                        schema_foreign_keys: Default::default(),
+                        schema_routines: Default::default(),
+                        dependents_cache: Default::default(),
+                        active_database: None,
+                        redis_key_cache: Default::default(),
+                        database_connections: Default::default(),
+                        proxy_tunnel: None,
+                    },
+                );
+            });
+        });
+        cx.update(|cx| doc.update(cx, |doc, cx| doc.request_new_bucket(cx)));
+        cx.update(|cx| {
+            let state = doc.read(cx).new_bucket().expect("modal open");
+            assert_eq!(state.region_input.read(cx).value(), "");
+        });
+    }
 
     /// T39: the toolbar's intent turns into an open modal on the next render
     /// pass, with the defaults the mock specifies.

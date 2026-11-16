@@ -8,6 +8,9 @@ repository.workspace = true
 homepage.workspace = true
 license.workspace = true
 
+[features]
+test-support = []
+
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
 postcard = { workspace = true }

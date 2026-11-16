@@ -7,10 +7,10 @@ use tokio::task::JoinHandle;
 use crate::error_messages;
 
 /// Budget for a pipeline stage that does not wait on a human (auth refresh, value
-/// resolution, opening an SSM tunnel).
+/// resolution, opening an access tunnel).
 const STAGE_BUDGET: Duration = Duration::from_secs(30);
 
-/// An SSO login waits for the user to finish the flow in a browser.
+/// A provider login waits for the user to finish the flow in a browser.
 const LOGIN_BUDGET: Duration = Duration::from_secs(300);
 
 /// Driver connects run their own network handshake and may include server-side

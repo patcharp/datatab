@@ -1,6 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -9,7 +10,8 @@ use datatab_core::DbError;
 use datatab_core::FormFieldKind;
 use datatab_core::auth::{
     AuthFormDef, AuthProfile, AuthProviderCapabilities, AuthSession, AuthSessionState,
-    DynAuthProvider, ResolvedCredentials, UrlCallback,
+    DynAuthProvider, FetchOptionsError, FetchOptionsRequest, FetchOptionsResponse,
+    ResolvedCredentials, UrlCallback,
 };
 use interprocess::local_socket::{Stream as IpcStream, prelude::*};
 
@@ -27,6 +29,16 @@ use crate::{RpcApiFamily, auth_provider_rpc_supported_versions, negotiate_highes
 
 const DEFAULT_STARTUP_TIMEOUT_MS: u64 = 5_000;
 const MIN_STARTUP_TIMEOUT_MS: u64 = 1;
+
+/// How long a request other than `Login` may take before the caller gets an error.
+const REQUEST_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How long a `Login` may take: the provider answers only after the user finished the
+/// browser step. It matches `SSO_LOGIN_TIMEOUT` in `datatab_ui`'s login modal
+/// (`crates/datatab_ui/src/ui/overlays/login_modal.rs`) and `LOGIN_BUDGET` in
+/// `datatab_mcp_server` (`src/server/connect_deadline/mod.rs`); `datatab_ipc` cannot depend on
+/// either crate, so keep the three equal by hand.
+const LOGIN_DEADLINE: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IpcServiceLaunchConfig {
@@ -51,6 +63,8 @@ pub struct RpcAuthProvider {
     /// Sanitizing sink for audit frames emitted by this provider.
     audit_emitter: Option<Arc<dyn ExternalAuditEmitter>>,
     launch: Option<IpcServiceLaunchConfig>,
+    request_deadline: Duration,
+    login_deadline: Duration,
 }
 
 #[derive(Debug)]
@@ -63,6 +77,20 @@ struct NormalizedAuthProviderHelloResponse {
     secret_dependency_opt_in: bool,
     /// Whether the provider opted in to emitting audit events (v1.3+).
     audit_emit_opt_in: bool,
+}
+
+/// What one request needs from its `RpcAuthProvider`. It is owned, so the
+/// request can run on its own thread while the caller's future waits.
+struct RequestTransport {
+    socket_id: String,
+    provider_id: String,
+    selected_version: ProtocolVersion,
+    audit_emit_opt_in: bool,
+    audit_emitter: Option<Arc<dyn ExternalAuditEmitter>>,
+    launch: Option<IpcServiceLaunchConfig>,
+    /// Set when the caller gave up (the deadline won or the future was dropped).
+    /// The worker then runs no callback and emits no audit event.
+    abandoned: Arc<AtomicBool>,
 }
 
 impl RpcAuthProvider {
@@ -133,6 +161,8 @@ impl RpcAuthProvider {
             audit_emit_opt_in: hello.audit_emit_opt_in,
             audit_emitter: None,
             launch,
+            request_deadline: REQUEST_DEADLINE,
+            login_deadline: LOGIN_DEADLINE,
         })
     }
 
@@ -167,17 +197,29 @@ impl RpcAuthProvider {
             audit_emit_opt_in,
             audit_emitter,
             launch: None,
+            request_deadline: REQUEST_DEADLINE,
+            login_deadline: LOGIN_DEADLINE,
         }
     }
 
-    #[allow(clippy::result_large_err)]
-    fn connect_stream(&self) -> Result<IpcStream, DbError> {
-        ensure_host_running_for(&self.socket_id, self.launch.as_ref())?;
+    /// Replaces the two deadlines so a test runs in milliseconds.
+    #[cfg(test)]
+    fn with_deadlines(mut self, request_deadline: Duration, login_deadline: Duration) -> Self {
+        self.request_deadline = request_deadline;
+        self.login_deadline = login_deadline;
+        self
+    }
 
-        let name = auth_provider_socket_name(&self.socket_id)
-            .map_err(|error| DbError::connection_failed(error.to_string()))?;
-
-        IpcStream::connect(name).map_err(|error| DbError::connection_failed(error.to_string()))
+    fn request_transport(&self) -> RequestTransport {
+        RequestTransport {
+            socket_id: self.socket_id.clone(),
+            provider_id: self.provider_id.clone(),
+            selected_version: self.selected_version,
+            audit_emit_opt_in: self.audit_emit_opt_in,
+            audit_emitter: self.audit_emitter.clone(),
+            launch: self.launch.clone(),
+            abandoned: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     #[allow(clippy::result_large_err)]
@@ -247,41 +289,75 @@ impl RpcAuthProvider {
         }
     }
 
+    /// Sends `body` and waits for the provider's answer without blocking the
+    /// calling thread (see `run_request_worker`).
+    #[allow(clippy::result_large_err)]
+    async fn send_request(
+        &self,
+        body: AuthProviderRequestBody,
+    ) -> Result<Vec<AuthProviderResponseEnvelope>, DbError> {
+        let transport = self.request_transport();
+
+        run_request_worker(
+            &self.socket_id,
+            &self.provider_id,
+            self.request_deadline,
+            Arc::clone(&transport.abandoned),
+            move || transport.send_request(body, &mut |_| {}),
+        )
+        .await
+    }
+}
+
+impl RequestTransport {
+    #[allow(clippy::result_large_err)]
+    fn connect_stream(&self) -> Result<IpcStream, DbError> {
+        ensure_host_running_for(&self.socket_id, self.launch.as_ref())?;
+
+        let name = auth_provider_socket_name(&self.socket_id)
+            .map_err(|error| DbError::connection_failed(error.to_string()))?;
+
+        IpcStream::connect(name).map_err(|error| DbError::connection_failed(error.to_string()))
+    }
+
+    /// Connects and runs one request to its terminal frame. Blocking: call it
+    /// from a request worker, never from an executor thread.
     #[allow(clippy::result_large_err)]
     fn send_request(
         &self,
         body: AuthProviderRequestBody,
+        on_response: &mut dyn FnMut(&AuthProviderResponseBody),
     ) -> Result<Vec<AuthProviderResponseEnvelope>, DbError> {
         let mut stream = self.connect_stream()?;
-        self.dispatch_request_loop(&mut stream, body)
+        self.dispatch_request_loop(&mut stream, body, on_response)
     }
 
     /// Sends `body` to the provider over `stream` and collects all response frames.
     ///
-    /// The loop exits on the first frame with `done = true`. To guard against misbehaving
-    /// providers that send frames indefinitely, two circuit breakers are applied:
-    /// - **Frame cap** (`MAX_INTERMEDIATE_FRAMES`): aborts after processing this many frames
-    ///   without a terminal `done = true` frame.
-    /// - **Per-request deadline** (`PER_REQUEST_DEADLINE`): aborts when the wall-clock time
-    ///   since the request started exceeds the limit.
+    /// The loop exits on the first frame with `done = true`. To guard against a misbehaving
+    /// provider that sends frames indefinitely, it aborts after `MAX_INTERMEDIATE_FRAMES`
+    /// frames without a terminal `done = true` frame.
     ///
-    /// Note: a `recv_msg` call that never returns cannot be interrupted by these guards —
-    /// socket-level read timeouts are not portable for the `interprocess` stream type used here.
+    /// The wall-clock limit is not checked here: `run_request_worker` races the whole request
+    /// against its deadline, which also covers a provider that sends no frame at all. A
+    /// `recv_msg` call that never returns cannot be interrupted from this loop.
+    ///
+    /// `on_response` sees each collected frame when it arrives, so a caller can act on a
+    /// progress frame while the provider still works on the terminal one.
     #[allow(clippy::result_large_err)]
     fn dispatch_request_loop<S: std::io::Read + std::io::Write>(
         &self,
         stream: &mut S,
         body: AuthProviderRequestBody,
+        on_response: &mut dyn FnMut(&AuthProviderResponseBody),
     ) -> Result<Vec<AuthProviderResponseEnvelope>, DbError> {
         const MAX_INTERMEDIATE_FRAMES: usize = 1000;
-        const PER_REQUEST_DEADLINE: Duration = Duration::from_secs(60);
 
         let request = AuthProviderRequestEnvelope::new(self.selected_version, 1, body);
         let correlation_id = uuid::Uuid::new_v4().to_string();
 
         framing::send_msg(&mut *stream, &request)?;
 
-        let deadline = Instant::now() + PER_REQUEST_DEADLINE;
         let mut frame_count: usize = 0;
         let mut responses = Vec::new();
 
@@ -302,18 +378,6 @@ impl RpcAuthProvider {
                 )));
             }
 
-            if Instant::now() > deadline {
-                log::warn!(
-                    "auth-provider '{}' request exceeded {:?} deadline; aborting",
-                    self.provider_id,
-                    PER_REQUEST_DEADLINE
-                );
-                return Err(DbError::connection_failed(format!(
-                    "auth-provider '{}' request exceeded {:?}",
-                    self.provider_id, PER_REQUEST_DEADLINE
-                )));
-            }
-
             if response.request_id != request.request_id {
                 return Err(DbError::connection_failed(format!(
                     "Request ID mismatch: sent {}, got {}",
@@ -326,6 +390,7 @@ impl RpcAuthProvider {
             match &response.body {
                 AuthProviderResponseBody::EmitAuditEvent(dto) if !done => {
                     if self.audit_emit_opt_in
+                        && !self.abandoned.load(Ordering::Acquire)
                         && let Some(sink) = &self.audit_emitter
                     {
                         let source = ExternalAuditSource::AuthProvider {
@@ -338,6 +403,9 @@ impl RpcAuthProvider {
                     // Never push EmitAuditEvent frames to `responses` — keep it terminal-only.
                 }
                 _ => {
+                    if !self.abandoned.load(Ordering::Acquire) {
+                        on_response(&response.body);
+                    }
                     responses.push(response);
                 }
             }
@@ -347,14 +415,118 @@ impl RpcAuthProvider {
             }
         }
     }
+}
 
+/// Runs one blocking request on its own thread and waits for its result
+/// without blocking the caller: the Settings form and the connection manager
+/// await these calls on the UI thread, and a login waits there for as long as
+/// the user takes in the browser.
+///
+/// A second thread waits `deadline` for the worker to finish and sends a timeout on the
+/// same channel when it does not, so the caller gets an error even when the provider sends
+/// no frame at all. The timer ends as soon as the worker does. It is not a tokio timer: the
+/// GPUI executors have no tokio runtime.
+///
+/// A dropped future or a lost race sets `abandoned`, so the worker runs no more callbacks
+/// and emits no more audit events. Its thread ends when the provider answers or closes the
+/// socket. `interprocess` offers no way to
+/// shut its stream down from another thread: the Unix stream has no public
+/// `shutdown` (`os/unix/c_wrappers.rs:448` is `pub(super)`) and the Windows
+/// stream has no read timeout (`os/windows/named_pipe/local_socket/stream.rs:53`).
+async fn run_request_worker<Output, Work>(
+    socket_id: &str,
+    provider_id: &str,
+    deadline: Duration,
+    abandoned: Arc<AtomicBool>,
+    work: Work,
+) -> Result<Output, DbError>
+where
+    Output: Send + 'static,
+    Work: FnOnce() -> Result<Output, DbError> + Send + 'static,
+{
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Option<Result<Output, DbError>>>(2);
+    let timer_sender = sender.clone();
+    let worker_socket_id = socket_id.to_string();
+    let (worker_done, timer_done) = std::sync::mpsc::channel::<()>();
+    let _abandon_on_drop = AbandonOnDrop(Arc::clone(&abandoned));
+
+    thread::Builder::new()
+        .name(format!("datatab-auth-provider-{socket_id}"))
+        .spawn(move || {
+            // Dropped when the closure ends, which wakes the timer.
+            let _worker_done = worker_done;
+            if sender.try_send(Some(work())).is_err() {
+                log::debug!("Auth-provider request on '{worker_socket_id}' was abandoned");
+            }
+        })
+        .map_err(|error| {
+            DbError::connection_failed(format!(
+                "Could not start the auth-provider request worker: {error}"
+            ))
+        })?;
+
+    thread::Builder::new()
+        .name(format!("datatab-auth-provider-deadline-{socket_id}"))
+        .spawn(move || run_deadline_timer(&timer_done, deadline, &timer_sender))
+        .map_err(|error| {
+            DbError::connection_failed(format!(
+                "Could not start the auth-provider request deadline: {error}"
+            ))
+        })?;
+
+    match receiver.recv().await {
+        Some(Some(result)) => result,
+        Some(None) => {
+            abandoned.store(true, Ordering::Release);
+            log::warn!("auth-provider '{provider_id}' request exceeded {deadline:?}; giving up");
+            Err(DbError::connection_failed(format!(
+                "auth-provider '{provider_id}' did not answer within {deadline:?}"
+            )))
+        }
+        None => Err(DbError::connection_failed(
+            "Auth-provider request worker stopped without a result".to_string(),
+        )),
+    }
+}
+
+/// Sets the flag when the request future is dropped, finished or not.
+struct AbandonOnDrop(Arc<AtomicBool>);
+
+impl Drop for AbandonOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// Waits up to `deadline` for the worker's done signal (its sender dropping) and sends the
+/// timeout only when the deadline passes first.
+fn run_deadline_timer<Output>(
+    worker_done: &std::sync::mpsc::Receiver<()>,
+    deadline: Duration,
+    sender: &tokio::sync::mpsc::Sender<Option<Result<Output, DbError>>>,
+) {
+    match worker_done.recv_timeout(deadline) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            if sender.try_send(None).is_err() {
+                log::trace!("Auth-provider request finished before its deadline");
+            }
+        }
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+    }
+}
+
+impl RpcAuthProvider {
     /// Fetch the available options for a `DynamicSelect` field.
     ///
     /// Returns `FetchFieldOptionsError::SessionExpired` if the provider
     /// response cannot be deserialized or is missing. Password-kind field
-    /// values are stripped from `dependencies` unless `secret_dependency_opt_in`
-    /// is true on this provider AND the target field lists that field in its
-    /// `depends_on`.
+    /// values are stripped from `dependencies` and from the profile unless
+    /// `secret_dependency_opt_in` is true on this provider AND the target
+    /// field lists that field in its `depends_on`. The profile also loses
+    /// every field this provider's form does not declare.
+    ///
+    /// A `session` of `None` or JSON `null` is sent as no session. Any other
+    /// value returns `FetchFieldOptionsError::Permanent` without a request.
     pub async fn fetch_dynamic_options(
         &self,
         profile: &AuthProfile,
@@ -374,18 +546,32 @@ impl RpcAuthProvider {
             )));
         }
 
-        // Build the filtered dependencies map, stripping Password fields when
-        // the provider has not opted in to receiving them.
-        let dependencies = build_fetch_dependencies(
+        // postcard cannot decode a `serde_json::Value`, so a provider would
+        // reject any request that carries one. JSON `null` holds no data and
+        // is sent as "no session"; real session data is refused here.
+        let session = match session {
+            None | Some(serde_json::Value::Null) => None,
+            Some(_) => {
+                return Err(FetchFieldOptionsError::Permanent(format!(
+                    "auth-provider '{}' cannot receive session data for dynamic options",
+                    self.provider_id
+                )));
+            }
+        };
+
+        // One filter for the dependency map and the profile: both drop the
+        // secret values the provider has not opted in to receiving.
+        let secret_filter = FetchSecretFilter::new(
             &self.form_definition,
             field_id,
-            &raw_dependencies,
             self.secret_dependency_opt_in,
         );
+        let dependencies = secret_filter.dependencies(&raw_dependencies);
 
-        let profile_json = profile_to_wire_json(profile).map_err(|error| {
-            FetchFieldOptionsError::Permanent(format!("could not serialize profile: {error}"))
-        })?;
+        let profile_json =
+            profile_to_fetch_wire_json(profile, &secret_filter).map_err(|error| {
+                FetchFieldOptionsError::Permanent(format!("could not serialize profile: {error}"))
+            })?;
 
         let request_body = AuthProviderRequestBody::FetchDynamicOptions(FetchFieldOptionsRequest {
             profile_json,
@@ -396,6 +582,7 @@ impl RpcAuthProvider {
 
         let responses = self
             .send_request(request_body)
+            .await
             .map_err(|error| FetchFieldOptionsError::Transient(error.to_string()))?;
 
         let last = responses
@@ -426,52 +613,93 @@ pub fn build_fetch_dependencies(
     raw_dependencies: &HashMap<String, String>,
     secret_dependency_opt_in: bool,
 ) -> HashMap<String, String> {
-    // Collect the target field's `depends_on` list, if known.
-    let depends_on: std::collections::HashSet<&str> = form_def
-        .tabs
-        .iter()
-        .flat_map(|tab| tab.sections.iter())
-        .flat_map(|section| section.fields.iter())
-        .find(|field| field.id == field_id)
-        .and_then(|field| {
-            if let FormFieldKind::DynamicSelect { depends_on, .. } = &field.kind {
-                Some(depends_on.iter().map(String::as_str).collect())
-            } else {
-                None
-            }
-        })
-        .unwrap_or_default();
+    FetchSecretFilter::new(form_def, field_id, secret_dependency_opt_in)
+        .dependencies(raw_dependencies)
+}
 
-    // Collect a set of field ids that have Password or WriteOnly kind.
-    // Both carry secret values and are filtered from dependency maps sent to
-    // external RPC providers unless the provider opts in via
-    // `secret_dependency_opt_in`.
-    let password_field_ids: std::collections::HashSet<&str> = form_def
-        .tabs
-        .iter()
-        .flat_map(|tab| tab.sections.iter())
-        .flat_map(|section| section.fields.iter())
-        .filter(|field| {
-            field.kind == FormFieldKind::Password || field.kind == FormFieldKind::WriteOnly
-        })
-        .map(|field| field.id.as_str())
-        .collect();
+/// Which secret values may go into a `FetchDynamicOptions` request for one
+/// field.
+///
+/// A `Password` or `WriteOnly` value is released only when the provider opted
+/// in via `secret_dependency_opt_in` AND the target field lists that field in
+/// its `depends_on`. The dependency map and the profile follow this one rule.
+/// The profile is also cut down to the fields the form declares.
+struct FetchSecretFilter<'a> {
+    /// Ids of every field of the form.
+    declared_field_ids: HashSet<&'a str>,
+    /// Ids of the `Password` and `WriteOnly` fields of the form.
+    secret_field_ids: HashSet<&'a str>,
+    /// The target field's `depends_on`, when the provider opted in.
+    released_field_ids: HashSet<&'a str>,
+}
 
-    raw_dependencies
-        .iter()
-        .filter(|(dep_field_id, _)| {
-            let is_password = password_field_ids.contains(dep_field_id.as_str());
+impl<'a> FetchSecretFilter<'a> {
+    fn new(form_def: &'a AuthFormDef, field_id: &str, secret_dependency_opt_in: bool) -> Self {
+        let fields = || {
+            form_def
+                .tabs
+                .iter()
+                .flat_map(|tab| tab.sections.iter())
+                .flat_map(|section| section.fields.iter())
+        };
 
-            if !is_password {
-                return true;
-            }
+        let declared_field_ids = fields().map(|field| field.id.as_str()).collect();
 
-            // For Password fields: include only when the provider opted in
-            // AND the field is listed in the target field's depends_on.
-            secret_dependency_opt_in && depends_on.contains(dep_field_id.as_str())
-        })
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
+        let secret_field_ids = fields()
+            .filter(|field| {
+                field.kind == FormFieldKind::Password || field.kind == FormFieldKind::WriteOnly
+            })
+            .map(|field| field.id.as_str())
+            .collect();
+
+        let released_field_ids = if secret_dependency_opt_in {
+            fields()
+                .find(|field| field.id == field_id)
+                .and_then(|field| {
+                    if let FormFieldKind::DynamicSelect { depends_on, .. } = &field.kind {
+                        Some(depends_on.iter().map(String::as_str).collect())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_default()
+        } else {
+            HashSet::new()
+        };
+
+        Self {
+            declared_field_ids,
+            secret_field_ids,
+            released_field_ids,
+        }
+    }
+
+    /// Whether the value of form field `field_id` must stay out of the request.
+    fn withholds(&self, field_id: &str) -> bool {
+        self.secret_field_ids.contains(field_id) && !self.released_field_ids.contains(field_id)
+    }
+
+    /// Whether an entry of `AuthProfile::fields` may be sent. The form must
+    /// declare the field: a profile can carry other keys, such as the fields
+    /// `expand_auth_profile_refs` copies in from a referenced profile, and
+    /// nothing says those hold no secret.
+    fn sends_profile_field(&self, field_id: &str) -> bool {
+        self.declared_field_ids.contains(field_id) && !self.withholds(field_id)
+    }
+
+    /// Whether an entry of `AuthProfile::secret_fields` may be sent. Such a
+    /// value is secret whatever kind the form gives its field now.
+    fn sends_stored_secret(&self, field_id: &str) -> bool {
+        self.declared_field_ids.contains(field_id) && self.released_field_ids.contains(field_id)
+    }
+
+    fn dependencies(&self, raw_dependencies: &HashMap<String, String>) -> HashMap<String, String> {
+        raw_dependencies
+            .iter()
+            .filter(|(dependency_field_id, _)| !self.withholds(dependency_field_id))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect()
+    }
 }
 
 /// Compute a stable hash of the dependencies map for cache keying.
@@ -496,8 +724,9 @@ pub fn hash_dependencies(dependencies: &HashMap<String, String>) -> u64 {
 /// Serialize an auth profile for the IPC wire, re-merging secret-kind field
 /// values back into the flat `fields` map the external provider expects.
 ///
-/// This is the single boundary where `AuthProfile::secret_fields` are exposed
-/// in plaintext. The derived `Serialize` skips that map, so without this merge
+/// This and `profile_to_fetch_wire_json` are the only places where
+/// `AuthProfile::secret_fields` are exposed in plaintext. The derived
+/// `Serialize` skips that map, so without this merge
 /// an external provider would never receive the secret values it needs to
 /// authenticate. The output shape is identical to the legacy
 /// `serde_json::to_string(profile)` that kept secrets inline in `fields`.
@@ -512,6 +741,37 @@ fn profile_to_wire_json(profile: &AuthProfile) -> Result<String, serde_json::Err
                 key.clone(),
                 serde_json::Value::String(secret.expose_secret().to_string()),
             );
+        }
+    }
+
+    serde_json::to_string(&value)
+}
+
+/// Serialize an auth profile for a `FetchDynamicOptions` request.
+///
+/// Same shape as `profile_to_wire_json`, but `fields` is an allowlist: only
+/// the fields the provider's form declares, and a secret one only under the
+/// rule of the dependency map. The provider reads this profile to list
+/// options, not to authenticate.
+fn profile_to_fetch_wire_json(
+    profile: &AuthProfile,
+    filter: &FetchSecretFilter<'_>,
+) -> Result<String, serde_json::Error> {
+    use secrecy::ExposeSecret;
+
+    let mut value = serde_json::to_value(profile)?;
+
+    if let Some(fields) = value.get_mut("fields").and_then(|f| f.as_object_mut()) {
+        // The Settings form snapshot keeps secret inputs inline in `fields`.
+        fields.retain(|key, _| filter.sends_profile_field(key));
+
+        for (key, secret) in &profile.secret_fields {
+            if filter.sends_stored_secret(key) {
+                fields.insert(
+                    key.clone(),
+                    serde_json::Value::String(secret.expose_secret().to_string()),
+                );
+            }
         }
     }
 
@@ -540,9 +800,11 @@ impl DynAuthProvider for RpcAuthProvider {
         let profile_json = profile_to_wire_json(profile)
             .map_err(|error| DbError::QueryFailed(error.to_string().into()))?;
 
-        let responses = self.send_request(AuthProviderRequestBody::ValidateSession(
-            ValidateSessionRequest { profile_json },
-        ))?;
+        let responses = self
+            .send_request(AuthProviderRequestBody::ValidateSession(
+                ValidateSessionRequest { profile_json },
+            ))
+            .await?;
 
         let response = responses.last().ok_or_else(|| {
             DbError::connection_failed("Auth-provider returned no response".to_string())
@@ -557,6 +819,7 @@ impl DynAuthProvider for RpcAuthProvider {
         }
     }
 
+    #[allow(clippy::result_large_err)]
     async fn login(
         &self,
         profile: &AuthProfile,
@@ -565,41 +828,40 @@ impl DynAuthProvider for RpcAuthProvider {
         let profile_json = profile_to_wire_json(profile)
             .map_err(|error| DbError::QueryFailed(error.to_string().into()))?;
 
-        let responses = self.send_request(AuthProviderRequestBody::Login(LoginRequest {
-            profile_json,
-        }))?;
+        let transport = self.request_transport();
 
-        let mut url_callback = Some(url_callback);
-        let mut saw_progress = false;
+        run_request_worker(
+            &self.socket_id,
+            &self.provider_id,
+            self.login_deadline,
+            Arc::clone(&transport.abandoned),
+            move || {
+                let mut url_callback = Some(url_callback);
 
-        for response in responses {
-            match response.body {
-                AuthProviderResponseBody::LoginUrlProgress(progress) => {
-                    saw_progress = true;
+                // The provider sends its result only after the user finished in
+                // the browser, so the URL is reported when its frame arrives.
+                let abandoned = Arc::clone(&transport.abandoned);
+                let responses = transport.send_request(
+                    AuthProviderRequestBody::Login(LoginRequest { profile_json }),
+                    &mut |body| {
+                        if let AuthProviderResponseBody::LoginUrlProgress(progress) = body
+                            && let Some(callback) = url_callback.take()
+                        {
+                            callback(progress.verification_url.clone());
+                        }
+                    },
+                )?;
 
-                    if let Some(callback) = url_callback.take() {
-                        callback(progress.verification_url);
-                    }
-                }
-                AuthProviderResponseBody::LoginResult { session } => {
-                    if !saw_progress && let Some(callback) = url_callback.take() {
-                        callback(None);
-                    }
-
-                    return Ok(session.into());
-                }
-                AuthProviderResponseBody::Error(error) => return Err(error.into_db_error()),
-                _ => {
+                if abandoned.load(Ordering::Acquire) {
                     return Err(DbError::connection_failed(
-                        "Unexpected response to Login".to_string(),
+                        "Auth-provider login was abandoned".to_string(),
                     ));
                 }
-            }
-        }
 
-        Err(DbError::connection_failed(
-            "Auth-provider login did not return a terminal result".to_string(),
-        ))
+                login_session_from_responses(responses, url_callback)
+            },
+        )
+        .await
     }
 
     async fn resolve_credentials(
@@ -609,9 +871,11 @@ impl DynAuthProvider for RpcAuthProvider {
         let profile_json = profile_to_wire_json(profile)
             .map_err(|error| DbError::QueryFailed(error.to_string().into()))?;
 
-        let responses = self.send_request(AuthProviderRequestBody::ResolveCredentials(
-            ResolveCredentialsRequest { profile_json },
-        ))?;
+        let responses = self
+            .send_request(AuthProviderRequestBody::ResolveCredentials(
+                ResolveCredentialsRequest { profile_json },
+            ))
+            .await?;
 
         let response = responses.last().ok_or_else(|| {
             DbError::connection_failed("Auth-provider returned no response".to_string())
@@ -624,6 +888,69 @@ impl DynAuthProvider for RpcAuthProvider {
                 "Unexpected response to ResolveCredentials".to_string(),
             )),
         }
+    }
+
+    async fn fetch_dynamic_options(
+        &self,
+        profile: &AuthProfile,
+        request: FetchOptionsRequest,
+    ) -> Result<FetchOptionsResponse, FetchOptionsError> {
+        // The inherent method of the same name owns the version gate, the
+        // secret stripping and the IPC round trip.
+        RpcAuthProvider::fetch_dynamic_options(
+            self,
+            profile,
+            &request.field_id,
+            request.dependencies,
+            request.session,
+        )
+        .await
+        .map(|response| FetchOptionsResponse {
+            options: response.options,
+            cache_hint_seconds: response.cache_hint_seconds,
+        })
+        .map_err(fetch_options_error_from_wire)
+    }
+}
+
+/// Reads the outcome of a `Login` exchange. `url_callback` is still set when
+/// no `LoginUrlProgress` frame arrived; a login result then reports "no URL".
+#[allow(clippy::result_large_err)]
+fn login_session_from_responses(
+    responses: Vec<AuthProviderResponseEnvelope>,
+    mut url_callback: Option<UrlCallback>,
+) -> Result<AuthSession, DbError> {
+    for response in responses {
+        match response.body {
+            // Reported when the frame arrived.
+            AuthProviderResponseBody::LoginUrlProgress(_) => {}
+            AuthProviderResponseBody::LoginResult { session } => {
+                if let Some(callback) = url_callback.take() {
+                    callback(None);
+                }
+
+                return Ok(session.into());
+            }
+            AuthProviderResponseBody::Error(error) => return Err(error.into_db_error()),
+            _ => {
+                return Err(DbError::connection_failed(
+                    "Unexpected response to Login".to_string(),
+                ));
+            }
+        }
+    }
+
+    Err(DbError::connection_failed(
+        "Auth-provider login did not return a terminal result".to_string(),
+    ))
+}
+
+fn fetch_options_error_from_wire(error: FetchFieldOptionsError) -> FetchOptionsError {
+    match error {
+        FetchFieldOptionsError::NeedsLogin => FetchOptionsError::NeedsLogin,
+        FetchFieldOptionsError::SessionExpired => FetchOptionsError::SessionExpired,
+        FetchFieldOptionsError::Transient(message) => FetchOptionsError::Transient(message),
+        FetchFieldOptionsError::Permanent(message) => FetchOptionsError::Permanent(message),
     }
 }
 
@@ -955,7 +1282,6 @@ mod tests {
                         supported: true,
                         verification_url_progress: true,
                     },
-                    edit: None,
                 },
             },
         ))
@@ -1373,11 +1699,13 @@ mod tests {
 
         let mut stream = MockStream::new(response_bytes);
         let responses = provider
+            .request_transport()
             .dispatch_request_loop(
                 &mut stream,
                 AuthProviderRequestBody::Login(crate::auth_provider_protocol::LoginRequest {
                     profile_json: "{}".to_string(),
                 }),
+                &mut |_| {},
             )
             .expect("dispatch should succeed");
 
@@ -1421,11 +1749,12 @@ mod tests {
         // Feed 1001 non-done frames — should abort before processing the 1001st.
         let mut stream = infinite_emit_stream(1001);
 
-        let result = provider.dispatch_request_loop(
+        let result = provider.request_transport().dispatch_request_loop(
             &mut stream,
             AuthProviderRequestBody::Login(crate::auth_provider_protocol::LoginRequest {
                 profile_json: "{}".to_string(),
             }),
+            &mut |_| {},
         );
 
         assert!(result.is_err(), "loop must abort after exceeding frame cap");
@@ -1446,11 +1775,12 @@ mod tests {
         response_bytes.extend(encode_response(&login_result_frame(1)));
 
         let mut stream = MockStream::new(response_bytes);
-        let result = provider.dispatch_request_loop(
+        let result = provider.request_transport().dispatch_request_loop(
             &mut stream,
             AuthProviderRequestBody::Login(crate::auth_provider_protocol::LoginRequest {
                 profile_json: "{}".to_string(),
             }),
+            &mut |_| {},
         );
 
         assert!(
@@ -1523,11 +1853,13 @@ mod tests {
 
         let mut stream = MockStream::new(response_bytes);
         let responses = provider
+            .request_transport()
             .dispatch_request_loop(
                 &mut stream,
                 AuthProviderRequestBody::Login(crate::auth_provider_protocol::LoginRequest {
                     profile_json: "{}".to_string(),
                 }),
+                &mut |_| {},
             )
             .expect("dispatch should succeed even with opt-in=false");
 
@@ -1547,6 +1879,906 @@ mod tests {
                 AuthProviderResponseBody::LoginResult { .. }
             ),
             "terminal response must be LoginResult"
+        );
+    }
+
+    // =========================================================================
+    // Dynamic options through `dyn DynAuthProvider` (#347)
+    // =========================================================================
+
+    use crate::auth_provider_protocol::{AuthSessionDto, FetchFieldOptionsResponse};
+    use datatab_core::SelectOption;
+
+    fn fake_options_response() -> FetchFieldOptionsResponse {
+        FetchFieldOptionsResponse {
+            options: vec![
+                SelectOption::new("dev", "Development"),
+                SelectOption::new("prod", "Production"),
+            ],
+            cache_hint_seconds: Some(60),
+        }
+    }
+
+    /// A provider on a real local socket. It decodes with the protocol types,
+    /// declares its form in its v1.2 `Hello`, and records each request, so a
+    /// test can check what crossed the IPC boundary.
+    struct FakeProviderServer {
+        socket_id: String,
+        requests: Arc<Mutex<Vec<AuthProviderRequestBody>>>,
+        /// Set when the server holds each `Login` answer until told to send it.
+        login_release: Option<std::sync::mpsc::Sender<()>>,
+    }
+
+    /// The request kind a silent server never answers.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum SilentOn {
+        Nothing,
+        Login,
+        FetchOptions,
+        /// Answers `Login` after `release_login`, sending the URL frame only then.
+        LoginUrlAfterRelease,
+    }
+
+    /// The URL a holding server reports before it waits.
+    const HELD_LOGIN_VERIFICATION_URL: &str = "https://verify.example/device";
+
+    /// How long a holding server waits for `release_login`. A client that
+    /// blocks its caller until the answer never gets to release it; the
+    /// fallback lets that run fail instead of hanging.
+    const HELD_LOGIN_FALLBACK: Duration = Duration::from_secs(6);
+
+    /// How long a test waits for the URL of a held login. Shorter than the
+    /// fallback, so a URL that arrives in time was sent before the answer.
+    const HELD_LOGIN_URL_WAIT: Duration = Duration::from_secs(2);
+
+    impl FakeProviderServer {
+        /// Starts a provider that declares `form_with_password_dep()`.
+        fn start(secret_dependency_opt_in: bool) -> Self {
+            Self::start_with_form(form_with_password_dep(), secret_dependency_opt_in)
+        }
+
+        fn start_with_form(form_definition: AuthFormDef, secret_dependency_opt_in: bool) -> Self {
+            Self::start_server(
+                form_definition,
+                secret_dependency_opt_in,
+                false,
+                SilentOn::Nothing,
+            )
+        }
+
+        /// Starts a provider that answers `Hello` but holds the socket open and
+        /// never answers the requests `silent_on` names.
+        fn start_silent(silent_on: SilentOn) -> Self {
+            Self::start_server(form_with_password_dep(), false, false, silent_on)
+        }
+
+        /// Starts a provider that sends the URL frame and the result of a `Login`
+        /// only after `release_login`.
+        fn start_late_login() -> Self {
+            Self::start_server(
+                form_with_password_dep(),
+                false,
+                true,
+                SilentOn::LoginUrlAfterRelease,
+            )
+        }
+
+        /// Starts a provider that answers `Login` as one waiting for a browser
+        /// step does: it reports the verification URL, then sends the result
+        /// only after `release_login`.
+        fn start_holding_login() -> Self {
+            Self::start_server(form_with_password_dep(), false, true, SilentOn::Nothing)
+        }
+
+        fn start_server(
+            form_definition: AuthFormDef,
+            secret_dependency_opt_in: bool,
+            hold_login: bool,
+            silent_on: SilentOn,
+        ) -> Self {
+            use interprocess::local_socket::traits::Listener;
+            use interprocess::local_socket::{ListenerNonblockingMode, ListenerOptions};
+
+            let socket_id = format!("options-test-{}", uuid::Uuid::new_v4().simple());
+            let name = auth_provider_socket_name(&socket_id).expect("socket name");
+            let listener = ListenerOptions::new()
+                .name(name)
+                .nonblocking(ListenerNonblockingMode::Neither)
+                .create_sync()
+                .expect("listener");
+
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let recorded = Arc::clone(&requests);
+
+            let (login_release, login_released) = std::sync::mpsc::channel::<()>();
+            let login_release = hold_login.then_some(login_release);
+            let login_released = hold_login.then_some(login_released);
+
+            thread::spawn(move || {
+                // Streams of silent requests stay open, so the client sees no close.
+                let mut kept_open = Vec::new();
+                loop {
+                    let Ok(mut stream) = listener.accept() else {
+                        continue;
+                    };
+
+                    // Liveness probes connect and close without sending a
+                    // request, and a request that does not decode ends here.
+                    let Ok(request) =
+                        framing::recv_msg::<_, AuthProviderRequestEnvelope>(&mut stream)
+                    else {
+                        continue;
+                    };
+
+                    let silent = match request.body {
+                        AuthProviderRequestBody::Login(_) => silent_on == SilentOn::Login,
+                        AuthProviderRequestBody::FetchDynamicOptions(_) => {
+                            silent_on == SilentOn::FetchOptions
+                        }
+                        _ => false,
+                    };
+                    if silent {
+                        kept_open.push(stream);
+                        continue;
+                    }
+
+                    let Some(body) = fake_provider_answer(
+                        &request.body,
+                        &form_definition,
+                        secret_dependency_opt_in,
+                    ) else {
+                        continue;
+                    };
+                    let held_login = login_released
+                        .as_ref()
+                        .filter(|_| matches!(request.body, AuthProviderRequestBody::Login(_)));
+                    recorded.lock().expect("lock").push(request.body);
+
+                    let late_url = silent_on == SilentOn::LoginUrlAfterRelease;
+                    if let Some(login_released) = held_login {
+                        if late_url && login_released.recv_timeout(HELD_LOGIN_FALLBACK).is_err() {
+                            eprintln!("fake provider answers a login nobody released");
+                        }
+                        let progress = AuthProviderResponseEnvelope::login_url_progress(
+                            request.protocol_version,
+                            request.request_id,
+                            Some(HELD_LOGIN_VERIFICATION_URL.to_string()),
+                        );
+                        if let Err(error) = framing::send_msg(&mut stream, &progress) {
+                            eprintln!("fake provider could not report the URL: {error}");
+                        }
+                        if !late_url && login_released.recv_timeout(HELD_LOGIN_FALLBACK).is_err() {
+                            eprintln!("fake provider answers a login nobody released");
+                        }
+                    }
+
+                    let response = AuthProviderResponseEnvelope::ok(
+                        request.protocol_version,
+                        request.request_id,
+                        body,
+                    );
+                    if let Err(error) = framing::send_msg(&mut stream, &response) {
+                        eprintln!("fake provider could not answer: {error}");
+                    }
+                }
+            });
+
+            Self {
+                socket_id,
+                requests,
+                login_release,
+            }
+        }
+
+        /// Lets a holding server send the `Login` result it is waiting with.
+        fn release_login(&self) {
+            self.login_release
+                .as_ref()
+                .expect("the server holds its login answers")
+                .send(())
+                .expect("the server is waiting to answer");
+        }
+
+        /// Probes the server and returns the provider the way the app holds
+        /// it: behind the trait object.
+        fn probe(&self) -> Arc<dyn DynAuthProvider> {
+            Arc::new(RpcAuthProvider::probe(&self.socket_id, None).expect("probe"))
+        }
+
+        fn fetch_requests(&self) -> Vec<FetchFieldOptionsRequest> {
+            self.requests
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter_map(|body| match body {
+                    AuthProviderRequestBody::FetchDynamicOptions(fetch) => Some(fetch.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn login_requests(&self) -> Vec<LoginRequest> {
+            self.requests
+                .lock()
+                .expect("lock")
+                .iter()
+                .filter_map(|body| match body {
+                    AuthProviderRequestBody::Login(login) => Some(login.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    fn fake_provider_answer(
+        body: &AuthProviderRequestBody,
+        form_definition: &AuthFormDef,
+        secret_dependency_opt_in: bool,
+    ) -> Option<AuthProviderResponseBody> {
+        match body {
+            AuthProviderRequestBody::Hello(_) => Some(AuthProviderResponseBody::HelloV1_2(
+                AuthProviderHelloResponseV1_2 {
+                    server_name: "fake-provider".to_string(),
+                    server_version: "0.0.0-test".to_string(),
+                    selected_version: AUTH_PROVIDER_RPC_V1_2,
+                    provider_id: "test-auth".to_string(),
+                    display_name: "Test Provider".to_string(),
+                    form_definition: form_definition.clone(),
+                    capabilities: AuthProviderCapabilities::default(),
+                    secret_dependency_opt_in,
+                },
+            )),
+            AuthProviderRequestBody::FetchDynamicOptions(_) => Some(
+                AuthProviderResponseBody::DynamicOptions(fake_options_response()),
+            ),
+            AuthProviderRequestBody::Login(_) => Some(AuthProviderResponseBody::LoginResult {
+                session: AuthSessionDto {
+                    provider_id: "test-auth".to_string(),
+                    profile_id: uuid::Uuid::nil(),
+                    expires_at: None,
+                    session_data: None,
+                },
+            }),
+            _ => None,
+        }
+    }
+
+    /// The request the Settings form builds: the null session marker, and a
+    /// dependency map that still holds the secret input.
+    fn environment_options_request() -> FetchOptionsRequest {
+        FetchOptionsRequest {
+            field_id: "environment".to_string(),
+            dependencies: HashMap::from([
+                ("region".to_string(), "us-east-1".to_string()),
+                ("api_key".to_string(), "secret-value".to_string()),
+            ]),
+            session: Some(serde_json::Value::Null),
+        }
+    }
+
+    fn options_profile() -> AuthProfile {
+        AuthProfile::new("rpc profile", "test-auth", HashMap::new())
+    }
+
+    /// The Settings form's call over a real socket: the provider declares the
+    /// field in its manifest, the fetch reaches it through the trait object,
+    /// and a provider that did not opt in never receives a secret dependency.
+    #[tokio::test]
+    async fn trait_fetch_dynamic_options_reaches_provider_as_the_settings_form_calls_it() {
+        let server = FakeProviderServer::start(false);
+        let provider = server.probe();
+
+        let declares_dynamic_select = provider
+            .form_def()
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.sections.iter())
+            .flat_map(|section| section.fields.iter())
+            .any(|field| {
+                field.id == "environment"
+                    && matches!(field.kind, FormFieldKind::DynamicSelect { .. })
+            });
+        assert!(
+            declares_dynamic_select,
+            "the manifest's DynamicSelect field must reach form_def()"
+        );
+
+        let response = provider
+            .fetch_dynamic_options(&options_profile(), environment_options_request())
+            .await
+            .expect("options from the RPC provider");
+
+        assert_eq!(response.options, fake_options_response().options);
+        assert_eq!(response.cache_hint_seconds, Some(60));
+
+        let requests = server.fetch_requests();
+        let [request] = requests.as_slice() else {
+            panic!("expected one recorded request, got {}", requests.len());
+        };
+        assert_eq!(request.field_id, "environment");
+        assert_eq!(
+            request.dependencies.get("region").map(String::as_str),
+            Some("us-east-1"),
+            "non-secret dependency must reach the provider"
+        );
+        assert!(
+            !request.dependencies.contains_key("api_key"),
+            "secret dependency must be stripped when the provider did not opt in"
+        );
+        assert_eq!(
+            request.session, None,
+            "the form's null marker is sent as no session"
+        );
+    }
+
+    /// Session data cannot cross the postcard wire, so the host refuses it
+    /// before it sends anything.
+    #[tokio::test]
+    async fn trait_fetch_dynamic_options_rejects_session_data_before_sending() {
+        let server = FakeProviderServer::start(false);
+        let provider = server.probe();
+        let request = FetchOptionsRequest {
+            session: Some(serde_json::json!({ "account": "dev" })),
+            ..environment_options_request()
+        };
+
+        let error = provider
+            .fetch_dynamic_options(&options_profile(), request)
+            .await
+            .expect_err("session data is not supported");
+
+        let FetchOptionsError::Permanent(message) = &error else {
+            panic!("expected a permanent error, got {error:?}");
+        };
+        assert!(
+            message.contains("session data"),
+            "expected the session message, got: {message}"
+        );
+        assert!(
+            server.fetch_requests().is_empty(),
+            "nothing may be sent to the provider"
+        );
+    }
+
+    /// A provider that opted in receives the secret dependency its field lists.
+    #[tokio::test]
+    async fn trait_fetch_dynamic_options_forwards_secret_dependency_when_opted_in() {
+        let server = FakeProviderServer::start(true);
+        let provider = server.probe();
+
+        provider
+            .fetch_dynamic_options(&options_profile(), environment_options_request())
+            .await
+            .expect("options from the RPC provider");
+
+        let requests = server.fetch_requests();
+        let [request] = requests.as_slice() else {
+            panic!("expected one recorded request, got {}", requests.len());
+        };
+        assert_eq!(
+            request.dependencies.get("api_key").map(String::as_str),
+            Some("secret-value"),
+            "secret dependency must reach a provider that opted in"
+        );
+    }
+
+    /// Below v1.2 the host answers "not supported" itself. The message is the
+    /// version gate's, which tells it apart from the trait default.
+    #[tokio::test]
+    async fn trait_fetch_dynamic_options_is_not_supported_below_v1_2() {
+        let mut provider =
+            RpcAuthProvider::new_for_test("options-test-no-listener", "test-auth", false, None);
+        provider.selected_version = crate::envelope::AUTH_PROVIDER_RPC_V1_1;
+        let provider: Arc<dyn DynAuthProvider> = Arc::new(provider);
+
+        let error = provider
+            .fetch_dynamic_options(&options_profile(), environment_options_request())
+            .await
+            .expect_err("a v1.1 provider has no dynamic options");
+
+        let FetchOptionsError::Permanent(message) = &error else {
+            panic!("expected a permanent error, got {error:?}");
+        };
+        assert!(
+            message.contains("does not support FetchDynamicOptions"),
+            "expected the version gate message, got: {message}"
+        );
+    }
+
+    /// The two places a profile can hold the secret: inline in `fields`, as
+    /// the Settings form snapshot does, and in `secret_fields`, as a stored
+    /// profile does.
+    fn profiles_with_secret() -> [AuthProfile; 2] {
+        let region = ("region".to_string(), "us-east-1".to_string());
+
+        let form_snapshot = AuthProfile::new(
+            "form snapshot",
+            "test-auth",
+            HashMap::from([
+                region.clone(),
+                ("api_key".to_string(), "secret-value".to_string()),
+            ]),
+        );
+
+        let mut stored = AuthProfile::new("stored", "test-auth", HashMap::from([region]));
+        stored.secret_fields.insert(
+            "api_key".to_string(),
+            secrecy::SecretString::from("secret-value".to_string()),
+        );
+
+        [form_snapshot, stored]
+    }
+
+    /// The `fields` object of a profile as the provider received it.
+    fn wire_profile_fields(profile_json: &str) -> serde_json::Map<String, serde_json::Value> {
+        let profile: serde_json::Value =
+            serde_json::from_str(profile_json).expect("profile_json is JSON");
+
+        profile
+            .get("fields")
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .expect("profile_json has a fields object")
+    }
+
+    /// A provider that did not opt in gets the profile without secret values.
+    #[tokio::test]
+    async fn trait_fetch_dynamic_options_withholds_profile_secrets_without_opt_in() {
+        let server = FakeProviderServer::start(false);
+        let provider = server.probe();
+
+        for profile in profiles_with_secret() {
+            provider
+                .fetch_dynamic_options(&profile, environment_options_request())
+                .await
+                .expect("options from the RPC provider");
+        }
+
+        let requests = server.fetch_requests();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            let fields = wire_profile_fields(&request.profile_json);
+            assert_eq!(
+                fields.get("region").and_then(serde_json::Value::as_str),
+                Some("us-east-1"),
+                "non-secret profile field must reach the provider"
+            );
+            assert!(
+                !fields.contains_key("api_key"),
+                "secret profile field must be withheld when the provider did not opt in"
+            );
+            assert!(
+                !request.profile_json.contains("secret-value"),
+                "the secret value must not appear anywhere in profile_json"
+            );
+        }
+    }
+
+    /// A provider that opted in gets the secret its field depends on.
+    #[tokio::test]
+    async fn trait_fetch_dynamic_options_sends_profile_secret_when_opted_in() {
+        let server = FakeProviderServer::start(true);
+        let provider = server.probe();
+
+        for profile in profiles_with_secret() {
+            provider
+                .fetch_dynamic_options(&profile, environment_options_request())
+                .await
+                .expect("options from the RPC provider");
+        }
+
+        let requests = server.fetch_requests();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            let fields = wire_profile_fields(&request.profile_json);
+            assert_eq!(
+                fields.get("api_key").and_then(serde_json::Value::as_str),
+                Some("secret-value"),
+                "a provider that opted in must receive the secret its field depends on"
+            );
+        }
+    }
+
+    /// `form_with_password_dep()` plus a secret the `DynamicSelect` does not
+    /// depend on and a reference to another profile.
+    fn form_with_unlisted_secret_and_profile_ref() -> AuthFormDef {
+        let mut form = form_with_password_dep();
+        let section = form
+            .tabs
+            .iter_mut()
+            .flat_map(|tab| tab.sections.iter_mut())
+            .next()
+            .expect("form has a section");
+        let template = section.fields.first().cloned().expect("form has a field");
+
+        section.fields.push(FormFieldDef {
+            id: "other_secret".to_string(),
+            label: "Other Secret".to_string(),
+            kind: FormFieldKind::Password,
+            ..template.clone()
+        });
+        section.fields.push(FormFieldDef {
+            id: "shared_ref".to_string(),
+            label: "Shared Profile".to_string(),
+            kind: FormFieldKind::AuthProfileRef { provider_id: None },
+            ..template
+        });
+
+        form
+    }
+
+    /// The opt-in releases only the secrets the target field depends on.
+    #[tokio::test]
+    async fn trait_fetch_dynamic_options_withholds_secret_outside_depends_on_when_opted_in() {
+        let server =
+            FakeProviderServer::start_with_form(form_with_unlisted_secret_and_profile_ref(), true);
+        let provider = server.probe();
+
+        let [mut form_snapshot, mut stored] = profiles_with_secret();
+        form_snapshot
+            .fields
+            .insert("other_secret".to_string(), "other-secret-value".to_string());
+        stored.secret_fields.insert(
+            "other_secret".to_string(),
+            secrecy::SecretString::from("other-secret-value".to_string()),
+        );
+
+        let mut request = environment_options_request();
+        request
+            .dependencies
+            .insert("other_secret".to_string(), "other-secret-value".to_string());
+
+        for profile in [form_snapshot, stored] {
+            provider
+                .fetch_dynamic_options(&profile, request.clone())
+                .await
+                .expect("options from the RPC provider");
+        }
+
+        let requests = server.fetch_requests();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            let fields = wire_profile_fields(&request.profile_json);
+            assert_eq!(
+                fields.get("api_key").and_then(serde_json::Value::as_str),
+                Some("secret-value"),
+                "the secret the field depends on is released"
+            );
+            assert!(
+                !fields.contains_key("other_secret"),
+                "a secret outside depends_on must stay out of the profile"
+            );
+            assert!(
+                !request.dependencies.contains_key("other_secret"),
+                "a secret outside depends_on must stay out of the dependency map"
+            );
+            assert!(
+                !request.profile_json.contains("other-secret-value"),
+                "the unlisted secret value must not appear anywhere in profile_json"
+            );
+        }
+    }
+
+    /// A referenced profile can still hold a secret as plaintext in `fields`
+    /// while its keyring migration is deferred. `expand_auth_profile_refs`
+    /// copies it into the snapshot under a key this provider's form does not
+    /// declare, so it must never be sent, with or without the opt-in.
+    #[tokio::test]
+    async fn trait_fetch_dynamic_options_never_sends_fields_the_form_does_not_declare() {
+        let form = form_with_unlisted_secret_and_profile_ref();
+
+        let referenced = AuthProfile::new(
+            "shared",
+            "other-auth",
+            HashMap::from([(
+                "legacy_token".to_string(),
+                "legacy-secret-value".to_string(),
+            )]),
+        );
+        let consumer = AuthProfile::new(
+            "form snapshot",
+            "test-auth",
+            HashMap::from([
+                ("region".to_string(), "us-east-1".to_string()),
+                ("shared_ref".to_string(), referenced.id.to_string()),
+            ]),
+        );
+        let snapshot = datatab_core::auth::expand_auth_profile_refs(&consumer, &form, &|id| {
+            (*id == referenced.id).then(|| referenced.clone())
+        });
+        assert_eq!(
+            snapshot.fields.get("legacy_token").map(String::as_str),
+            Some("legacy-secret-value"),
+            "the expansion copies the referenced profile's field into the snapshot"
+        );
+
+        for secret_dependency_opt_in in [false, true] {
+            let server =
+                FakeProviderServer::start_with_form(form.clone(), secret_dependency_opt_in);
+            let provider = server.probe();
+
+            provider
+                .fetch_dynamic_options(&snapshot, environment_options_request())
+                .await
+                .expect("options from the RPC provider");
+
+            let requests = server.fetch_requests();
+            let [request] = requests.as_slice() else {
+                panic!("expected one recorded request, got {}", requests.len());
+            };
+            let fields = wire_profile_fields(&request.profile_json);
+            assert!(
+                !request.profile_json.contains("legacy-secret-value"),
+                "a referenced legacy secret must never reach the provider \
+                 (opt-in: {secret_dependency_opt_in})"
+            );
+            assert!(
+                !fields.contains_key("legacy_token"),
+                "a field the form does not declare must be dropped"
+            );
+            assert_eq!(
+                fields.get("region").and_then(serde_json::Value::as_str),
+                Some("us-east-1"),
+                "a declared non-secret field must reach the provider"
+            );
+            assert_eq!(
+                fields.get("shared_ref").and_then(serde_json::Value::as_str),
+                Some(referenced.id.to_string().as_str()),
+                "the declared reference field must reach the provider"
+            );
+        }
+    }
+
+    /// Login needs the secret to authenticate: it keeps the full profile,
+    /// whatever the opt-in.
+    #[tokio::test]
+    async fn trait_login_still_sends_the_full_profile() {
+        let server = FakeProviderServer::start(false);
+        let provider = server.probe();
+
+        for profile in profiles_with_secret() {
+            provider
+                .login(&profile, Box::new(|_| {}))
+                .await
+                .expect("login result from the RPC provider");
+        }
+
+        let requests = server.login_requests();
+        assert_eq!(requests.len(), 2);
+        for request in requests {
+            let fields = wire_profile_fields(&request.profile_json);
+            assert_eq!(
+                fields.get("api_key").and_then(serde_json::Value::as_str),
+                Some("secret-value"),
+                "login must still carry the secret"
+            );
+        }
+    }
+
+    // =========================================================================
+    // Requests run off the calling thread (#369)
+    // =========================================================================
+
+    /// Polls `future` once, as an executor thread does. No tokio runtime is
+    /// involved: the GPUI executors have none.
+    fn poll_once<Output>(
+        future: &mut std::pin::Pin<Box<dyn Future<Output = Output> + Send + '_>>,
+    ) -> std::task::Poll<Output> {
+        let mut context = std::task::Context::from_waker(futures::task::noop_waker_ref());
+        future.as_mut().poll(&mut context)
+    }
+
+    /// The Settings form and the connection manager await `login` on the UI
+    /// thread. While the provider waits for the browser step, the future must
+    /// hand the thread back instead of blocking it on the socket.
+    #[test]
+    fn login_hands_the_calling_thread_back_while_the_provider_waits() {
+        let server = FakeProviderServer::start_holding_login();
+        let provider = server.probe();
+        let profile = options_profile();
+
+        let mut login = provider.login(&profile, Box::new(|_| {}));
+
+        assert!(
+            poll_once(&mut login).is_pending(),
+            "login blocked the calling thread until the provider answered"
+        );
+
+        server.release_login();
+        let session = futures::executor::block_on(login).expect("login result");
+        assert_eq!(session.provider_id, "test-auth");
+    }
+
+    const SHORT_TEST_DEADLINE: Duration = Duration::from_millis(150);
+    const LONG_TEST_DEADLINE: Duration = Duration::from_secs(5);
+
+    fn provider_with_deadlines(
+        server: &FakeProviderServer,
+        request_deadline: Duration,
+        login_deadline: Duration,
+    ) -> Arc<dyn DynAuthProvider> {
+        Arc::new(
+            RpcAuthProvider::probe(&server.socket_id, None)
+                .expect("probe")
+                .with_deadlines(request_deadline, login_deadline),
+        )
+    }
+
+    /// A login waits for the browser step for longer than any other request
+    /// may take, and still succeeds.
+    #[test]
+    fn login_may_outlive_the_request_deadline() {
+        let server = FakeProviderServer::start_holding_login();
+        let provider = provider_with_deadlines(&server, SHORT_TEST_DEADLINE, LONG_TEST_DEADLINE);
+        let profile = options_profile();
+
+        // The wait starts when the provider has the request, not before the call.
+        let release = server.login_release.clone().expect("holding server");
+        let received = Arc::clone(&server.requests);
+        thread::spawn(move || {
+            while !received
+                .lock()
+                .expect("lock")
+                .iter()
+                .any(|body| matches!(body, AuthProviderRequestBody::Login(_)))
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            thread::sleep(SHORT_TEST_DEADLINE * 3);
+            if release.send(()).is_err() {
+                eprintln!("the fake provider stopped waiting");
+            }
+        });
+
+        let session = futures::executor::block_on(provider.login(&profile, Box::new(|_| {})))
+            .expect("a login that outlives the request deadline succeeds");
+        assert_eq!(session.provider_id, "test-auth");
+    }
+
+    /// After the caller got the deadline error, a late URL frame and a late
+    /// result must not reach its callback.
+    #[test]
+    fn a_login_answered_after_the_deadline_runs_no_callback() {
+        let server = FakeProviderServer::start_late_login();
+        let provider = provider_with_deadlines(&server, LONG_TEST_DEADLINE, SHORT_TEST_DEADLINE);
+
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&calls);
+        let result = futures::executor::block_on(provider.login(
+            &options_profile(),
+            Box::new(move |_| {
+                counted.fetch_add(1, Ordering::SeqCst);
+            }),
+        ));
+        assert!(result.is_err(), "the deadline must end the login");
+
+        server.release_login();
+        // The worker handles both frames within milliseconds of the release.
+        thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the callback ran after the caller gave up"
+        );
+    }
+
+    /// A request that finished must not leave its timer asleep until the deadline.
+    #[test]
+    fn the_deadline_timer_ends_when_the_worker_finishes() {
+        let (worker_done, timer_done) = std::sync::mpsc::channel::<()>();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<Option<Result<(), DbError>>>(2);
+        let (ended, timer_ended) = std::sync::mpsc::channel::<()>();
+
+        thread::spawn(move || {
+            run_deadline_timer(&timer_done, Duration::from_secs(60), &sender);
+            if ended.send(()).is_err() {
+                eprintln!("the test stopped waiting for the timer");
+            }
+        });
+
+        drop(worker_done);
+
+        timer_ended
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the timer must end when the worker finishes");
+        assert!(
+            receiver.try_recv().is_err(),
+            "a finished request must not send a timeout"
+        );
+    }
+
+    #[test]
+    fn a_request_the_provider_never_answers_fails_at_the_request_deadline() {
+        let server = FakeProviderServer::start_silent(SilentOn::FetchOptions);
+        let provider = provider_with_deadlines(&server, SHORT_TEST_DEADLINE, LONG_TEST_DEADLINE);
+
+        let started = Instant::now();
+        let error = futures::executor::block_on(
+            provider.fetch_dynamic_options(&options_profile(), environment_options_request()),
+        )
+        .expect_err("a silent provider must hit the deadline");
+
+        assert!(started.elapsed() < LONG_TEST_DEADLINE);
+        assert!(
+            format!("{error:?}").contains("did not answer within"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_login_the_provider_never_answers_fails_at_the_login_deadline() {
+        let server = FakeProviderServer::start_silent(SilentOn::Login);
+        let provider = provider_with_deadlines(&server, LONG_TEST_DEADLINE, SHORT_TEST_DEADLINE);
+
+        let started = Instant::now();
+        let error =
+            futures::executor::block_on(provider.login(&options_profile(), Box::new(|_| {})))
+                .expect_err("a silent provider must hit the login deadline");
+
+        assert!(started.elapsed() < LONG_TEST_DEADLINE);
+        assert!(
+            format!("{error:?}").contains("did not answer within"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    /// The verification URL must reach the caller while the provider still
+    /// waits: the Settings form shows Cancel only once it has the URL.
+    #[test]
+    fn login_reports_the_verification_url_while_the_provider_waits() {
+        let server = FakeProviderServer::start_holding_login();
+        let provider = server.probe();
+        let profile = options_profile();
+
+        let (url_sender, url_receiver) = std::sync::mpsc::channel();
+        let mut login = provider.login(
+            &profile,
+            Box::new(move |url| {
+                if url_sender.send(url).is_err() {
+                    eprintln!("the test stopped waiting for the URL");
+                }
+            }),
+        );
+
+        assert!(
+            poll_once(&mut login).is_pending(),
+            "login blocked the calling thread until the provider answered"
+        );
+
+        // The server answers only after `release_login` below, so a URL that
+        // arrives here arrived before the login result.
+        let url = url_receiver
+            .recv_timeout(HELD_LOGIN_URL_WAIT)
+            .expect("the URL must arrive before the provider answers");
+        assert_eq!(url.as_deref(), Some(HELD_LOGIN_VERIFICATION_URL));
+
+        server.release_login();
+        futures::executor::block_on(login).expect("login result");
+        assert!(
+            url_receiver.try_recv().is_err(),
+            "the URL callback must run once"
+        );
+    }
+
+    /// The Settings form shows a different hint for each kind, so none may
+    /// change on the way from the wire type to the core type.
+    #[test]
+    fn fetch_options_error_from_wire_keeps_each_kind() {
+        assert_eq!(
+            fetch_options_error_from_wire(FetchFieldOptionsError::NeedsLogin),
+            FetchOptionsError::NeedsLogin
+        );
+        assert_eq!(
+            fetch_options_error_from_wire(FetchFieldOptionsError::SessionExpired),
+            FetchOptionsError::SessionExpired
+        );
+        assert_eq!(
+            fetch_options_error_from_wire(FetchFieldOptionsError::Transient("busy".to_string())),
+            FetchOptionsError::Transient("busy".to_string())
+        );
+        assert_eq!(
+            fetch_options_error_from_wire(FetchFieldOptionsError::Permanent("no".to_string())),
+            FetchOptionsError::Permanent("no".to_string())
         );
     }
 }

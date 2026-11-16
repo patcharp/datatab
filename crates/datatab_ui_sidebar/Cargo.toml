@@ -26,6 +26,7 @@ rfd.workspace = true
 dirs.workspace = true
 
 [dev-dependencies]
+datatab_test_support.workspace = true
 secrecy.workspace = true
 rusqlite.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
@@ -34,14 +35,13 @@ datatab_ui_base = { workspace = true, features = ["test-support"] }
 
 [features]
 default = []
-# Passthroughs: sidebar code has no direct mcp/lua/aws gates, but these must
+# Passthroughs: sidebar code has no direct mcp/lua gates, but these must
 # forward to every dependency that also exposes them (datatab_app, datatab_ui_base)
 # so the feature set stays unified regardless of build entry point and datatab_app
 # is never compiled twice with mismatched features.
 # Note: datatab_ui_windows features are forwarded by datatab_ui directly.
 mcp = ["datatab_app/mcp", "datatab_ui_base/mcp"]
 lua = ["datatab_app/lua", "datatab_ui_base/lua"]
-aws = ["datatab_app/aws", "datatab_ui_base/aws"]
 
 [lints]
 workspace = true

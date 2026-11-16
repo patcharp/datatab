@@ -1,8 +1,8 @@
 # Driver live integration tests
 
-All 13 first-party feature drivers (clickhouse, cloudwatch, dynamodb, influxdb,
-mongodb, mssql, mysql, postgres, redis, redshift, s3, sqlite, turso) ship a
-live integration suite. Twelve of them run against a local backend:
+All 10 first-party feature drivers (clickhouse, influxdb, mongodb, mssql, mysql,
+postgres, redis, redshift, sqlite, turso) ship a live integration suite. Nine of
+them run against a local backend:
 `testcontainers` starts an isolated container per test with a dynamic host port
 and tears it down automatically; SQLite uses a temporary local file. No real
 cloud credentials are needed anywhere in the local suite. Redshift is the
@@ -31,9 +31,9 @@ non-ignored SQLite suite, with no cloud credentials involved:
 ```bash
 cargo nextest run \
   -p datatab_driver_mysql -p datatab_driver_mongodb -p datatab_driver_redis \
-  -p datatab_driver_dynamodb -p datatab_driver_s3 -p datatab_driver_sqlite \
+  -p datatab_driver_sqlite \
   -p datatab_driver_mssql -p datatab_driver_influxdb -p datatab_driver_clickhouse \
-  -p datatab_driver_turso -p datatab_driver_cloudwatch \
+  -p datatab_driver_turso \
   --run-ignored all --test-threads=1
 
 # PostgreSQL is run separately because its crate also contains the
@@ -61,14 +61,11 @@ All suites run locally. This repository has no CI.
 | MySQL | `live_integration`, `ddl_integration` *(local only)*, `instance_catalog` *(local only)* | `mysql:8.4` | |
 | MongoDB | `live_integration`, `instance_catalog` *(local only)* | `mongo:7` | |
 | Redis | `live_integration`, `live_cluster`, `live_rdb`, `instance_catalog` *(local only)* | `redis:7`, `grokzen/redis-cluster:7.0.10` | `live_cluster` needs `--test-threads=1` (fixed ports 7000–7005). `live_rdb` exercises the RDB analyzer against the container's `dump.rdb` after a forced `SAVE`. |
-| DynamoDB | `live_integration` | `amazon/dynamodb-local` | |
-| S3 | `live_integration` | MinIO (`cgr.dev/chainguard/minio`, pinned by digest in `datatab_test_support`) | |
 | SQLite | `live_integration`, `ddl_integration` *(local only)* | temporary local file | No Docker. Not `#[ignore]`d — run without `-- --ignored`. |
 | SQL Server | `live_integration`, `ddl_integration`, `instance_catalog` | `mcr.microsoft.com/mssql/server:2022-latest` | amd64 image; single-threaded (one ~2 GB container per test). See specifics below. |
 | InfluxDB | `live_integration` | `influxdb:2.7` and `influxdb:1.8` | Covers both the v2 API and v1 (InfluxQL) code paths; single-threaded. |
 | ClickHouse | `live_integration` | `clickhouse/clickhouse-server:25.8.30.16` | Single-threaded. See specifics below. |
 | Turso | `live_integration` | `ghcr.io/tursodatabase/libsql-server` (pinned tag) or `TURSO_TEST_URL` | Single-threaded. |
-| CloudWatch | `live_integration` | LocalStack (`localstack/localstack:3`) | Single-threaded. Community-tier boundaries below. |
 | Redshift | `live_integration` | real Amazon Redshift cluster | Credential-gated; excluded from the local suite. See below. |
 
 Representative per-suite commands:
@@ -148,13 +145,6 @@ suite safe.
 
 ## Coverage limits
 
-- **CloudWatch** runs against LocalStack community, which implements the Logs
-  data-plane APIs the suite needs. `DashboardSource` and Logs Insights
-  (`StartQuery`/`GetQueryResults`) may be unimplemented in the community tier:
-  the tests treat any error from those specific calls as tier-not-supported and
-  return instead of failing; a real AWS account or LocalStack Pro is required
-  to verify those two seams end to end. `DashboardImporter::import` is pure
-  JSON parsing and runs unconditionally.
 - **SQL Server**: `ssl_mode = "required"` and named-instance routing are not
   covered by the live suite (self-signed test cert, no SQL Browser sidecar);
   both paths are covered by unit tests in

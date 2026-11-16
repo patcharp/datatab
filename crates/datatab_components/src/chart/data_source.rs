@@ -12,10 +12,8 @@
 //! Connection resolution, driver execution, and local-store aggregation all stay
 //! in the host crate (`datatab_ui`), not here.
 
-use crate::saved_chart::{MetricSeries, SavedChartSource};
-use datatab_core::{
-    CollectionRef, ExecutionContext, ExecutionSourceContext, MetricQuerySeries, QueryRequest,
-};
+use crate::saved_chart::SavedChartSource;
+use datatab_core::{CollectionRef, ExecutionContext, ExecutionSourceContext, QueryRequest};
 
 // ---------------------------------------------------------------------------
 // TimeWindow
@@ -185,30 +183,10 @@ pub trait ChartDataSource: Send + 'static {
         ChartSourceDescription::empty()
     }
 
-    /// Clone this source into a new heap-allocated box.
-    ///
-    /// Needed because `Clone` is not object-safe. The picker emits a
-    /// `ChartShellEvent::MetricPickerApplied(Box<dyn ChartDataSource>)` and
-    /// `ChartDocument` stashes the source in a `pending_data_source` field;
-    /// `clone_box` lets that field be cloned without knowing the concrete type.
-    fn clone_box(&self) -> Box<dyn ChartDataSource>;
-
-    /// Expose the concrete type as `Any` for downcasting.
-    ///
-    /// Required by the `DocumentKey::MetricChart` deduplication path: the
-    /// `matches_dedup_key` closure downcasts `&dyn ChartDataSource` to
-    /// `&MetricSource` to compare `(namespace, metric_name)`.
-    ///
-    /// Default implementation always returns `None`; only `MetricSource`
-    /// overrides it.
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
-        None
-    }
-
     /// Returns `true` when the source is self-contained and auto-executes
     /// without requiring the user to type or confirm a query.
     ///
-    /// `MetricSource` returns `true`: clicking a metric leaf auto-runs the chart.
+    /// `InstanceMetricSource` returns `true` for operational metrics.
     /// `QuerySource` returns `false` (default) because the chart stays idle
     /// until the user provides a query or presses Run.
     ///
@@ -252,12 +230,6 @@ impl QuerySource {
 }
 
 impl ChartDataSource for QuerySource {
-    fn clone_box(&self) -> Box<dyn ChartDataSource> {
-        Box::new(QuerySource {
-            query: self.query.clone(),
-        })
-    }
-
     fn build_plan(&self, window: Option<TimeWindow>) -> Result<ChartDataPlan, ChartSourceError> {
         let q = self.query.trim();
 
@@ -307,12 +279,6 @@ pub(crate) struct CollectionSource {
 }
 
 impl ChartDataSource for CollectionSource {
-    fn clone_box(&self) -> Box<dyn ChartDataSource> {
-        Box::new(CollectionSource {
-            collection_ref: self.collection_ref.clone(),
-        })
-    }
-
     fn build_plan(&self, window: Option<TimeWindow>) -> Result<ChartDataPlan, ChartSourceError> {
         // A window is mandatory: CollectionWindow requires concrete start/end bounds.
         let w = window.ok_or(ChartSourceError::WindowRequired)?;
@@ -338,138 +304,6 @@ impl ChartDataSource for CollectionSource {
 }
 
 // ---------------------------------------------------------------------------
-// MetricSource
-// ---------------------------------------------------------------------------
-
-/// A CloudWatch metrics chart source.
-///
-/// Holds the five user-visible parameters that identify a CloudWatch metric
-/// series. The time window (`start_ms`, `end_ms`) is NOT stored here — it is
-/// supplied by the chart engine at `build_plan` time and embedded into the
-/// resulting `MetricQuery` execution context.
-///
-/// A time window is **required**: `GetMetricData` mandates explicit `StartTime`
-/// and `EndTime`, so there is no representation for "metrics without window".
-/// `build_plan(None)` returns `Err(ChartSourceError::WindowRequired)`.
-///
-/// `MetricSource` is constructed directly by the UI entry point (not via
-/// `SavedChartSource`) — same pattern as `AuditSource`. Carries one or more
-/// `MetricSeries`; the driver issues a single GetMetricData batching every
-/// series and the chart receives one Y column per series.
-#[derive(Clone)]
-pub struct MetricSource {
-    /// Non-empty list of series. A single-metric chart holds exactly one entry.
-    pub series: Vec<MetricSeries>,
-}
-
-impl MetricSource {
-    /// Convenience constructor for a single-series source — the common case
-    /// when a user clicks a metric leaf in the sidebar.
-    pub fn single(
-        namespace: String,
-        metric_name: String,
-        dimensions: Vec<(String, String)>,
-        period_seconds: u32,
-        statistic: String,
-    ) -> Self {
-        Self {
-            series: vec![MetricSeries {
-                namespace,
-                metric_name,
-                dimensions,
-                period_seconds,
-                statistic,
-                region: None,
-                label: None,
-            }],
-        }
-    }
-
-    /// Returns the namespace of the first series, or `""` when empty.
-    /// Used by sidebar dedup to keep a stable identity even after the picker
-    /// rebuilds the source value.
-    pub fn primary_namespace(&self) -> &str {
-        self.series
-            .first()
-            .map(|s| s.namespace.as_str())
-            .unwrap_or("")
-    }
-
-    /// Returns the metric name of the first series, or `""` when empty.
-    pub fn primary_metric_name(&self) -> &str {
-        self.series
-            .first()
-            .map(|s| s.metric_name.as_str())
-            .unwrap_or("")
-    }
-}
-
-impl ChartDataSource for MetricSource {
-    fn clone_box(&self) -> Box<dyn ChartDataSource> {
-        Box::new(self.clone())
-    }
-
-    fn describe(&self) -> ChartSourceDescription {
-        let title = match self.series.as_slice() {
-            [] => String::new(),
-            [single] => format!("{} / {}", single.namespace, single.metric_name),
-            [first, ..] => format!(
-                "{} / {} (+{} more)",
-                first.namespace,
-                first.metric_name,
-                self.series.len() - 1
-            ),
-        };
-        ChartSourceDescription { title: Some(title) }
-    }
-
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
-        Some(self)
-    }
-
-    fn is_self_executing(&self) -> bool {
-        true
-    }
-
-    fn build_plan(&self, window: Option<TimeWindow>) -> Result<ChartDataPlan, ChartSourceError> {
-        // GetMetricData requires explicit StartTime/EndTime — window is mandatory.
-        let w = window.ok_or(ChartSourceError::WindowRequired)?;
-
-        if self.series.is_empty() {
-            return Err(ChartSourceError::Source(
-                "MetricSource has no series".to_string(),
-            ));
-        }
-
-        let series = self
-            .series
-            .iter()
-            .map(|s| MetricQuerySeries {
-                namespace: s.namespace.clone(),
-                metric_name: s.metric_name.clone(),
-                dimensions: s.dimensions.clone(),
-                period_s: s.period_seconds,
-                statistic: s.statistic.clone(),
-                label: s.label.clone(),
-            })
-            .collect();
-
-        let exec_ctx = ExecutionContext {
-            source: Some(ExecutionSourceContext::MetricQuery {
-                series,
-                start_ms: w.start_ms,
-                end_ms: w.end_ms,
-            }),
-            ..ExecutionContext::default()
-        };
-
-        let request = QueryRequest::new(String::new()).with_execution_context(Some(exec_ctx));
-
-        Ok(ChartDataPlan::Driver(request))
-    }
-}
-
-// ---------------------------------------------------------------------------
 // InstanceMetricSource
 // ---------------------------------------------------------------------------
 
@@ -484,10 +318,6 @@ pub struct InstanceMetricSource {
 }
 
 impl ChartDataSource for InstanceMetricSource {
-    fn clone_box(&self) -> Box<dyn ChartDataSource> {
-        Box::new(self.clone())
-    }
-
     fn describe(&self) -> ChartSourceDescription {
         ChartSourceDescription {
             title: Some(self.metric_id.clone()),
@@ -540,12 +370,6 @@ pub struct AuditSource {
 }
 
 impl ChartDataSource for AuditSource {
-    fn clone_box(&self) -> Box<dyn ChartDataSource> {
-        Box::new(AuditSource {
-            spec: self.spec.clone(),
-        })
-    }
-
     fn build_plan(&self, window: Option<TimeWindow>) -> Result<ChartDataPlan, ChartSourceError> {
         let mut spec = self.spec.clone();
 
@@ -590,9 +414,6 @@ pub fn resolve_source(source: &SavedChartSource) -> Box<dyn ChartDataSource> {
         SavedChartSource::Collection { collection_ref, .. } => Box::new(CollectionSource {
             collection_ref: collection_ref.clone(),
         }),
-        SavedChartSource::Metric { series } => Box::new(MetricSource {
-            series: series.clone(),
-        }),
         SavedChartSource::InstanceMetric { metric_id } => Box::new(InstanceMetricSource {
             metric_id: metric_id.clone(),
         }),
@@ -610,7 +431,7 @@ mod tests {
     // --- Display tests ---
 
     /// ChartSourceError::WindowRequired must display a source-agnostic message
-    /// (not "collection source") so it reads correctly for MetricSource too.
+    /// (not "collection source") so it also covers instance metrics.
     #[test]
     fn window_required_display_is_source_agnostic() {
         let msg = format!("{}", ChartSourceError::WindowRequired);
@@ -958,79 +779,6 @@ mod tests {
         assert_eq!(returned_spec.end_ms, Some(10_000));
     }
 
-    // --- MetricSource tests (T-1, T-2) ---
-
-    /// T-1: MetricSource::build_plan with a window must return Ok(ChartDataPlan::Driver)
-    /// carrying a MetricQuery execution context with the correct field values and the
-    /// window's start_ms/end_ms.
-    #[test]
-    fn metric_source_build_plan_with_window() {
-        let src = MetricSource::single(
-            "AWS/Lambda".to_string(),
-            "Invocations".to_string(),
-            vec![],
-            60,
-            "Sum".to_string(),
-        );
-
-        let window = TimeWindow {
-            start_ms: 1_000_000,
-            end_ms: 2_000_000,
-        };
-
-        let plan = src
-            .build_plan(Some(window))
-            .expect("build_plan must succeed with a window");
-
-        let ChartDataPlan::Driver(request) = plan else {
-            panic!("expected ChartDataPlan::Driver, got LocalAudit");
-        };
-
-        let ctx = request
-            .execution_context
-            .as_ref()
-            .expect("request must carry an execution context");
-
-        match ctx.source.as_ref().expect("source must be Some") {
-            ExecutionSourceContext::MetricQuery {
-                series,
-                start_ms,
-                end_ms,
-            } => {
-                assert_eq!(series.len(), 1);
-                let s = &series[0];
-                assert_eq!(s.namespace, "AWS/Lambda");
-                assert_eq!(s.metric_name, "Invocations");
-                assert!(s.dimensions.is_empty());
-                assert_eq!(s.period_s, 60);
-                assert_eq!(s.statistic, "Sum");
-                assert_eq!(*start_ms, 1_000_000);
-                assert_eq!(*end_ms, 2_000_000);
-            }
-            other => panic!("expected MetricQuery source context, got: {other:?}"),
-        }
-    }
-
-    /// T-2: MetricSource::build_plan without a window must return Err(WindowRequired).
-    #[test]
-    fn metric_source_build_plan_no_window() {
-        let src = MetricSource::single(
-            "AWS/Lambda".to_string(),
-            "Invocations".to_string(),
-            vec![],
-            60,
-            "Sum".to_string(),
-        );
-
-        let result = src.build_plan(None);
-
-        assert!(
-            matches!(result, Err(ChartSourceError::WindowRequired)),
-            "expected WindowRequired when no window is supplied, got: {:?}",
-            result
-        );
-    }
-
     // --- Purity guard ---
 
     /// Verify the source module carries no inappropriate import prefixes at test time.
@@ -1054,62 +802,5 @@ mod tests {
             outcomes: vec![],
             free_text: None,
         };
-    }
-
-    // ---- T17.1: is_self_executing ----
-
-    /// T17.1: `MetricSource::is_self_executing` must return `true`.
-    #[test]
-    fn metric_source_is_self_executing() {
-        let src = MetricSource::single(
-            "AWS/EC2".to_string(),
-            "CPUUtilization".to_string(),
-            vec![],
-            300,
-            "Average".to_string(),
-        );
-        assert!(
-            src.is_self_executing(),
-            "MetricSource must report is_self_executing() == true"
-        );
-    }
-
-    /// MetricSource::clone_box must produce a box with equal fields.
-    #[test]
-    fn metric_source_clone_box_produces_equal_source() {
-        let src = MetricSource::single(
-            "AWS/EC2".to_string(),
-            "CPUUtilization".to_string(),
-            vec![("InstanceId".to_string(), "i-abc".to_string())],
-            300,
-            "Average".to_string(),
-        );
-
-        let cloned = src.clone_box();
-
-        // The cloned source must produce an identical plan for the same window.
-        let window = TimeWindow {
-            start_ms: 1_000,
-            end_ms: 2_000,
-        };
-        let original_plan = src
-            .build_plan(Some(window))
-            .expect("MetricSource must succeed");
-        let cloned_plan = cloned
-            .build_plan(Some(window))
-            .expect("cloned MetricSource must succeed");
-
-        // Both plans are ChartDataPlan::Driver — compare their query requests.
-        let ChartDataPlan::Driver(orig_req) = original_plan else {
-            panic!("expected Driver plan");
-        };
-        let ChartDataPlan::Driver(clone_req) = cloned_plan else {
-            panic!("expected Driver plan");
-        };
-
-        assert_eq!(
-            orig_req.execution_context, clone_req.execution_context,
-            "cloned MetricSource must produce identical execution context"
-        );
     }
 }

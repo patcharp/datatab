@@ -21,4 +21,4 @@ pub use datatab_ui_base::platform;
 // Re-exports for convenience
 #[cfg(feature = "mcp")]
 pub use datatab_ui_base::McpRuntimeEventRaised;
-pub use datatab_ui_base::{AppStateChanged, AppStateEntity, AuthProfileCreated};
+pub use datatab_ui_base::{AppStateChanged, AppStateEntity};

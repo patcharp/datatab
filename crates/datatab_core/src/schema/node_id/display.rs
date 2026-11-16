@@ -3,19 +3,18 @@ use std::fmt;
 use super::SchemaNodeId;
 use super::{
     P_BASE_TYPE, P_COLL_FIELD, P_COLL_FIELDS_FOLDER, P_COLL_IDX_FOLDER, P_COLL_INDEX, P_COLLECTION,
-    P_COLLECTION_CHILD, P_COLLECTION_CHILDREN_MORE, P_COLLECTIONS_FOLDER, P_COLUMN,
-    P_COLUMNS_FOLDER, P_CONN_FOLDER, P_CONSTRAINT, P_CONSTRAINTS_FOLDER, P_CUSTOM_TYPE,
-    P_DASHBOARD_ITEM, P_DASHBOARDS_FOLDER, P_DATABASE, P_DATABASES_FOLDER, P_DB_IDX_FOLDER,
-    P_DEPENDENT_ITEM, P_DEPENDENTS_FOLDER, P_EMPTY_DATABASES_FOLDER, P_ENUM_VALUE, P_FK,
-    P_FK_FOLDER, P_INDEX, P_INDEXES_FOLDER, P_INST_FOLDER, P_INST_INSPECTOR_LEAF,
-    P_INST_INSPECTORS_FOLDER, P_INST_METRIC_LEAF, P_INST_METRICS_FOLDER, P_INST_OVERVIEW_LEAF,
-    P_LOADING, P_METRIC_LEAF, P_METRIC_NS_FOLDER, P_METRICS_FOLDER, P_PLACEHOLDER, P_PROFILE,
-    P_REMOTE_DASHBOARD_ITEM, P_REMOTE_DASHBOARDS_FOLDER, P_ROOT_SECTION, P_ROOT_SECTION_ITEM,
-    P_ROOT_SECTION_MORE, P_ROUTINE, P_ROUTINES_FOLDER, P_ROUTINES_LOADING, P_SAVED_CHART_ITEM,
-    P_SAVED_CHARTS_FOLDER, P_SCHEMA, P_SCHEMA_FK, P_SCHEMA_FK_FOLDER, P_SCHEMA_FK_LOADING,
-    P_SCHEMA_IDX_FOLDER, P_SCHEMA_IDX_LOADING, P_SCHEMA_INDEX, P_SCRIPT_FILE, P_SCRIPTS_FOLDER,
-    P_SCRIPTS_ROOT, P_SECRET_PATH, P_SECRET_STORE, P_STORAGE_HINT_ITEM, P_STORAGE_HINTS_FOLDER,
-    P_TABLE, P_TABLES_FOLDER, P_TYPES_FOLDER, P_TYPES_LOADING, P_VIEW, P_VIEWS_FOLDER,
+    P_COLLECTIONS_FOLDER, P_COLUMN, P_COLUMNS_FOLDER, P_CONN_FOLDER, P_CONSTRAINT,
+    P_CONSTRAINTS_FOLDER, P_CUSTOM_TYPE, P_DASHBOARD_ITEM, P_DASHBOARDS_FOLDER, P_DATABASE,
+    P_DATABASES_FOLDER, P_DB_IDX_FOLDER, P_DEPENDENT_ITEM, P_DEPENDENTS_FOLDER,
+    P_EMPTY_DATABASES_FOLDER, P_ENUM_VALUE, P_FK, P_FK_FOLDER, P_INDEX, P_INDEXES_FOLDER,
+    P_INST_FOLDER, P_INST_INSPECTOR_LEAF, P_INST_INSPECTORS_FOLDER, P_INST_METRIC_LEAF,
+    P_INST_METRICS_FOLDER, P_INST_OVERVIEW_LEAF, P_LOADING, P_PLACEHOLDER, P_PROFILE,
+    P_ROOT_SECTION, P_ROOT_SECTION_ITEM, P_ROOT_SECTION_MORE, P_ROUTINE, P_ROUTINES_FOLDER,
+    P_ROUTINES_LOADING, P_SAVED_CHART_ITEM, P_SAVED_CHARTS_FOLDER, P_SCHEMA, P_SCHEMA_FK,
+    P_SCHEMA_FK_FOLDER, P_SCHEMA_FK_LOADING, P_SCHEMA_IDX_FOLDER, P_SCHEMA_IDX_LOADING,
+    P_SCHEMA_INDEX, P_SCRIPT_FILE, P_SCRIPTS_FOLDER, P_SCRIPTS_ROOT, P_STORAGE_HINT_ITEM,
+    P_STORAGE_HINTS_FOLDER, P_TABLE, P_TABLES_FOLDER, P_TYPES_FOLDER, P_TYPES_LOADING, P_VIEW,
+    P_VIEWS_FOLDER,
 };
 
 impl fmt::Display for SchemaNodeId {
@@ -42,8 +41,6 @@ impl fmt::Display for SchemaNodeId {
             Self::Table { .. }
             | Self::View { .. }
             | Self::Collection { .. }
-            | Self::CollectionChild { .. }
-            | Self::CollectionChildrenMore { .. }
             | Self::CustomType { .. } => fmt_object_variants(self, f),
 
             Self::ColumnsFolder { .. }
@@ -76,18 +73,12 @@ impl fmt::Display for SchemaNodeId {
             | Self::RoutinesLoadingFolder { .. }
             | Self::Routine { .. } => fmt_routine_variants(self, f),
 
-            Self::MetricsFolder { .. }
-            | Self::MetricNamespaceFolder { .. }
-            | Self::MetricLeaf { .. } => fmt_metric_variants(self, f),
-
             Self::ScriptsFolder { .. } | Self::ScriptFile { .. } | Self::ScriptsRoot { .. } => {
                 fmt_scripts_variants(self, f)
             }
 
             Self::DashboardsFolder { .. }
             | Self::DashboardItem { .. }
-            | Self::RemoteDashboardsFolder { .. }
-            | Self::RemoteDashboardItem { .. }
             | Self::SavedChartsFolder { .. }
             | Self::SavedChartItem { .. } => fmt_dashboard_and_chart_variants(self, f),
 
@@ -115,15 +106,6 @@ impl fmt::Display for SchemaNodeId {
                 profile_id,
                 section_id,
             } => write!(f, "{}|{}|{}", P_ROOT_SECTION_MORE, profile_id, section_id),
-            Self::SecretStore {
-                profile_id,
-                store_id,
-            } => write!(f, "{}|{}|{}", P_SECRET_STORE, profile_id, store_id),
-            Self::SecretPath {
-                profile_id,
-                store_id,
-                path,
-            } => write!(f, "{}|{}|{}|{}", P_SECRET_PATH, profile_id, store_id, path),
         }
     }
 }
@@ -291,30 +273,6 @@ fn fmt_object_variants(id: &SchemaNodeId, f: &mut fmt::Formatter<'_>) -> fmt::Re
             name,
         } => {
             write!(f, "{}|{}|{}|{}", P_COLLECTION, profile_id, database, name)
-        }
-        SchemaNodeId::CollectionChild {
-            profile_id,
-            database,
-            collection,
-            child_id,
-            name,
-        } => {
-            write!(
-                f,
-                "{}|{}|{}|{}|{}|{}",
-                P_COLLECTION_CHILD, profile_id, database, collection, child_id, name
-            )
-        }
-        SchemaNodeId::CollectionChildrenMore {
-            profile_id,
-            database,
-            collection,
-        } => {
-            write!(
-                f,
-                "{}|{}|{}|{}",
-                P_COLLECTION_CHILDREN_MORE, profile_id, database, collection
-            )
         }
         SchemaNodeId::CustomType {
             profile_id,
@@ -591,41 +549,6 @@ fn fmt_routine_variants(id: &SchemaNodeId, f: &mut fmt::Formatter<'_>) -> fmt::R
     }
 }
 
-fn fmt_metric_variants(id: &SchemaNodeId, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    match id {
-        SchemaNodeId::MetricsFolder {
-            profile_id,
-            database,
-        } => {
-            write!(f, "{}|{}|{}", P_METRICS_FOLDER, profile_id, database)
-        }
-        SchemaNodeId::MetricNamespaceFolder {
-            profile_id,
-            database,
-            namespace,
-        } => {
-            write!(
-                f,
-                "{}|{}|{}|{}",
-                P_METRIC_NS_FOLDER, profile_id, database, namespace
-            )
-        }
-        SchemaNodeId::MetricLeaf {
-            profile_id,
-            database,
-            namespace,
-            metric_name,
-        } => {
-            write!(
-                f,
-                "{}|{}|{}|{}|{}",
-                P_METRIC_LEAF, profile_id, database, namespace, metric_name
-            )
-        }
-        _ => unreachable!("fmt_metric_variants called with an unexpected variant"),
-    }
-}
-
 fn fmt_scripts_variants(id: &SchemaNodeId, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     match id {
         SchemaNodeId::ScriptsFolder { path } => match path {
@@ -652,12 +575,6 @@ fn fmt_dashboard_and_chart_variants(id: &SchemaNodeId, f: &mut fmt::Formatter<'_
             dashboard_id,
         } => {
             write!(f, "{}|{}|{}", P_DASHBOARD_ITEM, profile_id, dashboard_id)
-        }
-        SchemaNodeId::RemoteDashboardsFolder { profile_id } => {
-            write!(f, "{}|{}", P_REMOTE_DASHBOARDS_FOLDER, profile_id)
-        }
-        SchemaNodeId::RemoteDashboardItem { profile_id, name } => {
-            write!(f, "{}|{}|{}", P_REMOTE_DASHBOARD_ITEM, profile_id, name)
         }
         SchemaNodeId::SavedChartsFolder { profile_id } => {
             write!(f, "{}|{}", P_SAVED_CHARTS_FOLDER, profile_id)

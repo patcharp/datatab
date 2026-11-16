@@ -142,7 +142,6 @@ fn register_stub_document_connection(
                 read_only_reason: None,
                 database_schemas: Default::default(),
                 table_details: Default::default(),
-                collection_children: Default::default(),
                 schema_types: Default::default(),
                 schema_columns: Default::default(),
                 schema_indexes: Default::default(),
@@ -343,4 +342,92 @@ fn grid_click_then_shift_right_extends_selection(cx: &mut TestAppContext) {
         .update(|_, cx| cx.read_from_clipboard())
         .and_then(|item| item.text());
     assert_eq!(copied.as_deref(), Some("one\ttwo\tthree"));
+}
+
+fn register_reserved_collection_connection(
+    cx: &mut TestAppContext,
+) -> (Entity<AppStateEntity>, uuid::Uuid) {
+    let (app_state, profile_id) = register_stub_document_connection(cx);
+    cx.update(|cx| {
+        app_state.update(cx, |state, _| {
+            let connected = state
+                .connections_mut()
+                .get_mut(&profile_id)
+                .expect("connected fixture");
+            connected.schema = Some(datatab_core::SchemaSnapshot::document(
+                datatab_core::DocumentSchema {
+                    databases: Vec::new(),
+                    current_database: Some("shop".to_string()),
+                    collections: vec![datatab_core::CollectionInfo {
+                        name: "events".to_string(),
+                        database: Some("shop".to_string()),
+                        document_count: None,
+                        avg_document_size: None,
+                        sample_fields: None,
+                        indexes: None,
+                        validator: None,
+                        is_capped: false,
+                        presentation: datatab_core::CollectionPresentation::ReservedEventStream,
+                        child_items: None,
+                    }],
+                },
+            ));
+        });
+    });
+    (app_state, profile_id)
+}
+
+#[gpui::test]
+fn reserved_event_stream_collection_opens_as_data_grid(cx: &mut TestAppContext) {
+    use crate::ui::views::workspace::actions::TabPlacement;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    let (app_state, profile_id) = register_reserved_collection_connection(cx);
+    let (workspace, _, window) = super::new_workspace_with(cx, app_state);
+    let opened = Rc::new(RefCell::new(Vec::new()));
+    let subscription = window.update(|_, cx| {
+        let opened = opened.clone();
+        cx.observe_new::<DataDocument>(move |_, _, cx| {
+            opened.borrow_mut().push(cx.entity());
+        })
+    });
+    let collection = datatab_core::CollectionRef::new("shop", "events");
+    for _ in 0..2 {
+        window.update(|window, cx| {
+            workspace.update(cx, |workspace, cx| {
+                workspace.open_collection_document(
+                    profile_id,
+                    collection.clone(),
+                    TabPlacement::ReuseExisting,
+                    window,
+                    cx,
+                );
+            });
+        });
+        window.run_until_parked();
+    }
+    assert_eq!(
+        opened.borrow().len(),
+        1,
+        "reserved presentation opens a grid and reuses it"
+    );
+    window.update(|window, cx| {
+        workspace.update(cx, |workspace, cx| {
+            workspace.open_collection_document(
+                profile_id,
+                collection.clone(),
+                TabPlacement::NewTab,
+                window,
+                cx,
+            );
+        });
+    });
+    window.run_until_parked();
+    assert_eq!(
+        opened.borrow().len(),
+        2,
+        "New Tab preserves the explicit duplicate request"
+    );
+    drop(subscription);
 }

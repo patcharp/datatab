@@ -37,9 +37,6 @@ impl ConnectionManagerWindow {
             super::AccessTabMode::Proxy => {
                 Some(datatab_i18n::t!("connection_manager.tab_badge.proxy"))
             }
-            super::AccessTabMode::ManagedSsm => {
-                Some(datatab_i18n::t!("connection_manager.tab_badge.ssm"))
-            }
         }
         .map(|label| (label, BadgeTone::Neutral));
 
@@ -486,15 +483,14 @@ impl ConnectionManagerWindow {
             ))
             .child(ssl_row);
 
-        // Cert path inputs — shown only when the driver declares ssl_cert_fields and the
-        // selected mode requires certificate verification.
+        // Driver metadata controls the pickers and their keyboard stops together.
         if let Some(driver) = &self.form.selected_driver {
             let metadata = driver.metadata();
             if let Some(cert_fields) = &metadata.ssl_cert_fields {
-                let mode_requires_root =
-                    datatab_core::ssl_mode_id_requires_root_cert(&current_ssl_mode);
+                let (show_root_cert, show_client_cert) =
+                    cert_fields.visible_for_mode(&current_ssl_mode);
 
-                if mode_requires_root {
+                if show_root_cert {
                     let ca_row = self.render_ssl_cert_picker_row(
                         datatab_i18n::t!("connection_manager.field.ca_certificate"),
                         super::SslCertSlot::CaCert,
@@ -503,23 +499,18 @@ impl ConnectionManagerWindow {
                     section = section.child(ca_row);
                 }
 
-                if cert_fields.client_cert {
-                    let mode_is_cert_active =
-                        datatab_core::ssl_mode_id_is_cert_active(&current_ssl_mode);
-
-                    if mode_is_cert_active {
-                        let cert_row = self.render_ssl_cert_picker_row(
-                            datatab_i18n::t!("connection_manager.field.client_cert"),
-                            super::SslCertSlot::ClientCert,
-                            cx,
-                        );
-                        let key_row = self.render_ssl_cert_picker_row(
-                            datatab_i18n::t!("connection_manager.field.client_key"),
-                            super::SslCertSlot::ClientKey,
-                            cx,
-                        );
-                        section = section.child(cert_row).child(key_row);
-                    }
+                if show_client_cert {
+                    let cert_row = self.render_ssl_cert_picker_row(
+                        datatab_i18n::t!("connection_manager.field.client_cert"),
+                        super::SslCertSlot::ClientCert,
+                        cx,
+                    );
+                    let key_row = self.render_ssl_cert_picker_row(
+                        datatab_i18n::t!("connection_manager.field.client_key"),
+                        super::SslCertSlot::ClientKey,
+                        cx,
+                    );
+                    section = section.child(cert_row).child(key_row);
                 }
             }
         }
@@ -1413,7 +1404,6 @@ mod connection_overrides_i18n_tests {
         "connection_manager.overrides.on",
         "connection_manager.overrides.off",
         "connection_manager.placeholder.extra_hook_ids",
-        "connection_manager.placeholder.use_connection_auth_profile",
         "settings.general.override_value_header",
     ];
 

@@ -13,7 +13,7 @@ fn short_deadlines() -> ConnectDeadlines {
 
 fn opening_access() -> PipelineState {
     PipelineState::OpeningAccess {
-        method_label: "SSM".to_string(),
+        method_label: "SSH".to_string(),
     }
 }
 
@@ -33,7 +33,7 @@ async fn a_stalled_stage_fails_naming_the_stage_and_cancels_the_token() {
 
     assert_eq!(
         error,
-        "Connection timed out after 100ms while Opening access (SSM)"
+        "Connection timed out after 100ms while Opening access (SSH)"
     );
     assert!(cancel.is_cancelled());
 }
@@ -64,7 +64,7 @@ async fn waiting_for_login_gets_the_longer_budget() {
     let cancel = CancelToken::new();
     let future = async move {
         state_sender.send_replace(PipelineState::WaitingForLogin {
-            provider_name: "AWS SSO".to_string(),
+            provider_name: "Test SSO".to_string(),
             verification_url: None,
         });
         tokio::time::sleep(Duration::from_millis(300)).await;
@@ -80,7 +80,7 @@ async fn waiting_for_login_gets_the_longer_budget() {
     let (state_sender, state_watcher) = datatab_core::pipeline_state_channel();
     let future = async move {
         state_sender.send_replace(PipelineState::WaitingForLogin {
-            provider_name: "AWS SSO".to_string(),
+            provider_name: "Test SSO".to_string(),
             verification_url: None,
         });
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -92,7 +92,7 @@ async fn waiting_for_login_gets_the_longer_budget() {
         .expect_err("a login past the login budget must time out");
     assert_eq!(
         error,
-        "Connection timed out after 600ms while Waiting for login (AWS SSO)"
+        "Connection timed out after 600ms while Waiting for login (Test SSO)"
     );
 }
 

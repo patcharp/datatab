@@ -3,8 +3,7 @@
 //! This thin adapter translates between the `EventSource` trait API (`EventQuery`,
 //! `EventRecord`, `EventDetail`) and the storage-layer DTOs (`AuditQueryFilter`,
 //! `AuditEventDto`). It allows `AuditDocument` to be decoupled from the raw storage
-//! API and enables future sources (CloudWatch, Loki) to be swapped in without
-//! changing the document logic.
+//! API while keeping the local audit filtering and aggregation in one place.
 
 use datatab_audit::{AuditAggregateParams, AuditGroupColumn, pivot_long_to_wide};
 use datatab_core::QueryResult;
@@ -15,6 +14,52 @@ use datatab_core::observability::{
     EventSeverity, EventSource, EventSourceId,
 };
 use datatab_storage::repositories::audit::{AuditEventDto, AuditQueryFilter, AuditRepository};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retired_secret_store_category_maps_to_system() {
+        let dto = AuditEventDto {
+            id: 42,
+            actor_id: "actor".into(),
+            tool_id: "tool".into(),
+            decision: "allow".into(),
+            reason: None,
+            profile_id: None,
+            classification: None,
+            duration_ms: Some(12),
+            created_at: "2026-01-01".into(),
+            created_at_epoch_ms: 123,
+            level: Some("info".into()),
+            category: Some("secret_store".into()),
+            action: Some("read".into()),
+            outcome: Some("success".into()),
+            actor_type: None,
+            source_id: None,
+            summary: Some("old row".into()),
+            connection_id: Some("connection".into()),
+            database_name: None,
+            driver_id: None,
+            object_type: None,
+            object_id: None,
+            details_json: None,
+            error_code: None,
+            error_message: None,
+            session_id: None,
+            correlation_id: None,
+        };
+        let record = AuditSourceAdapter::dto_to_record(&dto);
+        assert_eq!(record.category, EventCategory::System);
+        assert_eq!(record.id, Some(42));
+        assert_eq!(record.ts_ms, 123);
+        assert_eq!(record.action, "read");
+        assert_eq!(record.summary, "old row");
+        assert_eq!(record.connection_id.as_deref(), Some("connection"));
+        assert_eq!(record.duration_ms, Some(12));
+    }
+}
 
 /// Adapter exposing the `EventSource` interface over the `AuditRepository` storage layer.
 #[derive(Clone)]

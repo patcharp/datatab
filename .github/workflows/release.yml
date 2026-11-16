@@ -1,14 +1,15 @@
 # Build and package the DataTab release artifacts.
 #
-# A push of a tag vX.Y.Z builds every package and creates a draft GitHub
-# release for that tag. A manual run builds the ref you give it and only
-# uploads workflow artifacts; it never creates a release.
+# A push to main builds every package and saves dependency caches. A tag
+# vX.Y.Z creates a draft release from the successful main build of that exact
+# commit. A manual run builds the chosen ref and uploads artifacts only.
+# The release job refuses a tag that does not match [workspace.package].version.
 #
 # The release job only creates. If a release for the tag already exists, draft
-# or published, it fails and changes nothing. To build a tag again, delete its
-# draft release by hand first, then re-run the workflow.
+# or published, it fails and changes nothing. To create it again, delete its
+# draft release by hand first, then re-run the tag workflow.
 #
-# This workflow only builds. It runs no tests, lints or benchmarks.
+# This workflow runs no tests, lints or benchmarks.
 #
 # Runner facts, checked against the current GitHub documentation:
 #   https://docs.github.com/en/actions/reference/runners/github-hosted-runners
@@ -36,17 +37,26 @@
 #   core. macOS adds swap on its own, but a build at the memory limit can
 #   still be killed or swap until it times out. If that happens, use JOBS=2.
 #
-# No cargo cache. A release runs on a tag, and a cache saved on a tag can be
-# read only by later runs on that same tag, not by the next release. A cache
-# would need regular builds on the default branch to write it, and this
-# repository has none. A release binary is therefore always built cold.
+# Dependency caches exclude workspace crates. The cache key includes the OS,
+# target, release profile, Rust toolchain, Cargo manifests and lockfile. A
+# weekly restore on main is inferred to refresh last access; it never builds
+# or saves. GitHub evicts caches not accessed for 7 days and defaults to a
+# 10 GB repository limit:
+# https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching
+# GitHub may also evict entries for space or delayed schedules. A miss
+# builds dependencies cold. Caches are build inputs and can affect binaries.
+# Only main push builds save caches; manual and scheduled runs cannot save.
 
 name: Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
+  schedule:
+    - cron: "17 3 * * 1"
   workflow_dispatch:
     inputs:
       ref:
@@ -62,7 +72,57 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  keep-cache-alive:
+    if: github.event_name == 'schedule' && github.ref == 'refs/heads/main'
+    name: Restore cache (${{ matrix.key }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_RELEASE_LTO: ${{ matrix.lto }}
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ matrix.codegen }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            key: linux-x86_64-unknown-linux-gnu-release-lto
+          - os: windows-2025
+            key: windows-x86_64-pc-windows-msvc-release-lto
+          - os: macos-26
+            key: macos-x86_64-apple-darwin-release-no-lto-16
+            lto: "false"
+            codegen: "16"
+          - os: macos-26
+            key: macos-aarch64-apple-darwin-release-no-lto-16
+            lto: "false"
+            codegen: "16"
+    steps:
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install the pinned Rust toolchain
+        run: rustup toolchain install
+      - name: Restore dependency cache
+        id: cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ${{ matrix.key }}
+          add-job-id-key: "false"
+          cache-bin: "false"
+          cache-workspace-crates: "false"
+          save-if: "false"
+      - name: Require a cache hit
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          echo "Dependency cache missing for ${{ matrix.key }}" >&2
+          exit 1
+
   linux:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     name: Linux (.deb)
     runs-on: ubuntu-24.04
     timeout-minutes: 180
@@ -103,6 +163,15 @@ jobs:
           rustup toolchain install
           rustc --version
 
+      - name: Restore dependency cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: linux-x86_64-unknown-linux-gnu-release-lto
+          add-job-id-key: "false"
+          cache-bin: "false"
+          cache-workspace-crates: "false"
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
       - name: Build the binary and the .deb
         run: sh scripts/build-linux.sh --deb
 
@@ -116,6 +185,7 @@ jobs:
           retention-days: 14
 
   windows:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     name: Windows (installer)
     runs-on: windows-2025
     timeout-minutes: 240
@@ -147,6 +217,15 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           rustc --version
 
+      - name: Restore dependency cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: windows-x86_64-pc-windows-msvc-release-lto
+          add-job-id-key: "false"
+          cache-bin: "false"
+          cache-workspace-crates: "false"
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
       - name: Build the executable and the installer
         shell: pwsh
         run: |
@@ -163,6 +242,7 @@ jobs:
           retention-days: 14
 
   macos:
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     name: macOS ${{ matrix.arch }} (.app)
     # Both apps build on the Apple Silicon runner; see the header.
     runs-on: macos-26
@@ -215,8 +295,84 @@ jobs:
           rustup target add "$TARGET"
           rustc --version
 
+      - name: Restore dependency cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: macos-${{ matrix.target }}-release-no-lto-16
+          add-job-id-key: "false"
+          cache-bin: "false"
+          cache-workspace-crates: "false"
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
       - name: Build DataTab.app
+        env:
+          MACOS_SIGN_IDENTITY: ""
         run: sh scripts/build-macos.sh "$TARGET"
+
+      - name: Import the signing certificate
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        env:
+          MACOS_SIGN_P12_BASE64: ${{ secrets.MACOS_SIGN_P12_BASE64 }}
+          MACOS_SIGN_P12_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
+        run: |
+          set -euo pipefail
+          umask 077
+          certificate_path="$RUNNER_TEMP/datatab-signing.p12"
+          keychain_path="$RUNNER_TEMP/datatab-signing.keychain-db"
+          search_list_path="$RUNNER_TEMP/datatab-signing-search-list.txt"
+          trap 'rm -f "$certificate_path"' EXIT
+          [ -n "$MACOS_SIGN_P12_BASE64" ] && [ -n "$MACOS_SIGN_P12_PASSWORD" ] || {
+            echo "The macOS signing secrets must both be set" >&2
+            exit 1
+          }
+          security list-keychains -d user |
+            sed -e 's/^[[:space:]]*"//' -e 's/"[[:space:]]*$//' > "$search_list_path.pending"
+          mv "$search_list_path.pending" "$search_list_path"
+          original_keychains=()
+          while IFS= read -r keychain; do
+            original_keychains+=("$keychain")
+          done < "$search_list_path"
+          keychain_password=$(openssl rand -base64 32)
+          security create-keychain -p "$keychain_password" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$keychain_password" "$keychain_path"
+          printf '%s' "$MACOS_SIGN_P12_BASE64" | base64 --decode > "$certificate_path"
+          chmod 600 "$certificate_path"
+          security import "$certificate_path" -k "$keychain_path" -P "$MACOS_SIGN_P12_PASSWORD" -x -T /usr/bin/codesign > /dev/null
+          rm -f "$certificate_path"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$keychain_password" "$keychain_path" > /dev/null
+          security list-keychains -d user -s ${original_keychains[@]+"${original_keychains[@]}"} "$keychain_path"
+          # Include matching identities: this certificate is self-signed, not Apple-trusted.
+          imported_sha1=$(security find-identity -p codesigning "$keychain_path" |
+            awk '/"PCPLab DataTab Code Signing"/ {print $2}' | sort -u)
+          if [ "$imported_sha1" != "83FAB2CB8FC3A11AA870475C5022D0800AC605F6" ]; then
+            echo "The imported signing identity does not match the project certificate" >&2
+            exit 1
+          fi
+
+      - name: Sign DataTab.app
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          MACOS_SIGN_IDENTITY: PCPLab DataTab Code Signing
+        run: sh scripts/build-macos.sh --sign-only
+
+      - name: Verify the project signature
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -eu
+          app=target/macos-package/DataTab.app
+          bundle_id=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist")
+          requirement='identifier "'"$bundle_id"'" and certificate leaf = H"83fab2cb8fc3a11aa870475c5022d0800ac605f6"'
+          codesign --verify --strict -R="$requirement" "$app"
+
+      - name: Describe the unsigned test build
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          echo "macOS $ARCH: unsigned test build (ad-hoc signature)." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create the disk image
+        run: sh scripts/build-macos.sh --dmg-only "$ARCH"
 
       - name: Zip the app
         run: |
@@ -232,11 +388,34 @@ jobs:
       - name: Upload the app
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: package-macos-${{ matrix.arch }}
-          path: dist/datatab-macos-${{ matrix.arch }}.zip
+          name: package-macos-${{ matrix.arch }}${{ github.event_name == 'workflow_dispatch' && '-unsigned test build' || '' }}
+          path: |
+            dist/datatab-macos-${{ matrix.arch }}.zip
+            dist/datatab-macos-${{ matrix.arch }}.dmg
           if-no-files-found: error
           overwrite: true
           retention-days: 14
+
+      - name: Remove the signing keychain
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          keychain_path="$RUNNER_TEMP/datatab-signing.keychain-db"
+          search_list_path="$RUNNER_TEMP/datatab-signing-search-list.txt"
+          cleanup_status=0
+          if [ -f "$keychain_path" ]; then
+            security delete-keychain "$keychain_path" || cleanup_status=$?
+          fi
+          if [ -f "$search_list_path" ]; then
+            original_keychains=()
+            while IFS= read -r keychain; do
+              original_keychains+=("$keychain")
+            done < "$search_list_path"
+            security list-keychains -d user -s ${original_keychains[@]+"${original_keychains[@]}"} || cleanup_status=$?
+          fi
+          rm -f "$RUNNER_TEMP/datatab-signing.p12" "$search_list_path" "$search_list_path.pending"
+          exit "$cleanup_status"
 
   checksums:
     name: Collect and checksum
@@ -254,7 +433,7 @@ jobs:
       - name: Write SHA256SUMS.txt
         working-directory: dist
         run: |
-          expected="datatab-linux-amd64.deb datatab-macos-arm64.zip datatab-macos-x86_64.zip datatab-windows-amd64-setup.exe"
+          expected="datatab-linux-amd64.deb datatab-macos-arm64.dmg datatab-macos-arm64.zip datatab-macos-x86_64.dmg datatab-macos-x86_64.zip datatab-windows-amd64-setup.exe"
           for file in $expected; do
             [ -f "$file" ] || { echo "missing package: $file" >&2; exit 1; }
           done
@@ -270,7 +449,7 @@ jobs:
       - name: Upload the release set
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: datatab-release
+          name: datatab-release${{ github.event_name == 'workflow_dispatch' && '-unsigned test build' || '' }}
           path: dist/
           if-no-files-found: error
           overwrite: true
@@ -279,17 +458,118 @@ jobs:
   release:
     name: Draft GitHub release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: checksums
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 390
     permissions:
+      actions: read
       contents: write
     steps:
+      - name: Check out the tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - name: Check the tag against the workspace version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -eu
+          version=$(sed -n '/^\[workspace\.package\]/,/^\[/s/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
+          if [ -z "$version" ]; then
+            echo "could not read [workspace.package].version in Cargo.toml for tag '$TAG'" >&2
+            exit 1
+          fi
+          if [ "$TAG" != "v$version" ]; then
+            echo "tag '$TAG' does not match [workspace.package].version '$version' in Cargo.toml" >&2
+            exit 1
+          fi
+
+      - name: Find the successful main build of this commit
+        id: main-build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -eu
+          # One query feeds both fail-fast paths. A completed main build that
+          # did not succeed will never satisfy this wait, and neither will a
+          # commit main has moved past with no main build at all.
+          jq_summary='
+            [.workflow_runs[] | select(.head_sha == env.COMMIT and .head_branch == "main" and .event == "push")] as $runs
+            | [
+                ($runs | map(select(.status == "completed" and .conclusion == "success")) | .[0].id // ""),
+                ($runs | map(select(.status == "completed" and .conclusion != "success")) | .[0]
+                  | if . == null then "" else "\(.id) (\(.conclusion))" end),
+                ($runs | length | tostring)
+              ]
+            | join("|")
+          '
+          # Compare tagged commit...main: identical or ahead means the tag is
+          # an ancestor of main; behind or diverged means it is not on main.
+          for attempt in $(seq 1 360); do
+            if comparison=$(gh api "repos/$GH_REPO/compare/$COMMIT...main" --jq .status); then
+              case "$comparison" in
+                behind|diverged)
+                  echo "Tagged commit $COMMIT is not on main ($comparison)" >&2
+                  exit 1
+                  ;;
+                identical|ahead) ;;
+                *) echo "Unexpected comparison status: $comparison; retrying" >&2; sleep 60; continue ;;
+              esac
+            else
+              echo "Could not compare commit with main; retrying" >&2
+              sleep 60
+              continue
+            fi
+            if runs=$(gh api "repos/$GH_REPO/actions/workflows/release.yml/runs?branch=main&event=push&head_sha=$COMMIT&per_page=100") &&
+               summary=$(printf '%s' "$runs" | jq -er "$jq_summary"); then
+              IFS='|' read -r run_id failed_run run_count <<< "$summary"
+              if [ -n "$run_id" ]; then
+                echo "run-id=$run_id" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              if [ -n "$failed_run" ]; then
+                echo "The main build for $COMMIT did not succeed: run $failed_run." >&2
+                echo "Re-run the main build for this commit, then run this tag again." >&2
+                exit 1
+              fi
+              if [ "$comparison" = "ahead" ] && [ "$run_count" -eq 0 ]; then
+                echo "main has moved past $COMMIT and no main build ran for it." >&2
+                echo "The tag must point at a commit the main build ran for." >&2
+                exit 1
+              fi
+            else
+              echo "Could not query main builds; retrying" >&2
+            fi
+            sleep 60
+          done
+          echo "No successful main build found for $COMMIT" >&2
+          exit 1
+
       - name: Download the release set
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: datatab-release
           path: dist
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.main-build.outputs.run-id }}
+
+      - name: Verify the release set
+        working-directory: dist
+        env:
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -eu
+          [ "$(git rev-parse HEAD)" = "$COMMIT" ] || { echo "Tag checkout does not match the build commit" >&2; exit 1; }
+          expected="SHA256SUMS.txt datatab-linux-amd64.deb datatab-macos-arm64.dmg datatab-macos-arm64.zip datatab-macos-x86_64.dmg datatab-macos-x86_64.zip datatab-windows-amd64-setup.exe"
+          found=$(find . -mindepth 1 -maxdepth 1 -printf '%f\n' | LC_ALL=C sort | tr '\n' ' ')
+          [ "$found" = "$expected " ] || { echo "Unexpected files in dist: $found" >&2; exit 1; }
+          packages="datatab-linux-amd64.deb datatab-macos-arm64.dmg datatab-macos-arm64.zip datatab-macos-x86_64.dmg datatab-macos-x86_64.zip datatab-windows-amd64-setup.exe"
+          names=$(sed -n 's/^[0-9a-f]\{64\}  //p' SHA256SUMS.txt | LC_ALL=C sort | tr '\n' ' ')
+          [ "$(wc -l < SHA256SUMS.txt)" -eq 6 ] && [ "$names" = "$packages " ] || { echo "Invalid checksum list" >&2; exit 1; }
+          sha256sum -c SHA256SUMS.txt
 
       - name: Create the draft release
         env:
@@ -302,6 +582,7 @@ jobs:
             echo "tag '$TAG' is not vX.Y.Z or vX.Y.Z-suffix" >&2
             exit 1
           fi
+          python3 scripts/release-notes.py CHANGELOG.md "$TAG" "$GH_REPO" > release-notes.md
           # Create only: never upload into an existing release. Any answer
           # other than "release not found" stops the job.
           if view_output=$(gh release view "$TAG" --json isDraft --jq .isDraft 2>&1); then
@@ -318,4 +599,4 @@ jobs:
           esac
           gh release create "$TAG" dist/* --draft --verify-tag \
             --title "DataTab $TAG" \
-            --notes "Unsigned packages for DataTab $TAG. Check them against SHA256SUMS.txt."
+            --notes-file release-notes.md

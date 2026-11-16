@@ -182,12 +182,6 @@ pub struct UserErrorReported {
 #[derive(Clone, Copy)]
 pub struct OpenAuditRequested(pub Option<Uuid>);
 
-/// Emitted when an auth profile is created (used to update the sidebar).
-#[derive(Clone)]
-pub struct AuthProfileCreated {
-    pub profile_id: Uuid,
-}
-
 /// Emitted when an MCP runtime event occurs.
 #[cfg(feature = "mcp")]
 #[derive(Clone)]
@@ -528,7 +522,6 @@ impl std::ops::DerefMut for AppStateEntity {
 // ============================================================================
 
 impl EventEmitter<AppStateChanged> for AppStateEntity {}
-impl EventEmitter<AuthProfileCreated> for AppStateEntity {}
 impl EventEmitter<ObjectTreeEvent> for AppStateEntity {}
 impl EventEmitter<UserErrorReported> for AppStateEntity {}
 impl EventEmitter<OpenAuditRequested> for AppStateEntity {}

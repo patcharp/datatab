@@ -7,53 +7,11 @@ use serde::de::Deserializer;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-/// Capabilities advertised by an auth provider that supports file-backed editing.
-///
-/// All string fields carry the final-rendered text; the UI uses them verbatim
-/// without further substitution.  `dangling_messages` is keyed by the
-/// `dangling_origin` token stored on the profile.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AuthEditCapabilities {
-    /// Full banner text shown when a profile is reflected from an external
-    /// source and is therefore read-only. Providers supply the destination
-    /// description verbatim.
-    pub mirror_label: String,
-
-    /// Status text displayed after a successful clean write of a new profile.
-    pub success_written: String,
-
-    /// Hint shown next to the disabled name field on a reflected profile.
-    /// Empty string means the hint element is suppressed entirely.
-    pub name_field_hint: String,
-
-    /// Messages keyed by `dangling_origin` token.  The UI looks up the
-    /// active profile's `dangling_origin` and falls back to
-    /// `dangling_fallback()` when the key is absent.
-    #[serde(default)]
-    pub dangling_messages: HashMap<String, DanglingMessage>,
-}
-
-/// Title and body for a dangling-profile banner, sourced from the provider.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DanglingMessage {
-    pub title: String,
-    pub body: String,
-}
-
 /// Top-level capability descriptor for an auth provider.
-///
-/// `Copy` was intentionally removed when `edit: Option<AuthEditCapabilities>`
-/// was added — `String` fields inside `AuthEditCapabilities` are not `Copy`.
-/// All previous consumers that implicitly copied the struct now clone or borrow.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthProviderCapabilities {
     #[serde(default)]
     pub login: AuthProviderLoginCapabilities,
-
-    /// Present when the provider supports file-backed profile editing.
-    /// `None` means the edit UI affordances are hidden for this provider.
-    #[serde(default)]
-    pub edit: Option<AuthEditCapabilities>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,11 +25,6 @@ pub struct AuthProviderLoginCapabilities {
 /// `AuthProfile` uses a custom `Deserialize` impl to handle migration from
 /// the legacy `"config"` format (see impl below). `Serialize` is derived
 /// normally and always writes the new `"fields"` format.
-///
-/// `read_only` is `true` for profiles that are reflected live from AWS config
-/// files and must not be edited in DataTab. Stored profiles always have
-/// `read_only = false`. This field is never persisted to SQLite; reflected
-/// profiles are never serialized.
 #[derive(Clone, Serialize)]
 pub struct AuthProfile {
     pub id: Uuid,
@@ -94,23 +47,6 @@ pub struct AuthProfile {
     #[serde(skip)]
     pub secret_fields: HashMap<String, SecretString>,
     pub enabled: bool,
-    /// Whether this profile is a live reflection and must not be edited in DataTab.
-    ///
-    /// Defaults to `false` for stored profiles. `true` for AWS reflected profiles.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub read_only: bool,
-    /// Why this stored profile is dangling, if it is.
-    ///
-    /// Opaque provider-defined token. The human-readable description for each
-    /// token value is supplied by the owning provider via
-    /// `AuthEditCapabilities.dangling_messages`. DataTab core does not interpret
-    /// or enumerate the possible values.
-    ///
-    /// `None` for healthy stored profiles and for all reflected (virtual) profiles.
-    /// This field is never persisted by serialization; it is populated at load time
-    /// from the `dangling_origin` column in `cfg_auth_profiles`.
-    #[serde(skip)]
-    pub dangling_origin: Option<String>,
 }
 
 impl std::fmt::Debug for AuthProfile {
@@ -127,19 +63,7 @@ impl std::fmt::Debug for AuthProfile {
             .field("fields", &self.fields)
             .field("secret_fields", &secret_keys)
             .field("enabled", &self.enabled)
-            .field("read_only", &self.read_only)
-            .field("dangling_origin", &self.dangling_origin)
             .finish()
-    }
-}
-
-/// Provider ID rewrites for old `config.type` values.
-fn rewrite_provider_id(old_provider_id: &str, config_type: &str) -> String {
-    match config_type {
-        "aws_sso" => "aws-sso".to_string(),
-        "aws_shared_credentials" => "aws-shared-credentials".to_string(),
-        "aws_static_credentials" => "aws-static-credentials".to_string(),
-        _ => old_provider_id.to_string(),
     }
 }
 
@@ -186,17 +110,12 @@ impl<'de> Deserialize<'de> for AuthProfile {
                 .as_object()
                 .ok_or_else(|| D::Error::custom("'config' must be a JSON object"))?;
 
-            let config_type = config_obj
-                .get("type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
             let old_provider_id = obj
                 .get("provider_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
 
-            let provider_id = rewrite_provider_id(old_provider_id, config_type);
+            let provider_id = old_provider_id.to_string();
 
             // Flatten config object into fields, dropping the "type" key.
             let mut fields = HashMap::new();
@@ -223,11 +142,6 @@ impl<'de> Deserialize<'de> for AuthProfile {
             (HashMap::new(), provider_id)
         };
 
-        let read_only = obj
-            .get("read_only")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-
         Ok(AuthProfile {
             id,
             name,
@@ -235,8 +149,6 @@ impl<'de> Deserialize<'de> for AuthProfile {
             fields,
             secret_fields: HashMap::new(),
             enabled,
-            read_only,
-            dangling_origin: None,
         })
     }
 }
@@ -254,8 +166,6 @@ impl AuthProfile {
             fields,
             secret_fields: HashMap::new(),
             enabled: true,
-            read_only: false,
-            dangling_origin: None,
         }
     }
 }
@@ -292,8 +202,7 @@ pub struct AuthSession {
     pub profile_id: Uuid,
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 
-    /// Provider-specific opaque data (e.g., AWS `SdkConfig`) that
-    /// downstream components (secret/parameter providers) can downcast.
+    /// Provider-specific opaque session data.
     pub data: Option<Arc<dyn Any + Send + Sync>>,
 }
 
@@ -318,8 +227,7 @@ pub struct ResolvedCredentials {
     /// (e.g. `"secret_access_key"`, `"session_token"`).
     pub secret_fields: HashMap<String, secrecy::SecretString>,
 
-    /// Provider-specific opaque data (e.g., AWS `SdkConfig`) that
-    /// downstream value providers can downcast to build their clients.
+    /// Provider-specific opaque data carried with the resolved credentials.
     pub provider_data: Option<Arc<dyn Any + Send + Sync>>,
 }
 
@@ -348,74 +256,17 @@ mod tests {
     }
 
     #[test]
-    fn old_aws_sso_config_migrates_correctly() {
-        let json = serde_json::json!({
-            "id": make_uuid(),
-            "name": "My SSO",
-            "provider_id": "aws",
-            "config": {
-                "type": "aws_sso",
-                "profile_name": "dev",
-                "region": "us-east-1",
-                "sso_start_url": "https://example.awsapps.com/start",
-                "sso_account_id": "123456789012",
-                "sso_role_name": "DevRole"
-            },
-            "enabled": true
-        });
-
-        let profile: AuthProfile = serde_json::from_value(json).unwrap();
-
-        assert_eq!(profile.provider_id, "aws-sso");
-        assert_eq!(profile.fields["profile_name"], "dev");
-        assert_eq!(profile.fields["region"], "us-east-1");
+    fn legacy_auth_config_keeps_provider_id() {
+        let profile: AuthProfile = serde_json::from_value(serde_json::json!({
+            "id": Uuid::nil(), "name": "Legacy", "provider_id": "aws",
+            "config": {"type": "aws_sso", "profile_name": "legacy"}
+        }))
+        .expect("legacy profile");
+        assert_eq!(profile.provider_id, "aws");
         assert_eq!(
-            profile.fields["sso_start_url"],
-            "https://example.awsapps.com/start"
+            profile.fields.get("profile_name").map(String::as_str),
+            Some("legacy")
         );
-        assert_eq!(profile.fields["sso_account_id"], "123456789012");
-        assert_eq!(profile.fields["sso_role_name"], "DevRole");
-        assert!(!profile.fields.contains_key("type"));
-    }
-
-    #[test]
-    fn old_aws_shared_credentials_migrates() {
-        let json = serde_json::json!({
-            "id": make_uuid(),
-            "name": "Shared",
-            "provider_id": "aws",
-            "config": {
-                "type": "aws_shared_credentials",
-                "profile_name": "default",
-                "region": "eu-west-1"
-            },
-            "enabled": true
-        });
-
-        let profile: AuthProfile = serde_json::from_value(json).unwrap();
-
-        assert_eq!(profile.provider_id, "aws-shared-credentials");
-        assert_eq!(profile.fields["profile_name"], "default");
-        assert_eq!(profile.fields["region"], "eu-west-1");
-    }
-
-    #[test]
-    fn old_aws_static_credentials_migrates() {
-        let json = serde_json::json!({
-            "id": make_uuid(),
-            "name": "Static",
-            "provider_id": "aws",
-            "config": {
-                "type": "aws_static_credentials",
-                "region": "ap-southeast-1"
-            },
-            "enabled": true
-        });
-
-        let profile: AuthProfile = serde_json::from_value(json).unwrap();
-
-        assert_eq!(profile.provider_id, "aws-static-credentials");
-        assert_eq!(profile.fields["region"], "ap-southeast-1");
     }
 
     #[test]
@@ -431,8 +282,6 @@ mod tests {
             fields: fields.clone(),
             secret_fields: HashMap::new(),
             enabled: true,
-            read_only: false,
-            dangling_origin: None,
         };
 
         let serialized = serde_json::to_value(&original).unwrap();
@@ -463,8 +312,6 @@ mod tests {
             fields,
             secret_fields,
             enabled: true,
-            read_only: false,
-            dangling_origin: None,
         };
 
         let json = serde_json::to_string(&profile).unwrap();
@@ -498,8 +345,6 @@ mod tests {
             fields: HashMap::new(),
             secret_fields,
             enabled: true,
-            read_only: false,
-            dangling_origin: None,
         };
 
         let debug = format!("{profile:?}");
@@ -512,26 +357,5 @@ mod tests {
             debug.contains("secret_access_key"),
             "Debug should still list the secret field key: {debug}"
         );
-    }
-
-    #[test]
-    fn old_provider_id_aws_is_rewritten() {
-        let json = serde_json::json!({
-            "id": make_uuid(),
-            "name": "Test",
-            "provider_id": "aws",
-            "config": {
-                "type": "aws_sso",
-                "profile_name": "test",
-                "region": "us-east-1",
-                "sso_start_url": "https://x.awsapps.com/start",
-                "sso_account_id": "000000000000",
-                "sso_role_name": "TestRole"
-            },
-            "enabled": true
-        });
-
-        let profile: AuthProfile = serde_json::from_value(json).unwrap();
-        assert_eq!(profile.provider_id, "aws-sso");
     }
 }

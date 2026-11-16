@@ -530,7 +530,7 @@ impl Connection for SectionConnection {
     }
 
     fn kind(&self) -> datatab_core::DbKind {
-        datatab_core::DbKind::S3
+        datatab_core::DbKind::Postgres
     }
 
     fn schema_loading_strategy(&self) -> datatab_core::SchemaLoadingStrategy {

@@ -15,8 +15,6 @@ path = "src/lib.rs"
 [dependencies]
 datatab_core.workspace = true
 datatab_ipc.workspace = true
-datatab_driver_cloudwatch.workspace = true
-datatab_driver_dynamodb.workspace = true
 datatab_driver_influxdb.workspace = true
 datatab_driver_mongodb.workspace = true
 datatab_driver_mssql.workspace = true

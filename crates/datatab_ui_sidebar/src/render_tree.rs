@@ -11,7 +11,6 @@ use std::time::Duration;
 /// failure message and is usually wider than the sidebar.
 fn is_error_retry_row(item_id: &str) -> bool {
     item_id.starts_with("object-retry|")
-        || item_id.starts_with("metrics-retry|")
         || item_id.starts_with(crate::root_sections::DECLARATIONS_RETRY_PREFIX)
         || item_id.starts_with(crate::root_sections::LISTING_RETRY_PREFIX)
 }
@@ -230,16 +229,12 @@ pub(super) fn render_tree_item(
                 | SchemaNodeKind::ScriptsFolder
                 | SchemaNodeKind::ScriptsRoot
                 | SchemaNodeKind::Collection
-                | SchemaNodeKind::CollectionChild
                 | SchemaNodeKind::CollectionsFolder
                 | SchemaNodeKind::DatabaseIndexesFolder
                 | SchemaNodeKind::CollectionFieldsFolder
                 | SchemaNodeKind::CollectionIndexesFolder
                 | SchemaNodeKind::DependentsFolder
-                | SchemaNodeKind::MetricsFolder
-                | SchemaNodeKind::MetricNamespaceFolder
                 | SchemaNodeKind::DashboardsFolder
-                | SchemaNodeKind::RemoteDashboardsFolder
                 | SchemaNodeKind::SavedChartsFolder
                 | SchemaNodeKind::InstanceMetricsFolder
                 | SchemaNodeKind::InstanceInspectorsFolder
@@ -1388,7 +1383,6 @@ pub(crate) fn icon_for_node_kind(
         SchemaNodeKind::Constraint => Some(AppIcon::Lock),
         SchemaNodeKind::CollectionsFolder => Some(AppIcon::Folder),
         SchemaNodeKind::Collection => Some(AppIcon::Box),
-        SchemaNodeKind::CollectionChild => Some(AppIcon::ScrollText),
         SchemaNodeKind::DatabaseIndexesFolder | SchemaNodeKind::CollectionIndexesFolder => {
             Some(AppIcon::Hash)
         }
@@ -1411,13 +1405,8 @@ pub(crate) fn icon_for_node_kind(
         }
         SchemaNodeKind::DependentsFolder => Some(AppIcon::Link2),
         SchemaNodeKind::DependentItem => Some(AppIcon::ExternalLink),
-        SchemaNodeKind::MetricsFolder => Some(AppIcon::ChartSpline),
-        SchemaNodeKind::MetricNamespaceFolder => Some(AppIcon::Folder),
-        SchemaNodeKind::MetricLeaf => Some(AppIcon::ChartSpline),
         SchemaNodeKind::DashboardsFolder => Some(AppIcon::ChartColumnBig),
         SchemaNodeKind::DashboardItem => Some(AppIcon::ChartColumnBig),
-        SchemaNodeKind::RemoteDashboardsFolder => Some(AppIcon::ChartColumnBig),
-        SchemaNodeKind::RemoteDashboardItem => Some(AppIcon::ChartColumnBig),
         SchemaNodeKind::SavedChartsFolder => Some(AppIcon::ChartArea),
         SchemaNodeKind::SavedChartItem => Some(AppIcon::ChartArea),
         SchemaNodeKind::InstanceMetricsFolder => Some(AppIcon::ChartSpline),
@@ -1428,8 +1417,6 @@ pub(crate) fn icon_for_node_kind(
         SchemaNodeKind::InstanceFolder => Some(AppIcon::Server),
         SchemaNodeKind::RootSectionItem => Some(AppIcon::Box),
         SchemaNodeKind::RootSection => Some(AppIcon::Box),
-        SchemaNodeKind::SecretStore => Some(AppIcon::Lock),
-        SchemaNodeKind::SecretPath => Some(AppIcon::Folder),
         _ => None,
     }
 }
@@ -1498,7 +1485,6 @@ fn resolve_node_icon(
         SchemaNodeKind::Constraint => (Some(AppIcon::Lock), "", params.color_yellow),
         SchemaNodeKind::CollectionsFolder => (Some(AppIcon::Folder), "", params.color_teal),
         SchemaNodeKind::Collection => (Some(AppIcon::Box), "", params.color_teal),
-        SchemaNodeKind::CollectionChild => (Some(AppIcon::ScrollText), "", params.color_teal),
         SchemaNodeKind::DatabaseIndexesFolder | SchemaNodeKind::CollectionIndexesFolder => {
             (Some(AppIcon::Hash), "", params.color_purple)
         }
@@ -1524,19 +1510,10 @@ fn resolve_node_icon(
         }
         SchemaNodeKind::DependentsFolder => (Some(AppIcon::Link2), "", params.color_gray),
         SchemaNodeKind::DependentItem => (Some(AppIcon::ExternalLink), "", theme.muted_foreground),
-        SchemaNodeKind::MetricsFolder => (Some(AppIcon::ChartSpline), "", params.color_orange),
-        SchemaNodeKind::MetricNamespaceFolder => (Some(AppIcon::Folder), "", params.color_orange),
-        SchemaNodeKind::MetricLeaf => (Some(AppIcon::ChartSpline), "", params.color_teal),
         SchemaNodeKind::DashboardsFolder => {
             (Some(AppIcon::ChartColumnBig), "", params.color_orange)
         }
         SchemaNodeKind::DashboardItem => {
-            (Some(AppIcon::ChartColumnBig), "", theme.muted_foreground)
-        }
-        SchemaNodeKind::RemoteDashboardsFolder => {
-            (Some(AppIcon::ChartColumnBig), "", params.color_orange)
-        }
-        SchemaNodeKind::RemoteDashboardItem => {
             (Some(AppIcon::ChartColumnBig), "", theme.muted_foreground)
         }
         SchemaNodeKind::SavedChartsFolder => (Some(AppIcon::ChartArea), "", params.color_orange),
@@ -1552,8 +1529,6 @@ fn resolve_node_icon(
         SchemaNodeKind::InstanceOverviewLeaf => (Some(AppIcon::Layers), "", params.color_orange),
         SchemaNodeKind::RootSectionItem => (Some(AppIcon::Box), "", params.color_teal),
         SchemaNodeKind::RootSection => (Some(AppIcon::Box), "", params.color_orange),
-        SchemaNodeKind::SecretStore => (Some(AppIcon::Lock), "", params.color_orange),
-        SchemaNodeKind::SecretPath => (Some(AppIcon::Folder), "", theme.muted_foreground),
         _ => (None, "", theme.muted_foreground),
     }
 }
@@ -1739,7 +1714,6 @@ mod tests {
     #[test]
     fn error_placeholder_rows_are_recognised_by_their_retry_prefix() {
         assert!(is_error_retry_row("object-retry|profile|db"));
-        assert!(is_error_retry_row("metrics-retry|profile|db"));
         assert!(is_error_retry_row("root-sections-retry|profile"));
         assert!(is_error_retry_row("root-section-retry|profile|buckets"));
         assert!(!is_error_retry_row("connect-failure|profile|0"));

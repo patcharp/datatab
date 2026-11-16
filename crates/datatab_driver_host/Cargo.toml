@@ -26,7 +26,6 @@ postgres = ["datatab_driver_postgres"]
 mysql = ["datatab_driver_mysql"]
 mongodb = ["datatab_driver_mongodb"]
 redis = ["datatab_driver_redis"]
-dynamodb = ["datatab_driver_dynamodb"]
 
 [dependencies.datatab_driver_sqlite]
 path = "../datatab_driver_sqlite"
@@ -46,10 +45,6 @@ optional = true
 
 [dependencies.datatab_driver_redis]
 path = "../datatab_driver_redis"
-optional = true
-
-[dependencies.datatab_driver_dynamodb]
-path = "../datatab_driver_dynamodb"
 optional = true
 
 [lints]

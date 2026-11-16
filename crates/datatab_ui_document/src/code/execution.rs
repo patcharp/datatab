@@ -2940,7 +2940,6 @@ mod tests {
             QueryLanguage::RedisCommands,
             QueryLanguage::InfluxQuery,
             QueryLanguage::Flux,
-            QueryLanguage::CloudWatchLogsInsightsQl,
             QueryLanguage::Cql,
         ];
 
@@ -3127,12 +3126,12 @@ mod tests {
             ),
         };
 
-        // "fields @message" contains no macros; CloudWatchLogsInsightsQl passes through unchanged.
+        // "fields @message" contains no macros; a custom language passes through unchanged.
         let request = query_request_for_execution(
             "fields @message".into(),
             Some("logs".into()),
             &exec_ctx,
-            QueryLanguage::CloudWatchLogsInsightsQl,
+            QueryLanguage::Custom("logs".to_string()),
             Some(10_000),
         );
 

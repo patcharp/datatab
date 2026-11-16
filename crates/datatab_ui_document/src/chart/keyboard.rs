@@ -25,7 +25,7 @@ use datatab_components::chart::{AxisPickerOption, AxisPill, axis_picker_options}
 use datatab_components::common::time_range::state::TimeRange;
 use datatab_components::common::time_range::view::TimeRangePanel;
 use datatab_components::icons::AppIcon;
-use datatab_core::{ColumnMeta, DimensionFilter};
+use datatab_core::ColumnMeta;
 use gpui::{App, Context, Entity, Focusable as _, Window};
 
 /// What a chart made of a keymap command.
@@ -320,13 +320,11 @@ pub(crate) fn time_range_pane_actions(
 }
 
 /// The pane-action entries of a chart shell: the chart kind, the axis
-/// pickers (when there are columns to pick), the stats rail and, for a
-/// metric chart, the metric picker rail and its controls.
+/// pickers (when there are columns to pick) and the stats rail.
 pub(crate) fn chart_shell_pane_actions(
     shell: &Entity<ChartShell>,
     columns: &[ColumnMeta],
     context: datatab_app::keymap::ContextId,
-    cx: &App,
 ) -> Vec<PaneAction> {
     let mut actions = vec![
         PaneAction::command(
@@ -393,93 +391,6 @@ pub(crate) fn chart_shell_pane_actions(
         .icon(AppIcon::Sigma),
     );
 
-    if shell.read(cx).metric_picker.is_some() {
-        actions.extend(metric_picker_pane_actions(shell));
-    }
-
-    actions
-}
-
-/// The metric picker rail and its controls: open or close the rail, step the
-/// dimension filter, open the period and statistic lists, apply.
-fn metric_picker_pane_actions(shell: &Entity<ChartShell>) -> Vec<PaneAction> {
-    let mut actions = Vec::new();
-
-    let rail_shell = shell.clone();
-    actions.push(PaneAction::callback(
-        "chart-metric-rail",
-        datatab_i18n::t!("document.chart.pane_actions.metric_rail"),
-        move |_window, cx| {
-            rail_shell.update(cx, |shell, cx| shell.toggle_metric_rail(cx));
-        },
-    ));
-
-    for (id, label_key, delta) in [
-        (
-            "chart-metric-next-dimension",
-            "document.chart.pane_actions.next_dimension",
-            1,
-        ),
-        (
-            "chart-metric-prev-dimension",
-            "document.chart.pane_actions.prev_dimension",
-            -1,
-        ),
-    ] {
-        let shell = shell.clone();
-        actions.push(PaneAction::callback(
-            id,
-            datatab_i18n::t!(label_key),
-            move |_window, cx| {
-                shell.update(cx, |shell, cx| shell.step_metric_dimension(delta, cx));
-            },
-        ));
-    }
-
-    for (id, label_key, statistic) in [
-        (
-            "chart-metric-period",
-            "document.chart.pane_actions.period",
-            false,
-        ),
-        (
-            "chart-metric-statistic",
-            "document.chart.pane_actions.statistic",
-            true,
-        ),
-    ] {
-        let shell = shell.clone();
-        actions.push(PaneAction::callback(
-            id,
-            datatab_i18n::t!(label_key),
-            move |window, cx| {
-                let dropdown = shell.read(cx).metric_picker.as_ref().map(|picker| {
-                    if statistic {
-                        picker.statistic_dropdown.clone()
-                    } else {
-                        picker.period_dropdown.clone()
-                    }
-                });
-
-                if let Some(dropdown) = dropdown {
-                    dropdown.update(cx, |dropdown, cx| dropdown.focus_and_open(window, cx));
-                }
-            },
-        ));
-    }
-
-    let apply_shell = shell.clone();
-    actions.push(
-        PaneAction::callback(
-            "chart-metric-apply",
-            datatab_i18n::t!("document.chart.metric_picker.apply"),
-            move |_window, cx| {
-                apply_shell.update(cx, |shell, cx| shell.apply_metric_picker(cx));
-            },
-        )
-        .icon(AppIcon::Check),
-    );
-
     actions
 }
 
@@ -493,60 +404,5 @@ impl ChartShell {
                 (true, super::ChartRailTab::Stats)
             };
         cx.notify();
-    }
-
-    /// Opens the metric picker rail, or closes it when it is the one open.
-    fn toggle_metric_rail(&mut self, cx: &mut Context<Self>) {
-        (self.chart_rail_open, self.chart_rail_tab) =
-            if self.chart_rail_open && self.chart_rail_tab == super::ChartRailTab::Metric {
-                (false, self.chart_rail_tab)
-            } else {
-                (true, super::ChartRailTab::Metric)
-            };
-        cx.notify();
-    }
-
-    /// Moves the metric picker's dimension filter `delta` rows through its
-    /// list (aggregate all, then each loaded combination), wrapping.
-    #[expect(
-        clippy::indexing_slicing,
-        reason = "next is rem_euclid over rows.len(); rows is built in this function and always contains the AggregateAll entry"
-    )]
-    fn step_metric_dimension(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let Some(picker) = self.metric_picker.as_mut() else {
-            return;
-        };
-        let super::metric_picker::DimensionsState::Loaded(combos) = &picker.dimensions_state else {
-            return;
-        };
-
-        let rows: Vec<DimensionFilter> = std::iter::once(DimensionFilter::AggregateAll)
-            .chain(combos.iter().cloned().map(DimensionFilter::FilterTo))
-            .collect();
-        let current = rows
-            .iter()
-            .position(|row| *row == picker.dimension_filter)
-            .unwrap_or(0);
-        let next = (current as isize + delta).rem_euclid(rows.len() as isize) as usize;
-
-        picker.dimension_filter = rows[next].clone();
-        cx.notify();
-    }
-
-    /// Applies the metric picker, as its Apply button does.
-    fn apply_metric_picker(&mut self, cx: &mut Context<Self>) {
-        let Some(picker) = self.metric_picker.as_mut() else {
-            return;
-        };
-
-        if !picker.flush_pending_custom_inputs(cx) {
-            cx.notify();
-            return;
-        }
-
-        let source = picker.build_metric_source();
-        cx.emit(super::ChartShellEvent::MetricPickerApplied(Box::new(
-            source,
-        )));
     }
 }

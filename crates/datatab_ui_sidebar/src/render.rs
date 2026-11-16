@@ -364,10 +364,6 @@ impl Render for Sidebar {
             self.start_rename(&item_id, window, cx);
         }
 
-        if let Some(item_id) = self.pending_child_picker_item.take() {
-            self.open_child_picker_modal(&item_id, window, cx);
-        }
-
         let (search_input, query_is_empty) = match self.active_tab {
             SidebarTab::Connections => (
                 self.connections_search_input.clone(),

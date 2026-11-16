@@ -1,6 +1,6 @@
-//! Checks what a cancel request sends first, against a fake server that records
-//! the wire. A login over TLS needs real certificates, so `cancel_tls_live.rs`
-//! covers `require` and the verify modes.
+//! Checks login retries and what a cancel request sends first, against a fake
+//! server that records the wire. A successful login over TLS needs real
+//! certificates, so `cancel_tls_live.rs` covers `require` and the verify modes.
 
 #![allow(
     clippy::unwrap_used,
@@ -15,7 +15,7 @@ use datatab_core::{Connection, ConnectionProfile, DbConfig, DbDriver, DbError, Q
 use datatab_driver_redshift::RedshiftDriver;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -38,9 +38,13 @@ enum SslAnswer {
     Refuse,
     /// Accepts TLS, then sends bytes that are not a TLS record.
     BreakHandshake,
+    /// Refuses TLS, then rejects the startup with SQLSTATE 28P01.
+    RefuseThenAuthError,
+    /// Closes before sending the SSL negotiation response.
+    CloseBeforeSslReply,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum CancelPath {
     FormThenHandle,
     UriThenActive,
@@ -56,6 +60,7 @@ struct Shared {
 
 struct FakeServer {
     port: u16,
+    accepted_connections: Arc<AtomicUsize>,
     query_started: Receiver<()>,
     cancel_wire: Receiver<Vec<Message>>,
     end_session: Sender<()>,
@@ -68,6 +73,7 @@ impl FakeServer {
         let (query_started_sender, query_started) = channel();
         let (cancel_wire_sender, cancel_wire) = channel();
         let (end_session, end_session_receiver) = channel();
+        let accepted_connections = Arc::new(AtomicUsize::new(0));
         let shared = Arc::new(Shared {
             answer,
             query_running: AtomicBool::new(false),
@@ -76,8 +82,10 @@ impl FakeServer {
             end_session: Mutex::new(end_session_receiver),
         });
 
+        let connection_count = accepted_connections.clone();
         std::thread::spawn(move || {
             for stream in listener.incoming().flatten() {
+                connection_count.fetch_add(1, Ordering::SeqCst);
                 let shared = shared.clone();
                 std::thread::spawn(move || serve(stream, &shared));
             }
@@ -85,6 +93,7 @@ impl FakeServer {
 
         Self {
             port,
+            accepted_connections,
             query_started,
             cancel_wire,
             end_session,
@@ -122,22 +131,33 @@ fn serve(mut stream: TcpStream, shared: &Shared) -> io::Result<()> {
         }
 
         match shared.answer {
-            SslAnswer::Refuse => stream.write_all(b"N")?,
+            SslAnswer::Refuse | SslAnswer::RefuseThenAuthError => stream.write_all(b"N")?,
             SslAnswer::BreakHandshake => {
                 report(&wire)?;
                 stream.write_all(b"S")?;
                 return stream.write_all(b"this is not a TLS record\n");
             }
+            SslAnswer::CloseBeforeSslReply => return Ok(()),
         }
     }
 }
 
-/// Accepts the login and keeps the query running until the test ends it.
+/// Reads startup, then rejects login or keeps the query running until the test ends it.
 fn serve_session(mut stream: TcpStream, startup: Message, shared: &Shared) -> io::Result<()> {
     let [a, b, c, d, ..] = startup;
     let length = u32::from_be_bytes([a, b, c, d]) as usize;
     let mut parameters = vec![0; length - startup.len()];
     stream.read_exact(&mut parameters)?;
+    match shared.answer {
+        SslAnswer::RefuseThenAuthError => {
+            let fields = b"SFATAL\0C28P01\0Mpassword authentication failed\0\0";
+            stream.write_all(b"E")?;
+            stream.write_all(&((fields.len() + 4) as u32).to_be_bytes())?;
+            return stream.write_all(fields);
+        }
+        SslAnswer::CloseBeforeSslReply => return Ok(()),
+        SslAnswer::Refuse | SslAnswer::BreakHandshake => {}
+    }
     stream.write_all(LOGIN_OK)?;
 
     let mut first_query_byte = [0; 1];
@@ -217,11 +237,78 @@ fn cancel_asks_for_tls_when_the_connection_has_a_connector() {
 
 #[test]
 fn cancel_stays_in_clear_text_after_the_prefer_retry() {
+    // A failed TLS handshake may fall back to clear text under `prefer`.
     for path in [CancelPath::FormThenHandle, CancelPath::UriThenActive] {
         assert_eq!(
             cancel_wire("prefer", SslAnswer::BreakHandshake, path),
             [CANCEL_REQUEST]
         );
+    }
+}
+
+fn assert_one_failed_connection(ssl_mode: &str, answer: SslAnswer, path: CancelPath) {
+    let server = FakeServer::start(answer);
+    let result = connect(ssl_mode, server.port, path);
+    assert!(result.is_err(), "{ssl_mode} via {path:?} must fail");
+    assert_eq!(
+        server.accepted_connections.load(Ordering::SeqCst),
+        1,
+        "{ssl_mode} via {path:?} must not retry the login in clear text"
+    );
+    if let Err(error) = result
+        && matches!(answer, SslAnswer::RefuseThenAuthError)
+        && ssl_mode == "prefer"
+    {
+        assert!(error.to_string().contains("Authentication failed"));
+    }
+}
+
+#[test]
+fn prefer_does_not_retry_authentication_failure_from_form() {
+    assert_one_failed_connection(
+        "prefer",
+        SslAnswer::RefuseThenAuthError,
+        CancelPath::FormThenHandle,
+    );
+}
+
+#[test]
+fn prefer_does_not_retry_authentication_failure_from_uri() {
+    assert_one_failed_connection(
+        "prefer",
+        SslAnswer::RefuseThenAuthError,
+        CancelPath::UriThenActive,
+    );
+}
+
+#[test]
+fn prefer_does_not_retry_a_close_before_ssl_reply_from_form() {
+    assert_one_failed_connection(
+        "prefer",
+        SslAnswer::CloseBeforeSslReply,
+        CancelPath::FormThenHandle,
+    );
+}
+
+#[test]
+fn prefer_does_not_retry_a_close_before_ssl_reply_from_uri() {
+    assert_one_failed_connection(
+        "prefer",
+        SslAnswer::CloseBeforeSslReply,
+        CancelPath::UriThenActive,
+    );
+}
+
+#[test]
+fn require_does_not_retry_failed_connections() {
+    for path in [CancelPath::FormThenHandle, CancelPath::UriThenActive] {
+        for answer in [
+            SslAnswer::RefuseThenAuthError,
+            SslAnswer::CloseBeforeSslReply,
+            SslAnswer::BreakHandshake,
+        ] {
+            assert_one_failed_connection("require", answer, path);
+        }
     }
 }
 

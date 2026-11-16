@@ -220,7 +220,7 @@ The encoding is not gated by the negotiated version. A shape that decoded before
 
 ### Root sections (v1.9+)
 
-A driver can declare sections shown at the root of its connection in the sidebar, such as S3 buckets. The payloads are the `datatab_core` root section types, carried as they are:
+A driver can declare sections shown at the root of its connection in the sidebar, such as the buckets of an object store. The payloads are the `datatab_core` root section types, carried as they are:
 
 | Request | Response |
 | --- | --- |
@@ -231,6 +231,48 @@ A driver can declare sections shown at the root of its connection in the sidebar
 The host dispatches the three requests to the connection's `Connection::root_section_source`. A driver without a source answers `UnsupportedMethod` (`Driver does not declare root sections`), and a driver error answers as any other `Error`. A host refuses the requests on a session that negotiated an older minor with `VersionMismatch` (`root section requests require driver RPC protocol 1.9 or newer`), without calling the driver.
 
 The six variants are appended after the last v1.8 variant of their enum, for the wire-index reason described above. The client exposes root sections only when the session negotiated v1.9 or newer and the driver metadata declares `DriverCapabilities::ROOT_SECTIONS`; otherwise `IpcConnection` clears that capability and sends nothing. `IpcConnection` fetches the declaration once per connection and caches it; a failed fetch is returned as an error and not cached, so the host shows it with a retry row and asks again from there. A section id must not contain `|`; the host rejects and reports such a declaration. The host hides a section whose presentation opens an object-store document on a connection without `object_store_api`. `IpcConnection` has none, because no object-store RPC exists yet, and both presentations shipped so far (`ObjectContainerTable` and `ObjectBrowser`) are of that kind, so an external driver's sections stay hidden until a presentation without that need ships. Every `RootSectionAction` carries its `ExecutionClassification`, so the host confirms and audits actions the same way for external drivers as for built-in ones.
+
+### Reserved enum slots
+
+Frames are encoded with postcard, which writes an enum variant as its position in the enum. So a variant of an enum that rides in a frame is never removed or moved. When DataTab retires one, the variant stays in place as a hidden `Reserved*` slot. This needs no protocol version: the bytes of every other variant stay the same, and `crates/datatab_ipc/tests/driver_wire_roundtrip.rs` pins each index.
+
+| Enum | Carried in | Index | Reserved slot | Was |
+| --- | --- | --- | --- | --- |
+| `DbKind` | `DriverHelloResponse.driver_kind`, `SessionOpened.kind` | 6 | `ReservedDynamoDb` | DynamoDB |
+| | | 7 | `ReservedCloudWatchLogs` | CloudWatch Logs |
+| | | 11 | `ReservedS3` | Amazon S3 |
+| | | 15 | `ReservedAwsSecrets` | AWS Secrets |
+| `Icon` | `DriverMetadata.icon` | 6 | `ReservedDynamodb` | DynamoDB icon |
+| | | 8 | `ReservedS3` | Amazon S3 icon |
+| `QueryLanguage` | `DriverMetadata.query_language`, `PlannedQuery.language` | 1 | `ReservedCloudWatchLogsInsightsQl` | CloudWatch Logs Insights QL |
+| | | 2 | `ReservedOpenSearchPpl` | OpenSearch PPL |
+| | | 3 | `ReservedOpenSearchSql` | OpenSearch SQL |
+| `DatabaseCategory` | `DriverMetadata.category` | 3 | `ReservedGraph` | graph category |
+| | | 5 | `ReservedWideColumn` | wide-column category |
+| | | 6 | `ReservedLogStream` | log-stream category |
+| | | 8 | `ReservedSecretStore` | secret-store category |
+| `DataStructure` | schema snapshots | 3 | `ReservedGraph` | graph schema |
+| | | 4 | `ReservedWideColumn` | wide-column schema |
+| `ExecutionSourceContext` | `ExecutionContext.source` | 1 | `ReservedMetricQuery` | metric query source |
+| `CollectionPresentation` | `CollectionInfo.presentation`, `CollectionChildInfo` | 1 | `ReservedEventStream` | event stream presentation |
+
+`DriverCapabilities` crosses the wire as its raw bits, and a set with a bit the host does not define decodes as no capabilities at all. So retired bits stay defined, as hidden `RESERVED_*` constants that nothing reads. Never reuse them:
+
+| Bit | Constant |
+| --- | --- |
+| 49 | `RESERVED_METRIC_SERIES` |
+| 50 | `RESERVED_METRIC_CATALOG` |
+| 51 | `RESERVED_DASHBOARD_IMPORT` |
+| 52 | `RESERVED_DASHBOARD_SYNC` |
+| 64 | `RESERVED_SECRET_STORE` |
+| 65 | `RESERVED_REGION_SWITCH` |
+
+**A driver must not declare a reserved slot or set a retired bit.** A host still decodes such a driver and registers it, with these results:
+
+- **Kind.** A reserved `DbKind` has no stored name, so a connection with one could not be loaded again. The connection manager refuses to save a connection for the driver and says why. A portability bundle does not import a connection that names a reserved kind, or one whose driver declares it, and reports that connection as failed.
+- **Category.** The driver shows as a generic driver: the relational look, the last section of the driver picker, generic object wording, and no category-specific capability.
+- **Query language.** The language is handled like `Custom`: a plain-text editor, no keyword completion, and a statement the driver does not classify counts as a write.
+- **Icon.** The driver draws the fallback icon of its category.
 
 ## Auth-provider RPC contract
 
@@ -261,7 +303,9 @@ Server response must include:
 - `display_name`
 - `form_definition`
 
-The v1.2 `Hello` response additionally carries `secret_dependency_opt_in` (`bool`), declaring whether the provider opts in to receiving secret field values inside dependency maps for dynamic option lookups. When `false` (default), DataTab strips secret values from dependency maps before forwarding `FetchDynamicOptions` requests.
+The v1.2 `Hello` response additionally carries `secret_dependency_opt_in` (`bool`), declaring whether the provider opts in to receiving secret field values for dynamic option lookups. When `false` (default), DataTab strips secret values from the dependency map and from the profile (`profile_json`) before forwarding `FetchDynamicOptions` requests. When `true`, a `Password` or `WriteOnly` value is sent only if the target field lists that field in its `depends_on`.
+
+The profile of a `FetchDynamicOptions` request is filtered further: its `fields` hold only the fields the provider's own form declares. `Login`, `ValidateSession` and `ResolveCredentials` still receive the full profile, secret values included.
 
 The v1.3 `Hello` response additionally carries `audit_emit_opt_in` (`bool`). Set this to `true` to enable audit event emission (see below). Default is `false`.
 

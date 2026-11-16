@@ -196,7 +196,7 @@ pub(crate) fn format_redshift_query_error(e: &postgres::Error) -> DbError {
 }
 
 pub(crate) fn format_redshift_uri_error(e: &postgres::Error, uri: &str) -> DbError {
-    let sanitized = datatab_core::sanitize_uri(uri);
+    let sanitized = crate::driver::sanitize_connection_string(uri);
     let formatted = REDSHIFT_ERROR_FORMATTER.format_uri_error(e, &sanitized);
     log::error!("Redshift URI connection failed: {}", formatted.message);
     formatted.into_connection_error()

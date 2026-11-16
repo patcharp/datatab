@@ -40,9 +40,8 @@ libc = "0.2"
 # datatab_ui is driver-agnostic: it has no per-driver features and no driver
 # dependencies. The cross-cutting features only forward to the workspace/app and
 # the sibling UI crates so a single feature set is unified across the build.
-default = ["lua", "aws", "mcp"]
+default = ["lua", "mcp"]
 lua = ["datatab_app/lua", "datatab_ui_base/lua", "datatab_ui_document/lua", "datatab_ui_windows/lua", "datatab_ui_sidebar/lua"]
-aws = ["datatab_app/aws", "datatab_ui_base/aws", "datatab_ui_document/aws", "datatab_ui_windows/aws", "datatab_ui_sidebar/aws"]
 mcp = ["datatab_app/mcp", "datatab_ui_base/mcp", "datatab_ui_document/mcp", "datatab_ui_windows/mcp", "datatab_ui_sidebar/mcp"]
 # Off by default. Only datatab_ui_base holds the gated bridge code; every other
 # crate calls its always-present install function.

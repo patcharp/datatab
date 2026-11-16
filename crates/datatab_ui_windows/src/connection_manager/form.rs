@@ -62,11 +62,10 @@ fn delete_ssh_password_unless_unseen(
 #[allow(clippy::result_large_err)]
 fn finish_profile_save_after_primary_password(
     password_save_result: Result<(), datatab_core::DbError>,
-    commit_profile: impl FnOnce(),
+    commit_profile: impl FnOnce() -> Result<(), datatab_core::DbError>,
 ) -> Result<(), datatab_core::DbError> {
     password_save_result?;
-    commit_profile();
-    Ok(())
+    commit_profile()
 }
 
 impl ConnectionManagerWindow {
@@ -176,96 +175,24 @@ impl ConnectionManagerWindow {
             }
         }
 
-        // Validate SSM fields if SSM access method is selected (T-7.3)
-        if self.is_ssm_selected() {
-            let instance_id = self
-                .access
-                .input_ssm_instance_id
-                .read(cx)
-                .value()
-                .to_string();
-            if instance_id.trim().is_empty() {
-                self.validation_errors
-                    .push(datatab_i18n::t!("form.validation.ssm_instance_id_required"));
-            } else if !self.has_dynamic_value_ref_for_field("ssm_instance_id", cx)
-                && !instance_id.starts_with("i-")
-                && !instance_id.starts_with("mi-")
-            {
-                self.validation_errors
-                    .push(datatab_i18n::t!("form.validation.ssm_instance_id_format"));
-            }
-
-            let region = self.access.input_ssm_region.read(cx).value().to_string();
-            if region.trim().is_empty() {
-                self.validation_errors
-                    .push(datatab_i18n::t!("form.validation.ssm_region_required"));
-            }
-
-            let port_str = self
-                .access
-                .input_ssm_remote_port
-                .read(cx)
-                .value()
-                .to_string();
-            if !self.has_dynamic_value_ref_for_field("ssm_remote_port", cx) {
-                match port_str.parse::<u16>() {
-                    Ok(0) => {
-                        self.validation_errors
-                            .push(datatab_i18n::t!("form.validation.ssm_remote_port_positive"));
-                    }
-                    Err(_) => {
-                        self.validation_errors
-                            .push(datatab_i18n::t!("form.validation.ssm_remote_port_invalid"));
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // T-5.4: Dangling-reference guard. When a bound auth-profile UUID no
-        // longer resolves to any entry in the current reflected+stored union,
-        // block the connect with a user-facing message. When the stored profile
-        // is present but marked dangling, tailor the message to the origin.
-        if let Some(auth_profile_id) = self.auth_profile.selected_auth_profile_id {
-            let bound_profile = self
+        if let Some(auth_profile_id) = self.auth_profile.selected_auth_profile_id
+            && !self
                 .app_state
                 .read(cx)
                 .list_auth_profiles()
-                .into_iter()
-                .find(|profile| profile.id == auth_profile_id);
-
-            match bound_profile {
-                None => {
-                    self.validation_errors.push(datatab_i18n::t!(
-                        "form.validation.auth_profile_not_found",
-                        id = auth_profile_id.to_string()
-                    ));
-                }
-
-                Some(profile) if profile.dangling_origin.as_deref() == Some("keyring-only") => {
-                    self.validation_errors.push(datatab_i18n::t!(
-                        "form.validation.auth_profile_dangling_keyring_only",
-                        name = profile.name
-                    ));
-                }
-
-                Some(profile) if profile.dangling_origin.is_some() => {
-                    self.validation_errors.push(datatab_i18n::t!(
-                        "form.validation.auth_profile_dangling",
-                        name = profile.name
-                    ));
-                }
-
-                _ => {}
-            }
+                .iter()
+                .any(|profile| profile.id == auth_profile_id)
+        {
+            self.validation_errors.push(datatab_i18n::t!(
+                "form.validation.auth_profile_not_found",
+                id = auth_profile_id.to_string()
+            ));
         }
 
-        let uses_dynamic_auth_sources = self.collect_value_refs(cx).values().any(|value_ref| {
-            matches!(
-                value_ref,
-                ValueRef::Secret { .. } | ValueRef::Parameter { .. } | ValueRef::Auth { .. }
-            )
-        });
+        let uses_dynamic_auth_sources = self
+            .collect_value_refs(cx)
+            .values()
+            .any(|value_ref| matches!(value_ref, ValueRef::Secret { .. } | ValueRef::Auth { .. }));
 
         if uses_dynamic_auth_sources {
             let Some(auth_profile_id) = self.auth_profile.selected_auth_profile_id else {
@@ -295,7 +222,7 @@ impl ConnectionManagerWindow {
                     ));
                 }
             } else {
-                // Already reported above in the dangling-reference guard; no
+                // Already reported above in the missing-profile guard; no
                 // duplicate message needed.
             }
         }
@@ -371,8 +298,9 @@ impl ConnectionManagerWindow {
                     // `collect_form_values` does not carry the selected mode, so
                     // the driver's `build_config` fell back to its "on" default
                     // and set `trust_server_certificate: true`. Derive trust from
-                    // the user's selection exactly as the driver does: only
-                    // `required` validates the chain.
+                    // the user's selection: the form clears it for `required`.
+                    // The driver also enforces legacy `verify-*` modes even
+                    // when this saved trust flag is true.
                     *trust_server_certificate = !matches!(selected.as_str(), "required");
                 }
                 _ => {}
@@ -477,9 +405,7 @@ impl ConnectionManagerWindow {
 
         // Collect access kind — keep SSH/proxy profile selections as references instead
         // of flattening them into inline connection fields.
-        let access_kind = if self.is_ssm_selected() {
-            Some(self.collect_managed_access_kind(cx))
-        } else if let Some(ssh_tunnel_profile_id) = self.access.selected_ssh_tunnel_id {
+        let access_kind = if let Some(ssh_tunnel_profile_id) = self.access.selected_ssh_tunnel_id {
             Some(AccessKind::Ssh {
                 ssh_tunnel_profile_id,
             })
@@ -528,7 +454,6 @@ impl ConnectionManagerWindow {
         }
 
         self.apply_pending_auth_profile(window, cx);
-        self.apply_pending_ssm_auth_profile();
 
         if !self.validate_form(true, cx) {
             cx.notify();
@@ -539,9 +464,42 @@ impl ConnectionManagerWindow {
             return;
         };
 
+        // Refused before any secret is written: a profile whose driver
+        // declares a reserved kind could not be loaded again.
+        if datatab_app::AppState::check_profile_can_be_saved(&profile).is_err() {
+            self.validation_errors
+                .push(datatab_i18n::t!("form.validation.reserved_database_kind"));
+            cx.notify();
+            return;
+        }
+
         let saved_profile_id = profile.id;
 
         let mut password = self.form.input_password.read(cx).value().to_string();
+        let password_source_is_literal = self
+            .form
+            .password_value_source_selector
+            .read(cx)
+            .is_literal(cx);
+        if !self
+            .app_state
+            .read(cx)
+            .connection_manager_password_is_resolved(
+                &profile,
+                if password_source_is_literal {
+                    &password
+                } else {
+                    ""
+                },
+            )
+        {
+            self.validation_errors.push(datatab_i18n::t!(
+                "form.validation.broken_password_unresolved"
+            ));
+            cx.notify();
+            return;
+        }
+
         let uri_password = profile.config.strip_uri_password();
 
         if password.is_empty()
@@ -552,11 +510,6 @@ impl ConnectionManagerWindow {
 
         let ssh_secret = self.get_ssh_secret(cx);
         let is_edit = self.editing_profile_id.is_some();
-        let password_source_is_literal = self
-            .form
-            .password_value_source_selector
-            .read(cx)
-            .is_literal(cx);
 
         let save_action = if is_edit {
             datatab_i18n::t!("form.action.updating")
@@ -625,7 +578,7 @@ impl ConnectionManagerWindow {
                     }
 
                     if is_edit {
-                        state.update_profile(profile);
+                        state.update_profile_from_connection_manager(profile, &password)?;
 
                         // If the edited profile is currently connected, surface a
                         // reconnect prompt — the sidebar consumes this flag on the
@@ -703,6 +656,7 @@ impl ConnectionManagerWindow {
                     }
 
                     cx.emit(datatab_ui_base::AppStateChanged);
+                    Ok(())
                 })
             });
 
@@ -719,12 +673,17 @@ impl ConnectionManagerWindow {
     }
 
     pub(super) fn test_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(error) = self.value_ref_notice.clone() {
+            self.test_status = TestStatus::Failed;
+            self.test_error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
         if self.defer_until_secrets_read(DeferredAction::TestConnection) {
             return;
         }
 
         self.apply_pending_auth_profile(window, cx);
-        self.apply_pending_ssm_auth_profile();
 
         if !self.validate_form(false, cx) {
             cx.notify();
@@ -749,6 +708,13 @@ impl ConnectionManagerWindow {
             cx.notify();
             return;
         };
+
+        if let Err(error) = driver.validate_profile(&profile) {
+            self.test_status = TestStatus::Failed;
+            self.test_error = Some(error.to_string());
+            cx.notify();
+            return;
+        }
 
         let profile_name = profile.name.clone();
         let app_state = self.app_state.clone();
@@ -938,8 +904,7 @@ impl ConnectionManagerWindow {
                         Err(error) => {
                             info!("Test connection failed: {}", error);
                             this.test_status = TestStatus::Failed;
-                            this.test_error =
-                                Some(normalize_aws_credentials_error(&profile_name, &error));
+                            this.test_error = Some(error);
                             this.test_result = None;
                         }
                     }
@@ -1139,31 +1104,13 @@ fn format_detached_hook_cleanup_failure(
     )
 }
 
-/// Detect AWS SDK credential-resolution failures and replace them with a
-/// user-facing message that directs to `~/.aws/credentials`.
-///
-/// AWS SDK error strings for missing credentials typically contain phrases
-/// like "no credentials" or "CredentialsNotLoaded". We normalise these so the
-/// user sees a clear, actionable message and is never prompted to enter a
-/// secret access key directly into DataTab.
-fn normalize_aws_credentials_error(profile_name: &str, error: &str) -> String {
-    let lower = error.to_ascii_lowercase();
-
-    let is_missing_credentials = lower.contains("no credentials")
-        || lower.contains("credentials not found")
-        || lower.contains("credentialsnotloaded")
-        || lower.contains("no credential providers")
-        || lower.contains("no credentials in chain");
-
-    if is_missing_credentials {
-        return datatab_i18n::t!("form.error.aws_credentials_missing", name = profile_name);
-    }
-
-    error.to_string()
-}
-
 #[cfg(test)]
 mod tests {
+    mod managed_access;
+    mod refusal;
+    mod tls;
+    mod value_refs;
+
     use super::*;
     use crate::connection_manager::{EditState, FormFocus};
     use crate::connection_manager::{KEYRING_PASSWORD_READ_ERROR, KEYRING_SECRETS_READ_ERROR};
@@ -1181,6 +1128,31 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
+    #[::core::prelude::v1::test]
+    fn missing_bound_auth_profile_is_reported() {
+        let mut cx = TestAppContext::single();
+        let _host = init_form_test_runtime(&mut cx);
+        let app_state = test_app_state(
+            &mut cx,
+            SecretStoreFixture::new(PasswordSaveOutcome::Success),
+        );
+        let window = open_new_profile_window(app_state, &mut cx);
+        let missing_id = uuid::Uuid::new_v4();
+        window
+            .update(&mut cx, |manager, _, cx| {
+                manager.auth_profile.selected_auth_profile_id = Some(missing_id);
+                assert!(!manager.validate_form(false, cx));
+                assert!(manager.validation_errors.contains(&datatab_i18n::t!(
+                    "form.validation.auth_profile_not_found",
+                    id = missing_id.to_string()
+                )));
+            })
+            .expect("validate form");
+        window
+            .update(&mut cx, |_, window, _| window.remove_window())
+            .expect("close window");
+    }
+
     const FORM_KEYS: &[&str] = &[
         "form.validation.connection_name_required",
         "form.validation.no_driver_selected",
@@ -1189,14 +1161,7 @@ mod tests {
         "form.validation.ssh_host_required",
         "form.validation.ssh_user_required",
         "form.validation.ssh_port_invalid",
-        "form.validation.ssm_instance_id_required",
-        "form.validation.ssm_instance_id_format",
-        "form.validation.ssm_region_required",
-        "form.validation.ssm_remote_port_positive",
-        "form.validation.ssm_remote_port_invalid",
         "form.validation.auth_profile_not_found",
-        "form.validation.auth_profile_dangling_keyring_only",
-        "form.validation.auth_profile_dangling",
         "form.validation.dynamic_auth_profile_required",
         "form.validation.auth_profile_no_provider",
         "form.action.updating",
@@ -1208,7 +1173,6 @@ mod tests {
         "form.error.test_cleanup_failed",
         "form.error.test_cleanup_warning",
         "form.error.detached_hook_cleanup_failed",
-        "form.error.aws_credentials_missing",
         "form.error.pipeline_stage_failed",
     ];
 
@@ -1823,81 +1787,64 @@ mod tests {
         assert!(message.contains("app state was released"));
     }
 
-    #[::core::prelude::v1::test]
-    fn normalize_aws_credentials_error_rewrites_no_credentials() {
-        let result = normalize_aws_credentials_error("my-profile", "no credentials provided");
-        assert!(
-            result.contains("~/.aws/credentials"),
-            "error should direct user to ~/.aws/credentials"
-        );
-        assert!(!result.contains("secret"), "error must not mention secrets");
-        assert!(
-            result.contains("my-profile"),
-            "error should name the profile"
-        );
-    }
-
-    #[::core::prelude::v1::test]
-    fn normalize_aws_credentials_error_rewrites_credentials_not_found() {
-        let result =
-            normalize_aws_credentials_error("ci-user", "Credentials not found for profile");
-        assert!(result.contains("~/.aws/credentials"));
-        assert!(result.contains("ci-user"));
-    }
-
-    #[::core::prelude::v1::test]
-    fn normalize_aws_credentials_error_rewrites_no_credentials_in_chain() {
-        let result = normalize_aws_credentials_error("prod", "no credentials in chain");
-        assert!(result.contains("~/.aws/credentials"));
-    }
-
-    #[::core::prelude::v1::test]
-    fn normalize_aws_credentials_error_preserves_unrelated_errors() {
-        let original = "connection refused: 127.0.0.1:5432";
-        let result = normalize_aws_credentials_error("pg-local", original);
-        assert_eq!(result, original);
-    }
-
-    #[::core::prelude::v1::test]
-    fn normalize_aws_credentials_error_is_case_insensitive() {
-        let result = normalize_aws_credentials_error("dev", "NO CREDENTIALS");
-        assert!(result.contains("~/.aws/credentials"));
-    }
-
     const DRIVER_BUILD_ERROR: &str = "Profile and Access Key ID cannot both be set";
 
-    /// Wraps a registered driver and rejects every form in `build_config`, so
-    /// the window's handling of a driver-side config error is exercised.
-    struct RejectingBuildDriver(Arc<dyn DbDriver>);
+    /// Refuses either form construction or pure profile validation. With a
+    /// `declared_kind` it refuses neither: like an RPC driver, it reports the
+    /// kind its Hello declared and builds a generic config of that kind.
+    struct RejectingDriver {
+        inner: Arc<dyn DbDriver>,
+        refuses_profile: bool,
+        declared_kind: Option<datatab_core::DbKind>,
+    }
 
-    impl DbDriver for RejectingBuildDriver {
+    impl DbDriver for RejectingDriver {
+        fn validate_profile(&self, _: &ConnectionProfile) -> Result<(), datatab_core::DbError> {
+            if self.refuses_profile {
+                Err(datatab_core::DbError::InvalidProfile(
+                    "fixture refusal".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
         fn kind(&self) -> datatab_core::DbKind {
-            self.0.kind()
+            self.declared_kind.unwrap_or_else(|| self.inner.kind())
         }
 
         fn metadata(&self) -> &datatab_core::DriverMetadata {
-            self.0.metadata()
+            self.inner.metadata()
         }
 
         fn form_definition(&self) -> &datatab_core::DriverFormDef {
-            self.0.form_definition()
+            self.inner.form_definition()
         }
 
         fn driver_key(&self) -> datatab_core::DriverKey {
-            self.0.driver_key()
+            self.inner.driver_key()
         }
 
         fn build_config(
             &self,
-            _values: &datatab_core::FormValues,
+            values: &datatab_core::FormValues,
         ) -> Result<DbConfig, datatab_core::DbError> {
+            if let Some(kind) = self.declared_kind {
+                return Ok(DbConfig::External {
+                    kind,
+                    values: values.clone(),
+                });
+            }
+            if self.refuses_profile {
+                return self.inner.build_config(values);
+            }
             Err(datatab_core::DbError::InvalidProfile(
                 DRIVER_BUILD_ERROR.to_string(),
             ))
         }
 
         fn extract_values(&self, config: &DbConfig) -> datatab_core::FormValues {
-            self.0.extract_values(config)
+            self.inner.extract_values(config)
         }
 
         fn connect_with_secrets(
@@ -1906,14 +1853,16 @@ mod tests {
             password: Option<&SecretString>,
             ssh_secret: Option<&SecretString>,
         ) -> Result<Box<dyn datatab_core::Connection>, datatab_core::DbError> {
-            self.0.connect_with_secrets(profile, password, ssh_secret)
+            assert!(!self.refuses_profile, "refused form reached driver connect");
+            self.inner
+                .connect_with_secrets(profile, password, ssh_secret)
         }
 
         fn test_connection(
             &self,
             profile: &ConnectionProfile,
         ) -> Result<(), datatab_core::DbError> {
-            self.0.test_connection(profile)
+            self.inner.test_connection(profile)
         }
     }
 
@@ -1932,7 +1881,11 @@ mod tests {
                     .selected_driver
                     .clone()
                     .expect("SQLite driver selected");
-                manager.form.selected_driver = Some(Arc::new(RejectingBuildDriver(inner)));
+                manager.form.selected_driver = Some(Arc::new(RejectingDriver {
+                    inner,
+                    refuses_profile: false,
+                    declared_kind: None,
+                }));
             })
             .expect("swap in the rejecting driver");
         (app_state, window)
@@ -3691,8 +3644,8 @@ mod tests {
             .log_err();
     }
 
-    /// A driver field without a ring stop of its own, such as the auth
-    /// profile picker of an AWS driver, is an extra stop: Enter opens it and
+    /// A driver field without a ring stop of its own, such as an auth
+    /// profile picker, is an extra stop: Enter opens it and
     /// the dropdown keys drive it.
     #[::core::prelude::v1::test]
     fn the_form_ring_reaches_the_auth_profile_picker() {
@@ -3704,7 +3657,13 @@ mod tests {
 
         let picker_stop = window
             .update(&mut cx, |manager, window, cx| {
-                manager.select_driver("dynamodb", window, cx);
+                let inner = manager
+                    .form
+                    .selected_driver
+                    .clone()
+                    .expect("PostgreSQL driver selected");
+                let driver = super::super::keyboard_coverage_tests::FormFieldsTestDriver::with_auth_profile_ref(inner);
+                manager.select_driver_with("postgres", Some(Arc::new(driver)), window, cx);
                 manager.edit_state = EditState::Navigating;
                 window.focus(&manager.focus_handle, cx);
 
@@ -3721,7 +3680,7 @@ mod tests {
                     .map(|index| FormFocus::MainExtra(index as u8))
             })
             .expect("window is open")
-            .expect("the DynamoDB form has an auth profile picker");
+            .expect("the test driver form has an auth profile picker");
 
         window
             .update(&mut cx, |manager, _, _| manager.form_focus = picker_stop)
@@ -4487,8 +4446,8 @@ mod sqlserver_ssl_tests {
 
     /// Selecting `required` for SQL Server with a CA path must save a config
     /// that validates the certificate chain (S2): the mode is carried and
-    /// `trust_server_certificate` is derived from it exactly as the driver
-    /// does, because `collect_form_values` does not carry the selected mode.
+    /// `trust_server_certificate` is cleared for `required`, because
+    /// `collect_form_values` does not carry the selected mode.
     #[gpui::test]
     fn sqlserver_required_mode_builds_a_chain_validating_config_with_the_ca_path(
         cx: &mut TestAppContext,

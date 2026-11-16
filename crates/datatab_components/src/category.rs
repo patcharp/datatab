@@ -23,7 +23,9 @@ pub const fn category_presentation(category: DatabaseCategory) -> CategoryPresen
         // keep wire indices, so they borrow the relational look.
         DatabaseCategory::Relational
         | DatabaseCategory::ReservedGraph
-        | DatabaseCategory::ReservedWideColumn => (
+        | DatabaseCategory::ReservedWideColumn
+        | DatabaseCategory::ReservedLogStream
+        | DatabaseCategory::ReservedSecretStore => (
             AppIcon::Database,
             DriverIconTone::Info,
             "sidebar.tree.container.relational",
@@ -43,20 +45,10 @@ pub const fn category_presentation(category: DatabaseCategory) -> CategoryPresen
             DriverIconTone::Violet,
             "sidebar.tree.container.time_series",
         ),
-        DatabaseCategory::LogStream => (
-            AppIcon::Database,
-            DriverIconTone::Warning,
-            "sidebar.tree.container.log_stream",
-        ),
         DatabaseCategory::ObjectStorage => (
             AppIcon::Boxes,
             DriverIconTone::Warning,
             "sidebar.tree.container.object_storage",
-        ),
-        DatabaseCategory::SecretStore => (
-            AppIcon::Lock,
-            DriverIconTone::Violet,
-            "sidebar.tree.container.secret_store",
         ),
     };
 
@@ -71,14 +63,12 @@ pub const fn category_presentation(category: DatabaseCategory) -> CategoryPresen
 mod tests {
     use super::*;
 
-    const ALL_CATEGORIES: [DatabaseCategory; 7] = [
+    const ALL_CATEGORIES: [DatabaseCategory; 5] = [
         DatabaseCategory::Relational,
         DatabaseCategory::Document,
         DatabaseCategory::KeyValue,
         DatabaseCategory::TimeSeries,
-        DatabaseCategory::LogStream,
         DatabaseCategory::ObjectStorage,
-        DatabaseCategory::SecretStore,
     ];
 
     #[test]
@@ -100,6 +90,34 @@ mod tests {
             .map(|category| category_presentation(*category).container_label_key)
             .collect();
         assert_eq!(keys.len(), ALL_CATEGORIES.len());
+    }
+
+    /// A reserved wire slot is no category a driver declares: every one of
+    /// them borrows the relational look and container label.
+    #[test]
+    fn reserved_category_slots_borrow_the_relational_presentation() {
+        let relational = category_presentation(DatabaseCategory::Relational);
+
+        for reserved in [
+            DatabaseCategory::ReservedGraph,
+            DatabaseCategory::ReservedWideColumn,
+            DatabaseCategory::ReservedLogStream,
+            DatabaseCategory::ReservedSecretStore,
+        ] {
+            let presentation = category_presentation(reserved);
+            assert_eq!(
+                presentation.fallback_icon, relational.fallback_icon,
+                "{reserved:?}"
+            );
+            assert_eq!(
+                presentation.fallback_tone, relational.fallback_tone,
+                "{reserved:?}"
+            );
+            assert_eq!(
+                presentation.container_label_key, relational.container_label_key,
+                "{reserved:?}"
+            );
+        }
     }
 
     #[test]
@@ -126,19 +144,9 @@ mod tests {
                 DriverIconTone::Violet,
             ),
             (
-                DatabaseCategory::LogStream,
-                AppIcon::Database,
-                DriverIconTone::Warning,
-            ),
-            (
                 DatabaseCategory::ObjectStorage,
                 AppIcon::Boxes,
                 DriverIconTone::Warning,
-            ),
-            (
-                DatabaseCategory::SecretStore,
-                AppIcon::Lock,
-                DriverIconTone::Violet,
             ),
         ];
 

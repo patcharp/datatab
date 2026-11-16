@@ -17,6 +17,8 @@ use datatab_byte_source::{ByteSource, FileSource, MemorySource, SourceError};
 use datatab_core::chrono::{DateTime, Utc};
 use datatab_core::{Connection, DbError, ObjectMetadata, ObjectStoreConnection};
 
+use crate::code::display_path::display_path;
+
 /// Where a file lives.
 ///
 /// An object is reached the way the object editor reaches one: through the
@@ -178,7 +180,7 @@ impl fmt::Display for StorageError {
 
             Self::LocalIo { path, source } => formatter.write_str(&datatab_i18n::t!(
                 "document.file.error.storage.local_io",
-                path = path.display(),
+                path = display_path(path),
                 cause = source
             )),
 
@@ -189,7 +191,7 @@ impl fmt::Display for StorageError {
             } => formatter.write_str(&datatab_i18n::t!(
                 "document.file.error.storage.temporary_file",
                 target = target,
-                directory = directory.display(),
+                directory = display_path(directory),
                 cause = source
             )),
 
@@ -638,4 +640,50 @@ pub(crate) fn object_store(
             "document.object_browser.error.api_unavailable"
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StorageError;
+    use std::path::PathBuf;
+
+    /// A path as Windows canonicalisation returns one, and as the user must not
+    /// see it.
+    const CANONICAL_DIRECTORY: &str = r"\\?\C:\Users\ana\data";
+
+    /// The same directory as the user should read it.
+    const SHOWN_DIRECTORY: &str = r"C:\Users\ana\data";
+
+    /// A local file the storage layer could not reach is named as the user
+    /// should read it, never in the extended-length form Windows
+    /// canonicalisation returns.
+    #[test]
+    fn a_local_io_message_hides_the_windows_verbatim_prefix() {
+        let error = StorageError::LocalIo {
+            path: PathBuf::from(r"\\?\UNC\server\share\cities.csv"),
+            source: std::io::Error::other("access denied"),
+        };
+
+        let message = error.to_string();
+
+        assert!(message.contains(r"\\server\share\cities.csv"), "{message}");
+        assert!(!message.contains(r"\\?\"), "{message}");
+    }
+
+    /// The directory of a temporary file a save could not write is named as the
+    /// user should read it, never in the extended-length form Windows
+    /// canonicalisation returns.
+    #[test]
+    fn a_temporary_file_message_hides_the_windows_verbatim_prefix() {
+        let error = StorageError::TemporaryFile {
+            target: r"C:\Users\ana\data\cities.csv".to_string(),
+            directory: PathBuf::from(CANONICAL_DIRECTORY),
+            source: std::io::Error::other("access denied"),
+        };
+
+        let message = error.to_string();
+
+        assert!(message.contains(SHOWN_DIRECTORY), "{message}");
+        assert!(!message.contains(r"\\?\"), "{message}");
+    }
 }

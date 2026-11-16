@@ -12,12 +12,11 @@ use datatab_core::observability::{
 };
 use datatab_core::secrecy::SecretString;
 use datatab_core::{
-    AuthProfile, CancelToken, Connection, ConnectionHooks, ConnectionProfile, DbDriver, DbError,
-    DbSchemaInfo, DriverKey, EffectiveSettings, ExternalScriptRoot, FetchCollectionChildrenParams,
-    FetchSchemaColumnsParams, FormValues, GeneralSettings, GlobalOverrides, HistoryEntry,
-    HookContext, HookPhase, SavedQuery, SchemaColumnInfo, SchemaForeignKeyInfo, SchemaIndexInfo,
-    SchemaSnapshot, ScriptsDirectory, SecretStore, SessionFacade, ShutdownPhase, SshTunnelProfile,
-    TaskId, TaskKind, TaskSnapshot,
+    CancelToken, Connection, ConnectionHooks, ConnectionProfile, DbDriver, DbError, DbSchemaInfo,
+    DriverKey, EffectiveSettings, ExternalScriptRoot, FetchSchemaColumnsParams, FormValues,
+    GeneralSettings, GlobalOverrides, HistoryEntry, HookContext, HookPhase, SavedQuery,
+    SchemaColumnInfo, SchemaForeignKeyInfo, SchemaIndexInfo, SchemaSnapshot, ScriptsDirectory,
+    SecretStore, SessionFacade, ShutdownPhase, SshTunnelProfile, TaskId, TaskKind, TaskSnapshot,
 };
 use datatab_storage::bootstrap::StorageRuntime;
 use datatab_storage::repositories::sch_schema_snapshots::SchemaSnapshotRepo;
@@ -122,16 +121,6 @@ pub struct AppState {
     scripts_directory: Option<ScriptsDirectory>,
     storage_runtime: StorageRuntime,
     audit_service: datatab_audit::AuditService,
-    /// Session-scoped cache for metric catalog data (namespaces + metrics pages).
-    ///
-    /// Shared via `Arc` so multiple chart documents can read and write it
-    /// without holding a reference to `AppState` itself.
-    pub metric_catalog_cache: Arc<crate::metric_catalog_cache::MetricCatalogCache>,
-    /// Session-scoped cache for upstream dashboard listings (read-only browse).
-    ///
-    /// Shared via `Arc` so the sidebar can read and write it without holding a
-    /// reference to `AppState` itself.
-    pub remote_dashboard_cache: Arc<crate::remote_dashboard_cache::RemoteDashboardCache>,
     /// Tracks whether the audit service was initialized from a degraded (in-memory)
     /// store because the real SQLite database could not be opened. When true,
     /// bootstrap_audit_settings will not enable the service even if persisted
@@ -146,6 +135,7 @@ pub struct AppState {
     /// by profile. Held only in memory; never serialized, logged, or written
     /// to the keyring.
     remembered_connection_passwords: HashMap<Uuid, SecretString>,
+    value_ref_diagnostics: crate::config_loader::ProfileValueRefDiagnostics,
     #[cfg(feature = "mcp")]
     mcp_runtime: McpRuntime,
 
@@ -231,26 +221,7 @@ impl AppState {
         &mut self,
         profile_id: Uuid,
     ) -> Option<std::thread::JoinHandle<Result<(), datatab_core::DbError>>> {
-        let teardown = self.facade.connections.disconnect(profile_id);
-
-        // Evict stale metric catalog data for this connection.
-        self.metric_catalog_cache.invalidate(profile_id);
-        // Evict the cached remote dashboard listing for this connection.
-        self.remote_dashboard_cache.invalidate(profile_id);
-
-        teardown
-    }
-
-    /// Access the session-scoped metric catalog cache.
-    pub fn metric_catalog_cache(&self) -> &Arc<crate::metric_catalog_cache::MetricCatalogCache> {
-        &self.metric_catalog_cache
-    }
-
-    /// Access the session-scoped remote dashboard listing cache.
-    pub fn remote_dashboard_cache(
-        &self,
-    ) -> &Arc<crate::remote_dashboard_cache::RemoteDashboardCache> {
-        &self.remote_dashboard_cache
+        self.facade.connections.disconnect(profile_id)
     }
 
     #[allow(dead_code)]
@@ -552,6 +523,61 @@ impl AppState {
 
     // --- Prepare/Apply ---
 
+    pub fn value_ref_diagnostics(
+        &self,
+        profile_id: Uuid,
+    ) -> &[datatab_storage::repositories::connection_profile_value_refs::ValueRefLoadDiagnostic]
+    {
+        self.value_ref_diagnostics
+            .get(&profile_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    pub fn value_ref_load_error(&self, profile_id: Uuid) -> Option<String> {
+        let diagnostics = self.value_ref_diagnostics(profile_id);
+        (!diagnostics.is_empty()).then(|| {
+            diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.message())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+    }
+
+    /// Refuses an invalid profile before prompts, secret reads, or access setup.
+    pub fn validate_connect_profile(
+        &self,
+        profile_id: Uuid,
+    ) -> Result<(), datatab_core::PrepareConnectError> {
+        use datatab_core::PrepareConnectError;
+
+        let profile = self
+            .profiles()
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .ok_or(PrepareConnectError::ProfileNotFound)?;
+        if let Some(error) = self.value_ref_load_error(profile_id) {
+            return Err(PrepareConnectError::ProfileRefused { error });
+        }
+        let driver = self.driver_for_profile(profile).ok_or_else(|| {
+            let driver_id = profile.driver_id();
+            match driver_id.strip_prefix("rpc:") {
+                Some(socket_id) => PrepareConnectError::ExternalDriverUnavailable {
+                    socket_id: socket_id.to_owned(),
+                    driver_id,
+                },
+                None => PrepareConnectError::DriverNotRegistered { driver_id },
+            }
+        })?;
+
+        driver
+            .validate_profile(profile)
+            .map_err(|error| PrepareConnectError::ProfileRefused {
+                error: error.to_string(),
+            })
+    }
+
     pub fn prepare_connect_profile(
         &self,
         profile_id: Uuid,
@@ -567,6 +593,7 @@ impl AppState {
         profile_id: Uuid,
         override_passphrase: Option<&str>,
     ) -> Result<ConnectProfileParams, datatab_core::PrepareConnectError> {
+        self.validate_connect_profile(profile_id)?;
         let secrets = &self.facade.secrets;
 
         let proxy_secret = {
@@ -698,6 +725,9 @@ impl AppState {
     }
 
     fn password_prompt_profile(&self, profile_id: Uuid) -> Option<&ConnectionProfile> {
+        if !self.value_ref_diagnostics(profile_id).is_empty() {
+            return None;
+        }
         let profile = self
             .facade
             .profiles
@@ -816,35 +846,6 @@ impl AppState {
             connection,
             schema,
         );
-    }
-
-    pub fn prepare_switch_region(
-        &self,
-        profile_id: Uuid,
-        region: &str,
-    ) -> Result<datatab_core::connection_manager::SwitchRegionParams, String> {
-        self.facade.connections.prepare_switch_region(
-            profile_id,
-            region,
-            &self.facade.secrets.secret_store_arc(),
-        )
-    }
-
-    pub fn apply_switch_region(
-        &mut self,
-        profile_id: Uuid,
-        original_profile: ConnectionProfile,
-        connection: Arc<dyn Connection>,
-        schema: Option<SchemaSnapshot>,
-        session_generation: u64,
-    ) -> bool {
-        self.facade.connections.apply_switch_region(
-            profile_id,
-            original_profile,
-            connection,
-            schema,
-            session_generation,
-        )
     }
 
     pub fn add_database_connection(
@@ -1104,30 +1105,6 @@ impl AppState {
             .restore_database_connection(profile_id, database, entry)
     }
 
-    pub fn prepare_fetch_collection_children(
-        &self,
-        profile_id: Uuid,
-        database: &str,
-        collection: &str,
-        limit: u32,
-    ) -> Result<FetchCollectionChildrenParams, String> {
-        self.facade
-            .connections
-            .prepare_fetch_collection_children(profile_id, database, collection, limit)
-    }
-
-    pub fn set_collection_children_page(
-        &mut self,
-        profile_id: Uuid,
-        database: String,
-        collection: String,
-        page: datatab_core::CollectionChildrenPage,
-    ) {
-        self.facade
-            .connections
-            .set_collection_children_page(profile_id, database, collection, page);
-    }
-
     pub fn prepare_fetch_schema_types(
         &self,
         profile_id: Uuid,
@@ -1293,6 +1270,7 @@ impl AppState {
     pub fn remove_profile(&mut self, idx: usize) -> Option<ConnectionProfile> {
         let removed = self.facade.remove_profile(idx)?;
         self.facade.connections.clear_connect_failure(removed.id);
+        self.value_ref_diagnostics.remove(&removed.id);
 
         self.record_config_event(
             EventOutcome::Success,
@@ -1316,6 +1294,56 @@ impl AppState {
         }
 
         Some(removed)
+    }
+
+    pub fn connection_manager_password_is_resolved(
+        &self,
+        profile: &ConnectionProfile,
+        password: &str,
+    ) -> bool {
+        !self
+            .value_ref_diagnostics(profile.id)
+            .iter()
+            .any(|diagnostic| diagnostic.field == "password")
+            || match profile.value_refs.get("password") {
+                Some(datatab_core::ValueRef::Literal { .. }) | None => !password.trim().is_empty(),
+                Some(_) => true,
+            }
+            || !profile.save_password
+    }
+
+    /// Refuses a profile whose kind is a reserved driver-wire slot, for
+    /// example one built from an RPC driver that declared such a kind. It
+    /// could be saved under no name a loader reads, so it would be gone at
+    /// the next start. Check before any secret of the profile is written.
+    #[allow(clippy::result_large_err)]
+    pub fn check_profile_can_be_saved(
+        profile: &ConnectionProfile,
+    ) -> Result<(), datatab_core::DbError> {
+        match crate::config_loader::reserved_kind_refusal(profile) {
+            Some(reason) => Err(datatab_core::DbError::InvalidProfile(reason)),
+            None => Ok(()),
+        }
+    }
+
+    /// Only the connection manager has shown the broken-source notice and let
+    /// the user choose replacement values. Background edits cannot acknowledge it.
+    #[allow(clippy::result_large_err)]
+    pub fn update_profile_from_connection_manager(
+        &mut self,
+        profile: ConnectionProfile,
+        password: &str,
+    ) -> Result<(), datatab_core::DbError> {
+        Self::check_profile_can_be_saved(&profile)?;
+        if !self.connection_manager_password_is_resolved(&profile, password) {
+            return Err(datatab_core::DbError::InvalidProfile(
+                "The broken password source needs a value or a source, or save password must be turned off."
+                    .into(),
+            ));
+        }
+        self.value_ref_diagnostics.remove(&profile.id);
+        self.update_profile(profile);
+        Ok(())
     }
 
     pub fn update_profile(&mut self, profile: ConnectionProfile) {
@@ -1355,11 +1383,19 @@ impl AppState {
     }
 
     pub fn save_profiles(&self) {
-        if let Err(e) = crate::config_loader::save_profiles(
+        if let Err(e) = crate::config_loader::save_profiles_preserving_value_refs(
             &self.storage_runtime,
             &self.facade.profiles.profiles,
+            &self.value_ref_diagnostics,
         ) {
-            log::error!("Failed to save connection profiles: {}", e);
+            match e {
+                datatab_storage::error::StorageError::Data(_) => {
+                    log::error!(
+                        "Some connection profiles were refused at save, the others were saved: {e}"
+                    );
+                }
+                _ => log::error!("Failed to save connection profiles: {e}"),
+            }
         }
     }
 
@@ -1707,44 +1743,13 @@ impl AppState {
         }
     }
 
-    /// Returns all auth profiles visible to the application: stored non-AWS profiles
-    /// unioned with AWS profiles reflected live from `~/.aws/config` and
-    /// `~/.aws/credentials`.
-    ///
-    /// This is the single read seam for auth profiles. All callers must use this
-    /// method instead of reading `facade.auth_profiles.items` directly, so that
-    /// reflected AWS profiles are always included.
+    /// Returns all stored auth profiles.
     pub fn list_auth_profiles(&self) -> Vec<datatab_core::AuthProfile> {
-        const AWS_REFLECTED_PROVIDER_IDS: &[&str] =
-            &["aws-sso", "aws-sso-session", "aws-shared-credentials"];
-
-        let mut profiles: Vec<datatab_core::AuthProfile> = self
-            .facade
-            .auth_profiles
-            .items
-            .iter()
-            .filter(|p| !AWS_REFLECTED_PROVIDER_IDS.contains(&p.provider_id.as_str()))
-            .cloned()
-            .collect();
-
-        for provider in self.auth_provider_registry.providers() {
-            profiles.extend(provider.reflect_profiles());
-        }
-
-        profiles
+        self.facade.auth_profiles.items.clone()
     }
 
-    /// Returns only profiles stored in the SQLite database.
-    ///
-    /// Reflected AWS profiles (from `~/.aws/config`) are NOT included.
-    /// All callers that resolve auth identity at connect time, dropdown
-    /// fetch time, or SSO login time MUST use `list_auth_profiles()` instead
-    /// so that reflected profiles participate in resolution.
-    ///
-    /// This method is retained only for callers that genuinely need the raw
-    /// stored slice: migration code, config loaders that write back to storage,
-    /// and MCP state that lists persisted profiles only.
-    #[deprecated(note = "use list_auth_profiles(); stored-only view hides reflected AWS profiles")]
+    /// Returns the stored auth profiles without cloning them.
+    #[deprecated(note = "use list_auth_profiles()")]
     pub fn auth_profiles(&self) -> &[datatab_core::AuthProfile] {
         &self.facade.auth_profiles.items
     }
@@ -2208,6 +2213,18 @@ impl AppState {
 
     pub fn drivers(&self) -> &HashMap<String, Arc<dyn DbDriver>> {
         &self.facade.connections.drivers
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn register_driver_for_test(
+        &mut self,
+        driver_id: impl Into<String>,
+        driver: Arc<dyn DbDriver>,
+    ) {
+        self.facade
+            .connections
+            .drivers
+            .insert(driver_id.into(), driver);
     }
 
     pub fn storage_runtime(&self) -> &StorageRuntime {
@@ -2971,6 +2988,14 @@ impl AppState {
         self.secret_provider_registry.list()
     }
 
+    #[cfg(feature = "test-support")]
+    pub fn register_auth_provider_for_test(
+        &mut self,
+        provider: Arc<dyn datatab_core::DynAuthProvider>,
+    ) {
+        self.auth_provider_registry.register(provider);
+    }
+
     pub fn auth_provider_registry(&self) -> &AuthProviderRegistry {
         &self.auth_provider_registry
     }
@@ -2983,8 +3008,8 @@ impl AppState {
     }
 
     /// Provider ids that exist only to be referenced by another provider's
-    /// `AuthProfileRef` field (e.g. an SSO-session block referenced by an SSO
-    /// profile). Profiles from these providers are building blocks, not
+    /// `AuthProfileRef` field (e.g. a shared identity profile referenced by a
+    /// credential provider). Profiles from these providers are building blocks, not
     /// standalone connection credentials, so a connection's Auth Profile picker
     /// must exclude them. Derived from the form definitions so the UI stays
     /// agnostic to concrete provider ids.
@@ -3028,7 +3053,7 @@ impl AppState {
     }
 
     pub fn profile_uses_connect_pipeline(&self, profile: &ConnectionProfile) -> bool {
-        profile.uses_pipeline() || self.infer_auth_profile_for_connection(profile).is_some()
+        profile.uses_pipeline()
     }
 
     pub fn prepare_pipeline_input(
@@ -3045,12 +3070,9 @@ impl AppState {
             .ok_or_else(|| format!("Profile {} not found", profile_id))?
             .clone();
 
-        let driver = self
-            .driver_for_profile(&profile)
-            .ok_or_else(|| format!("Driver '{}' not found", profile.driver_id()))?;
-
         let profile_name = profile.name.clone();
         let input = self.build_pipeline_input_for_profile(profile, cancel)?;
+        let driver = Arc::clone(&input.driver);
 
         Ok((input, profile_name, driver))
     }
@@ -3060,6 +3082,16 @@ impl AppState {
         profile: ConnectionProfile,
         cancel: CancelToken,
     ) -> Result<datatab_core::PipelineInput, String> {
+        if let Some(error) = self.value_ref_load_error(profile.id) {
+            return Err(error);
+        }
+        let driver = self
+            .driver_for_profile(&profile)
+            .ok_or_else(|| format!("Driver '{}' not found", profile.driver_id()))?;
+        driver
+            .validate_profile(&profile)
+            .map_err(|error| error.to_string())?;
+
         let selected_auth_profile_id = profile
             .access_kind
             .as_ref()
@@ -3071,14 +3103,11 @@ impl AppState {
             })
             .or(profile.auth_profile_id);
 
-        let selected_auth_profile = selected_auth_profile_id.and_then(|auth_id| {
+        let auth_profile = selected_auth_profile_id.and_then(|auth_id| {
             self.list_auth_profiles()
                 .into_iter()
                 .find(|p| p.id == auth_id && p.enabled)
         });
-
-        let auth_profile =
-            selected_auth_profile.or_else(|| self.infer_auth_profile_for_connection(&profile));
 
         let uses_managed_access = matches!(
             profile.access_kind,
@@ -3086,7 +3115,7 @@ impl AppState {
         );
         if uses_managed_access && auth_profile.is_none() {
             return Err(
-                "Managed access requires an auth profile. Select one in Access > SSM Auth Profile."
+                "Managed access requires an auth profile. Select one in Access > Auth Profile."
                     .to_string(),
             );
         }
@@ -3102,8 +3131,7 @@ impl AppState {
                 .value_refs
                 .values()
                 .any(|value_ref| match value_ref {
-                    datatab_core::values::ValueRef::Secret { provider, .. }
-                    | datatab_core::values::ValueRef::Parameter { provider, .. } => {
+                    datatab_core::values::ValueRef::Secret { provider, .. } => {
                         registered_auth_provider_ids.contains(provider)
                     }
                     _ => false,
@@ -3154,16 +3182,26 @@ impl AppState {
         let mut resolver = datatab_core::values::CompositeValueResolver::new(cache);
         self.secret_provider_registry.register_into(&mut resolver);
 
-        #[cfg(feature = "aws")]
-        let aws_profile_name = auth_profile
-            .as_ref()
-            .and_then(|p| p.fields.get("profile_name").cloned());
+        let selected_ssh_tunnel_id = match &profile.access_kind {
+            Some(datatab_core::access::AccessKind::Ssh {
+                ssh_tunnel_profile_id,
+            }) => Some(*ssh_tunnel_profile_id),
+            _ => None,
+        };
+        let selected_proxy_id = match &profile.access_kind {
+            Some(datatab_core::access::AccessKind::Proxy { proxy_profile_id }) => {
+                Some(*proxy_profile_id)
+            }
+            _ => None,
+        };
 
         let ssh_tunnels = self
             .facade
             .ssh_tunnels
             .items
             .iter()
+            .find(|tunnel| Some(tunnel.id) == selected_ssh_tunnel_id)
+            .into_iter()
             .map(|tunnel| {
                 (
                     tunnel.id,
@@ -3180,6 +3218,8 @@ impl AppState {
             .proxies
             .items
             .iter()
+            .find(|proxy| Some(proxy.id) == selected_proxy_id)
+            .into_iter()
             .map(|proxy| {
                 (
                     proxy.id,
@@ -3191,17 +3231,12 @@ impl AppState {
             })
             .collect();
 
-        let access_manager: Arc<dyn datatab_core::access::AccessManager> =
-            Arc::new(crate::access_manager::AppAccessManager::new(
-                ssh_tunnels,
-                proxy_tunnels,
-                #[cfg(feature = "aws")]
-                Some(Arc::new(datatab_ssm::SsmTunnelFactory::new(
-                    aws_profile_name,
-                ))),
-            ));
+        let access_manager: Arc<dyn datatab_core::access::AccessManager> = Arc::new(
+            crate::access_manager::AppAccessManager::new(ssh_tunnels, proxy_tunnels),
+        );
 
         Ok(datatab_core::PipelineInput {
+            driver,
             profile,
             auth_provider,
             auth_profile,
@@ -3210,59 +3245,20 @@ impl AppState {
             cancel,
         })
     }
-
-    fn infer_auth_profile_for_connection(
-        &self,
-        profile: &ConnectionProfile,
-    ) -> Option<AuthProfile> {
-        let aws_profile_name = profile.external_auth_profile_name()?.trim();
-
-        if aws_profile_name.is_empty() {
-            return None;
-        }
-
-        if let Some(profile) = self.list_auth_profiles().into_iter().find(|auth_profile| {
-            auth_profile.enabled
-                && auth_profile
-                    .fields
-                    .get("profile_name")
-                    .is_some_and(|name| name == aws_profile_name)
-                && self
-                    .auth_provider_registry
-                    .get(&auth_profile.provider_id)
-                    .is_some_and(|provider| provider.capabilities().login.supported)
-        }) {
-            return Some(profile);
-        }
-
-        self.auth_provider_registry
-            .providers()
-            .filter(|provider| provider.capabilities().login.supported)
-            .flat_map(|provider| provider.detect_importable_profiles())
-            .find(|candidate| {
-                candidate
-                    .fields
-                    .get("profile_name")
-                    .is_some_and(|name| name == aws_profile_name)
-            })
-            .map(|candidate| {
-                AuthProfile::new(
-                    candidate.display_name,
-                    candidate.provider_id,
-                    candidate.fields,
-                )
-            })
-    }
 }
 
 #[cfg(test)]
 mod tests {
+    mod access_secrets;
+    mod managed_access;
+    mod refusal;
+    mod value_refs;
     use super::*;
     use datatab_core::ServiceConfig;
     use datatab_core::access::AccessKind;
     use datatab_core::auth::{
         AuthFormDef, AuthProfile, AuthSession, AuthSessionState, DynAuthProvider,
-        ImportableProfile, ResolvedCredentials, UrlCallback,
+        ResolvedCredentials, UrlCallback,
     };
     use datatab_core::{
         ConnectionProfile, DatabaseCategory, DbConfig, DbError, DbKind, DriverFormDef,
@@ -3270,6 +3266,26 @@ mod tests {
         ServiceRpcApiContract,
     };
     use datatab_driver_ipc::IpcDriver;
+
+    #[test]
+    fn list_auth_profiles_keeps_all_stored_provider_rows() {
+        let rpc = AuthProfile::new("RPC", "rpc-auth", HashMap::new());
+        let leftover = AuthProfile::new("Leftover", "aws-sso", HashMap::new());
+        let expected = vec![rpc.id, leftover.id];
+        let state = test_state_with_profiles_and_auth_profiles(
+            HashMap::new(),
+            Vec::new(),
+            vec![rpc, leftover],
+        );
+        assert_eq!(
+            state
+                .list_auth_profiles()
+                .iter()
+                .map(|p| p.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
+    }
 
     #[test]
     fn profile_session_generation_absent_profile_is_none() {
@@ -3311,24 +3327,12 @@ mod tests {
 
     struct TestAuthProvider {
         provider_id: String,
-        importable_profile_name: Option<String>,
     }
 
     impl TestAuthProvider {
         fn new(provider_id: impl Into<String>) -> Self {
             Self {
                 provider_id: provider_id.into(),
-                importable_profile_name: None,
-            }
-        }
-
-        fn with_importable_profile(
-            provider_id: impl Into<String>,
-            profile_name: impl Into<String>,
-        ) -> Self {
-            Self {
-                provider_id: provider_id.into(),
-                importable_profile_name: Some(profile_name.into()),
             }
         }
     }
@@ -3355,7 +3359,6 @@ mod tests {
                         supported: true,
                         verification_url_progress: true,
                     },
-                    edit: None,
                 };
 
             &CAPABILITIES
@@ -3389,21 +3392,6 @@ mod tests {
         ) -> Result<ResolvedCredentials, DbError> {
             Ok(ResolvedCredentials::default())
         }
-
-        fn detect_importable_profiles(&self) -> Vec<ImportableProfile> {
-            let Some(profile_name) = self.importable_profile_name.as_ref() else {
-                return Vec::new();
-            };
-
-            let mut fields = HashMap::new();
-            fields.insert("profile_name".to_string(), profile_name.clone());
-
-            vec![ImportableProfile {
-                display_name: profile_name.clone(),
-                provider_id: self.provider_id.clone(),
-                fields,
-            }]
-        }
     }
 
     fn test_state_with_profiles(
@@ -3431,6 +3419,7 @@ mod tests {
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            HashMap::new(),
             runtime,
             profiles,
             auth_profiles,
@@ -3464,17 +3453,6 @@ mod tests {
             .expect("create script");
         assert!(created.starts_with(&runtime_root));
         assert!(created.is_file());
-    }
-
-    #[test]
-    fn build_builtin_drivers_registers_cloudwatch_driver() {
-        let drivers = AppState::build_builtin_drivers();
-
-        assert!(drivers.contains_key("cloudwatch"));
-
-        let driver = drivers.get("cloudwatch").expect("cloudwatch driver");
-        assert_eq!(driver.metadata().id, "cloudwatch");
-        assert_eq!(driver.display_name(), "CloudWatch Logs");
     }
 
     #[test]
@@ -3669,7 +3647,7 @@ mod tests {
         profile.auth_profile_id = Some(auth_profile.id);
 
         let mut state = test_state_with_profiles_and_auth_profiles(
-            HashMap::new(),
+            test_drivers(&profile.driver_id(), false, false),
             vec![profile.clone()],
             vec![auth_profile.clone()],
         );
@@ -3706,12 +3684,12 @@ mod tests {
         let mut profile = ConnectionProfile::new("rpc profile", DbConfig::default_postgres());
         profile.auth_profile_id = Some(fallback_auth_profile.id);
         profile.access_kind = Some(AccessKind::Managed {
-            provider: "aws-ssm".to_string(),
+            provider: "custom-access".to_string(),
             params: managed_params,
         });
 
         let mut state = test_state_with_profiles_and_auth_profiles(
-            HashMap::new(),
+            test_drivers(&profile.driver_id(), false, false),
             vec![profile.clone()],
             vec![fallback_auth_profile, managed_auth_profile.clone()],
         );
@@ -3731,100 +3709,6 @@ mod tests {
         assert_eq!(selected_auth_profile.provider_id, "custom-oidc");
     }
 
-    #[test]
-    fn profile_uses_connect_pipeline_for_importable_aws_sso_profile() {
-        let profile = ConnectionProfile::new(
-            "cloudwatch",
-            DbConfig::CloudWatchLogs {
-                region: "us-east-1".to_string(),
-                profile: Some("example-sso-profile".to_string()),
-                endpoint: None,
-            },
-        );
-
-        let mut state = test_state_with_profiles(HashMap::new(), vec![profile.clone()]);
-        state
-            .auth_provider_registry
-            .register(Arc::new(TestAuthProvider::with_importable_profile(
-                "aws-sso",
-                "example-sso-profile",
-            )));
-
-        assert!(state.profile_uses_connect_pipeline(&profile));
-    }
-
-    #[test]
-    fn build_pipeline_input_infers_importable_aws_sso_profile() {
-        let profile = ConnectionProfile::new(
-            "cloudwatch",
-            DbConfig::CloudWatchLogs {
-                region: "us-east-1".to_string(),
-                profile: Some("example-sso-profile".to_string()),
-                endpoint: None,
-            },
-        );
-
-        let mut state = test_state_with_profiles(HashMap::new(), vec![profile.clone()]);
-        state
-            .auth_provider_registry
-            .register(Arc::new(TestAuthProvider::with_importable_profile(
-                "aws-sso",
-                "example-sso-profile",
-            )));
-
-        let input = state
-            .build_pipeline_input_for_profile(profile, CancelToken::new())
-            .expect("importable AWS SSO profile should build pipeline input");
-
-        let auth_profile = input
-            .auth_profile
-            .expect("pipeline input should include inferred auth profile");
-
-        assert_eq!(auth_profile.name, "example-sso-profile");
-        assert_eq!(auth_profile.provider_id, "aws-sso");
-        assert_eq!(
-            auth_profile.fields.get("profile_name").map(String::as_str),
-            Some("example-sso-profile")
-        );
-        assert!(input.auth_provider.is_some());
-    }
-
-    #[test]
-    fn build_pipeline_input_infers_importable_aws_sso_profile_when_selected_id_is_stale() {
-        let mut profile = ConnectionProfile::new(
-            "cloudwatch",
-            DbConfig::CloudWatchLogs {
-                region: "us-east-1".to_string(),
-                profile: Some("example-sso-profile".to_string()),
-                endpoint: None,
-            },
-        );
-        profile.auth_profile_id = Some(Uuid::new_v4());
-
-        let mut state = test_state_with_profiles(HashMap::new(), vec![profile.clone()]);
-        state
-            .auth_provider_registry
-            .register(Arc::new(TestAuthProvider::with_importable_profile(
-                "aws-sso",
-                "example-sso-profile",
-            )));
-
-        let input = state
-            .build_pipeline_input_for_profile(profile, CancelToken::new())
-            .expect("stale auth profile id should fall back to importable AWS SSO profile");
-
-        let auth_profile = input
-            .auth_profile
-            .expect("pipeline input should include inferred auth profile");
-
-        assert_eq!(auth_profile.provider_id, "aws-sso");
-        assert_eq!(
-            auth_profile.fields.get("profile_name").map(String::as_str),
-            Some("example-sso-profile")
-        );
-        assert!(input.auth_provider.is_some());
-    }
-
     // --- Password prompt for profiles that do not save their password ---
 
     use datatab_core::secrecy::ExposeSecret;
@@ -3834,9 +3718,18 @@ mod tests {
 
     struct PasswordTestDriver {
         metadata: datatab_core::DriverMetadata,
+        refuses_profile: bool,
     }
 
     impl DbDriver for PasswordTestDriver {
+        fn validate_profile(&self, _: &ConnectionProfile) -> Result<(), DbError> {
+            if self.refuses_profile {
+                Err(DbError::InvalidProfile("fixture refusal".into()))
+            } else {
+                Ok(())
+            }
+        }
+
         fn kind(&self) -> datatab_core::DbKind {
             datatab_core::DbKind::Postgres
         }
@@ -3882,6 +3775,14 @@ mod tests {
     }
 
     fn password_test_drivers(requires_password: bool) -> HashMap<String, Arc<dyn DbDriver>> {
+        test_drivers("postgres", requires_password, false)
+    }
+
+    fn test_drivers(
+        driver_id: &str,
+        requires_password: bool,
+        refuses_profile: bool,
+    ) -> HashMap<String, Arc<dyn DbDriver>> {
         let capabilities = if requires_password {
             datatab_core::DriverCapabilities::AUTHENTICATION
         } else {
@@ -3897,8 +3798,11 @@ mod tests {
         .build();
 
         HashMap::from([(
-            "postgres".to_string(),
-            Arc::new(PasswordTestDriver { metadata }) as Arc<dyn DbDriver>,
+            driver_id.to_string(),
+            Arc::new(PasswordTestDriver {
+                metadata,
+                refuses_profile,
+            }) as Arc<dyn DbDriver>,
         )])
     }
 
@@ -4098,204 +4002,6 @@ mod tests {
             state.scripts_directory().is_none(),
             !state.scripts_directory_diagnostics().is_empty(),
             "a scripts directory that could not be resolved is the only thing that reports a diagnostic"
-        );
-    }
-
-    // --- T-3.6: list_auth_profiles() union seam ---
-    // Tests for a driver whose `driver_key()` is `"builtin:influxdb"`.
-
-    struct ReflectingTestAuthProvider {
-        provider_id: String,
-        reflected: Vec<AuthProfile>,
-    }
-
-    impl ReflectingTestAuthProvider {
-        fn new(provider_id: impl Into<String>, reflected: Vec<AuthProfile>) -> Self {
-            Self {
-                provider_id: provider_id.into(),
-                reflected,
-            }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl DynAuthProvider for ReflectingTestAuthProvider {
-        fn provider_id(&self) -> &str {
-            &self.provider_id
-        }
-
-        fn display_name(&self) -> &str {
-            "Reflecting Test Provider"
-        }
-
-        fn form_def(&self) -> &AuthFormDef {
-            static FORM: std::sync::OnceLock<AuthFormDef> = std::sync::OnceLock::new();
-            FORM.get_or_init(|| AuthFormDef { tabs: vec![] })
-        }
-
-        async fn validate_session(
-            &self,
-            _profile: &AuthProfile,
-        ) -> Result<AuthSessionState, DbError> {
-            Ok(AuthSessionState::LoginRequired)
-        }
-
-        async fn login(
-            &self,
-            profile: &AuthProfile,
-            url_callback: UrlCallback,
-        ) -> Result<AuthSession, DbError> {
-            url_callback(None);
-            Ok(AuthSession {
-                provider_id: self.provider_id.clone(),
-                profile_id: profile.id,
-                expires_at: None,
-                data: None,
-            })
-        }
-
-        async fn resolve_credentials(
-            &self,
-            _profile: &AuthProfile,
-        ) -> Result<ResolvedCredentials, DbError> {
-            Ok(ResolvedCredentials::default())
-        }
-
-        fn reflect_profiles(&self) -> Vec<AuthProfile> {
-            self.reflected.clone()
-        }
-    }
-
-    fn make_reflected_sso_profile(name: &str) -> AuthProfile {
-        use datatab_core::auth::aws_profile_uuid;
-        let id = aws_profile_uuid("aws-sso", name);
-        AuthProfile {
-            id,
-            name: name.to_string(),
-            provider_id: "aws-sso".to_string(),
-            fields: HashMap::new(),
-            secret_fields: HashMap::new(),
-            enabled: true,
-            read_only: true,
-            dangling_origin: None,
-        }
-    }
-
-    #[test]
-    fn list_auth_profiles_returns_reflected_aws_profiles_when_store_is_empty() {
-        let reflected_a = make_reflected_sso_profile("dev");
-        let reflected_b = make_reflected_sso_profile("prod");
-
-        let mut state =
-            test_state_with_profiles_and_auth_profiles(HashMap::new(), Vec::new(), Vec::new());
-
-        // Replace the registry with a clean one so real AWS providers that read
-        // from the test machine's ~/.aws/config do not pollute the result.
-        state.auth_provider_registry = AuthProviderRegistry::new();
-        state
-            .auth_provider_registry
-            .register(Arc::new(ReflectingTestAuthProvider::new(
-                "aws-sso",
-                vec![reflected_a.clone(), reflected_b.clone()],
-            )));
-
-        let result = state.list_auth_profiles();
-
-        assert_eq!(result.len(), 2, "expected exactly two reflected profiles");
-        assert!(
-            result
-                .iter()
-                .any(|p| p.id == reflected_a.id && p.name == "dev")
-        );
-        assert!(
-            result
-                .iter()
-                .any(|p| p.id == reflected_b.id && p.name == "prod")
-        );
-    }
-
-    #[test]
-    fn list_auth_profiles_includes_stored_non_aws_profile_alongside_reflected() {
-        let stored_non_aws = AuthProfile {
-            id: Uuid::new_v4(),
-            name: "OIDC Provider".to_string(),
-            provider_id: "custom-oidc".to_string(),
-            fields: HashMap::new(),
-            secret_fields: HashMap::new(),
-            enabled: true,
-            read_only: false,
-            dangling_origin: None,
-        };
-        let reflected_sso = make_reflected_sso_profile("staging");
-
-        let mut state = test_state_with_profiles_and_auth_profiles(
-            HashMap::new(),
-            Vec::new(),
-            vec![stored_non_aws.clone()],
-        );
-
-        // Replace the registry with a clean one so real AWS providers that read
-        // from the test machine's ~/.aws/config do not pollute the result.
-        state.auth_provider_registry = AuthProviderRegistry::new();
-        state
-            .auth_provider_registry
-            .register(Arc::new(ReflectingTestAuthProvider::new(
-                "aws-sso",
-                vec![reflected_sso.clone()],
-            )));
-
-        let result = state.list_auth_profiles();
-
-        assert_eq!(result.len(), 2);
-        assert!(
-            result.iter().any(|p| p.id == stored_non_aws.id),
-            "stored non-AWS profile must appear in union"
-        );
-        assert!(
-            result.iter().any(|p| p.id == reflected_sso.id),
-            "reflected AWS profile must appear in union"
-        );
-    }
-
-    #[test]
-    fn list_auth_profiles_excludes_stored_aws_rows_in_favour_of_reflection() {
-        // A stored aws-sso row — this should be excluded from the union
-        // because aws-sso is a reflected provider-id.
-        let stored_aws_row = AuthProfile {
-            id: Uuid::new_v4(),
-            name: "legacy-sso".to_string(),
-            provider_id: "aws-sso".to_string(),
-            fields: HashMap::new(),
-            secret_fields: HashMap::new(),
-            enabled: true,
-            read_only: false,
-            dangling_origin: None,
-        };
-
-        let reflected_sso = make_reflected_sso_profile("current-sso");
-
-        let mut state = test_state_with_profiles_and_auth_profiles(
-            HashMap::new(),
-            Vec::new(),
-            vec![stored_aws_row.clone()],
-        );
-
-        state
-            .auth_provider_registry
-            .register(Arc::new(ReflectingTestAuthProvider::new(
-                "aws-sso",
-                vec![reflected_sso.clone()],
-            )));
-
-        let result = state.list_auth_profiles();
-
-        assert!(
-            result.iter().all(|p| p.id != stored_aws_row.id),
-            "stored aws-sso row must NOT appear in union (reflection supersedes stored)"
-        );
-        assert!(
-            result.iter().any(|p| p.id == reflected_sso.id),
-            "reflected profile must appear in union"
         );
     }
 

@@ -517,7 +517,7 @@ impl DashboardDocument {
             .entered_panel
             .and_then(|index| self.panel_slots.get(index as usize))
         {
-            return panel.read(cx).embedded_pane_actions(cx);
+            return panel.read(cx).embedded_pane_actions();
         }
 
         let context = ContextId::Dashboard;

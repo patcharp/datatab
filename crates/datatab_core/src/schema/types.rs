@@ -625,7 +625,7 @@ pub struct TableInfo {
     #[serde(default)]
     pub presentation: CollectionPresentation,
 
-    /// Driver-provided child sources that should appear under this container.
+    /// Legacy child metadata retained for driver wire compatibility. Drivers write `None`.
     #[serde(default)]
     pub child_items: Option<Vec<CollectionChildInfo>>,
 
@@ -871,7 +871,7 @@ pub struct CollectionInfo {
     #[serde(default)]
     pub presentation: CollectionPresentation,
 
-    /// Driver-provided child sources that should appear under this collection.
+    /// Legacy child metadata retained for driver wire compatibility. Drivers write `None`.
     #[serde(default)]
     pub child_items: Option<Vec<CollectionChildInfo>>,
 }
@@ -881,50 +881,25 @@ pub struct CollectionInfo {
 pub enum CollectionPresentation {
     #[default]
     DataGrid,
-    EventStream,
+    /// Reserves postcard index 1 for the event stream presentation retired in #311.
+    #[doc(hidden)]
+    #[serde(rename = "EventStream")]
+    ReservedEventStream,
     ObjectBrowser,
 }
 
-/// Driver-provided child source metadata for a collection/container.
+/// Legacy collection child metadata retained for driver wire compatibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollectionChildInfo {
     pub id: String,
     pub label: String,
 
-    /// Optional driver-provided event timestamp used for generic child pickers.
+    /// Legacy event timestamp retained for driver wire compatibility.
     #[serde(default)]
     pub last_event_ts_ms: Option<i64>,
 
     #[serde(default)]
     pub presentation: CollectionPresentation,
-}
-
-/// Request for a page of driver-owned child sources under a collection/container.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CollectionChildrenRequest {
-    pub collection: crate::CollectionRef,
-    pub limit: u32,
-
-    #[serde(default)]
-    pub page_token: Option<String>,
-}
-
-/// One page of driver-owned child sources under a collection/container.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CollectionChildrenPage {
-    pub items: Vec<CollectionChildInfo>,
-
-    #[serde(default)]
-    pub next_page_token: Option<String>,
-}
-
-/// Cached collection child list plus continuation token.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CollectionChildrenCache {
-    pub items: Vec<CollectionChildInfo>,
-
-    #[serde(default)]
-    pub next_page_token: Option<String>,
 }
 
 /// Field info discovered from document sampling.
@@ -1165,7 +1140,10 @@ mod tests {
     fn collection_presentation_serde_roundtrip_all_variants() {
         for (variant, expected_json) in [
             (CollectionPresentation::DataGrid, "\"DataGrid\""),
-            (CollectionPresentation::EventStream, "\"EventStream\""),
+            (
+                CollectionPresentation::ReservedEventStream,
+                "\"EventStream\"",
+            ),
             (CollectionPresentation::ObjectBrowser, "\"ObjectBrowser\""),
         ] {
             let json = serde_json::to_string(&variant).expect("serialize");

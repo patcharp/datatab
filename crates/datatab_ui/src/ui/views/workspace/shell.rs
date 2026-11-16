@@ -315,16 +315,28 @@ impl Workspace {
     }
 
     /// The 44 px row at the top of the window, on the desk: the command
-    /// search centered, the notifications bell at the right end and, on a
-    /// client-decorated Linux window, the window controls after it. Empty
-    /// space in the row moves the window there.
+    /// search centered, the notifications bell at the right end and window
+    /// controls where the app draws them. Empty space moves the window.
     pub(super) fn render_title_bar(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let client_decorated = platform::prepare_client_decorations(window);
-        let window_controls = client_decorated.then(|| {
+        let draw_window_controls =
+            (client_decorated || cfg!(target_os = "windows")) && !window.is_fullscreen();
+        let control_count = if !draw_window_controls {
+            0
+        } else if cfg!(target_os = "windows") {
+            3
+        } else {
+            let controls = window.window_controls();
+            1 + usize::from(controls.minimize) + usize::from(controls.maximize)
+        };
+        let right_min_width = ShellMetrics::MIN_DRAG_GAP
+            + ShellMetrics::WINDOW_CONTROL_WIDTH * control_count as f32
+            + ShellMetrics::BELL_WIDTH.to_pixels(window.rem_size());
+        let window_controls = draw_window_controls.then(|| {
             let close = self.title_bar_close_handler(cx);
             platform::render_csd_window_controls(window, cx, Some(close))
         });
@@ -337,6 +349,7 @@ impl Workspace {
             datatab_i18n::t!("workspace.title_bar.command_search"),
         )
         .shortcut(palette_keys)
+        .shrinkable(true)
         .focus_handle(&self.command_search_focus)
         .on_open(move |window, cx| {
             workspace.update(cx, |workspace, cx| {
@@ -344,6 +357,22 @@ impl Workspace {
             });
         });
 
+        let drag_start = platform::csd_drag_area("title-bar-drag-area", window, cx)
+            .debug_selector(|| "title-bar-drag-area".to_string())
+            .min_w(ShellMetrics::MIN_DRAG_GAP)
+            .flex_1()
+            .flex_basis(px(0.0))
+            .h_full()
+            .pl(if cfg!(target_os = "macos") && !window.is_fullscreen() {
+                ShellMetrics::MAC_TRAFFIC_LIGHT_RESERVE
+            } else {
+                ShellMetrics::TITLE_BAR_PADDING_X
+            });
+        let drag_end = platform::csd_drag_area("title-bar-drag-area-end", window, cx)
+            .debug_selector(|| "title-bar-drag-area-end".to_string())
+            .min_w(ShellMetrics::MIN_DRAG_GAP)
+            .flex_1()
+            .h_full();
         let bell = self.render_notification_bell(cx);
 
         div()
@@ -353,30 +382,21 @@ impl Workspace {
             .items_center()
             .w_full()
             .h(ShellMetrics::TITLE_BAR_HEIGHT)
-            .pl(ShellMetrics::TITLE_BAR_PADDING_X)
-            .when(!client_decorated, |bar| {
+            .when(!draw_window_controls, |bar| {
                 bar.pr(ShellMetrics::TITLE_BAR_PADDING_X)
             })
-            .child(
-                platform::csd_drag_area("title-bar-drag-area")
-                    .flex_1()
-                    .flex_basis(px(0.0))
-                    .h_full(),
-            )
+            .child(drag_start)
             .child(command_search)
             .child(
                 div()
                     .flex()
+                    .min_w(right_min_width)
                     .flex_1()
                     .flex_basis(px(0.0))
                     .h_full()
                     .items_center()
                     .justify_end()
-                    .child(
-                        platform::csd_drag_area("title-bar-drag-area-end")
-                            .flex_1()
-                            .h_full(),
-                    )
+                    .child(drag_end)
                     .child(bell)
                     .children(window_controls),
             )

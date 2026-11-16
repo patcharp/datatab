@@ -83,22 +83,6 @@ impl ConnectionManagerWindow {
         )
     }
 
-    pub(super) fn render_control_focus_shell(
-        &self,
-        focused: bool,
-        ring_color: Hsla,
-        child: impl IntoElement,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        focus_ring(
-            focused,
-            FocusShape::Chamfer(ChamferCut::CONTROL),
-            Some(ring_color),
-            child,
-            cx,
-        )
-    }
-
     #[allow(clippy::too_many_arguments)]
     pub(super) fn render_password_field(
         &self,
@@ -271,6 +255,7 @@ impl ConnectionManagerWindow {
             ActiveTab::Mcp => self.render_mcp_tab(cx),
         };
 
+        let value_ref_error = self.value_ref_notice.clone();
         let test_banner = self.render_test_banner(cx);
         let header = self
             .render_form_header(title, is_editing, show_focus, cx)
@@ -306,6 +291,24 @@ impl ConnectionManagerWindow {
                                 )
                                 .with_body(combined),
                             ),
+                        )
+                    })
+                    .when_some(value_ref_error, |body, error| {
+                        body.child(
+                            div()
+                                .id("broken-value-ref-notice")
+                                .role(Role::Note)
+                                .aria_label(error.clone())
+                                .py(FormMetrics::ROW_PADDING_Y)
+                                .child(
+                                    BannerBlock::new(
+                                        BannerVariant::Danger,
+                                        datatab_i18n::t!(
+                                            "connection_manager.banner.correct_following"
+                                        ),
+                                    )
+                                    .with_body(error),
+                                ),
                         )
                     })
                     .children(tab_content),
@@ -814,7 +817,7 @@ impl ConnectionManagerWindow {
                         .unwrap_or(false)
                 };
 
-                let checkbox_id = gpui::SharedString::from(field_id.clone());
+                let checkbox_id = cm_field_id(&field_id);
                 let control = layout::check_row(
                     layout::cursor_ring(
                         focused,
@@ -871,7 +874,7 @@ impl ConnectionManagerWindow {
                             });
                         },
                     )
-                    .group(field_def.id.clone());
+                    .group(cm_field_id(&field_def.id));
 
                     Self::field_row_cm(
                         field_def.label.clone(),
@@ -915,7 +918,7 @@ impl ConnectionManagerWindow {
                             });
                         },
                     )
-                    .group(field_def.id.clone());
+                    .group(cm_field_id(&field_def.id));
 
                     Self::field_row_cm(
                         field_def.label.clone(),
@@ -1354,7 +1357,6 @@ impl Render for ConnectionManagerWindow {
         }
 
         self.apply_pending_auth_profile(window, cx);
-        self.apply_pending_ssm_auth_profile();
 
         if let Some(tunnel_id) = self.pending.ssh_tunnel_selection.take() {
             let tunnel = self
@@ -1365,7 +1367,11 @@ impl Render for ConnectionManagerWindow {
                 .find(|t| t.id == tunnel_id)
                 .cloned();
             if let Some(tunnel) = tunnel {
-                let secret = self.app_state.read(cx).get_ssh_tunnel_secret(&tunnel);
+                let secret = if self.value_ref_notice.is_none() {
+                    self.app_state.read(cx).get_ssh_tunnel_secret(&tunnel)
+                } else {
+                    None
+                };
                 self.apply_ssh_tunnel(&tunnel, secret, window, cx);
             }
         }
@@ -1402,7 +1408,7 @@ impl Render for ConnectionManagerWindow {
             state.set_masked(!show_ssh_password, window, cx);
         });
 
-        let csd_title_bar = platform::render_csd_title_bar(
+        let csd_title_bar = platform::render_shell_title_bar(
             window,
             cx,
             &datatab_i18n::t!("connection_manager.window_title"),

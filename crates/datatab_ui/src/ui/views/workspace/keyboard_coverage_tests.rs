@@ -31,6 +31,9 @@ const SHELL: SurfaceRegistry = SurfaceRegistry {
     name: "workspace shell (rail, title bar, status bar, tab bar, empty state)",
     contexts: &[ContextId::Global],
     entries: &[
+        ("csd-minimize", KeyboardPath::MouseOnly("window chrome")),
+        ("csd-maximize", KeyboardPath::MouseOnly("window chrome")),
+        ("csd-close", KeyboardPath::MouseOnly("window chrome")),
         (
             "title-bar-drag-area*",
             KeyboardPath::MouseOnly("window chrome: drags the window"),
@@ -641,4 +644,16 @@ fn the_keyboard_reaches_a_schema_diff_and_m_lists_its_actions(cx: &mut TestAppCo
         entries.iter().any(|entry| entry == "schema-diff-compute"),
         "{entries:?}"
     );
+}
+
+#[test]
+fn window_controls_are_registered_as_chrome() {
+    for id in ["csd-minimize", "csd-maximize", "csd-close"] {
+        assert!(
+            SHELL.entries.iter().any(|(entry, path)| {
+                *entry == id && matches!(path, KeyboardPath::MouseOnly("window chrome"))
+            }),
+            "missing window chrome entry for {id}"
+        );
+    }
 }

@@ -11,8 +11,6 @@ impl SchemaNodeKind {
                 | Self::Table
                 | Self::View
                 | Self::Collection
-                | Self::CollectionChild
-                | Self::CollectionChildrenMore
                 | Self::ConnectionFolder
                 | Self::Schema
                 | Self::TablesFolder
@@ -34,13 +32,8 @@ impl SchemaNodeKind {
                 | Self::ScriptsRoot
                 | Self::DependentsFolder
                 | Self::Routine
-                | Self::MetricsFolder
-                | Self::MetricNamespaceFolder
-                | Self::MetricLeaf
                 | Self::DashboardsFolder
                 | Self::DashboardItem
-                | Self::RemoteDashboardsFolder
-                | Self::RemoteDashboardItem
                 | Self::SavedChartsFolder
                 | Self::SavedChartItem
                 | Self::InstanceMetricsFolder
@@ -52,8 +45,6 @@ impl SchemaNodeKind {
                 | Self::RootSection
                 | Self::RootSectionItem
                 | Self::RootSectionLoadMore
-                | Self::SecretStore
-                | Self::SecretPath
         )
     }
 
@@ -82,17 +73,12 @@ impl SchemaNodeKind {
                 | Self::ScriptsFolder
                 | Self::ScriptsRoot
                 | Self::DependentsFolder
-                | Self::MetricsFolder
-                | Self::MetricNamespaceFolder
                 | Self::DashboardsFolder
-                | Self::RemoteDashboardsFolder
                 | Self::SavedChartsFolder
                 | Self::InstanceMetricsFolder
                 | Self::InstanceInspectorsFolder
                 | Self::InstanceFolder
                 | Self::RootSection
-                | Self::SecretStore
-                | Self::SecretPath
         )
     }
 
@@ -102,13 +88,9 @@ impl SchemaNodeKind {
             Self::Profile
                 | Self::Database
                 | Self::ConnectionFolder
-                | Self::CollectionChild
-                | Self::CollectionChildrenMore
                 | Self::ScriptFile
                 | Self::Routine
-                | Self::MetricLeaf
                 | Self::DashboardItem
-                | Self::RemoteDashboardItem
                 | Self::SavedChartItem
                 | Self::InstanceMetricLeaf
                 | Self::InstanceInspectorLeaf
@@ -116,8 +98,6 @@ impl SchemaNodeKind {
                 | Self::RootSection
                 | Self::RootSectionItem
                 | Self::RootSectionLoadMore
-                | Self::SecretStore
-                | Self::SecretPath
         )
     }
 }

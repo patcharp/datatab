@@ -477,7 +477,7 @@ impl DataTabServer {
         }
 
         match connection.metadata().category {
-            DatabaseCategory::Document | DatabaseCategory::LogStream => Self::select_data_document(
+            DatabaseCategory::Document => Self::select_data_document(
                 connection,
                 table,
                 database,
@@ -497,8 +497,9 @@ impl DataTabServer {
             | DatabaseCategory::ReservedGraph
             | DatabaseCategory::TimeSeries
             | DatabaseCategory::ReservedWideColumn
+            | DatabaseCategory::ReservedLogStream
             | DatabaseCategory::ObjectStorage
-            | DatabaseCategory::SecretStore => {
+            | DatabaseCategory::ReservedSecretStore => {
                 Self::select_data_table_routed(&check, &request).await
             }
         }
@@ -613,7 +614,7 @@ impl DataTabServer {
     /// contain dots.
     fn hint_target(connection: &Arc<dyn Connection>, table: &str) -> TableRef {
         match connection.metadata().category {
-            DatabaseCategory::Document | DatabaseCategory::LogStream => TableRef::new(table),
+            DatabaseCategory::Document => TableRef::new(table),
             _ => Self::table_ref_for_connection(connection, table),
         }
     }
@@ -672,7 +673,7 @@ impl DataTabServer {
             .collect()
     }
 
-    /// Handle select_data for document databases (MongoDB, DynamoDB)
+    /// Handle select_data for document databases (MongoDB)
     async fn select_data_document(
         connection: &Arc<dyn Connection>,
         table: &str,
@@ -806,7 +807,7 @@ impl DataTabServer {
         };
 
         let outcome: Result<u64, CallFailure> = match connection.metadata().category {
-            DatabaseCategory::Document | DatabaseCategory::LogStream => {
+            DatabaseCategory::Document => {
                 #[allow(clippy::unnecessary_lazy_evaluations)]
                 let db_name = database.ok_or_else(|| {
                     "Database parameter is required for document databases. Use: count_records(connection_id, table, database=\"db_name\", ...)"
@@ -838,8 +839,9 @@ impl DataTabServer {
             | DatabaseCategory::ReservedGraph
             | DatabaseCategory::TimeSeries
             | DatabaseCategory::ReservedWideColumn
+            | DatabaseCategory::ReservedLogStream
             | DatabaseCategory::ObjectStorage
-            | DatabaseCategory::SecretStore => {
+            | DatabaseCategory::ReservedSecretStore => {
                 let mut request =
                     TableCountRequest::new(Self::table_ref_for_connection(&connection, table));
 
@@ -1228,6 +1230,87 @@ mod tests {
             Err(DbError::NotSupported(
                 "aggregate semantics are not supported by this driver".into(),
             ))
+        }
+    }
+
+    /// A connection that only answers for its metadata.
+    struct CategoryConnection {
+        metadata: DriverMetadata,
+    }
+
+    impl CategoryConnection {
+        fn of(category: DatabaseCategory) -> Arc<dyn Connection> {
+            Arc::new(Self {
+                metadata: datatab_core::DriverMetadataBuilder::new(
+                    "category-fixture",
+                    "Category fixture",
+                    category,
+                    QueryLanguage::Custom("fixture".to_string()),
+                )
+                .build(),
+            })
+        }
+    }
+
+    impl Connection for CategoryConnection {
+        fn metadata(&self) -> &DriverMetadata {
+            &self.metadata
+        }
+
+        fn ping(&self) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        fn close(&mut self) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        fn execute(&self, _req: &datatab_core::QueryRequest) -> Result<QueryResult, DbError> {
+            Err(DbError::NotSupported("category fixture".into()))
+        }
+
+        fn cancel(&self, _handle: &QueryHandle) -> Result<(), DbError> {
+            Ok(())
+        }
+
+        fn schema(&self) -> Result<SchemaSnapshot, DbError> {
+            Ok(SchemaSnapshot::default())
+        }
+
+        fn kind(&self) -> DbKind {
+            DbKind::Postgres
+        }
+
+        fn schema_loading_strategy(&self) -> SchemaLoadingStrategy {
+            SchemaLoadingStrategy::SingleDatabase
+        }
+
+        fn dialect(&self) -> &dyn datatab_core::SqlDialect {
+            &DefaultSqlDialect
+        }
+    }
+
+    /// Only a document category takes a dotted name whole, as a collection.
+    /// The reserved category slots, the retired log-stream slot among them,
+    /// resolve it like a table.
+    #[test]
+    fn reserved_category_slots_resolve_hint_targets_like_a_table() {
+        let dotted = "logs.app";
+
+        assert_eq!(
+            DataTabServer::hint_target(&CategoryConnection::of(DatabaseCategory::Document), dotted),
+            TableRef::new(dotted)
+        );
+        for reserved in [
+            DatabaseCategory::ReservedLogStream,
+            DatabaseCategory::ReservedSecretStore,
+            DatabaseCategory::ReservedGraph,
+        ] {
+            assert_eq!(
+                DataTabServer::hint_target(&CategoryConnection::of(reserved), dotted),
+                TableRef::from_qualified(dotted),
+                "{reserved:?}"
+            );
         }
     }
 

@@ -9,28 +9,6 @@ pub(crate) fn container_folder_label(category: DatabaseCategory, count: usize) -
     datatab_i18n::t!(key, count = count)
 }
 
-/// Translated page indicator for the collection child picker, e.g.
-/// `"Page 1/3 (1-50)"`. `page` and `pages` are 1-based, `from`/`to` are the
-/// 1-based inclusive row range shown on the current page.
-pub(crate) fn page_label(page: usize, pages: usize, from: usize, to: usize) -> String {
-    if pages == 0 {
-        return datatab_i18n::t!("sidebar.overlay.child_picker.page_label_empty");
-    }
-
-    datatab_i18n::t!(
-        "sidebar.overlay.child_picker.page_label",
-        current = page,
-        total = pages,
-        start = from,
-        end = to
-    )
-}
-
-/// Translated child-picker modal title, e.g. `"Event streams: orders"`.
-pub(crate) fn child_picker_title(collection: &str) -> String {
-    datatab_i18n::t!("sidebar.overlay.child_picker.title", name = collection)
-}
-
 /// Translated toast headline reporting a connection profile was updated,
 /// e.g. `"'prod-db' updated"`.
 pub(crate) fn profile_updated_label(name: &str) -> String {
@@ -252,37 +230,9 @@ pub(crate) fn storage_folder_label(count: usize) -> String {
     datatab_i18n::t!("sidebar.tree.folder.storage", count = count)
 }
 
-/// Translated label for the Dashboards sidebar folder. Also used as the
-/// fallback label for the remote-dashboards folder when the driver does not
-/// supply its own `DashboardSource::container_label`.
+/// Translated label for the Dashboards sidebar folder.
 pub(crate) fn dashboards_folder_label() -> String {
     datatab_i18n::t!("sidebar.tree.folder.dashboards")
-}
-
-/// Translated label for a remote-dashboards folder base label, suffixed with
-/// the cached listing count once it resolves (the driver-supplied base
-/// followed by `(N)`). `base` stays untranslated.
-pub(crate) fn remote_dashboards_count_label(base: &str, count: usize) -> String {
-    datatab_i18n::t!(
-        "sidebar.tree.status.remote_listing_count",
-        label = base,
-        count = count
-    )
-}
-
-/// Translated label for a retryable remote-dashboards fetch error, e.g.
-/// `"Error: access denied — collapse and expand to retry"`.
-pub(crate) fn remote_dashboards_error_label(error: &str) -> String {
-    datatab_i18n::t!(
-        "sidebar.tree.status.remote_dashboards_error_retry",
-        error = error
-    )
-}
-
-/// Translated placeholder for a remote-dashboards folder whose listing
-/// resolved empty.
-pub(crate) fn remote_dashboards_empty_label() -> String {
-    datatab_i18n::t!("sidebar.tree.empty.remote_dashboards")
 }
 
 /// Translated label for the Saved Charts sidebar folder.
@@ -300,15 +250,9 @@ pub(crate) fn untitled_chart_label() -> String {
     datatab_i18n::t!("sidebar.tree.node.untitled_chart")
 }
 
-/// Translated placeholder for an empty Dashboards folder, e.g. `"No
-/// dashboards yet — right-click to create"`. `can_import` selects the
-/// variant that also mentions importing, gated on `DASHBOARD_IMPORT`.
-pub(crate) fn no_dashboards_yet_label(can_import: bool) -> String {
-    if can_import {
-        datatab_i18n::t!("sidebar.tree.empty.dashboards_with_import")
-    } else {
-        datatab_i18n::t!("sidebar.tree.empty.dashboards")
-    }
+/// Translated placeholder for an empty Dashboards folder.
+pub(crate) fn no_dashboards_yet_label() -> String {
+    datatab_i18n::t!("sidebar.tree.empty.dashboards")
 }
 
 /// Translated label for the Instance Metrics sidebar folder.
@@ -342,12 +286,6 @@ pub(crate) fn no_inspectors_available_label() -> String {
 /// Translated label for the Instance Overview sidebar leaf.
 pub(crate) fn instance_overview_label() -> String {
     datatab_i18n::t!("sidebar.tree.node.instance_overview")
-}
-
-/// Translated label for a database-level Metrics folder (metric catalog
-/// browsing, e.g. CloudWatch namespaces).
-pub(crate) fn metrics_folder_label() -> String {
-    datatab_i18n::t!("sidebar.tree.folder.metrics")
 }
 
 /// Translated task-panel label for an in-flight connect attempt, e.g.
@@ -513,28 +451,11 @@ pub(crate) fn pipeline_completed_detail_label() -> String {
     datatab_i18n::t!("sidebar.task.pipeline.completed")
 }
 
-/// Translated task-panel label for a background schema fetch that loads
-/// event streams for a collection, e.g. `"Loading event streams: orders"`.
-pub(crate) fn loading_event_streams_task_label(name: &str) -> String {
-    datatab_i18n::t!("sidebar.task.loading_event_streams", name = name)
-}
-
 /// Translated toast reported when loading a table's schema details fails,
 /// e.g. `"Failed to load orders schema: connection reset"`.
 pub(crate) fn table_load_failed_label(name: &str, error: &str) -> String {
     datatab_i18n::t!(
         "sidebar.toast.load_failed.table",
-        name = name,
-        error = error
-    )
-}
-
-/// Translated toast reported when loading a collection's event streams
-/// fails, e.g. `"Failed to load event streams for orders: connection
-/// reset"`.
-pub(crate) fn collection_load_failed_label(name: &str, error: &str) -> String {
-    datatab_i18n::t!(
-        "sidebar.toast.load_failed.collection",
         name = name,
         error = error
     )
@@ -705,26 +626,9 @@ pub(crate) fn list_root_section_failed_label(section: &str, error: &str) -> Stri
     )
 }
 
-/// Translated task-panel label for a background listing of a secret store's
-/// path tree, e.g. `"Listing secret paths: prod-aws"`.
-pub(crate) fn listing_secret_paths_task_label(name: &str) -> String {
-    datatab_i18n::t!("sidebar.task.listing_secret_paths", name = name)
-}
-
-/// Translated task-failure detail reported when listing secret paths fails.
-pub(crate) fn list_secret_paths_failed_label(error: &str) -> String {
-    datatab_i18n::t!("sidebar.toast.list_secret_paths_failed", error = error)
-}
-
 /// Translated toast reported when SQL/query code generation fails.
 pub(crate) fn code_generation_failed_label(error: &str) -> String {
     datatab_i18n::t!("sidebar.toast.code_generation_failed", error = error)
-}
-
-/// Translated toast shown while an event-stream child-picker fetch is still
-/// loading in the background.
-pub(crate) fn loading_event_streams_toast_label() -> String {
-    datatab_i18n::t!("sidebar.toast.loading_event_streams")
 }
 
 /// Translated toast reported when loading a database's schema fails.
@@ -814,24 +718,20 @@ pub(crate) fn pipeline_stage_label(state: &PipelineState) -> Option<String> {
 mod tests {
     use datatab_core::DatabaseCategory;
 
-    const ALL_CATEGORIES: [DatabaseCategory; 7] = [
+    const ALL_CATEGORIES: [DatabaseCategory; 5] = [
         DatabaseCategory::Relational,
         DatabaseCategory::Document,
         DatabaseCategory::KeyValue,
         DatabaseCategory::TimeSeries,
-        DatabaseCategory::LogStream,
         DatabaseCategory::ObjectStorage,
-        DatabaseCategory::SecretStore,
     ];
 
-    const CONTAINER_KEYS: [&str; 7] = [
+    const CONTAINER_KEYS: [&str; 5] = [
         "sidebar.tree.container.relational",
         "sidebar.tree.container.document",
         "sidebar.tree.container.key_value",
         "sidebar.tree.container.time_series",
-        "sidebar.tree.container.log_stream",
         "sidebar.tree.container.object_storage",
-        "sidebar.tree.container.secret_store",
     ];
 
     const SLICE_KEYS: [&str; 10] = [
@@ -844,27 +744,17 @@ mod tests {
         "sidebar.empty.scripts_hint",
         "sidebar.status.connection_summary",
         "sidebar.tree.container.relational",
-        "sidebar.tree.container.log_stream",
+        "sidebar.tree.container.object_storage",
     ];
 
-    const OVERLAY_KEYS: [&str; 23] = [
+    const OVERLAY_KEYS: [&str; 13] = [
         "sidebar.filter.connections_placeholder",
         "sidebar.filter.scripts_placeholder",
-        "sidebar.filter.stream_placeholder",
         "sidebar.overlay.add_folder",
         "sidebar.overlay.add_connection",
         "sidebar.overlay.add_script_file",
         "sidebar.overlay.add_script_folder",
         "sidebar.overlay.import_file",
-        "sidebar.overlay.child_picker.title",
-        "sidebar.overlay.child_picker.column_name",
-        "sidebar.overlay.child_picker.column_last_event",
-        "sidebar.overlay.child_picker.empty",
-        "sidebar.overlay.child_picker.prev",
-        "sidebar.overlay.child_picker.next",
-        "sidebar.overlay.child_picker.page_label",
-        "sidebar.overlay.child_picker.page_label_empty",
-        "sidebar.overlay.child_picker.unsupported",
         "sidebar.toast.edit_reconnect_updated",
         "sidebar.toast.edit_reconnect_body",
         "sidebar.toast.edit_reconnect_now",
@@ -930,53 +820,6 @@ mod tests {
                 "translation fell back to the miss sentinel for en.{key}"
             );
         }
-    }
-
-    #[test]
-    fn overlay_prev_english_text() {
-        let english = datatab_i18n::t!("sidebar.overlay.child_picker.prev", locale = "en");
-
-        assert_eq!(english, "Prev");
-    }
-
-    #[test]
-    fn page_label_reports_current_page_and_visible_range() {
-        let label = super::page_label(1, 3, 1, 50);
-
-        assert!(label.contains('1'));
-        assert!(label.contains('3'));
-        assert!(label.contains("50"));
-        assert_eq!(
-            label,
-            datatab_i18n::t!(
-                "sidebar.overlay.child_picker.page_label",
-                current = 1,
-                total = 3,
-                start = 1,
-                end = 50
-            )
-        );
-    }
-
-    #[test]
-    fn page_label_falls_back_to_empty_variant_when_there_are_no_pages() {
-        let label = super::page_label(0, 0, 0, 0);
-
-        assert_eq!(
-            label,
-            datatab_i18n::t!("sidebar.overlay.child_picker.page_label_empty")
-        );
-    }
-
-    #[test]
-    fn child_picker_title_includes_the_collection_name() {
-        let title = super::child_picker_title("orders");
-
-        assert!(title.contains("orders"));
-        assert_eq!(
-            title,
-            datatab_i18n::t!("sidebar.overlay.child_picker.title", name = "orders")
-        );
     }
 
     #[test]
@@ -1131,20 +974,17 @@ mod tests {
         assert_ne!(singular, plural);
     }
 
-    const C2_KEYS: [&str; 13] = [
+    const C2_KEYS: [&str; 10] = [
         "sidebar.tree.folder.dashboards",
         "sidebar.tree.folder.saved_charts",
         "sidebar.tree.folder.instance_metrics",
         "sidebar.tree.folder.instance_inspectors",
-        "sidebar.tree.folder.metrics",
         "sidebar.tree.node.instance_overview",
         "sidebar.tree.node.untitled_chart",
         "sidebar.tree.empty.dashboards",
-        "sidebar.tree.empty.dashboards_with_import",
         "sidebar.tree.empty.saved_charts",
         "sidebar.tree.empty.metrics",
         "sidebar.tree.empty.inspectors",
-        "sidebar.tree.empty.remote_dashboards",
     ];
 
     #[test]
@@ -1159,52 +999,6 @@ mod tests {
                 "translation fell back to the miss sentinel for en.{key}"
             );
         }
-    }
-
-    #[test]
-    fn remote_dashboards_count_label_includes_base_and_count() {
-        let label = super::remote_dashboards_count_label("CloudWatch Dashboards", 3);
-
-        assert!(label.contains("CloudWatch Dashboards"));
-        assert!(label.contains('3'));
-        assert_eq!(
-            label,
-            datatab_i18n::t!(
-                "sidebar.tree.status.remote_listing_count",
-                label = "CloudWatch Dashboards",
-                count = 3
-            )
-        );
-    }
-
-    #[test]
-    fn remote_dashboards_error_label_includes_the_error_message() {
-        let label = super::remote_dashboards_error_label("access denied");
-
-        assert!(label.contains("access denied"));
-        assert_eq!(
-            label,
-            datatab_i18n::t!(
-                "sidebar.tree.status.remote_dashboards_error_retry",
-                error = "access denied"
-            )
-        );
-    }
-
-    #[test]
-    fn no_dashboards_yet_label_differs_with_and_without_import() {
-        let with_import = super::no_dashboards_yet_label(true);
-        let without_import = super::no_dashboards_yet_label(false);
-
-        assert_eq!(
-            with_import,
-            datatab_i18n::t!("sidebar.tree.empty.dashboards_with_import")
-        );
-        assert_eq!(
-            without_import,
-            datatab_i18n::t!("sidebar.tree.empty.dashboards")
-        );
-        assert_ne!(with_import, without_import);
     }
 
     #[test]
@@ -1558,10 +1352,8 @@ mod tests {
         );
     }
 
-    const D2_KEYS: [&str; 15] = [
-        "sidebar.task.loading_event_streams",
+    const D2_KEYS: [&str; 13] = [
         "sidebar.toast.load_failed.table",
-        "sidebar.toast.load_failed.collection",
         "sidebar.confirm.items.one",
         "sidebar.confirm.items.many",
         "sidebar.task.dropping.table",
@@ -1639,17 +1431,6 @@ mod tests {
     }
 
     #[test]
-    fn loading_event_streams_task_label_includes_the_collection_name() {
-        let label = super::loading_event_streams_task_label("orders");
-
-        assert!(label.contains("orders"));
-        assert_eq!(
-            label,
-            datatab_i18n::t!("sidebar.task.loading_event_streams", name = "orders")
-        );
-    }
-
-    #[test]
     fn table_load_failed_label_includes_name_and_error() {
         let label = super::table_load_failed_label("orders", "connection reset");
 
@@ -1662,18 +1443,6 @@ mod tests {
                 name = "orders",
                 error = "connection reset"
             )
-        );
-    }
-
-    #[test]
-    fn collection_load_failed_label_includes_name_and_error() {
-        let label = super::collection_load_failed_label("orders", "connection reset");
-
-        assert!(label.contains("orders"));
-        assert!(label.contains("connection reset"));
-        assert_ne!(
-            label,
-            super::table_load_failed_label("orders", "connection reset")
         );
     }
 
@@ -1771,7 +1540,7 @@ mod tests {
         );
     }
 
-    const E1_KEYS: [&str; 37] = [
+    const E1_KEYS: [&str; 34] = [
         "sidebar.error.cannot_load_schema_types",
         "sidebar.error.cannot_load_schema_indexes",
         "sidebar.error.cannot_load_schema_foreign_keys",
@@ -1795,10 +1564,7 @@ mod tests {
         "sidebar.root_section.confirm_message",
         "sidebar.root_section.action.delete_bucket",
         "sidebar.root_section.action.delete_bucket_description",
-        "sidebar.task.listing_secret_paths",
-        "sidebar.toast.list_secret_paths_failed",
         "sidebar.toast.code_generation_failed",
-        "sidebar.toast.loading_event_streams",
         "sidebar.task.loading_database_schema",
         "sidebar.toast.load_schema_failed",
         "sidebar.task.connecting_to_database",

@@ -1089,7 +1089,6 @@ fn h3_approval_required_does_not_open_confirmation_modal(cx: &mut TestAppContext
                 read_only_reason: None,
                 database_schemas: Default::default(),
                 table_details: Default::default(),
-                collection_children: Default::default(),
                 schema_types: Default::default(),
                 schema_columns: Default::default(),
                 schema_indexes: Default::default(),

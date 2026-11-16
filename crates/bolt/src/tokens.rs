@@ -1720,6 +1720,11 @@ impl ShellMetrics {
     /// Title bar: 44 px on the desk, 14 px side padding, no line.
     pub const TITLE_BAR_HEIGHT: Rems = ui(44.0);
     pub const TITLE_BAR_PADDING_X: Pixels = px(14.0);
+    pub const WINDOW_CONTROL_WIDTH: Pixels = px(46.0);
+    pub const WINDOW_CONTROL_ICON: Rems = ui(15.0);
+    pub const MAC_TRAFFIC_LIGHT_RESERVE: Pixels = px(80.0);
+    pub const MIN_DRAG_GAP: Pixels = px(48.0);
+    pub const MAC_TRAFFIC_LIGHT_POSITION: Pixels = px(14.0);
 
     /// Command search field, centered in the title bar: 420 by 30 px, cut
     /// 6, 10 px padding, 8 px gap, 14 px search icon, 12.5 px text.
@@ -2481,8 +2486,6 @@ impl ChartDocumentMetrics {
     pub const RAIL_SERIES_ROW_HEIGHT: Rems = ui(30.0);
     pub const RAIL_SWATCH: Pixels = px(10.0);
     pub const RAIL_ICON: Rems = ui(13.0);
-    /// Width of the metric picker rail. (320 px)
-    pub const PICKER_WIDTH: Rems = ui(320.0);
 }
 
 /// Geometry of the chart axis row (the chart design board): the X, Y, Group and Agg

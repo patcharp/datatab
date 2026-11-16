@@ -20,15 +20,13 @@
 use super::{
     ChartDocument, ExecState, seed_initial_window, should_render_stats_rail, toggle_stats_rail,
 };
-use crate::chart::ChartRailTab;
-use crate::chart::metric_picker_render::MetricPickerView;
 use crate::chart::toolbar::chart_window_label;
 use crate::chart::toolbar::{ChartToolbarContext, ChartToolbarHandlers, render_chart_toolbar};
 use crate::chrome::{document_bar, document_title};
 use crate::pane::DocumentSidePanel;
 use datatab_components::chart::{
-    ChartDetection, ChartView, MetricSource, axis_bar_element, format_span, format_x_value,
-    format_y_value, legend_element,
+    ChartDetection, ChartView, axis_bar_element, format_span, format_x_value, format_y_value,
+    legend_element,
 };
 use datatab_components::common::time_range::state::TimeRange;
 use datatab_components::common::time_range::view::{TimeRangeChanged, TimeRangePanel};
@@ -92,13 +90,12 @@ impl Render for ChartDocument {
             );
 
             self.time_range_panel = Some(panel.clone());
-            self._time_range_sub = Some(time_range_sub);
-            self._subscriptions.push(preset_sub);
+            self._time_range_subscriptions = Some((time_range_sub, preset_sub));
 
             // Seed the initial window synchronously rather than relying on
             // emit_initial's event delivery, which GPUI defers until after the
-            // current render pass. Sources that require a window (MetricSource,
-            // CollectionSource) would otherwise call build_plan(None) → WindowRequired
+            // current render pass. Collection sources would otherwise call
+            // build_plan(None) → WindowRequired
             // toast on the very first auto-run triggered by pending_run_on_first_render.
             let now_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -129,13 +126,6 @@ impl Render for ChartDocument {
             // Also trigger emit_initial so that the subscription fires on the
             // next render pass, keeping the dropdown and panel state consistent.
             panel.update(cx, |panel, cx| panel.emit_initial(cx));
-        }
-
-        // -- Consume pending data-source swap from MetricPickerApplied event.
-        // Must run before the reexecute drain so the new source is in place
-        // when the immediate re-execution request is issued.
-        if let Some(source) = self.pending_data_source.take() {
-            self.set_data_source(source, window, cx);
         }
 
         // -- Drain pending chart re-execute triggered by time-range changes.
@@ -253,10 +243,6 @@ impl ChartDocument {
     /// Called from the `ViewHandle::render` closure produced by
     /// `into_view_handle`. Pixel-equivalent to the former standalone render body
     /// minus the header row (which is now projected as chrome-row segments).
-    ///
-    /// When the Metric rail is open (i.e. `ChartRailTab::Metric` is active),
-    /// an absolute-positioned 320px panel is overlaid on the right edge showing
-    /// the `MetricPickerView` — same layout as the Stats rail in `DataGridPanel`.
     pub(super) fn render_chart_content(
         &mut self,
         window: &mut Window,
@@ -273,38 +259,29 @@ impl ChartDocument {
             div().size_full().child(chart_entity).into_any_element()
         } else {
             // Degraded state: show a placeholder based on detection result.
-            // For self-executing sources (MetricSource) the copy is tailored to
+            // For self-executing sources the copy is tailored to
             // metric charts; for query/empty sources the generic copy is shown.
             let is_metric = self.data_source.is_self_executing();
-            let metric_unconfigured = self
-                .data_source
-                .as_any()
-                .and_then(|any| any.downcast_ref::<MetricSource>())
-                .is_some_and(|source| source.series.is_empty());
-            let msg = if metric_unconfigured {
-                "This chart has no metric series configured. Edit it to add one.".into()
-            } else {
-                match &chart_detection {
-                    Some(ChartDetection::EmptyResult) | None => {
-                        if is_metric {
-                            if self.exec_state == ExecState::Running {
-                                datatab_i18n::t!("document.chart.shell.degraded.loading_metric")
-                            } else {
-                                datatab_i18n::t!("document.chart.shell.degraded.no_data_points")
-                            }
+            let msg = match &chart_detection {
+                Some(ChartDetection::EmptyResult) | None => {
+                    if is_metric {
+                        if self.exec_state == ExecState::Running {
+                            datatab_i18n::t!("document.chart.shell.degraded.loading_metric")
                         } else {
-                            datatab_i18n::t!("document.chart.shell.degraded.run_query")
+                            datatab_i18n::t!("document.chart.shell.degraded.no_data_points")
                         }
+                    } else {
+                        datatab_i18n::t!("document.chart.shell.degraded.run_query")
                     }
-                    Some(ChartDetection::NoTimeColumn) => {
-                        datatab_i18n::t!("document.chart.shell.degraded.no_time_column")
-                    }
-                    Some(ChartDetection::NoNumericSeries) => {
-                        datatab_i18n::t!("document.chart.shell.degraded.no_numeric_series")
-                    }
-                    Some(ChartDetection::Ok { .. }) => {
-                        datatab_i18n::t!("document.chart.shell.degraded.build_failed")
-                    }
+                }
+                Some(ChartDetection::NoTimeColumn) => {
+                    datatab_i18n::t!("document.chart.shell.degraded.no_time_column")
+                }
+                Some(ChartDetection::NoNumericSeries) => {
+                    datatab_i18n::t!("document.chart.shell.degraded.no_numeric_series")
+                }
+                Some(ChartDetection::Ok { .. }) => {
+                    datatab_i18n::t!("document.chart.shell.degraded.build_failed")
                 }
             };
             div()
@@ -554,7 +531,7 @@ impl ChartDocument {
                 None
             };
 
-        // -- Side rails (metric picker, stats) --
+        // -- Stats rail --
         // A chart tab hands its rails to the workspace, which draws them as
         // islands beside the document island (`side_panels`). Embedded in a
         // dashboard panel there is no workspace slot, so they stay docked
@@ -608,55 +585,16 @@ impl ChartDocument {
             .into_any_element()
     }
 
-    /// The open rail, if any, as `(id, width, content)`: the metric picker
-    /// while the Metric tab is open, the stats rail while the Stats tab is.
+    /// The stats rail, when open, as `(id, width, content)`.
     fn rail_panels(
         &mut self,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<(&'static str, Pixels, AnyElement)> {
         let (rail_open, rail_tab) = {
             let shell = self.chart_shell.read(cx);
             (shell.chart_rail_open, shell.chart_rail_tab)
         };
-
-        if rail_open && rail_tab == ChartRailTab::Metric {
-            // Single read+update path: render the picker inside one `update`
-            // closure so a concurrent clear of `metric_picker` (subscription,
-            // pending action) cannot turn the previously observed `Some` into
-            // a `None` between the read and the update.
-            let cache = self.app_state.read(cx).metric_catalog_cache().clone();
-            let picker: Option<AnyElement> = self.chart_shell.update(cx, |shell, cx| {
-                shell.metric_picker.as_mut().map(|picker| {
-                    MetricPickerView {
-                        state: picker,
-                        cache: &cache,
-                    }
-                    .render(window, cx)
-                    .into_any_element()
-                })
-            });
-
-            return picker
-                .map(|element| {
-                    let content = div()
-                        .flex()
-                        .flex_col()
-                        .size_full()
-                        .min_h_0()
-                        .overflow_hidden()
-                        .child(element)
-                        .into_any_element();
-
-                    (
-                        "chart-metric-picker",
-                        ChartDocumentMetrics::PICKER_WIDTH.to_pixels(window.rem_size()),
-                        content,
-                    )
-                })
-                .into_iter()
-                .collect();
-        }
 
         if should_render_stats_rail(rail_open, rail_tab) {
             let theme = cx.theme().clone();

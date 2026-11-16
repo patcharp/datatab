@@ -126,7 +126,7 @@ Collections on drivers that offer it (MongoDB) have a visual builder for find
 queries and simple aggregations. Click **Builder** in the collection header to
 open it in the right rail; click it again, or the rail's close button, to hide
 it. The draft stays while the tab is open. On a document driver without a
-builder, such as DynamoDB, the button is disabled and its tooltip says why; the
+builder, the button is disabled and its tooltip says why; the
 query slots still work.
 
 The rail has a **Find** / **Aggregate** mode switch, the cards described below,

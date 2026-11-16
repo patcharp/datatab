@@ -90,6 +90,22 @@ fn confirm(document: &Entity<SpreadsheetDocument>, window: &mut VisualTestContex
     window.run_until_parked();
 }
 
+/// A file the write could not reach is named as the user should read it,
+/// never in the extended-length form Windows canonicalisation returns.
+#[test]
+fn a_local_io_message_hides_the_windows_verbatim_prefix() {
+    let error = super::save_as::SaveAsError::Local {
+        path: PathBuf::from(r"\\?\C:\Users\ana\book.xlsx"),
+        source: std::io::Error::other("access denied"),
+    };
+
+    let error = super::save_as::save_as_error_to_user_facing(&error, "book.xls");
+    let cause = error.cause.expect("the cause names the file");
+
+    assert!(cause.contains(r"C:\Users\ana\book.xlsx"), "{cause}");
+    assert!(!cause.contains(r"\\?\"), "{cause}");
+}
+
 #[gpui::test]
 fn save_as_warns_before_writing(cx: &mut TestAppContext) {
     let directory = TestDirectory::new("save-as-warns");

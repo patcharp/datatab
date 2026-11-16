@@ -4,13 +4,7 @@ use crate::ui::labels::{
     charts_cannot_open_chart_message, charts_create_dashboard_failed_message,
     charts_delete_chart_failed_message, charts_delete_dashboard_failed_message,
     charts_duplicate_chart_failed_message, charts_duplicate_dashboard_failed_message,
-    charts_import_failed_message, charts_import_success_message,
-    charts_load_metrics_failed_message, charts_load_namespaces_failed_message,
-    charts_loading_metrics_label, charts_panel_already_exists_message,
-    charts_persist_chart_for_panel_failed_message, charts_persist_import_chart_failed_message,
-    charts_persist_import_dashboard_failed_message,
-    charts_persist_metric_chart_for_panel_failed_message, charts_remote_parse_failed_message,
-    charts_rename_failed_message, charts_save_dashboard_failed_message,
+    charts_persist_chart_for_panel_failed_message, charts_rename_failed_message,
 };
 
 impl Workspace {
@@ -147,7 +141,6 @@ impl Workspace {
                 );
             }
             datatab_components::saved_chart::SavedChartSource::Query { .. }
-            | datatab_components::saved_chart::SavedChartSource::Metric { .. }
             | datatab_components::saved_chart::SavedChartSource::InstanceMetric { .. } => {
                 // Validate before allocating an entity — from_saved checks the source variant.
                 let validation = crate::ui::document::ChartDocument::validate_saved_source(&chart);
@@ -173,9 +166,9 @@ impl Workspace {
                               `open_collection_document` and returns"
                 )]
                 let doc = cx.new(|cx| {
-                    // from_saved is guaranteed Ok for Query and Metric sources (validated above).
+                    // from_saved is guaranteed Ok for Query and InstanceMetric sources (validated above).
                     crate::ui::document::ChartDocument::from_saved(&chart, app_state, window, cx)
-                        .expect("Query/Metric source validated before entity creation")
+                        .expect("Query/InstanceMetric source validated before entity creation")
                 });
 
                 let pane = crate::ui::document::ChartDocument::into_pane(doc, cx);
@@ -309,7 +302,7 @@ impl Workspace {
             use crate::ui::document::DashboardPanelSlot;
             use datatab_components::common::time_range::{TimeRange, TimeRangePanel};
 
-            // Build panel slots: Loaded when a Query/Metric-source chart exists,
+            // Build panel slots: Loaded when a Query/InstanceMetric-source chart exists,
             // Orphan otherwise. Grid position is carried on every slot so
             // the render can sort and size panels correctly.
             let panel_slots: Vec<DashboardPanelSlot> =
@@ -371,9 +364,6 @@ impl Workspace {
                                 if matches!(
                                 saved_chart.source,
                                 datatab_components::saved_chart::SavedChartSource::Query { .. }
-                                    | datatab_components::saved_chart::SavedChartSource::Metric {
-                                        ..
-                                    }
                                     | datatab_components::saved_chart::SavedChartSource::InstanceMetric {
                                         ..
                                     }
@@ -382,8 +372,8 @@ impl Workspace {
                                 let app_state_inner = app_state.clone();
                                 #[expect(
                                     clippy::expect_used,
-                                    reason = "the match guard above admits the Query, \
-                                              Metric and InstanceMetric sources, \
+                                    reason = "the match guard above admits the Query and \
+                                              InstanceMetric sources, \
                                               and `from_saved` returns `Err` only \
                                               for the Collection source (the \
                                               `Collection` arm of its `match \
@@ -398,7 +388,7 @@ impl Workspace {
                                         window,
                                         cx,
                                     )
-                                    .expect("Query/Metric/InstanceMetric source validated before entity creation");
+                                    .expect("Query/InstanceMetric source validated before entity creation");
                                     // Mark embedded so the chart's own chrome
                                     // (title/Run/Save segments + internal
                                     // toolbar row) is suppressed; the
@@ -442,504 +432,6 @@ impl Workspace {
                 shared_time_range,
                 dashboard.shared_time_range_preset,
                 dashboard.shared_refresh_policy,
-                false,
-                app_state.clone(),
-                cx,
-            )
-        });
-
-        let pane = crate::ui::document::DashboardDocument::into_pane(doc, cx);
-        self.tab_manager.update(cx, |mgr, cx| {
-            mgr.open(Tab::Pane(Box::new(pane)), cx);
-        });
-        self.set_focus(FocusTarget::Document, window, cx);
-    }
-
-    /// Runs the dashboard import flow after the user confirms JSON input.
-    ///
-    /// Calls `conn.dashboard_importer()?.import(&json)` to get `WidgetImportSpec`
-    /// records, creates one `SavedChart` per metric widget (multi-series), one
-    /// `DashboardPanel { kind: Divider }` per text widget, upserts a new
-    /// `Dashboard` and its panel set, then opens the dashboard in a new tab.
-    /// This method does not inspect `driver_id`.
-    pub(in crate::ui::views::workspace) fn run_dashboard_import(
-        &mut self,
-        json: String,
-        name: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        use datatab_components::chart::{
-            AxisKind, AxisSpec, BindingSpec, ChartKind, ChartSpec, YScale,
-        };
-        use datatab_components::saved_chart::{MetricSeries, SavedChart, SavedChartRefreshPolicy};
-        use datatab_ui_base::{Dashboard, DashboardPanel, DashboardPanelKind};
-
-        // Borrow app_state in a scoped block so the borrow ends before the update below.
-        let import_result: Result<(uuid::Uuid, Vec<datatab_core::WidgetImportSpec>), String> = {
-            let app_state = self.app_state.read(cx);
-
-            let Some(active) = app_state.active_connection() else {
-                return Toast::error(datatab_i18n::t!("charts.error.no_active_connection_import"))
-                    .meta_right(now_hms())
-                    .push(cx);
-            };
-
-            let profile_id = active.profile.id;
-
-            let importer = match active.connection.dashboard_importer() {
-                Some(i) => i,
-                None => {
-                    return Toast::error(datatab_i18n::t!("charts.error.import_unsupported"))
-                        .meta_right(now_hms())
-                        .push(cx);
-                }
-            };
-
-            match importer.import(&json) {
-                Ok(specs) => Ok((profile_id, specs)),
-                Err(e) => Err(charts_import_failed_message(e)),
-            }
-        };
-
-        let (profile_id, specs) = match import_result {
-            Ok(v) => v,
-            Err(e) => {
-                report_error(UserFacingError::new(ErrorKind::Driver, e), cx);
-                return;
-            }
-        };
-
-        // Build the dashboard domain object.
-        let now = chrono::Utc::now();
-        let dashboard_id = uuid::Uuid::new_v4();
-        let dashboard = Dashboard {
-            id: dashboard_id,
-            name: if name.trim().is_empty() {
-                datatab_i18n::t!("charts.default_import_name")
-            } else {
-                name
-            },
-            description: None,
-            profile_id: Some(profile_id),
-            shared_time_range_preset: None,
-            shared_refresh_policy: SavedChartRefreshPolicy::Off,
-            grid_columns: 12,
-            created_at: now,
-            updated_at: now,
-        };
-
-        // Convert each WidgetImportSpec to a SavedChart + DashboardPanel
-        // (metric widgets) or a divider-only DashboardPanel (text widgets).
-        //
-        // CloudWatch widgets natively live on a 24-column grid; DataTab dashboards
-        // use 12 columns, so widget `x`/`width` are halved (clamped to ≥1 col).
-        // Each widget becomes ONE panel — multi-series widgets persist all
-        // series inside a single SavedChart instead of subdividing the grid.
-        let mut charts: Vec<SavedChart> = Vec::new();
-        let mut panels: Vec<DashboardPanel> = Vec::with_capacity(specs.len());
-
-        for (widget_index, spec) in specs.iter().enumerate() {
-            let layout = spec.layout;
-            let scaled_col = layout.x / 2;
-            let scaled_width = (layout.width / 2).max(1);
-            let scaled_row = layout.y;
-            let scaled_height = layout.height.max(1);
-
-            match &spec.kind {
-                datatab_core::WidgetImportKind::Metric { view, series } => {
-                    let metric_series: Vec<MetricSeries> = series
-                        .iter()
-                        .map(|s| MetricSeries {
-                            namespace: s.namespace.clone(),
-                            metric_name: s.metric_name.clone(),
-                            dimensions: s.dimensions.clone(),
-                            period_seconds: s.period_seconds,
-                            statistic: s.statistic.clone(),
-                            region: s.region.clone(),
-                            label: s.label.clone(),
-                        })
-                        .collect();
-
-                    let chart_kind = match view {
-                        datatab_core::MetricView::SingleValue => ChartKind::Number,
-                        datatab_core::MetricView::StackedArea => ChartKind::Area,
-                        datatab_core::MetricView::TimeSeries => ChartKind::Line,
-                    };
-
-                    let placeholder_spec = ChartSpec {
-                        kind: chart_kind,
-                        x_axis: AxisSpec {
-                            column_index: 0,
-                            label: String::new(),
-                            kind: AxisKind::Time,
-                            unit: None,
-                        },
-                        series: Vec::new(),
-                        legend_visible: false,
-                        // Dashboard panels are small (~240 px wide); 500
-                        // LTTB points already saturate the pixel grid and
-                        // keep paint cheap when many panels are visible.
-                        decimation_threshold: 500,
-                        binding: BindingSpec::default(),
-                        track_source_indices: false,
-                        y_scale: YScale::Linear,
-                    };
-
-                    // CloudWatch widgets often omit `properties.title`. Fall
-                    // back to the first series' metric_name (joined when many
-                    // distinct metric_names share the panel) so the dashboard
-                    // header is never blank — the panel must always be
-                    // identifiable at a glance.
-                    let chart_name = if spec.title.trim().is_empty() {
-                        let mut names: Vec<&str> =
-                            series.iter().map(|s| s.metric_name.as_str()).collect();
-                        names.sort_unstable();
-                        names.dedup();
-                        names.join(", ")
-                    } else {
-                        spec.title.clone()
-                    };
-
-                    let chart = SavedChart::new_metric(
-                        chart_name,
-                        profile_id,
-                        metric_series,
-                        placeholder_spec,
-                        BindingSpec::default(),
-                    );
-
-                    let panel = DashboardPanel {
-                        dashboard_id,
-                        panel_index: widget_index as u32,
-                        kind: DashboardPanelKind::Chart {
-                            saved_chart_id: chart.id,
-                        },
-                        title_override: None,
-                        grid_row: scaled_row,
-                        grid_column: scaled_col,
-                        grid_width: scaled_width,
-                        grid_height: scaled_height,
-                    };
-
-                    charts.push(chart);
-                    panels.push(panel);
-                }
-                datatab_core::WidgetImportKind::TextDivider { markdown } => {
-                    panels.push(DashboardPanel {
-                        dashboard_id,
-                        panel_index: widget_index as u32,
-                        kind: DashboardPanelKind::Divider {
-                            markdown: markdown.clone(),
-                        },
-                        title_override: None,
-                        grid_row: scaled_row,
-                        grid_column: scaled_col,
-                        grid_width: scaled_width,
-                        grid_height: scaled_height,
-                    });
-                }
-            }
-        }
-
-        // Persist charts, dashboard, and panels. Collect the first storage
-        // failure so we can surface it to the user and record an audit event.
-        let persist_result: Result<(), (String, String)> =
-            self.app_state.update(cx, |state, _cx| {
-                for chart in &charts {
-                    if let Err(e) = state.saved_charts.upsert(chart.clone()) {
-                        state.record_storage_failure(
-                            datatab_core::observability::actions::CONFIG_CREATE,
-                            "saved_chart",
-                            chart.id.to_string(),
-                            charts_persist_import_chart_failed_message(&chart.name),
-                            e.to_string(),
-                        );
-                        return Err((chart.name.clone(), e.to_string()));
-                    }
-                }
-
-                if let Err(e) = state.dashboards.upsert_dashboard(dashboard.clone()) {
-                    state.record_storage_failure(
-                        datatab_core::observability::actions::CONFIG_CREATE,
-                        "dashboard",
-                        dashboard.id.to_string(),
-                        charts_persist_import_dashboard_failed_message(&dashboard.name),
-                        e.to_string(),
-                    );
-                    return Err((dashboard.name.clone(), e.to_string()));
-                }
-
-                if let Err(e) = state.dashboards.replace_panels(dashboard_id, panels) {
-                    state.record_storage_failure(
-                        datatab_core::observability::actions::CONFIG_UPDATE,
-                        "dashboard_panels",
-                        dashboard_id.to_string(),
-                        datatab_i18n::t!("charts.error.persist_import_panels_failed"),
-                        e.to_string(),
-                    );
-                    return Err((dashboard.name.clone(), e.to_string()));
-                }
-
-                Ok(())
-            });
-
-        if let Err((name, message)) = persist_result {
-            report_error(
-                UserFacingError::new(
-                    ErrorKind::Storage,
-                    charts_save_dashboard_failed_message(&name, &message),
-                ),
-                cx,
-            );
-            return;
-        }
-
-        Toast::info(charts_import_success_message(charts.len()))
-            .meta_right(now_hms())
-            .push(cx);
-
-        self.open_dashboard(dashboard_id, window, cx);
-    }
-
-    /// Open a dashboard fetched live from the connection's upstream source,
-    /// read-only. Nothing is persisted: the body is fetched via
-    /// `DashboardSource::fetch_dashboard`, parsed with the connection's
-    /// dashboard importer, and rendered into an ephemeral `DashboardDocument`.
-    /// Re-opening the same dashboard focuses the existing tab (id is derived
-    /// deterministically from the profile + name); it does not re-fetch while
-    /// the tab is open. This method does not inspect `driver_id`.
-    pub(in crate::ui::views::workspace) fn open_remote_dashboard(
-        &mut self,
-        profile_id: uuid::Uuid,
-        name: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        use crate::ui::document::DocumentKey;
-
-        // Deterministic id so re-opening the same upstream dashboard dedups to
-        // the open tab instead of stacking duplicates.
-        let dashboard_id = uuid::Uuid::new_v5(
-            &uuid::Uuid::NAMESPACE_OID,
-            format!("remote-dashboard:{profile_id}:{name}").as_bytes(),
-        );
-
-        let key = DocumentKey::Dashboard { dashboard_id };
-        if let Some(existing) = self.tab_manager.read(cx).find_by_key(&key, cx) {
-            self.tab_manager
-                .update(cx, |mgr, cx| mgr.activate(existing, cx));
-            self.set_focus(FocusTarget::Document, window, cx);
-            return;
-        }
-
-        let connection = match self
-            .app_state
-            .read(cx)
-            .connections()
-            .get(&profile_id)
-            .map(|c| c.connection.clone())
-        {
-            Some(c) => c,
-            None => {
-                return Toast::error(datatab_i18n::t!("charts.toast.connection_not_found"))
-                    .meta_right(now_hms())
-                    .push(cx);
-            }
-        };
-
-        let app_state = self.app_state.clone();
-        let name_for_fetch = name.clone();
-
-        // Fetch + parse off the foreground thread; both the source and the
-        // importer live on the connection, so the whole IO+parse runs here.
-        let background = cx.background_executor().spawn(async move {
-            let source = connection
-                .dashboard_source()
-                .ok_or_else(|| datatab_i18n::t!("charts.error.browsing_unsupported"))?;
-            let remote = source
-                .fetch_dashboard(&name_for_fetch)
-                .map_err(|e| e.to_string())?;
-
-            let importer = connection
-                .dashboard_importer()
-                .ok_or_else(|| datatab_i18n::t!("charts.error.parse_unsupported"))?;
-            importer
-                .import(&remote.body_json)
-                .map(|specs| (remote.body_json, specs))
-                .map_err(charts_remote_parse_failed_message)
-        });
-
-        cx.spawn_in(window, async move |this, cx| {
-            let result = background.await;
-            this.update_in(cx, |this, window, cx| {
-                let specs = match result {
-                    Ok((_body, specs)) => specs,
-                    Err(message) => {
-                        report_error(UserFacingError::new(ErrorKind::Network, message), cx);
-                        return;
-                    }
-                };
-
-                this.open_remote_dashboard_document(
-                    dashboard_id,
-                    name,
-                    profile_id,
-                    specs,
-                    app_state,
-                    window,
-                    cx,
-                );
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Build the ephemeral `DashboardDocument` from parsed widget specs and open
-    /// it. In-memory only — no `SavedChart`/`Dashboard`/panel rows are written.
-    #[allow(clippy::too_many_arguments)]
-    fn open_remote_dashboard_document(
-        &mut self,
-        dashboard_id: uuid::Uuid,
-        name: String,
-        profile_id: uuid::Uuid,
-        specs: Vec<datatab_core::WidgetImportSpec>,
-        app_state: Entity<datatab_ui_base::AppStateEntity>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        use crate::ui::document::dashboard::PanelGridPos;
-        use crate::ui::document::{ChartDocument, DashboardDocument, DashboardPanelSlot};
-        use datatab_components::chart::{
-            AxisKind, AxisSpec, BindingSpec, ChartKind, ChartSpec, YScale,
-        };
-        use datatab_components::common::time_range::{TimeRange, TimeRangePanel};
-        use datatab_components::saved_chart::{MetricSeries, SavedChart, SavedChartRefreshPolicy};
-
-        let doc = cx.new(|cx| {
-            let panel_slots: Vec<DashboardPanelSlot> = specs
-                .iter()
-                .map(|spec| {
-                    // CloudWatch widgets live on a 24-column grid; DataTab uses
-                    // 12, so x/width are halved (clamped to >= 1 col).
-                    let grid_pos = PanelGridPos {
-                        grid_row: spec.layout.y,
-                        grid_column: spec.layout.x / 2,
-                        grid_width: (spec.layout.width / 2).max(1),
-                        grid_height: spec.layout.height.max(1),
-                    };
-
-                    let series = match &spec.kind {
-                        datatab_core::WidgetImportKind::TextDivider { markdown } => {
-                            return DashboardPanelSlot::Divider {
-                                markdown: markdown.clone(),
-                                grid_pos,
-                            };
-                        }
-                        datatab_core::WidgetImportKind::Metric { series, .. } => series,
-                    };
-
-                    let view = match &spec.kind {
-                        datatab_core::WidgetImportKind::Metric { view, .. } => *view,
-                        datatab_core::WidgetImportKind::TextDivider { .. } => unreachable!(),
-                    };
-
-                    let metric_series: Vec<MetricSeries> = series
-                        .iter()
-                        .map(|s| MetricSeries {
-                            namespace: s.namespace.clone(),
-                            metric_name: s.metric_name.clone(),
-                            dimensions: s.dimensions.clone(),
-                            period_seconds: s.period_seconds,
-                            statistic: s.statistic.clone(),
-                            region: s.region.clone(),
-                            label: s.label.clone(),
-                        })
-                        .collect();
-
-                    let chart_kind = match view {
-                        datatab_core::MetricView::SingleValue => ChartKind::Number,
-                        datatab_core::MetricView::StackedArea => ChartKind::Area,
-                        datatab_core::MetricView::TimeSeries => ChartKind::Line,
-                    };
-
-                    let placeholder_spec = ChartSpec {
-                        kind: chart_kind,
-                        x_axis: AxisSpec {
-                            column_index: 0,
-                            label: String::new(),
-                            kind: AxisKind::Time,
-                            unit: None,
-                        },
-                        series: Vec::new(),
-                        legend_visible: false,
-                        decimation_threshold: 500,
-                        binding: BindingSpec::default(),
-                        track_source_indices: false,
-                        y_scale: YScale::Linear,
-                    };
-
-                    let chart_name = if spec.title.trim().is_empty() {
-                        let mut names: Vec<&str> =
-                            series.iter().map(|s| s.metric_name.as_str()).collect();
-                        names.sort_unstable();
-                        names.dedup();
-                        names.join(", ")
-                    } else {
-                        spec.title.clone()
-                    };
-
-                    let saved_chart = SavedChart::new_metric(
-                        chart_name,
-                        profile_id,
-                        metric_series,
-                        placeholder_spec,
-                        BindingSpec::default(),
-                    );
-
-                    let app_state_inner = app_state.clone();
-                    #[expect(
-                        clippy::expect_used,
-                        reason = "`saved_chart` was constructed by \
-                                  `SavedChart::new_metric` just above, so its \
-                                  source is the Metric variant, and `from_saved` \
-                                  returns `Err` only for the Collection source \
-                                  (the `Collection` arm of its `match \
-                                  &saved.source` in chart_document/mod.rs)"
-                    )]
-                    let panel_entity = cx.new(|cx| {
-                        let mut chart =
-                            ChartDocument::from_saved(&saved_chart, app_state_inner, window, cx)
-                                .expect("metric source is always valid for ChartDocument");
-                        chart.set_embedded(true, cx);
-                        chart
-                    });
-
-                    DashboardPanelSlot::Loaded {
-                        panel: panel_entity,
-                        grid_pos,
-                        title_override: None,
-                    }
-                })
-                .collect();
-
-            let shared_time_range = cx.new(|cx| {
-                TimeRangePanel::new(
-                    TimeRangePanel::preset_label(TimeRange::Last24Hours),
-                    Some(3),
-                    window,
-                    cx,
-                )
-            });
-
-            DashboardDocument::new(
-                dashboard_id,
-                name,
-                panel_slots,
-                shared_time_range,
-                None,
-                SavedChartRefreshPolicy::Off,
                 false,
                 app_state.clone(),
                 cx,
@@ -1041,21 +533,6 @@ impl Workspace {
                 );
             }
         }
-    }
-
-    /// Open the "Import Dashboard from JSON" modal scoped to the given profile.
-    ///
-    /// Opens the existing import modal. Full profile-scoping (pre-selecting the
-    /// profile in the modal) is Phase O.6 work.
-    pub(in crate::ui::views::workspace) fn import_dashboard_for_profile(
-        &mut self,
-        _profile_id: uuid::Uuid,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.modal_import_dashboard.update(cx, |modal, cx| {
-            modal.open(window, cx);
-        });
     }
 
     /// Open the rename modal for a dashboard.
@@ -1402,172 +879,17 @@ impl Workspace {
                 Vec::new()
             };
 
-        // Detect the metric-catalog capability synchronously (cheap — reads
-        // the driver metadata bitset). The actual namespace list is fetched
-        // off the foreground thread below so the modal opens immediately.
-        let (profile_id, has_metric_catalog, connection_for_catalog) =
-            if let Some(pid) = profile_id_opt {
-                let app_state = self.app_state.read(cx);
-                if let Some(connected) = app_state.connections().get(&pid) {
-                    let has = connected
-                        .connection
-                        .metadata()
-                        .capabilities
-                        .contains(DriverCapabilities::METRIC_CATALOG);
-                    let connection = has.then(|| connected.connection.clone());
-                    (pid, has, connection)
-                } else {
-                    (pid, false, None)
-                }
-            } else {
-                (uuid::Uuid::nil(), false, None)
-            };
-
-        // Open the picker right away with an empty namespace list and the
-        // loading flag set so the user sees feedback the moment they click
-        // Add. Previously the modal blocked on `list_namespaces()` for a few
-        // seconds with no indication that anything was happening.
         self.modal_add_panel.update(cx, |modal, cx| {
             modal.open(
                 AddPanelRequest {
                     dashboard_id,
-                    profile_id,
+                    profile_id: profile_id_opt.unwrap_or_else(uuid::Uuid::nil),
                     candidates,
-                    has_metric_catalog,
-                    metric_namespaces: Vec::new(),
-                    metric_namespaces_loading: has_metric_catalog,
                 },
                 window,
                 cx,
             );
         });
-
-        // Kick off the background namespace fetch and register a Tasks-panel
-        // entry so the user can see the work happening. The Arc<dyn
-        // Connection> is `Send + Sync`, so we can move it into the
-        // background_executor closure and call `metric_catalog()` from there.
-        if let Some(connection) = connection_for_catalog {
-            let task_id = self.app_state.update(cx, |state, _| {
-                let (task_id, _) = state.start_task_for_profile(
-                    datatab_core::TaskKind::LoadSchema,
-                    datatab_i18n::t!("charts.status.loading_namespaces"),
-                    Some(profile_id),
-                );
-                state.tasks_mut().mark_uncancellable(task_id);
-                task_id
-            });
-            let modal = self.modal_add_panel.clone();
-            let app_state = self.app_state.clone();
-
-            cx.spawn(async move |_this, cx| {
-                let result = cx
-                    .background_executor()
-                    .spawn(async move {
-                        match connection.metric_catalog() {
-                            Some(catalog) => catalog.list_namespaces(),
-                            None => Ok(Vec::new()),
-                        }
-                    })
-                    .await;
-
-                cx.update(|cx| match result {
-                    Ok(namespaces) => {
-                        app_state.update(cx, |state, _| state.complete_task(task_id));
-                        modal.update(cx, |m, cx| m.set_metric_namespaces(namespaces, cx));
-                    }
-                    Err(err) => {
-                        let msg = err.to_string();
-                        app_state.update(cx, |state, _| state.fail_task(task_id, msg.clone()));
-                        report_error(
-                            UserFacingError::new(
-                                ErrorKind::Network,
-                                charts_load_namespaces_failed_message(&msg),
-                            ),
-                            cx,
-                        );
-                        modal.update(cx, |m, cx| m.set_metric_namespaces(Vec::new(), cx));
-                    }
-                });
-            })
-            .detach();
-        }
-    }
-
-    /// Fetch metrics for a namespace and push them back into the modal.
-    ///
-    /// Runs on the background executor with a Tasks-panel entry so the user
-    /// sees the request progressing. Previously this call was synchronous on
-    /// the foreground thread and blocked the UI for several seconds.
-    pub(in crate::ui::views::workspace) fn on_request_metrics_for_namespace(
-        &mut self,
-        modal: gpui::Entity<datatab_ui_base::modals::ModalAddPanelPicker>,
-        ev: datatab_ui_base::modals::RequestMetricsForNamespace,
-        cx: &mut Context<Self>,
-    ) {
-        let connection = self
-            .app_state
-            .read(cx)
-            .connections()
-            .get(&ev.profile_id)
-            .map(|c| c.connection.clone());
-
-        let Some(connection) = connection else {
-            modal.update(cx, |m, cx| {
-                m.set_metrics_for_namespace(ev.namespace.clone(), Vec::new(), cx);
-            });
-            return;
-        };
-
-        let task_id = self.app_state.update(cx, |state, _| {
-            let (task_id, _) = state.start_task_for_profile(
-                datatab_core::TaskKind::LoadSchema,
-                charts_loading_metrics_label(&ev.namespace),
-                Some(ev.profile_id),
-            );
-            state.tasks_mut().mark_uncancellable(task_id);
-            task_id
-        });
-        let app_state = self.app_state.clone();
-        let namespace = ev.namespace.clone();
-
-        cx.spawn(async move |_this, cx| {
-            let namespace_for_bg = namespace.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    match connection.metric_catalog() {
-                        Some(catalog) => catalog
-                            .list_metrics(&namespace_for_bg, None)
-                            .map(|page| page.metrics),
-                        None => Ok(Vec::new()),
-                    }
-                })
-                .await;
-
-            cx.update(|cx| match result {
-                Ok(metrics) => {
-                    app_state.update(cx, |state, _| state.complete_task(task_id));
-                    modal.update(cx, |m, cx| {
-                        m.set_metrics_for_namespace(namespace, metrics, cx);
-                    });
-                }
-                Err(err) => {
-                    let msg = err.to_string();
-                    app_state.update(cx, |state, _| state.fail_task(task_id, msg.clone()));
-                    report_error(
-                        UserFacingError::new(
-                            ErrorKind::Network,
-                            charts_load_metrics_failed_message(&msg),
-                        ),
-                        cx,
-                    );
-                    modal.update(cx, |m, cx| {
-                        m.set_metrics_for_namespace(namespace, Vec::new(), cx);
-                    });
-                }
-            });
-        })
-        .detach();
     }
 
     /// Build a new SavedChart from a user-typed query, persist it, and append
@@ -1647,149 +969,6 @@ impl Workspace {
         }
     }
 
-    /// Build a new SavedChart from a metric selection, persist it, and append
-    /// it as a panel to the target dashboard.
-    #[allow(clippy::too_many_arguments)]
-    pub(in crate::ui::views::workspace) fn on_create_panel_from_metric(
-        &mut self,
-        dashboard_id: uuid::Uuid,
-        profile_id: uuid::Uuid,
-        name: String,
-        namespace: String,
-        metric_name: String,
-        dimensions: Vec<(String, String)>,
-        period_seconds: u32,
-        statistic: String,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        use datatab_components::chart::{
-            AxisKind, AxisSpec, BindingSpec, ChartKind, ChartSpec, YScale,
-        };
-        use datatab_components::saved_chart::{SavedChart, SavedChartSource};
-        use datatab_ui_base::DashboardPanelDraft;
-
-        // Reject the request if this dashboard already has a panel pointing
-        // to a chart with the same metric identity. Each on_create call mints
-        // a fresh saved_chart UUID, so without this guard a second "Create
-        // panel" for the same metric produces a visually duplicate panel
-        // (same namespace + metric + dimensions + period + statistic =
-        // identical data, different UUID).
-        let already_present = {
-            let app_state = self.app_state.read(cx);
-            let existing_panel_charts: Vec<uuid::Uuid> = app_state
-                .dashboards
-                .panels_for_dashboard(dashboard_id)
-                .iter()
-                .filter_map(|p| p.saved_chart_id())
-                .collect();
-            app_state.saved_charts.all_charts().iter().any(|chart| {
-                if !existing_panel_charts.contains(&chart.id) {
-                    return false;
-                }
-                // A single-series metric chart created via this action collides
-                // with another single-series chart whose first series carries
-                // the same (namespace, metric_name, dimensions, period, stat).
-                // Multi-series charts (only ever produced via dashboard import)
-                // never collide with a single-metric create.
-                match &chart.source {
-                    SavedChartSource::Metric { series } if series.len() == 1 => {
-                        #[expect(
-                            clippy::indexing_slicing,
-                            reason = "the match guard `series.len() == 1` bounds the \
-                                      index: the slice holds one element, so \
-                                      index 0 is in bounds"
-                        )]
-                        let s = &series[0];
-                        s.namespace == namespace
-                            && s.metric_name == metric_name
-                            && s.dimensions == dimensions
-                            && s.period_seconds == period_seconds
-                            && s.statistic == statistic
-                    }
-                    _ => false,
-                }
-            })
-        };
-
-        if already_present {
-            Toast::error(charts_panel_already_exists_message(
-                &namespace,
-                &metric_name,
-            ))
-            .meta_right(now_hms())
-            .push(cx);
-            return;
-        }
-
-        let placeholder_spec = ChartSpec {
-            kind: ChartKind::Line,
-            x_axis: AxisSpec {
-                column_index: 0,
-                label: String::new(),
-                kind: AxisKind::Time,
-                unit: None,
-            },
-            series: Vec::new(),
-            legend_visible: false,
-            decimation_threshold: 10_000,
-            binding: BindingSpec::default(),
-            track_source_indices: false,
-            y_scale: YScale::Linear,
-        };
-
-        let chart = SavedChart::new_metric(
-            name.clone(),
-            profile_id,
-            vec![datatab_components::saved_chart::MetricSeries {
-                namespace,
-                metric_name,
-                dimensions,
-                period_seconds,
-                statistic,
-                region: None,
-                label: None,
-            }],
-            placeholder_spec,
-            BindingSpec::default(),
-        );
-        let chart_id = chart.id;
-
-        let append_result = self.app_state.update(cx, |state, _cx| {
-            if let Err(e) = state.saved_charts.upsert(chart) {
-                state.record_storage_failure(
-                    datatab_core::observability::actions::CONFIG_CREATE,
-                    "saved_chart",
-                    chart_id.to_string(),
-                    charts_persist_metric_chart_for_panel_failed_message(&name),
-                    e.to_string(),
-                );
-                return Err(e);
-            }
-            state.dashboards.append_panels(
-                dashboard_id,
-                vec![DashboardPanelDraft::Chart {
-                    saved_chart_id: chart_id,
-                    layout: None,
-                }],
-            )
-        });
-
-        match append_result {
-            Ok(()) => {
-                self.app_state.update(cx, |_state, cx| {
-                    cx.emit(AppStateChanged);
-                });
-            }
-            Err(e) => {
-                report_error(
-                    UserFacingError::new(ErrorKind::Storage, charts_add_panel_failed_message(e)),
-                    cx,
-                );
-            }
-        }
-    }
-
     /// Called when `ModalAddPanelPicker` emits `Confirmed`.
     pub(in crate::ui::views::workspace) fn on_add_panels_confirmed(
         &mut self,
@@ -1831,39 +1010,20 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     const CHARTS_CATALOG_KEYS: &[&str] = &[
-        "charts.default_import_name",
         "charts.orphaned_profile_label",
-        "charts.status.loading_namespaces",
-        "charts.status.loading_metrics",
         "charts.toast.chart_not_found",
         "charts.toast.dashboard_not_found",
-        "charts.toast.connection_not_found",
         "charts.toast.add_profile_first",
-        "charts.toast.import_success",
-        "charts.toast.panel_already_exists",
         "charts.error.cannot_open_chart",
         "charts.error.rescale_failed",
-        "charts.error.no_active_connection_import",
-        "charts.error.import_unsupported",
-        "charts.error.import_failed",
-        "charts.error.persist_import_chart_failed",
-        "charts.error.persist_import_dashboard_failed",
-        "charts.error.persist_import_panels_failed",
-        "charts.error.save_dashboard_failed",
-        "charts.error.browsing_unsupported",
-        "charts.error.parse_unsupported",
-        "charts.error.remote_parse_failed",
         "charts.error.create_dashboard_failed",
         "charts.error.delete_dashboard_failed",
         "charts.error.duplicate_dashboard_failed",
         "charts.error.rename_failed",
         "charts.error.delete_chart_failed",
         "charts.error.duplicate_chart_failed",
-        "charts.error.load_namespaces_failed",
-        "charts.error.load_metrics_failed",
         "charts.error.persist_chart_for_panel_failed",
         "charts.error.add_panel_failed",
-        "charts.error.persist_metric_chart_for_panel_failed",
         "charts.error.add_panels_failed",
     ];
 

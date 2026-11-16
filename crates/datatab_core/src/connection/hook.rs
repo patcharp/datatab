@@ -528,8 +528,6 @@ fn profile_config_context(config: &DbConfig) -> (Option<String>, Option<u16>, Op
             Some(*port),
             database.map(|db| db.to_string()),
         ),
-        DbConfig::DynamoDB { region, table, .. } => (Some(region.clone()), None, table.clone()),
-        DbConfig::CloudWatchLogs { region, .. } => (Some(region.clone()), None, None),
         DbConfig::InfluxDB {
             url,
             default_bucket,
@@ -551,16 +549,6 @@ fn profile_config_context(config: &DbConfig) -> (Option<String>, Option<u16>, Op
             database,
             ..
         } => (Some(host.clone()), Some(*port), Some(database.clone())),
-        DbConfig::S3 {
-            region, endpoint, ..
-        }
-        | DbConfig::AwsSecrets {
-            region, endpoint, ..
-        } => (
-            endpoint.clone().or_else(|| Some(region.clone())),
-            None,
-            None,
-        ),
         DbConfig::External { values, .. } => {
             let host = values.get("host").cloned();
             let port = values

@@ -49,6 +49,7 @@ impl PgInstanceCatalog {
                 display_name: "Transactions / sec".to_string(),
                 group: "Throughput".to_string(),
                 unit: InstanceMetricUnit::PerSecond,
+                kind: datatab_core::InstanceMetricKind::Counter,
                 description: Some(
                     "Total transaction commits and rollbacks per second (all databases)."
                         .to_string(),
@@ -60,6 +61,7 @@ impl PgInstanceCatalog {
                 display_name: "Buffer cache hit ratio".to_string(),
                 group: "Cache".to_string(),
                 unit: InstanceMetricUnit::Percent,
+                kind: datatab_core::InstanceMetricKind::Gauge,
                 description: Some(
                     "Fraction of block reads served from the shared buffer cache (0–100)."
                         .to_string(),
@@ -71,6 +73,7 @@ impl PgInstanceCatalog {
                 display_name: "Active connections".to_string(),
                 group: "Connections".to_string(),
                 unit: InstanceMetricUnit::Count,
+                kind: datatab_core::InstanceMetricKind::Gauge,
                 description: Some(
                     "Number of backends currently in an active query state.".to_string(),
                 ),
@@ -81,6 +84,7 @@ impl PgInstanceCatalog {
                 display_name: "Idle connections".to_string(),
                 group: "Connections".to_string(),
                 unit: InstanceMetricUnit::Count,
+                kind: datatab_core::InstanceMetricKind::Gauge,
                 description: Some(
                     "Number of backends connected but not executing a query.".to_string(),
                 ),
@@ -88,11 +92,12 @@ impl PgInstanceCatalog {
             },
             InstanceMetricDef {
                 id: "pg.blocks_read".to_string(),
-                display_name: "Disk block reads".to_string(),
+                display_name: "Disk block reads / sec".to_string(),
                 group: "I/O".to_string(),
-                unit: InstanceMetricUnit::Count,
+                unit: InstanceMetricUnit::PerSecond,
+                kind: datatab_core::InstanceMetricKind::Counter,
                 description: Some(
-                    "Cumulative blocks read from disk (not cache) across all user tables."
+                    "Blocks read from disk (not cache) across all user tables, per second."
                         .to_string(),
                 ),
                 default_refresh_secs: 30,
@@ -129,6 +134,7 @@ impl PgInstanceCatalog {
                 display_name: "Mean query exec time (ms)".to_string(),
                 group: "Queries".to_string(),
                 unit: InstanceMetricUnit::Milliseconds,
+                kind: datatab_core::InstanceMetricKind::Gauge,
                 description: Some(
                     "Average execution time across all tracked queries (pg_stat_statements)."
                         .to_string(),
@@ -386,6 +392,13 @@ fn float_or(row: &postgres::Row, idx: usize, fallback: f64) -> Result<f64, DbErr
 
 #[async_trait]
 impl InstanceCatalog for PgInstanceCatalog {
+    fn metric_kind(&self, metric_id: &str) -> Option<datatab_core::InstanceMetricKind> {
+        Self::metrics_with_probes(true, true)
+            .into_iter()
+            .find(|metric| metric.id == metric_id)
+            .map(|metric| metric.kind)
+    }
+
     async fn list_metrics(&self) -> Result<Vec<InstanceMetricDef>, DbError> {
         let mut client = self.client.lock().map_err(|_| {
             DbError::QueryFailed("postgres client mutex poisoned".to_string().into())
@@ -584,16 +597,24 @@ fn fetch_stat_statements_mean_exec(client: &mut Client) -> Result<QueryResult, D
     ))
 }
 
-fn fetch_activity_snapshot(client: &mut Client) -> Result<QueryResult, DbError> {
-    let sql = "SELECT pid::text, usename, application_name, client_addr::text, \
+/// `pg_stat_activity` snapshot behind the `pg.activity` inspector.
+///
+/// The age is measured from `clock_timestamp()`, the wall clock at the moment
+/// the expression runs, and not from `now()`, which returns the transaction
+/// start: `now()` predates `query_start` for the statement that runs this
+/// query, so the inspector's own session reported a negative age.
+const ACTIVITY_SNAPSHOT_QUERY: &str = "SELECT pid::text, usename, application_name, client_addr::text, \
                       state, wait_event_type, wait_event, \
-                      EXTRACT(EPOCH FROM (now() - query_start))::float8 AS query_age_secs, \
+                      EXTRACT(EPOCH FROM (clock_timestamp() - query_start))::float8 AS query_age_secs, \
                       LEFT(query, 200) AS query_preview \
                FROM pg_stat_activity \
                WHERE state IS NOT NULL \
                ORDER BY query_start NULLS LAST";
 
-    let rows = client.query(sql, &[]).map_err(pg_error)?;
+fn fetch_activity_snapshot(client: &mut Client) -> Result<QueryResult, DbError> {
+    let rows = client
+        .query(ACTIVITY_SNAPSHOT_QUERY, &[])
+        .map_err(pg_error)?;
 
     let columns = vec![
         text_col("pid"),
@@ -862,6 +883,38 @@ pub(crate) fn probe_postgres_write_privilege(client: &mut Client) -> WritePrivil
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counter_metric_kinds() {
+        let counters: Vec<_> = PgInstanceCatalog::static_metrics()
+            .into_iter()
+            .filter(|metric| metric.kind == datatab_core::InstanceMetricKind::Counter)
+            .collect();
+
+        let actual: Vec<&str> = counters.iter().map(|metric| metric.id.as_str()).collect();
+        assert_eq!(actual, vec!["pg.tps", "pg.blocks_read"]);
+
+        for metric in counters {
+            assert_eq!(
+                metric.unit,
+                InstanceMetricUnit::PerSecond,
+                "counter {:?} must be charted per second",
+                metric.id
+            );
+        }
+    }
+
+    #[test]
+    fn activity_snapshot_measures_age_from_the_statement_clock() {
+        assert!(
+            ACTIVITY_SNAPSHOT_QUERY.contains("clock_timestamp()"),
+            "pg.activity must age queries from clock_timestamp(): {ACTIVITY_SNAPSHOT_QUERY}"
+        );
+        assert!(
+            !ACTIVITY_SNAPSHOT_QUERY.contains("now()"),
+            "now() is the transaction start, which predates query_start: {ACTIVITY_SNAPSHOT_QUERY}"
+        );
+    }
 
     /// BF10: when pg_monitor probe returns false, pg.tps is absent from the
     /// metric list (it requires cluster-wide pg_stat_database read access).

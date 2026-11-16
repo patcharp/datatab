@@ -678,20 +678,9 @@ impl FormFocus {
 
         match mode {
             AccessTabMode::Direct => match self {
-                AccessMethod => SsmAuthProfile,
-                SsmAuthProfile => SsmAuthManage,
-                SsmAuthManage | SsmAuthLogin | SsmAuthRefresh => TestConnection,
-                TestConnection => Save,
-                Save => AccessMethod,
-                _ => AccessMethod,
-            },
-            AccessTabMode::ManagedSsm => match self {
-                AccessMethod => SsmInstanceIdValueSource,
-                SsmInstanceIdValueSource | SsmInstanceId => SsmRegionValueSource,
-                SsmRegionValueSource | SsmRegion => SsmRemotePortValueSource,
-                SsmRemotePortValueSource | SsmRemotePort => SsmAuthProfile,
-                SsmAuthProfile => SsmAuthManage,
-                SsmAuthManage | SsmAuthLogin | SsmAuthRefresh => TestConnection,
+                AccessMethod => AccessAuthProfile,
+                AccessAuthProfile => AccessAuthManage,
+                AccessAuthManage | AccessAuthLogin | AccessAuthRefresh => TestConnection,
                 TestConnection => Save,
                 Save => AccessMethod,
                 _ => AccessMethod,
@@ -718,20 +707,9 @@ impl FormFocus {
         match mode {
             AccessTabMode::Direct => match self {
                 AccessMethod => Save,
-                SsmAuthProfile => AccessMethod,
-                SsmAuthManage | SsmAuthLogin | SsmAuthRefresh => SsmAuthProfile,
-                TestConnection => SsmAuthManage,
-                Save => TestConnection,
-                _ => Save,
-            },
-            AccessTabMode::ManagedSsm => match self {
-                AccessMethod => Save,
-                SsmInstanceIdValueSource | SsmInstanceId => AccessMethod,
-                SsmRegionValueSource | SsmRegion => SsmInstanceIdValueSource,
-                SsmRemotePortValueSource | SsmRemotePort => SsmRegionValueSource,
-                SsmAuthProfile => SsmRemotePortValueSource,
-                SsmAuthManage | SsmAuthLogin | SsmAuthRefresh => SsmAuthProfile,
-                TestConnection => SsmAuthManage,
+                AccessAuthProfile => AccessMethod,
+                AccessAuthManage | AccessAuthLogin | AccessAuthRefresh => AccessAuthProfile,
+                TestConnection => AccessAuthManage,
                 Save => TestConnection,
                 _ => Save,
             },
@@ -755,16 +733,6 @@ impl FormFocus {
         use FormFocus::*;
 
         match mode {
-            AccessTabMode::ManagedSsm => match self {
-                SsmInstanceId => SsmInstanceIdValueSource,
-                SsmRegion => SsmRegionValueSource,
-                SsmRemotePort => SsmRemotePortValueSource,
-                SsmAuthManage => SsmAuthProfile,
-                SsmAuthLogin => SsmAuthManage,
-                SsmAuthRefresh => SsmAuthLogin,
-                Save => TestConnection,
-                other => other,
-            },
             AccessTabMode::Ssh => self
                 .normalize_access_focus()
                 .left_ssh(ssh_state)
@@ -774,9 +742,9 @@ impl FormFocus {
                 .left_proxy(proxy_state)
                 .denormalize_access_focus(),
             AccessTabMode::Direct => match self {
-                SsmAuthManage => SsmAuthProfile,
-                SsmAuthLogin => SsmAuthManage,
-                SsmAuthRefresh => SsmAuthLogin,
+                AccessAuthManage => AccessAuthProfile,
+                AccessAuthLogin => AccessAuthManage,
+                AccessAuthRefresh => AccessAuthLogin,
                 Save => TestConnection,
                 other => other,
             },
@@ -792,16 +760,6 @@ impl FormFocus {
         use FormFocus::*;
 
         match mode {
-            AccessTabMode::ManagedSsm => match self {
-                SsmInstanceIdValueSource => SsmInstanceId,
-                SsmRegionValueSource => SsmRegion,
-                SsmRemotePortValueSource => SsmRemotePort,
-                SsmAuthProfile => SsmAuthManage,
-                SsmAuthManage => SsmAuthLogin,
-                SsmAuthLogin => SsmAuthRefresh,
-                TestConnection => Save,
-                other => other,
-            },
             AccessTabMode::Ssh => self
                 .normalize_access_focus()
                 .right_ssh(ssh_state)
@@ -811,9 +769,9 @@ impl FormFocus {
                 .right_proxy(proxy_state)
                 .denormalize_access_focus(),
             AccessTabMode::Direct => match self {
-                SsmAuthProfile => SsmAuthManage,
-                SsmAuthManage => SsmAuthLogin,
-                SsmAuthLogin => SsmAuthRefresh,
+                AccessAuthProfile => AccessAuthManage,
+                AccessAuthManage => AccessAuthLogin,
+                AccessAuthLogin => AccessAuthRefresh,
                 TestConnection => Save,
                 other => other,
             },
@@ -1118,12 +1076,6 @@ impl ConnectionManagerWindow {
             return true;
         }
 
-        if self.access.ssm_auth_profile_dropdown.read(cx).is_open()
-            && self.handle_ssm_auth_profile_dropdown_command(command, cx)
-        {
-            return true;
-        }
-
         if self.handle_focused_value_source_dropdown_command(command, cx) {
             return true;
         }
@@ -1340,64 +1292,6 @@ impl ConnectionManagerWindow {
         }
     }
 
-    fn handle_ssm_auth_profile_dropdown_command(
-        &mut self,
-        command: Command,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        match command {
-            Command::SelectNext => {
-                self.access
-                    .ssm_auth_profile_dropdown
-                    .update(cx, |dropdown, cx| {
-                        dropdown.select_next_item(cx);
-                    });
-                true
-            }
-            Command::SelectPrev => {
-                self.access
-                    .ssm_auth_profile_dropdown
-                    .update(cx, |dropdown, cx| {
-                        dropdown.select_prev_item(cx);
-                    });
-                true
-            }
-            Command::PageDown => {
-                self.access
-                    .ssm_auth_profile_dropdown
-                    .update(cx, |dropdown, cx| {
-                        dropdown.select_next_page(cx);
-                    });
-                true
-            }
-            Command::PageUp => {
-                self.access
-                    .ssm_auth_profile_dropdown
-                    .update(cx, |dropdown, cx| {
-                        dropdown.select_prev_page(cx);
-                    });
-                true
-            }
-            Command::Execute => {
-                self.access
-                    .ssm_auth_profile_dropdown
-                    .update(cx, |dropdown, cx| {
-                        dropdown.accept_selection(cx);
-                    });
-                true
-            }
-            Command::Cancel => {
-                self.access
-                    .ssm_auth_profile_dropdown
-                    .update(cx, |dropdown, cx| {
-                        dropdown.close(cx);
-                    });
-                true
-            }
-            _ => false,
-        }
-    }
-
     fn focused_value_source_selector(
         &self,
     ) -> Option<&Entity<datatab_components::components::value_source_selector::ValueSourceSelector>>
@@ -1409,9 +1303,6 @@ impl ConnectionManagerWindow {
             DatabaseValueSource => Some(&self.form.database_value_source_selector),
             UserValueSource => Some(&self.form.user_value_source_selector),
             PasswordValueSource => Some(&self.form.password_value_source_selector),
-            SsmInstanceIdValueSource => Some(&self.access.ssm_instance_id_value_source_selector),
-            SsmRegionValueSource => Some(&self.access.ssm_region_value_source_selector),
-            SsmRemotePortValueSource => Some(&self.access.ssm_remote_port_value_source_selector),
             _ => None,
         }
     }
@@ -1657,9 +1548,6 @@ impl ConnectionManagerWindow {
             &self.access.input_ssh_key_path,
             &self.access.input_ssh_key_passphrase,
             &self.access.input_ssh_password,
-            &self.access.input_ssm_instance_id,
-            &self.access.input_ssm_region,
-            &self.access.input_ssm_remote_port,
             &self.settings_tab.conn_pre_hook_extra_input,
             &self.settings_tab.conn_post_hook_extra_input,
             &self.settings_tab.conn_pre_disconnect_hook_extra_input,
@@ -1749,7 +1637,7 @@ impl ConnectionManagerWindow {
         }
     }
 
-    fn ssm_auth_login_enabled(&self, cx: &Context<Self>) -> bool {
+    fn access_auth_login_enabled(&self, cx: &Context<Self>) -> bool {
         !self.auth_profile.auth_profile_login_in_progress
             && self.selected_auth_profile_needs_login(cx)
     }
@@ -1782,12 +1670,11 @@ impl ConnectionManagerWindow {
                 }
             }
             ActiveTab::Access => {
-                if (self.access.access_tab_mode == AccessTabMode::ManagedSsm
-                    || self.access.access_tab_mode == AccessTabMode::Direct)
-                    && !self.ssm_auth_login_enabled(cx)
-                    && next_focus == SsmAuthLogin
+                if self.access.access_tab_mode == AccessTabMode::Direct
+                    && !self.access_auth_login_enabled(cx)
+                    && next_focus == AccessAuthLogin
                 {
-                    next_focus = SsmAuthManage;
+                    next_focus = AccessAuthManage;
                 }
             }
             ActiveTab::Settings | ActiveTab::Mcp => {}
@@ -1818,19 +1705,8 @@ impl ConnectionManagerWindow {
             ActiveTab::Access => match self.access.access_tab_mode {
                 AccessTabMode::Direct => match self.form_focus {
                     AccessMethod => 0,
-                    SsmAuthProfile => 1,
-                    SsmAuthManage | SsmAuthLogin | SsmAuthRefresh => 2,
-                    _ => 3,
-                },
-                AccessTabMode::ManagedSsm => match self.form_focus {
-                    AccessMethod => 0,
-                    SsmInstanceIdValueSource
-                    | SsmInstanceId
-                    | SsmRegionValueSource
-                    | SsmRegion
-                    | SsmRemotePortValueSource
-                    | SsmRemotePort => 1,
-                    SsmAuthProfile | SsmAuthManage | SsmAuthLogin | SsmAuthRefresh => 2,
+                    AccessAuthProfile => 1,
+                    AccessAuthManage | AccessAuthLogin | AccessAuthRefresh => 2,
                     _ => 3,
                 },
                 AccessTabMode::Ssh => {
@@ -2126,12 +2002,11 @@ impl ConnectionManagerWindow {
         };
 
         if self.active_tab == ActiveTab::Access
-            && (self.access.access_tab_mode == AccessTabMode::ManagedSsm
-                || self.access.access_tab_mode == AccessTabMode::Direct)
-            && self.form_focus == FormFocus::SsmAuthLogin
-            && !self.ssm_auth_login_enabled(cx)
+            && self.access.access_tab_mode == AccessTabMode::Direct
+            && self.form_focus == FormFocus::AccessAuthLogin
+            && !self.access_auth_login_enabled(cx)
         {
-            self.form_focus = FormFocus::SsmAuthManage;
+            self.form_focus = FormFocus::AccessAuthManage;
         }
 
         self.normalize_focus_for_state(cx);
@@ -2155,12 +2030,11 @@ impl ConnectionManagerWindow {
         };
 
         if self.active_tab == ActiveTab::Access
-            && (self.access.access_tab_mode == AccessTabMode::ManagedSsm
-                || self.access.access_tab_mode == AccessTabMode::Direct)
-            && self.form_focus == FormFocus::SsmAuthLogin
-            && !self.ssm_auth_login_enabled(cx)
+            && self.access.access_tab_mode == AccessTabMode::Direct
+            && self.form_focus == FormFocus::AccessAuthLogin
+            && !self.access_auth_login_enabled(cx)
         {
-            self.form_focus = FormFocus::SsmAuthRefresh;
+            self.form_focus = FormFocus::AccessAuthRefresh;
         }
 
         self.normalize_focus_for_state(cx);
@@ -2326,52 +2200,7 @@ impl ConnectionManagerWindow {
                     state.focus(window, cx);
                 });
             }
-            FormFocus::SsmInstanceId => {
-                self.edit_state = EditState::Editing;
-                self.access.input_ssm_instance_id.update(cx, |state, cx| {
-                    state.focus(window, cx);
-                });
-            }
-
-            FormFocus::SsmInstanceIdValueSource => {
-                self.access
-                    .ssm_instance_id_value_source_selector
-                    .update(cx, |selector, cx| {
-                        selector.open_source_dropdown(cx);
-                    });
-            }
-
-            FormFocus::SsmRegion => {
-                self.edit_state = EditState::Editing;
-                self.access.input_ssm_region.update(cx, |state, cx| {
-                    state.focus(window, cx);
-                });
-            }
-
-            FormFocus::SsmRegionValueSource => {
-                self.access
-                    .ssm_region_value_source_selector
-                    .update(cx, |selector, cx| {
-                        selector.open_source_dropdown(cx);
-                    });
-            }
-
-            FormFocus::SsmRemotePort => {
-                self.edit_state = EditState::Editing;
-                self.access.input_ssm_remote_port.update(cx, |state, cx| {
-                    state.focus(window, cx);
-                });
-            }
-
-            FormFocus::SsmRemotePortValueSource => {
-                self.access
-                    .ssm_remote_port_value_source_selector
-                    .update(cx, |selector, cx| {
-                        selector.open_source_dropdown(cx);
-                    });
-            }
-
-            FormFocus::SsmAuthProfile => {
+            FormFocus::AccessAuthProfile => {
                 self.auth_profile
                     .auth_profile_dropdown
                     .update(cx, |dropdown, cx| {
@@ -2379,11 +2208,11 @@ impl ConnectionManagerWindow {
                     });
             }
 
-            FormFocus::SsmAuthManage => {
+            FormFocus::AccessAuthManage => {
                 self.open_auth_profiles_settings(cx);
             }
 
-            FormFocus::SsmAuthLogin => {
+            FormFocus::AccessAuthLogin => {
                 if !self.auth_profile.auth_profile_login_in_progress
                     && self.selected_auth_profile_needs_login(cx)
                 {
@@ -2391,7 +2220,7 @@ impl ConnectionManagerWindow {
                 }
             }
 
-            FormFocus::SsmAuthRefresh => {
+            FormFocus::AccessAuthRefresh => {
                 self.refresh_auth_profile_statuses(cx);
             }
 
@@ -2977,97 +2806,6 @@ mod tests {
         );
     }
 
-    // --- Managed SSM access mode ---
-
-    #[test]
-    fn managed_ssm_vertical_flow_uses_selector_then_input_rows() {
-        let ssh_state = ssh_disabled();
-        let proxy_state = proxy_state(false, false);
-
-        let mut focus = FormFocus::AccessMethod;
-        focus = focus.down_access(AccessTabMode::ManagedSsm, ssh_state, proxy_state);
-        assert_eq!(focus, FormFocus::SsmInstanceIdValueSource);
-
-        focus = focus.down_access(AccessTabMode::ManagedSsm, ssh_state, proxy_state);
-        assert_eq!(focus, FormFocus::SsmRegionValueSource);
-
-        focus = focus.down_access(AccessTabMode::ManagedSsm, ssh_state, proxy_state);
-        assert_eq!(focus, FormFocus::SsmRemotePortValueSource);
-
-        focus = focus.down_access(AccessTabMode::ManagedSsm, ssh_state, proxy_state);
-        assert_eq!(focus, FormFocus::SsmAuthProfile);
-
-        focus = focus.down_access(AccessTabMode::ManagedSsm, ssh_state, proxy_state);
-        assert_eq!(focus, FormFocus::SsmAuthManage);
-
-        focus = focus.down_access(AccessTabMode::ManagedSsm, ssh_state, proxy_state);
-        assert_eq!(focus, FormFocus::TestConnection);
-    }
-
-    #[test]
-    fn managed_ssm_horizontal_flow_moves_selector_and_input() {
-        let ssh_state = ssh_disabled();
-        let proxy_state = proxy_state(false, false);
-
-        assert_eq!(
-            FormFocus::SsmInstanceIdValueSource.right_access(
-                AccessTabMode::ManagedSsm,
-                ssh_state,
-                proxy_state,
-            ),
-            FormFocus::SsmInstanceId
-        );
-
-        assert_eq!(
-            FormFocus::SsmRegion.left_access(AccessTabMode::ManagedSsm, ssh_state, proxy_state,),
-            FormFocus::SsmRegionValueSource
-        );
-    }
-
-    #[test]
-    fn managed_ssm_horizontal_flow_moves_across_auth_actions() {
-        let ssh_state = ssh_disabled();
-        let proxy_state = proxy_state(false, false);
-
-        assert_eq!(
-            FormFocus::SsmAuthProfile.right_access(
-                AccessTabMode::ManagedSsm,
-                ssh_state,
-                proxy_state,
-            ),
-            FormFocus::SsmAuthManage
-        );
-
-        assert_eq!(
-            FormFocus::SsmAuthManage.right_access(
-                AccessTabMode::ManagedSsm,
-                ssh_state,
-                proxy_state,
-            ),
-            FormFocus::SsmAuthLogin
-        );
-
-        assert_eq!(
-            FormFocus::SsmAuthRefresh.left_access(
-                AccessTabMode::ManagedSsm,
-                ssh_state,
-                proxy_state,
-            ),
-            FormFocus::SsmAuthLogin
-        );
-    }
-
-    #[test]
-    fn managed_ssm_up_from_test_connection_goes_to_auth_manage() {
-        let ssh_state = ssh_disabled();
-        let proxy_state = proxy_state(false, false);
-
-        assert_eq!(
-            FormFocus::TestConnection.up_access(AccessTabMode::ManagedSsm, ssh_state, proxy_state),
-            FormFocus::SsmAuthManage
-        );
-    }
-
     // --- Direct access mode ---
 
     #[test]
@@ -3077,10 +2815,10 @@ mod tests {
 
         let mut focus = FormFocus::AccessMethod;
         focus = focus.down_access(AccessTabMode::Direct, ssh_state, proxy_state);
-        assert_eq!(focus, FormFocus::SsmAuthProfile);
+        assert_eq!(focus, FormFocus::AccessAuthProfile);
 
         focus = focus.down_access(AccessTabMode::Direct, ssh_state, proxy_state);
-        assert_eq!(focus, FormFocus::SsmAuthManage);
+        assert_eq!(focus, FormFocus::AccessAuthManage);
 
         focus = focus.down_access(AccessTabMode::Direct, ssh_state, proxy_state);
         assert_eq!(focus, FormFocus::TestConnection);
@@ -3092,19 +2830,63 @@ mod tests {
         let proxy_state = proxy_state(false, false);
 
         assert_eq!(
-            FormFocus::SsmAuthProfile.right_access(AccessTabMode::Direct, ssh_state, proxy_state,),
-            FormFocus::SsmAuthManage
+            FormFocus::AccessAuthProfile.right_access(
+                AccessTabMode::Direct,
+                ssh_state,
+                proxy_state,
+            ),
+            FormFocus::AccessAuthManage
         );
 
         assert_eq!(
-            FormFocus::SsmAuthManage.right_access(AccessTabMode::Direct, ssh_state, proxy_state,),
-            FormFocus::SsmAuthLogin
+            FormFocus::AccessAuthManage
+                .right_access(AccessTabMode::Direct, ssh_state, proxy_state,),
+            FormFocus::AccessAuthLogin
         );
 
         assert_eq!(
-            FormFocus::SsmAuthRefresh.left_access(AccessTabMode::Direct, ssh_state, proxy_state,),
-            FormFocus::SsmAuthLogin
+            FormFocus::AccessAuthRefresh
+                .left_access(AccessTabMode::Direct, ssh_state, proxy_state,),
+            FormFocus::AccessAuthLogin
         );
+    }
+
+    #[test]
+    fn direct_ring_goes_down_and_up_through_auth_profile_stops() {
+        let ssh_state = ssh_disabled();
+        let proxy_state = proxy_state(false, false);
+        let ring = [
+            FormFocus::AccessMethod,
+            FormFocus::AccessAuthProfile,
+            FormFocus::AccessAuthManage,
+            FormFocus::TestConnection,
+            FormFocus::Save,
+        ];
+
+        for (index, focus) in ring.iter().copied().enumerate() {
+            let next = ring[(index + 1) % ring.len()];
+
+            assert_eq!(
+                focus.down_access(AccessTabMode::Direct, ssh_state, proxy_state),
+                next
+            );
+            assert_eq!(
+                next.up_access(AccessTabMode::Direct, ssh_state, proxy_state),
+                focus
+            );
+        }
+
+        // Login and Refresh share the Manage row, so they leave it the same way.
+        for focus in [FormFocus::AccessAuthLogin, FormFocus::AccessAuthRefresh] {
+            assert_eq!(
+                focus.down_access(AccessTabMode::Direct, ssh_state, proxy_state),
+                FormFocus::TestConnection
+            );
+            assert_eq!(
+                focus.up_access(AccessTabMode::Direct, ssh_state, proxy_state),
+                FormFocus::AccessAuthProfile
+            );
+        }
     }
 
     // --- SSH tab: disabled ---

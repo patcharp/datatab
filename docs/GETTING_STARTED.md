@@ -19,6 +19,14 @@ install there is nothing to restore, so focus defaults to the sidebar.
   <img src="images/getting-started/first-launch-light.webp" alt="The DataTab main window on a fresh install, with an empty sidebar and no connections">
 </picture>
 
+## Command line
+
+Run `datatab` to focus or launch DataTab. Run `datatab <PATH>` to open an
+existing script file. Use `datatab --help` (`-h`) for options and
+`datatab --version` (`-V`) for the version. Invalid options and missing files
+produce an error without starting the application. See [MCP integration](MCP_AI_INTEGRATION.md)
+for the `datatab mcp` command.
+
 ## Create a connection
 
 Press `Ctrl+Shift+N` to open the Connection Manager,
@@ -46,7 +54,7 @@ it. The result renders in a result tab inside the document.
 ## Next steps
 
 - [Connecting](CONNECTIONS.md) — the Connection Manager, drivers, SSH tunnels,
-  proxies, AWS SSO, and value sources.
+  proxies, auth profiles, and value sources.
 - [Browsing the Schema](SCHEMA_BROWSER.md) — the sidebar, the schema tree,
   routines, and the schema diagram.
 - [Running Queries](EDITOR.md) — query tabs, execution, scripts, the

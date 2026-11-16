@@ -188,7 +188,7 @@ While you are in the text, `Escape` gives the keyboard back to the tab and
 
 | Store | How the object is read |
 |-------|------------------------|
-| A store that can read part of an object (S3 today) | Only the bytes each sheet needs are read. |
+| A store that can read part of an object | Only the bytes each sheet needs are read. |
 | Any other store | DataTab first asks whether to download the whole object and shows its size. Declining closes the tab. |
 
 A downloaded object is kept in memory up to 64 MiB and in a temporary file

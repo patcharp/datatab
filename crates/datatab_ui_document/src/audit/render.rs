@@ -4,8 +4,6 @@
 //! presentation utilities live here so that `mod.rs` can focus on
 //! document lifecycle, data loading, and filter state.
 
-use std::collections::HashMap;
-
 use super::chart_view::AuditViewMode;
 use super::filters::{TimestampDisplayMode, format_timestamp_ms};
 use super::{AuditContextMenuAction, AuditDocument, ToolbarSlot};
@@ -17,7 +15,7 @@ use crate::handle::DocumentEvent;
 use crate::syntax_runs::json_highlights;
 use datatab_components::chart::YScale;
 use datatab_components::components::multi_select::MultiSelect;
-use datatab_components::controls::{Button, ButtonVariant, ReadOnlyEditor};
+use datatab_components::controls::{Button, ButtonVariant};
 use datatab_components::icons::AppIcon;
 use datatab_components::primitives::{
     Badge, BadgeTone, Chamfer, FocusShape, Icon, SegmentedControl, SegmentedItem, Status,
@@ -27,13 +25,11 @@ use datatab_components::tokens::{
     ChamferCut, ChromeColors, DocumentMetrics, Feedback, Spacing, SyntaxColors, ui,
 };
 use datatab_components::typography::AppFonts;
-use datatab_components::vim::VimBinding;
 use datatab_core::{EventCategory, EventOutcome};
 use datatab_storage::repositories::audit::AuditEventDto;
 use gpui::prelude::*;
 use gpui::*;
 use gpui_component::ActiveTheme;
-use gpui_component::input::{EditorState as GpuiEditorState, Textarea, TextareaState};
 use gpui_component::scroll::ScrollableElement;
 
 use super::super::types::DocumentState;
@@ -62,7 +58,7 @@ const AUDIT_COMPACT_JSON_LIMIT: usize = 160;
 const AUDIT_LONG_SUMMARY: usize = 100;
 
 /// Column widths of the event table (P1Audit: 26, 110, 70, 130, 1fr, 140,
-/// 70, 90); an external stream uses a partition and an event id column.
+/// 70, 90).
 struct AuditColumns;
 
 impl AuditColumns {
@@ -73,8 +69,6 @@ impl AuditColumns {
     const ACTOR: Rems = ui(140.0);
     const DURATION: Rems = ui(70.0);
     const OUTCOME: Rems = ui(90.0);
-    const PARTITION: Rems = ui(200.0);
-    const EVENT_ID: Rems = ui(220.0);
 }
 
 fn now_epoch_ms() -> i64 {
@@ -146,7 +140,6 @@ fn category_icon(category: Option<EventCategory>) -> AppIcon {
         Some(EventCategory::Mcp) => AppIcon::Bot,
         Some(EventCategory::Governance) => AppIcon::Scale,
         Some(EventCategory::ObjectStorage) => AppIcon::Boxes,
-        Some(EventCategory::SecretStore) => AppIcon::Lock,
         None => AppIcon::Info,
     }
 }
@@ -200,14 +193,6 @@ impl AuditDocument {
             (Some(connection), None) => Some(connection.to_string()),
             (None, Some(driver)) => Some(driver.to_string()),
             _ => None,
-        }
-    }
-
-    pub(super) fn pretty_json(json: &str) -> String {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(json) {
-            serde_json::to_string_pretty(&value).unwrap_or_else(|_| json.to_string())
-        } else {
-            json.to_string()
         }
     }
 
@@ -276,26 +261,22 @@ impl AuditDocument {
         Some(element)
     }
 
-    /// The header row: the audit icon and title with its description, or the
-    /// event stream's title for an external source.
+    /// The header row: the audit icon and title with its description.
     pub(super) fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let tint = ChromeColors::tint(theme);
 
-        let (icon, subtitle) = if self.is_external_event_stream() {
-            (AppIcon::Logs, None)
-        } else {
-            (
-                AppIcon::FingerprintPattern,
-                Some(datatab_i18n::t!("document.audit.subtitle")),
-            )
-        };
-
         document_bar(DocumentMetrics::HEADER_HEIGHT, cx)
-            .child(document_title(icon, tint, self.title.clone(), cx))
-            .when_some(subtitle, |header, subtitle| {
-                header.child(document_subtitle(subtitle, cx))
-            })
+            .child(document_title(
+                AppIcon::FingerprintPattern,
+                tint,
+                self.title.clone(),
+                cx,
+            ))
+            .child(document_subtitle(
+                datatab_i18n::t!("document.audit.subtitle"),
+                cx,
+            ))
     }
 
     pub(super) fn render_toolbar(
@@ -303,7 +284,6 @@ impl AuditDocument {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let is_internal = !self.is_external_event_stream();
         let is_chart = matches!(self.view_mode, AuditViewMode::Chart);
 
         let search = search_field(
@@ -364,38 +344,36 @@ impl AuditDocument {
             this.clear_filters(window, cx);
         }));
 
-        let view_switch = is_internal.then(|| {
-            let weak_self = cx.weak_entity();
+        let weak_self = cx.weak_entity();
 
-            SegmentedControl::new(
-                vec![
-                    SegmentedItem::new(
-                        "audit-view-table",
-                        datatab_i18n::t!("document.audit.filter.view_mode.table"),
-                    )
-                    .icon(AppIcon::Table),
-                    SegmentedItem::new(
-                        "audit-view-chart",
-                        datatab_i18n::t!("document.audit.filter.view_mode.chart"),
-                    )
-                    .icon(AppIcon::ChartColumnBig),
-                ],
-                if is_chart {
-                    "audit-view-chart"
-                } else {
-                    "audit-view-table"
-                },
-                move |id, _, cx| {
-                    let chart = id.as_ref() == "audit-view-chart";
+        let view_switch = SegmentedControl::new(
+            vec![
+                SegmentedItem::new(
+                    "audit-view-table",
+                    datatab_i18n::t!("document.audit.filter.view_mode.table"),
+                )
+                .icon(AppIcon::Table),
+                SegmentedItem::new(
+                    "audit-view-chart",
+                    datatab_i18n::t!("document.audit.filter.view_mode.chart"),
+                )
+                .icon(AppIcon::ChartColumnBig),
+            ],
+            if is_chart {
+                "audit-view-chart"
+            } else {
+                "audit-view-table"
+            },
+            move |id, _, cx| {
+                let chart = id.as_ref() == "audit-view-chart";
 
-                    if let Some(doc) = weak_self.upgrade() {
-                        doc.update(cx, |this, cx| this.set_view_mode(chart, cx));
-                    }
-                },
-            )
-        });
+                if let Some(doc) = weak_self.upgrade() {
+                    doc.update(cx, |this, cx| this.set_view_mode(chart, cx));
+                }
+            },
+        );
 
-        let chart_controls = (is_internal && is_chart).then(|| {
+        let chart_controls = is_chart.then(|| {
             let current_y_scale = self.chart.chart_shell.read(cx).y_scale();
             let weak_self = cx.weak_entity();
 
@@ -473,16 +451,14 @@ impl AuditDocument {
             .child(search)
             .child(presets)
             .child(timezone)
-            .when(is_internal, |bar| {
-                bar.child(toolbar_rule(cx))
-                    .child(level)
-                    .child(category)
-                    .child(outcome)
-            })
+            .child(toolbar_rule(cx))
+            .child(level)
+            .child(category)
+            .child(outcome)
             .child(div().flex_1())
             .children(chart_controls)
             .child(clear)
-            .children(view_switch)
+            .child(view_switch)
             .child(refresh)
     }
 
@@ -693,25 +669,6 @@ impl AuditDocument {
                     .child(datatab_i18n::t!("document.audit.detail.time")),
             );
 
-        if self.is_external_event_stream() {
-            return header
-                .child(
-                    div()
-                        .w(AuditColumns::PARTITION)
-                        .child(datatab_i18n::t!("document.audit.detail.partition")),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .child(datatab_i18n::t!("document.audit.detail.message")),
-                )
-                .child(
-                    div()
-                        .w(AuditColumns::EVENT_ID)
-                        .child(datatab_i18n::t!("document.audit.detail.event_id")),
-                );
-        }
-
         header
             .child(
                 div()
@@ -855,7 +812,6 @@ impl AuditDocument {
         let is_selected = self.has_focus && self.selected_row == Some(row_index);
         let time_label = row_time_label(event.created_at_epoch_ms, self.timestamp_mode, now_ms);
         let summary = event.summary.clone().unwrap_or_default();
-        let is_external = self.is_external_event_stream();
 
         let expanded_wash = ChromeColors::tint(&theme).opacity(DocumentMetrics::EXPANDED_ROW_ALPHA);
 
@@ -928,85 +884,69 @@ impl AuditDocument {
             )
             .child(mono_cell(AuditColumns::TIME, time_label));
 
-        if is_external {
-            let partition = event.action.clone().filter(|value| !value.is_empty());
+        let category = event
+            .category
+            .as_deref()
+            .and_then(datatab_core::EventCategory::from_str_repr);
+        let outcome = event
+            .outcome
+            .as_deref()
+            .and_then(datatab_core::EventOutcome::from_str_repr);
 
-            row = row
-                .child(
-                    Self::badge_cell(AuditColumns::PARTITION)
-                        .when_some(partition, |cell, value| {
-                            cell.child(Badge::new(value, BadgeTone::Neutral))
-                        }),
-                )
-                .child(summary_cell(summary, false))
-                .child(mono_cell(
-                    AuditColumns::EVENT_ID,
-                    event.object_id.clone().unwrap_or_default(),
-                ));
-        } else {
-            let category = event
-                .category
-                .as_deref()
-                .and_then(datatab_core::EventCategory::from_str_repr);
-            let outcome = event
-                .outcome
-                .as_deref()
-                .and_then(datatab_core::EventOutcome::from_str_repr);
+        let level_cell = Self::badge_cell(AuditColumns::LEVEL).when_some(
+            event.level.as_deref(),
+            |cell, level| {
+                cell.child(Badge::new(
+                    Self::short_level_label(level),
+                    level_tone(level),
+                ))
+            },
+        );
 
-            let level_cell = Self::badge_cell(AuditColumns::LEVEL).when_some(
-                event.level.as_deref(),
-                |cell, level| {
-                    cell.child(Badge::new(
-                        Self::short_level_label(level),
-                        level_tone(level),
-                    ))
-                },
+        let category_cell = div()
+            .w(AuditColumns::CATEGORY)
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap(Feedback::STATUS_GAP)
+            .pr(DocumentMetrics::GAP)
+            .overflow_hidden()
+            .text_color(theme.foreground)
+            .child(
+                Icon::new(category_icon(category))
+                    .size(DocumentMetrics::TABLE_ICON)
+                    .color(muted),
+            )
+            .child(
+                div()
+                    .truncate()
+                    .child(Self::category_label(event.category.as_deref())),
             );
 
-            let category_cell = div()
-                .w(AuditColumns::CATEGORY)
+        let outcome_cell =
+            div()
+                .w(AuditColumns::OUTCOME)
                 .flex_shrink_0()
-                .flex()
-                .items_center()
-                .gap(Feedback::STATUS_GAP)
-                .pr(DocumentMetrics::GAP)
-                .overflow_hidden()
-                .text_color(theme.foreground)
-                .child(
-                    Icon::new(category_icon(category))
-                        .size(DocumentMetrics::TABLE_ICON)
-                        .color(muted),
-                )
-                .child(
-                    div()
-                        .truncate()
-                        .child(Self::category_label(event.category.as_deref())),
-                );
-
-            let outcome_cell = div().w(AuditColumns::OUTCOME).flex_shrink_0().when_some(
-                outcome,
-                |cell, outcome| {
+                .when_some(outcome, |cell, outcome| {
                     cell.child(
                         StatusIndicator::new(outcome_status(outcome))
                             .label(crate::labels::audit_outcome_label(outcome)),
                     )
-                },
-            );
+                });
 
-            row = row
-                .child(level_cell)
-                .child(category_cell)
-                .child(summary_cell(
-                    summary,
-                    category == Some(datatab_core::EventCategory::Query),
-                ))
-                .child(mono_cell(AuditColumns::ACTOR, event.actor_id.clone()))
-                .child(mono_cell(
-                    AuditColumns::DURATION,
-                    format_duration_ms(event.duration_ms),
-                ))
-                .child(outcome_cell);
-        }
+        row = row
+            .child(level_cell)
+            .child(category_cell)
+            .child(summary_cell(
+                summary,
+                category == Some(datatab_core::EventCategory::Query),
+            ))
+            .child(mono_cell(AuditColumns::ACTOR, event.actor_id.clone()))
+            .child(mono_cell(
+                AuditColumns::DURATION,
+                format_duration_ms(event.duration_ms),
+            ))
+            .child(outcome_cell);
 
         // The per-event id scopes the ids of the detail's controls, which
         // repeat in every expanded row.
@@ -1147,13 +1087,9 @@ impl AuditDocument {
     pub(super) fn render_inline_detail(
         &mut self,
         event: AuditEventDto,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        if self.is_external_event_stream() {
-            return self.render_external_inline_detail(event, window, cx);
-        }
-
         let theme = cx.theme().clone();
         let timestamp = self.format_timestamp_ms(event.created_at_epoch_ms);
         let actor = if event
@@ -1329,141 +1265,6 @@ impl AuditDocument {
             .into_any_element()
     }
 
-    pub(super) fn render_external_inline_detail(
-        &mut self,
-        event: AuditEventDto,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let theme = cx.theme().clone();
-        let row_event_id = event.id;
-        let timestamp = self.format_timestamp_ms(event.created_at_epoch_ms);
-        let secondary_timestamp = event
-            .error_message
-            .as_deref()
-            .and_then(|value| value.parse::<i64>().ok())
-            .map(|value| self.format_timestamp_ms(value));
-        let message = event.summary.clone().filter(|value| !value.is_empty());
-        let details_json = event.details_json.clone().filter(|value| !value.is_empty());
-
-        let mut fields: Vec<AnyElement> = vec![
-            detail_field(
-                datatab_i18n::t!("document.audit.detail.time"),
-                timestamp,
-                cx,
-            )
-            .into_any_element(),
-            detail_field(
-                datatab_i18n::t!("document.audit.detail.source"),
-                Self::detail_value(event.connection_id.clone()),
-                cx,
-            )
-            .into_any_element(),
-            detail_field(
-                datatab_i18n::t!("document.audit.detail.partition"),
-                Self::detail_value(event.action.clone()),
-                cx,
-            )
-            .into_any_element(),
-            detail_field(
-                datatab_i18n::t!("document.audit.detail.event_id"),
-                Self::detail_value(event.object_id.clone()),
-                cx,
-            )
-            .into_any_element(),
-        ];
-
-        if let Some(value) = secondary_timestamp {
-            fields.push(
-                detail_field(
-                    datatab_i18n::t!("document.audit.detail.secondary_time"),
-                    value,
-                    cx,
-                )
-                .into_any_element(),
-            );
-        }
-
-        let block = |child: AnyElement| {
-            div()
-                .relative()
-                .mt(DocumentMetrics::DETAIL_BLOCK_MARGIN_TOP)
-                .px(DocumentMetrics::DETAIL_BLOCK_PADDING_X)
-                .py(DocumentMetrics::DETAIL_BLOCK_PADDING_Y)
-                .child(
-                    Chamfer::new(ChamferCut::INPUT)
-                        .fill(theme.popover)
-                        .border(theme.border),
-                )
-                .child(child)
-        };
-
-        let message_block = message.map(|value| {
-            let message_input =
-                self.ensure_external_message_input(row_event_id, &value, window, cx);
-
-            block(
-                Textarea::new(&message_input)
-                    .appearance(false)
-                    .disabled(true)
-                    .w_full()
-                    .into_any_element(),
-            )
-        });
-
-        let details_block = details_json.map(|value| {
-            let pretty_details = Self::pretty_json(&value);
-            let details_input =
-                self.ensure_external_details_input(row_event_id, &pretty_details, window, cx);
-            let details_rows = Self::event_code_rows(&pretty_details, 4);
-            let input_id = details_input.entity_id();
-            let scope = match self.external_details_vims.get(&input_id) {
-                Some(vim) => vim.leader_scope(div(), cx),
-                None => div(),
-            };
-            let container = VimBinding::capture_run_command(
-                VimBinding::wire(scope, input_id, cx),
-                input_id,
-                cx,
-            );
-            let indicator = self
-                .external_details_vims
-                .get(&input_id)
-                .and_then(|vim| vim.render_indicator(cx));
-
-            block(
-                container
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        ReadOnlyEditor::new(&details_input)
-                            .appearance(false)
-                            .w_full()
-                            .h(Self::event_text_height(details_rows)),
-                    )
-                    .children(indicator)
-                    .into_any_element(),
-            )
-        });
-
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .pt(DocumentMetrics::DETAIL_PADDING_TOP)
-            .pb(DocumentMetrics::DETAIL_PADDING_BOTTOM)
-            .pl(DocumentMetrics::DETAIL_PADDING_LEFT)
-            .pr(DocumentMetrics::PADDING_X)
-            .border_b_1()
-            .border_color(theme.table_row_border)
-            .bg(theme.background)
-            .child(Self::detail_grid(fields))
-            .children(message_block)
-            .children(details_block)
-            .into_any_element()
-    }
-
     /// The footer's Export button (secondary, with a chevron) and, when
     /// open, its menu of file formats.
     pub(super) fn render_export_button(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1587,7 +1388,7 @@ impl AuditDocument {
             )
         });
 
-        let can_export = self.total_events > 0 && !self.is_external_event_stream();
+        let can_export = self.total_events > 0;
         let loading = self.is_loading && self.status_message.is_some();
 
         document_footer(cx)
@@ -1606,154 +1407,6 @@ impl AuditDocument {
                     .child(self.render_export_button(cx))
                     .child(datatab_i18n::t!("document.audit.export.hint"))
             })
-    }
-
-    // ── Input entity helpers ──────────────────────────────────────────────
-
-    fn ensure_event_editor_input(
-        cache: &mut HashMap<i64, Entity<GpuiEditorState>>,
-        event_id: i64,
-        value: &str,
-        editor_mode: Option<&'static str>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<GpuiEditorState> {
-        let value = value.to_string();
-
-        let input = cache
-            .entry(event_id)
-            .or_insert_with(|| {
-                let initial_value = value.clone();
-
-                cx.new(|cx| {
-                    let mut state = GpuiEditorState::new(window, cx)
-                        .language(editor_mode.unwrap_or("plaintext"))
-                        .line_number(false)
-                        .soft_wrap(true);
-
-                    state.set_value(&initial_value, window, cx);
-                    state
-                })
-            })
-            .clone();
-
-        if input.read(cx).value() != value {
-            input.update(cx, |state, cx| state.set_value(value, window, cx));
-        }
-
-        input
-    }
-
-    fn ensure_event_textarea(
-        cache: &mut HashMap<i64, Entity<TextareaState>>,
-        event_id: i64,
-        value: &str,
-        rows: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<TextareaState> {
-        let value = value.to_string();
-
-        let input = cache
-            .entry(event_id)
-            .or_insert_with(|| {
-                let initial_value = value.clone();
-
-                cx.new(|cx| {
-                    let mut state = TextareaState::new(window, cx)
-                        .auto_grow(rows, usize::MAX)
-                        .soft_wrap(true);
-
-                    state.set_value(&initial_value, window, cx);
-                    state
-                })
-            })
-            .clone();
-
-        if input.read(cx).value() != value {
-            input.update(cx, |state, cx| state.set_value(value, window, cx));
-        }
-
-        input
-    }
-
-    /// Returns (or lazily creates) the `InputState` entity used to display an
-    /// external event's message field as an editable read-only text area.
-    pub(super) fn ensure_external_message_input(
-        &mut self,
-        event_id: i64,
-        message: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<TextareaState> {
-        let rows = Self::event_message_rows(message, 2);
-        Self::ensure_event_textarea(
-            &mut self.external_message_inputs,
-            event_id,
-            message,
-            rows,
-            window,
-            cx,
-        )
-    }
-
-    /// Returns (or lazily creates) the `InputState` entity used to display an
-    /// external event's details JSON as a code editor.
-    pub(super) fn ensure_external_details_input(
-        &mut self,
-        event_id: i64,
-        details_json: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<GpuiEditorState> {
-        let input = Self::ensure_event_editor_input(
-            &mut self.external_details_inputs,
-            event_id,
-            details_json,
-            Some("json"),
-            window,
-            cx,
-        );
-
-        let input_id = input.entity_id();
-        if let std::collections::hash_map::Entry::Vacant(slot) =
-            self.external_details_vims.entry(input_id)
-        {
-            slot.insert(VimBinding::new(input.clone(), window, cx));
-            VimBinding::follow_setting(self, input_id, cx);
-        }
-
-        input
-    }
-
-    // ── Row sizing helpers ────────────────────────────────────────────────
-
-    pub(super) fn event_text_rows(value: &str, min_rows: usize) -> usize {
-        const ESTIMATED_CHARS_PER_ROW: usize = 80;
-
-        let line_rows = value.lines().count().max(1);
-        let wrap_rows = value
-            .lines()
-            .map(|line| {
-                let char_count = line.chars().count();
-                char_count.div_ceil(ESTIMATED_CHARS_PER_ROW).max(1)
-            })
-            .sum::<usize>()
-            .max(1);
-
-        line_rows.max(wrap_rows).max(min_rows)
-    }
-
-    pub(super) fn event_message_rows(value: &str, min_rows: usize) -> usize {
-        Self::event_text_rows(value, min_rows)
-    }
-
-    pub(super) fn event_code_rows(value: &str, min_rows: usize) -> usize {
-        value.lines().count().max(min_rows).max(1)
-    }
-
-    pub(super) fn event_text_height(rows: usize) -> Pixels {
-        px((rows as f32 * 24.0) + 20.0)
     }
 
     // ── CSV / copy helpers ────────────────────────────────────────────────
@@ -1810,8 +1463,6 @@ mod tests {
         "document.audit.filter.y_scale.linear",
         "document.audit.filter.y_scale.log",
         "document.audit.filter.placeholder.search_events",
-        "document.audit.filter.placeholder.filter_events",
-        "document.audit.filter.placeholder.all_time",
         "document.audit.filter.placeholder.last_12_hours",
         "document.audit.filter.timezone.local",
         "document.audit.filter.timezone.utc",
@@ -1845,12 +1496,8 @@ mod tests {
         "document.audit.detail.details",
         "document.audit.detail.duration",
         "document.audit.detail.error",
-        "document.audit.detail.event_id",
         "document.audit.detail.level",
-        "document.audit.detail.message",
         "document.audit.detail.outcome",
-        "document.audit.detail.partition",
-        "document.audit.detail.secondary_time",
         "document.audit.detail.source",
         "document.audit.detail.summary",
         "document.audit.detail.time",

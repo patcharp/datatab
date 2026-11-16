@@ -85,7 +85,8 @@ impl ConnectionManagerWindow {
                                 .child(Label::new(datatab_i18n::t!("access.auth_profile_optional")))
                                 .child(
                                     self.render_focus_shell(
-                                        show_focus && self.form_focus == FormFocus::SsmAuthProfile,
+                                        show_focus
+                                            && self.form_focus == FormFocus::AccessAuthProfile,
                                         ring_color,
                                         self.auth_profile.auth_profile_dropdown.clone(),
                                         cx,
@@ -95,7 +96,7 @@ impl ConnectionManagerWindow {
                                         MouseButton::Left,
                                         cx.listener(|this, _, window, cx| {
                                             this.enter_edit_mode_for_field(
-                                                FormFocus::SsmAuthProfile,
+                                                FormFocus::AccessAuthProfile,
                                                 window,
                                                 cx,
                                             );
@@ -110,7 +111,8 @@ impl ConnectionManagerWindow {
                                         .child(
                                             self.render_focus_shell(
                                                 show_focus
-                                                    && self.form_focus == FormFocus::SsmAuthManage,
+                                                    && self.form_focus
+                                                        == FormFocus::AccessAuthManage,
                                                 ring_color,
                                                 Button::new(
                                                     "auth-open-settings",
@@ -126,7 +128,7 @@ impl ConnectionManagerWindow {
                                                 MouseButton::Left,
                                                 cx.listener(|this, _, window, cx| {
                                                     this.enter_edit_mode_for_field(
-                                                        FormFocus::SsmAuthManage,
+                                                        FormFocus::AccessAuthManage,
                                                         window,
                                                         cx,
                                                     );
@@ -136,7 +138,8 @@ impl ConnectionManagerWindow {
                                         .child(
                                             self.render_focus_shell(
                                                 show_focus
-                                                    && self.form_focus == FormFocus::SsmAuthLogin,
+                                                    && self.form_focus
+                                                        == FormFocus::AccessAuthLogin,
                                                 ring_color,
                                                 Button::new(
                                                     "auth-login-selected",
@@ -153,7 +156,7 @@ impl ConnectionManagerWindow {
                                                 MouseButton::Left,
                                                 cx.listener(|this, _, window, cx| {
                                                     this.enter_edit_mode_for_field(
-                                                        FormFocus::SsmAuthLogin,
+                                                        FormFocus::AccessAuthLogin,
                                                         window,
                                                         cx,
                                                     );
@@ -163,7 +166,8 @@ impl ConnectionManagerWindow {
                                         .child(
                                             self.render_focus_shell(
                                                 show_focus
-                                                    && self.form_focus == FormFocus::SsmAuthRefresh,
+                                                    && self.form_focus
+                                                        == FormFocus::AccessAuthRefresh,
                                                 ring_color,
                                                 Button::new(
                                                     "auth-refresh-session",
@@ -179,7 +183,7 @@ impl ConnectionManagerWindow {
                                                 MouseButton::Left,
                                                 cx.listener(|this, _, window, cx| {
                                                     this.enter_edit_mode_for_field(
-                                                        FormFocus::SsmAuthRefresh,
+                                                        FormFocus::AccessAuthRefresh,
                                                         window,
                                                         cx,
                                                     );
@@ -207,257 +211,9 @@ impl ConnectionManagerWindow {
             }
             AccessTabMode::Ssh => sections.extend(self.render_ssh_tab(cx)),
             AccessTabMode::Proxy => sections.extend(self.render_proxy_tab(cx)),
-            AccessTabMode::ManagedSsm => sections.push(self.render_ssm_access_section(cx)),
         }
 
         sections
-    }
-
-    fn render_ssm_access_section(&self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = cx.theme().clone();
-        let ring_color = theme.ring;
-        let show_focus =
-            self.edit_state == EditState::Navigating && self.active_tab == ActiveTab::Access;
-        let login_enabled = !self.auth_profile.auth_profile_login_in_progress
-            && self.selected_auth_profile_needs_login(cx);
-        let auth_profile_is_valid = self.selected_auth_profile_is_valid(cx);
-
-        let ssm_title = datatab_i18n::t!("access.ssm_title");
-        let ssm_instance_id_label = datatab_i18n::t!("access.ssm_instance_id");
-        let ssm_region_label = datatab_i18n::t!("access.ssm_region");
-        let ssm_remote_port_label = datatab_i18n::t!("access.ssm_remote_port");
-
-        self.render_section(
-            &ssm_title,
-            div()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .child(self.render_ssm_value_field(
-                    &ssm_instance_id_label,
-                    "ssm_instance_id",
-                    &self.access.input_ssm_instance_id,
-                    self.access.ssm_instance_id_value_source_selector.clone(),
-                    true,
-                    show_focus && self.form_focus == FormFocus::SsmInstanceIdValueSource,
-                    show_focus && self.form_focus == FormFocus::SsmInstanceId,
-                    ring_color,
-                    FormFocus::SsmInstanceIdValueSource,
-                    FormFocus::SsmInstanceId,
-                    cx,
-                ))
-                .child(self.render_ssm_value_field(
-                    &ssm_region_label,
-                    "ssm_region",
-                    &self.access.input_ssm_region,
-                    self.access.ssm_region_value_source_selector.clone(),
-                    true,
-                    show_focus && self.form_focus == FormFocus::SsmRegionValueSource,
-                    show_focus && self.form_focus == FormFocus::SsmRegion,
-                    ring_color,
-                    FormFocus::SsmRegionValueSource,
-                    FormFocus::SsmRegion,
-                    cx,
-                ))
-                .child(self.render_ssm_value_field(
-                    &ssm_remote_port_label,
-                    "ssm_remote_port",
-                    &self.access.input_ssm_remote_port,
-                    self.access.ssm_remote_port_value_source_selector.clone(),
-                    false,
-                    show_focus && self.form_focus == FormFocus::SsmRemotePortValueSource,
-                    show_focus && self.form_focus == FormFocus::SsmRemotePort,
-                    ring_color,
-                    FormFocus::SsmRemotePortValueSource,
-                    FormFocus::SsmRemotePort,
-                    cx,
-                ))
-                .child(Text::caption(datatab_i18n::t!("access.ssm_port_hint")))
-                .child(
-                    div()
-                        .flex()
-                        .flex_col()
-                        .gap_1()
-                        .child(Label::new(datatab_i18n::t!("access.auth_profile")))
-                        .child(
-                            self.render_focus_shell(
-                                show_focus && self.form_focus == FormFocus::SsmAuthProfile,
-                                ring_color,
-                                self.auth_profile.auth_profile_dropdown.clone(),
-                                cx,
-                            )
-                            .min_w(px(280.0))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, window, cx| {
-                                    this.enter_edit_mode_for_field(
-                                        FormFocus::SsmAuthProfile,
-                                        window,
-                                        cx,
-                                    );
-                                }),
-                            ),
-                        )
-                        .child(
-                            div()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    self.render_focus_shell(
-                                        show_focus && self.form_focus == FormFocus::SsmAuthManage,
-                                        ring_color,
-                                        Button::new(
-                                            "ssm-auth-open-settings",
-                                            datatab_i18n::t!("access.manage"),
-                                        )
-                                        .ghost()
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.open_auth_profiles_settings(cx);
-                                            }),
-                                        ),
-                                        cx,
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, window, cx| {
-                                            this.enter_edit_mode_for_field(
-                                                FormFocus::SsmAuthManage,
-                                                window,
-                                                cx,
-                                            );
-                                        }),
-                                    ),
-                                )
-                                .child(
-                                    self.render_focus_shell(
-                                        show_focus && self.form_focus == FormFocus::SsmAuthLogin,
-                                        ring_color,
-                                        Button::new(
-                                            "ssm-auth-login-selected",
-                                            datatab_i18n::t!("access.login"),
-                                        )
-                                        .ghost()
-                                        .disabled(!login_enabled)
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.login_selected_auth_profile(cx);
-                                            }),
-                                        ),
-                                        cx,
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, window, cx| {
-                                            this.enter_edit_mode_for_field(
-                                                FormFocus::SsmAuthLogin,
-                                                window,
-                                                cx,
-                                            );
-                                        }),
-                                    ),
-                                )
-                                .child(
-                                    self.render_focus_shell(
-                                        show_focus && self.form_focus == FormFocus::SsmAuthRefresh,
-                                        ring_color,
-                                        Button::new(
-                                            "ssm-auth-refresh-session",
-                                            datatab_i18n::t!("access.refresh"),
-                                        )
-                                        .ghost()
-                                        .on_click(
-                                            cx.listener(|this, _, _, cx| {
-                                                this.refresh_auth_profile_statuses(cx);
-                                            }),
-                                        ),
-                                        cx,
-                                    )
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _, window, cx| {
-                                            this.enter_edit_mode_for_field(
-                                                FormFocus::SsmAuthRefresh,
-                                                window,
-                                                cx,
-                                            );
-                                        }),
-                                    ),
-                                ),
-                        )
-                        .when_some(self.selected_auth_profile_status_text(cx), |d, status| {
-                            d.child(Text::caption(status))
-                        })
-                        .when(auth_profile_is_valid, |d| {
-                            d.child(
-                                StatusIndicator::new(Status::Connected)
-                                    .label(datatab_i18n::t!("access.session_valid")),
-                            )
-                        }),
-                ),
-            &theme,
-            cx,
-        )
-        .into_any_element()
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn render_ssm_value_field(
-        &self,
-        label: &str,
-        field_id: &str,
-        input: &Entity<datatab_components::controls::InputState>,
-        selector: Entity<
-            datatab_components::components::value_source_selector::ValueSourceSelector,
-        >,
-        required: bool,
-        selector_focused: bool,
-        focused: bool,
-        ring_color: gpui::Hsla,
-        selector_focus: FormFocus,
-        field: FormFocus,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(Label::new(label.to_string()).required(required))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        self.render_focus_shell(selector_focused, ring_color, selector, cx)
-                            .w(px(170.0))
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(move |this, _, window, cx| {
-                                    this.enter_edit_mode_for_field(selector_focus, window, cx);
-                                }),
-                            ),
-                    )
-                    .child(
-                        self.render_control_focus_shell(
-                            focused,
-                            ring_color,
-                            Input::new(input)
-                                .id(cm_field_id(field_id))
-                                .aria_label(label.to_string()),
-                            cx,
-                        )
-                        .flex_1()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, window, cx| {
-                                this.enter_edit_mode_for_field(field, window, cx);
-                            }),
-                        ),
-                    ),
-            )
-            .into_any_element()
     }
 
     pub(super) fn render_proxy_tab(&mut self, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -1394,7 +1150,7 @@ fn proxy_auth_label(auth: &datatab_core::ProxyAuth) -> String {
 
 #[cfg(test)]
 mod tests {
-    const ACCESS_DIRECT_SSM_KEYS: &[&str] = &[
+    const ACCESS_DIRECT_KEYS: &[&str] = &[
         "access.tab_label",
         "access.method_label",
         "access.direct_hint",
@@ -1404,17 +1160,11 @@ mod tests {
         "access.refresh",
         "access.auth_profile_hint",
         "access.session_valid",
-        "access.ssm_title",
-        "access.ssm_instance_id",
-        "access.ssm_region",
-        "access.ssm_remote_port",
-        "access.ssm_port_hint",
-        "access.auth_profile",
     ];
 
     #[test]
-    fn access_direct_ssm_keys_resolve() {
-        for key in ACCESS_DIRECT_SSM_KEYS {
+    fn access_direct_keys_resolve() {
+        for key in ACCESS_DIRECT_KEYS {
             let value = datatab_i18n::t!(key, locale = "en");
 
             assert!(!value.is_empty(), "key {key} resolved empty");
@@ -1425,13 +1175,6 @@ mod tests {
                 "key {key} fell back to the raw en-qualified form"
             );
         }
-    }
-
-    #[test]
-    fn access_ssm_instance_id_label_exact_values() {
-        let en = datatab_i18n::t!("access.ssm_instance_id", locale = "en");
-
-        assert_eq!(en, "Instance ID");
     }
 
     const ACCESS_PROXY_KEYS: &[&str] = &[

@@ -2022,9 +2022,7 @@ impl DashboardDocument {
                 Some(chart)
                     if matches!(
                         chart.source,
-                        SavedChartSource::Query { .. }
-                            | SavedChartSource::Metric { .. }
-                            | SavedChartSource::InstanceMetric { .. }
+                        SavedChartSource::Query { .. } | SavedChartSource::InstanceMetric { .. }
                     ) =>
                 {
                     let app_state_inner = self.app_state.clone();
@@ -2032,7 +2030,7 @@ impl DashboardDocument {
                     let panel_entity = cx.new(|cx| {
                         #[expect(
                             clippy::expect_used,
-                            reason = "the match guard admits only Query, Metric and InstanceMetric sources; from_saved returns Err only for Collection sources"
+                            reason = "the match guard admits only Query and InstanceMetric sources; from_saved returns Err only for Collection sources"
                         )]
                         let mut doc =
                             ChartDocument::from_saved(&chart, app_state_inner, window, cx).expect(
@@ -3401,9 +3399,7 @@ mod tests {
 
         let is_loadable = matches!(
             source,
-            SavedChartSource::Query { .. }
-                | SavedChartSource::Metric { .. }
-                | SavedChartSource::InstanceMetric { .. }
+            SavedChartSource::Query { .. } | SavedChartSource::InstanceMetric { .. }
         );
 
         assert!(
@@ -3426,14 +3422,12 @@ mod tests {
 
         let is_loadable = matches!(
             source,
-            SavedChartSource::Query { .. }
-                | SavedChartSource::Metric { .. }
-                | SavedChartSource::InstanceMetric { .. }
+            SavedChartSource::Query { .. } | SavedChartSource::InstanceMetric { .. }
         );
 
         assert!(
             !is_loadable,
-            "Collection source must not match the Query/Metric/InstanceMetric guard"
+            "Collection source must not match the Query/InstanceMetric guard"
         );
     }
 

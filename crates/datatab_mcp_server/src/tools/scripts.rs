@@ -848,9 +848,6 @@ impl DataTabServer {
         // Only SQL/MongoDB/Redis queries are supported for execution
         match language {
             QueryLanguage::Sql
-            | QueryLanguage::CloudWatchLogsInsightsQl
-            | QueryLanguage::OpenSearchPpl
-            | QueryLanguage::OpenSearchSql
             | QueryLanguage::MongoQuery
             | QueryLanguage::RedisCommands
             | QueryLanguage::Cql
@@ -870,7 +867,10 @@ impl DataTabServer {
             QueryLanguage::Lua | QueryLanguage::Python | QueryLanguage::Bash => Err(
                 "Script language not supported for execution (only database queries)".to_string(),
             ),
-            QueryLanguage::Custom(_) => {
+            QueryLanguage::Custom(_)
+            | QueryLanguage::ReservedCloudWatchLogsInsightsQl
+            | QueryLanguage::ReservedOpenSearchPpl
+            | QueryLanguage::ReservedOpenSearchSql => {
                 Err("Custom language not supported for execution".to_string())
             }
         }

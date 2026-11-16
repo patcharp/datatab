@@ -21,8 +21,6 @@ pub(crate) const PREFIX_CATEGORY_MAP: &[(&str, EventCategory)] = &[
     ("datatab_app::access_manager", EventCategory::Connection),
     ("datatab_ssh", EventCategory::Connection),
     ("datatab_proxy", EventCategory::Connection),
-    ("datatab_aws", EventCategory::Connection),
-    ("datatab_ssm", EventCategory::Connection),
     ("datatab_driver_ipc", EventCategory::Connection),
     // Config plane (would be Config but coerces to System — see above)
     ("datatab_app::config", EventCategory::Config),
