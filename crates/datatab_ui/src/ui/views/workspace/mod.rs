@@ -25,14 +25,15 @@ use datatab_ui_base::modals::{
     RenameItemRequest, RenameTarget,
 };
 use datatab_ui_base::{
-    AppStateGlobal, OpenAuditRequested, UserErrorReported, drain_hook_load_diagnostics,
-    report_error,
+    AppStateGlobal, OpenAuditRequested, ReportWindowRequest, ReportWindowRequested,
+    UserErrorReported, drain_hook_load_diagnostics, report_error,
 };
 
 #[cfg(feature = "mcp")]
 use crate::app::McpRuntimeEventRaised;
 
 use crate::keymap::{self, Command, CommandDispatcher, ContextId, FocusTarget};
+use crate::ui::diagnostics::{ReportNotice, ReportNoticeEvent, ReportSendModal, ReportSendOutcome};
 use crate::ui::dock::{SidebarDock, SidebarDockEvent};
 use crate::ui::document::{CodeDocument, DataDocument, Tab, TabBar, TabBarEvent, TabManager};
 use datatab_ui_base::keymap::{RunCommand, run_command};
@@ -406,6 +407,11 @@ pub struct Workspace {
     /// login flow. Consumed in render() by `show_settings_login`.
     pending_login_modal_open: Option<PendingSettingsLogin>,
 
+    /// The window that shows every byte of one report (ADR 0008 § 2).
+    report_send: Entity<ReportSendModal>,
+    /// The startup offer for a report a panic left behind.
+    report_notice: Entity<ReportNotice>,
+
     /// The Settings login the login modal shows, while the two are tied.
     settings_login: Option<ShownSettingsLogin>,
 
@@ -537,6 +543,57 @@ impl Workspace {
                 }
             },
         )
+        .detach();
+
+        // Error toasts ask whether a report may be offered; the answer comes
+        // from the three sources of the off switch (ADR 0008), read live.
+        crate::ui::diagnostics::install_report_offer(cx);
+
+        let report_send = cx.new(|cx| ReportSendModal::new(app_state.clone(), cx));
+        let report_notice = cx.new(|cx| ReportNotice::new(app_state.clone(), cx));
+
+        // An error toast's "Send report…" and About's Send both ask for the
+        // window here. The request can come from the Settings window, so the
+        // window that shows the report is brought forward first.
+        cx.subscribe_in(
+            &app_state,
+            window,
+            |this, _, _: &ReportWindowRequested, window, cx| {
+                let request = this
+                    .app_state
+                    .update(cx, |state, _| state.take_pending_report_window());
+
+                if let Some(request) = request {
+                    window.activate_window();
+
+                    this.report_send.update(cx, |send, cx| match &request {
+                        ReportWindowRequest::Error(request) => send.open_error(request, cx),
+                        ReportWindowRequest::Pending(path) => send.open_pending(path, cx),
+                    });
+                    this.focus_handle.focus(window, cx);
+                }
+            },
+        )
+        .detach();
+
+        cx.subscribe(&report_notice, |this, _, event: &ReportNoticeEvent, cx| {
+            if let ReportNoticeEvent::Review(path) = event {
+                this.report_send
+                    .update(cx, |send, cx| send.open_pending(path, cx));
+            }
+        })
+        .detach();
+
+        // Declining or sending in the window answers the startup notice too.
+        // Closing the window without an answer refreshes nothing: the notice
+        // already stopped offering that report for the session, and a refresh
+        // would put the banner back under the user.
+        cx.subscribe(&report_send, |this, _, outcome: &ReportSendOutcome, cx| {
+            if outcome.settled {
+                this.report_notice
+                    .update(cx, |notice, cx| notice.refresh(cx));
+            }
+        })
         .detach();
 
         let modal_delete_connection =
@@ -1675,9 +1732,13 @@ impl Workspace {
             last_user_error: None,
             _background_purge_task: None,
             pending_login_modal_open: None,
+            report_send,
+            report_notice,
             settings_login: None,
             last_settings_login_id: 0,
         };
+
+        workspace.register_settings_forwarder(cx);
 
         {
             let settings = workspace.app_state.read(cx).general_settings().clone();
@@ -1851,6 +1912,11 @@ impl Workspace {
             PaletteCommand::new(
                 "toggle_comment",
                 datatab_i18n::t!("palette.command.toggle_comment.name"),
+                datatab_i18n::t!("palette.category.editor"),
+            ),
+            PaletteCommand::new(
+                "format_sql",
+                datatab_i18n::t!("palette.command.format_sql.name"),
                 datatab_i18n::t!("palette.category.editor"),
             ),
             PaletteCommand::new(

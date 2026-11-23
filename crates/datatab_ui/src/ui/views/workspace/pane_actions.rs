@@ -561,8 +561,9 @@ mod tests {
             "the history starts closed"
         );
 
-        // The disabled formatter entry is skipped on the way to History.
-        keys(window, "j j j enter");
+        // The formatter is available now, so History is the fifth entry: four
+        // moves down from Run.
+        keys(window, "j j j j enter");
 
         assert!(
             menu_ids(&workspace, window).is_empty(),

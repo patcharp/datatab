@@ -30,6 +30,9 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# The report allowlist is bound to `ErrorKind` by a test; only the test build
+# links the diagnostics crate, so the UI never pulls its HTTP client.
+datatab_diagnostics.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 # The keyboard-coverage registry's frame capture lives behind Bolt's
 # `test-support` feature, which a plain dependency build does not enable.

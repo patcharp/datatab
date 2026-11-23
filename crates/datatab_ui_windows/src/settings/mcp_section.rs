@@ -22,6 +22,7 @@ use datatab_mcp::{MUTATING_CLASS_IDS, PolicyRoleDto, ToolPolicyDto, TrustedClien
 use datatab_policy::ClassDecision;
 use datatab_ui_base::keymap::key_chord_from_gpui;
 use datatab_ui_base::toast::{Toast, copy_action, now_hms};
+use datatab_ui_base::user_error::{ErrorKind, UserFacingError, report_error};
 use datatab_ui_base::{AppStateChanged, AppStateEntity, McpRuntimeEventRaised};
 use gpui::prelude::*;
 use gpui::*;
@@ -895,16 +896,21 @@ impl McpSection {
             approval_classes,
         };
 
-        self.app_state.update(cx, |state, cx| {
-            if let Err(e) = state.upsert_mcp_policy(dto) {
-                log::warn!("failed to upsert policy '{}': {}", id, e);
-                return;
+        let saved = self.app_state.update(cx, |state, cx| {
+            let result = state.upsert_mcp_policy(dto);
+            if result.is_ok() {
+                for event in state.drain_mcp_runtime_events() {
+                    cx.emit(McpRuntimeEventRaised { event });
+                }
+                cx.emit(AppStateChanged);
             }
-            for event in state.drain_mcp_runtime_events() {
-                cx.emit(McpRuntimeEventRaised { event });
-            }
-            cx.emit(AppStateChanged);
+            result
         });
+
+        if let Err(error) = saved {
+            report_error(UserFacingError::new(ErrorKind::Config, error), cx);
+            return;
+        }
 
         self.selected_policy_id = Some(id);
         Toast::info(datatab_i18n::t!("settings.mcp.toast.policy_saved"))
@@ -2834,5 +2840,152 @@ mod tests {
         let english = datatab_i18n::t!("settings.mcp.tool.list_connections.name", locale = "en");
 
         assert_eq!(english, "List Connections");
+    }
+}
+
+#[cfg(test)]
+mod save_policy_tests {
+    use datatab_policy::ClassDecision;
+    use datatab_storage::bootstrap::StorageRuntime;
+    use datatab_ui_base::AppStateEntity;
+    use datatab_ui_base::toast::{ToastGlobal, ToastHost, ToastKind};
+    use gpui::{AppContext as _, Entity, TestAppContext, WindowOptions};
+
+    use super::{McpSection, McpSectionVariant};
+
+    fn init_toast_host(cx: &mut TestAppContext) -> Entity<ToastHost> {
+        cx.update(gpui_component::init);
+        cx.update(datatab_components::theme::init);
+        cx.update(|cx| {
+            let host = cx.new(|_| ToastHost::new());
+            cx.set_global(ToastGlobal { host: host.clone() });
+            host
+        })
+    }
+
+    fn test_app_state(cx: &mut TestAppContext) -> Entity<AppStateEntity> {
+        cx.update(|cx| {
+            cx.new(|_| {
+                AppStateEntity::new_with_storage_runtime(
+                    StorageRuntime::in_memory().expect("in-memory storage runtime"),
+                )
+                .expect("test app state")
+            })
+        })
+    }
+
+    /// A refused policy has to reach the person who pressed Save: an error
+    /// toast that names the pair, no selection, and nothing stored. The save
+    /// path used to log the refusal and carry on to the "policy saved" toast.
+    #[gpui::test]
+    fn a_refused_policy_shows_the_pair_and_is_not_selected(cx: &mut TestAppContext) {
+        let toast_host = init_toast_host(cx);
+        let app_state = test_app_state(cx);
+        let window = cx
+            .update(|cx| {
+                cx.open_window(WindowOptions::default(), |window, cx| {
+                    cx.new(|cx| {
+                        McpSection::new(app_state.clone(), McpSectionVariant::Policies, window, cx)
+                    })
+                })
+            })
+            .expect("the policies section opens");
+
+        window
+            .update(cx, |section, window, cx| {
+                section
+                    .input_policy_id
+                    .update(cx, |input, cx| input.set_value("custom", window, cx));
+                // A new-policy draft asks on every mutating class, so denying
+                // `destructive` asks on the classes above it (#490).
+                section
+                    .draft_policy_classes
+                    .set("destructive", ClassDecision::Deny);
+
+                section.save_policy(window, cx);
+
+                assert!(
+                    section.selected_policy_id.is_none(),
+                    "a refused policy must not be selected as if it were saved"
+                );
+            })
+            .expect("the policies section is open");
+
+        toast_host.read_with(cx, |host, _| {
+            assert_eq!(
+                host.last_toast_kind(),
+                Some(ToastKind::Error),
+                "a refused save is reported as an error"
+            );
+
+            let title = host.last_toast_title().expect("a toast");
+            for expected in ["custom", "AdminSafe", "Destructive"] {
+                assert!(title.contains(expected), "{title} must name {expected}");
+            }
+        });
+
+        let ids: Vec<String> = app_state
+            .read_with(cx, |state, _| state.list_mcp_policies())
+            .expect("list policies")
+            .into_iter()
+            .map(|policy| policy.id)
+            .collect();
+        assert!(
+            !ids.contains(&"custom".to_string()),
+            "nothing stored: {ids:?}"
+        );
+    }
+
+    /// A coherent policy still saves, is selected, and says so: the refusal
+    /// above must not turn every save into an error.
+    #[gpui::test]
+    fn a_coherent_policy_still_saves_and_says_so(cx: &mut TestAppContext) {
+        let toast_host = init_toast_host(cx);
+        let app_state = test_app_state(cx);
+        let window = cx
+            .update(|cx| {
+                cx.open_window(WindowOptions::default(), |window, cx| {
+                    cx.new(|cx| {
+                        McpSection::new(app_state.clone(), McpSectionVariant::Policies, window, cx)
+                    })
+                })
+            })
+            .expect("the policies section opens");
+
+        window
+            .update(cx, |section, window, cx| {
+                section
+                    .input_policy_id
+                    .update(cx, |input, cx| input.set_value("custom", window, cx));
+                section
+                    .draft_policy_classes
+                    .set("destructive", ClassDecision::Deny);
+                section
+                    .draft_policy_classes
+                    .set("admin_safe", ClassDecision::Deny);
+                section
+                    .draft_policy_classes
+                    .set("admin", ClassDecision::Deny);
+                section
+                    .draft_policy_classes
+                    .set("admin_destructive", ClassDecision::Deny);
+
+                section.save_policy(window, cx);
+
+                assert_eq!(section.selected_policy_id.as_deref(), Some("custom"));
+            })
+            .expect("the policies section is open");
+
+        toast_host.read_with(cx, |host, _| {
+            assert_eq!(host.last_toast_kind(), Some(ToastKind::Info));
+        });
+
+        let ids: Vec<String> = app_state
+            .read_with(cx, |state, _| state.list_mcp_policies())
+            .expect("list policies")
+            .into_iter()
+            .map(|policy| policy.id)
+            .collect();
+        assert!(ids.contains(&"custom".to_string()), "{ids:?}");
     }
 }

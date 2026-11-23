@@ -22,13 +22,13 @@ Redis key-value driver for DataTab, built on the [`redis`](https://crates.io/cra
 - Best-effort write-privilege probe on connect (`probe_write_privilege`): tries `ACL WHOAMI` + `ACL DRYRUN` first, and falls back to a short-TTL namespaced `SET ... NX` / `DEL` when `ACL` is unavailable (older server or restricted managed provider); a replica's `READONLY` reply or a `NOPERM` denial resolves to a read-only connection.
 - TLS/SSL with three modes (`off`, `on`, `verify`):
   - `off` — plain `redis://` connection.
-  - `on` — `rediss://`, encrypted, with no check of the certificate chain or name, so it does not protect against a man in the middle. Refused with the Sentinel topology (see Limitations).
-  - `verify` — `rediss://` with a supplied root certificate and optional client certificate/key, built through `Client::build_with_tls`. Certificate pickers appear only in this mode; switching modes keeps their saved paths. Refused with the Sentinel topology (see Limitations).
+  - `on` — `rediss://`, encrypted, with no check of the certificate chain or name, so it does not protect against a man in the middle.
+  - `verify` — `rediss://` with a supplied root certificate and optional client certificate/key, built through `Client::build_with_tls`. Certificate pickers appear only in this mode; switching modes keeps their saved paths.
 - SSH tunnel support for reaching Redis through a bastion host (manual mode only; see Limitations).
 - Deployment topology can be detected automatically or set explicitly (`standalone`, `cluster`, `sentinel`):
   - Automatic detection probes `ROLE` and `INFO cluster` at connect time and routes to standalone or Cluster handling.
   - `cluster` skips detection and connects directly via `ClusterClient`, using the primary host/port plus any configured additional seed nodes. A Cluster connection only ever exposes database 0; a nonzero database on a Cluster profile is rejected at connect time instead of being silently applied to db 0.
-  - `sentinel` connects through `SentinelClient`, without TLS, resolving the named master from one or more Sentinel nodes (primary host/port plus any configured additional nodes). After resolving, the driver runs `CLIENT SETNAME`, `PING`, and a `ROLE` sanity check that the resolved node is actually a master.
+  - `sentinel` resolves the named master from the primary Sentinel node or configured additional nodes. Plain connections use `SentinelClient`. In manual mode, TLS connections use DataTab's resolver with the same TLS mode and certificates for every Sentinel node and the master, including after failover. The driver runs `CLIENT SETNAME`, `PING`, and a `ROLE` check on connect. TLS requires a successful master `ROLE` reply on connect and after every re-resolve.
   - Sentinel failover recovery: a connection-class failure (dropped connection, IO error) on a Sentinel-backed connection triggers exactly one re-resolve through Sentinel and one retry of the failed command before the error is surfaced.
 - Key browsing and discovery:
   - Cursor-based key scanning (`KV_SCAN`, `PaginationStyle::Cursor`). One page request keeps issuing `SCAN` until the page holds the requested number of keys or the scan completes, so a sparse `MATCH` filter does not produce empty pages. Each page is bounded to 1000 `SCAN` round trips and 500 ms; when the bound is reached, the page returns the keys found so far with a pending cursor. A key that `SCAN` repeats is listed once per page, and a page can exceed the requested size by at most one `SCAN` batch. The page's key types are fetched in one pipeline. On a Cluster connection, a plain `SCAN` has no single-node meaning, so the driver scans the pending masters in turn under the same page bound: each node's cursor is tracked independently, and the aggregated cursor round-trips as an opaque JSON object mapping `"<host>:<port>"` to its pending `SCAN` cursor. The overall scan is exhausted once every master reports cursor 0. Cancelling a key scan stops the page before its next `SCAN` round trip (`KeyValueApi::scan_keys_with_cancel`); a round trip already sent finishes first.
@@ -61,15 +61,15 @@ Exposes a curated set of live server metrics sourced from the `INFO` command out
 - `redis.blocked_clients` — clients waiting on a blocking command
 - `redis.used_memory` — bytes allocated by Redis allocator
 - `redis.used_memory_rss` — bytes allocated by the OS (resident set size)
-- `redis.total_commands_processed` — commands processed per second
-- `redis.total_connections_received` — cumulative connections accepted
-- `redis.instantaneous_ops_per_sec` — commands processed per second (server-side rate)
-- `redis.keyspace_hits` — cache hits per second on key lookups
-- `redis.keyspace_misses` — cache misses per second on key lookups
-- `redis.evicted_keys` — keys evicted due to `maxmemory` policy
-- `redis.expired_keys` — keys expired by TTL
-- `redis.rdb_changes_since_last_save` — changes since last RDB snapshot
-- `redis.connected_slaves` — attached replica count
+- `redis.mem_fragmentation_ratio` — resident memory divided by allocated memory
+- `redis.ops_per_sec` — commands processed per second (server-side rate)
+- `redis.input_kbps` — network input rate reported by the server
+- `redis.output_kbps` — network output rate reported by the server
+- `redis.total_commands` — commands processed per second (counter)
+- `redis.keyspace_hits` — cache hits per second on key lookups (counter)
+- `redis.keyspace_misses` — cache misses per second on key lookups (counter)
+- `redis.repl_backlog_size` — replication backlog size in bytes
+- `redis.connected_replicas` — attached replica count
 
 Each metric is returned as a single `(timestamp_ms, value)` row for live charting.
 
@@ -103,6 +103,8 @@ Sensitive fields (`addr`, `laddr`, `name`) are redacted to `[redacted]` to avoid
 - The type filter needs Redis 6.0 or later (`SCAN ... TYPE`). Paging a stream past its first page needs Redis 6.2 or later (exclusive range bounds); consumer groups need Redis 5.0 or later.
 - Key sizes come from `MEMORY USAGE`, which some managed providers disable; the size column then stays empty while the expiry column still fills in.
 - Bulk delete counts matches with a full `SCAN` of the database before anything is deleted, which reads the whole keyspace once.
-- Sentinel does not support TLS. DataTab cannot reach the resolved Sentinel master over TLS yet. In manual mode, TLS modes `on` and `verify`, unknown modes, and legacy `tls: true` without `ssl_mode` are refused. In URI mode, every `rediss://` URI is refused. Refusal comes before any network access, including PreConnect hooks, authentication, SSH and proxies. The check reads the address as the `redis` crate parses it, so a trailing space or an upper-case scheme does not get past it. Use TLS mode `off` or a `redis://` URI with Sentinel; the password then travels unencrypted to the Sentinel master.
+- Sentinel TLS requires manual mode and Direct access. Modes `on` and `verify`, and legacy `tls: true` without `ssl_mode`, are supported. Unknown modes, TLS Sentinel with any other access kind (including SSH, Proxy and Managed), and Sentinel `rediss://` URIs remain refused before hooks, authentication, secret reads, or network access. Validation reads no certificate files. The URI check uses the `redis` crate's parser, including its handling of trailing spaces and upper-case schemes.
+- In Sentinel `verify` mode, the master certificate needs a SAN for the address the Sentinels announce, often an IP address. Sentinels can instead announce hostnames that match the certificates. TLS never falls back to plain TCP or disables verification after a certificate failure. Mode `on` encrypts both legs without verifying either certificate.
+- Sentinel answers are trusted for master discovery. A compromised Sentinel can redirect the connection to any host with a CA-valid certificate for that address. Master credentials are sent to that host after TLS verification. Mode `on` provides no certificate protection against that redirection.
 - Cluster additional seed nodes are always contacted over plain `redis://`; per-node TLS configuration for those extra nodes is not supported.
 - Sentinel authentication applies only to the resolved master connection (via the configured username/password); the Sentinel nodes themselves are contacted without authentication.

@@ -1403,11 +1403,14 @@ impl ConnectionManager {
                 error: error.to_string(),
             })?;
 
-        let secret_store_param = if kind == DbKind::SQLite {
-            None
-        } else {
-            Some(secret_store.clone())
-        };
+        // A SQLite profile has no password; the store is still needed for the
+        // secret fields an RPC driver keeps in the keyring.
+        let secret_store_param =
+            if kind == DbKind::SQLite && profile.keyring_secret_fields.is_empty() {
+                None
+            } else {
+                Some(secret_store.clone())
+            };
 
         let ssh_secret = get_ssh_secret(&profile, ssh_tunnels);
 
@@ -2613,9 +2616,22 @@ impl ConnectProfileParams {
             }
         }
 
+        // Without a secret store a marked field has no value to give, which
+        // refuses the connect as a missing entry does.
+        let form = self.driver.form_definition();
+        let keyring_fields_profile = match self.secret_store.as_ref() {
+            Some(secret_store) => {
+                crate::profile_with_keyring_fields_from(&profile, form, secret_store)?
+            }
+            None => crate::profile_with_keyring_fields(&profile, form, |_| Ok(None))?,
+        };
         let connection = self
             .driver
-            .connect_with_secrets(&profile, password.as_ref(), self.ssh_secret.as_ref())
+            .connect_with_secrets(
+                keyring_fields_profile.as_ref().unwrap_or(&profile),
+                password.as_ref(),
+                self.ssh_secret.as_ref(),
+            )
             .map_err(|e| e.to_string())?;
 
         let schema = match connection.schema() {
@@ -2656,19 +2672,21 @@ impl ConnectProfileParams {
             return Ok(None);
         };
 
-        if !self.profile.save_password {
+        if !self.profile.save_password || self.profile.kind() == DbKind::SQLite {
             return Ok(None);
         }
 
-        let read = match secret_store.read() {
-            Ok(store) => store.get(&self.profile.secret_ref()),
-            Err(poison_err) => {
-                log::warn!("Secret store RwLock poisoned during password retrieval, recovering...");
-                poison_err.into_inner().get(&self.profile.secret_ref())
+        crate::keyring_password_for_connect(&self.profile, self.driver.requires_password(), || {
+            match secret_store.read() {
+                Ok(store) => store.get(&self.profile.secret_ref()),
+                Err(poison_err) => {
+                    log::warn!(
+                        "Secret store RwLock poisoned during password retrieval, recovering..."
+                    );
+                    poison_err.into_inner().get(&self.profile.secret_ref())
+                }
             }
-        };
-
-        crate::keyring_password_for_connect(&self.profile, self.driver.requires_password(), read)
+        })
     }
 }
 
@@ -3406,6 +3424,7 @@ pub enum StaleInstallReason {
 
 #[cfg(test)]
 mod tests {
+    mod keyring_fields;
     mod refusal;
     #[test]
     fn unsupported_cancel_before_teardown_logs_at_debug_only() {

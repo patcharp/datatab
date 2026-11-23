@@ -163,6 +163,10 @@ pub(crate) const SETTINGS: SurfaceRegistry = SurfaceRegistry {
             KeyboardPath::Command(Command::Execute),
         ),
         (
+            "offer-error-reports",
+            KeyboardPath::Command(Command::Execute),
+        ),
+        (
             "general-*-font-family",
             KeyboardPath::Command(Command::Execute),
         ),
@@ -197,6 +201,10 @@ pub(crate) const SETTINGS: SurfaceRegistry = SurfaceRegistry {
         ),
         (
             "cancel-auth-profile",
+            KeyboardPath::Command(Command::Execute),
+        ),
+        (
+            "auth-options-retry-*",
             KeyboardPath::Command(Command::Execute),
         ),
         (
@@ -254,6 +262,17 @@ pub(crate) const SETTINGS: SurfaceRegistry = SurfaceRegistry {
             KeyboardPath::Command(Command::Execute),
         ),
         ("about-link-*", KeyboardPath::Command(Command::Execute)),
+        // The delete action of a report that was already sent. Enter on the
+        // ring runs the focused action of a row, so it takes the same
+        // `Execute` the row's other actions do; the entry stands on its own so
+        // the one action of a sent report reads as a path of its own here.
+        (
+            "about-report-*-delete",
+            KeyboardPath::Command(Command::Execute),
+        ),
+        // The pending-report rows: J and K walk the page's ring and Enter
+        // runs the action it points at.
+        ("about-report-*", KeyboardPath::Command(Command::Execute)),
         ("mcp-client-active", KeyboardPath::Command(Command::Execute)),
         ("mcp-role-*.*", KeyboardPath::Command(Command::Execute)),
         ("mcp-policy-*", KeyboardPath::Command(Command::Execute)),

@@ -27,7 +27,10 @@ pub(crate) const CODE_EDITOR_CHROME: SurfaceRegistry = SurfaceRegistry {
         ("toolbar-history-btn", KeyboardPath::Menu("history")),
         ("toolbar-explain-btn", KeyboardPath::Menu("explain")),
         ("toolbar-chart-btn", KeyboardPath::Menu("chart")),
-        ("toolbar-format-btn", KeyboardPath::Menu("format")),
+        (
+            "toolbar-format-btn",
+            KeyboardPath::Command(Command::FormatSql),
+        ),
         ("sql-refresh-action", KeyboardPath::Menu("refresh")),
         ("sql-auto-refresh.*", KeyboardPath::Menu("auto-refresh")),
         (
@@ -80,9 +83,13 @@ pub(crate) const DATA_GRID: SurfaceRegistry = SurfaceRegistry {
     ],
     entries: &[
         ("cell-*", KeyboardPath::Command(Command::SelectNext)),
-        // The table menu of the column carries Order ascending / descending.
+        // The table menu carries copy, ordering and filter actions for the active column.
         (
             "header-col-*",
+            KeyboardPath::Command(Command::OpenContextMenu),
+        ),
+        (
+            "column-menu-action-*",
             KeyboardPath::Command(Command::OpenContextMenu),
         ),
         // Every row of the table menu and its submenus.

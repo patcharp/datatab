@@ -41,8 +41,15 @@ const AUTH_SELECT_WIDTH: Rems = ui(300.0);
 /// a hash of the sorted dependency key-value pairs.
 struct CachedOptions {
     options: Vec<datatab_core::SelectOption>,
-    expires_at: Instant,
+    /// `None` when the provider gave no lifetime (a zero or missing hint): the
+    /// entry then lasts until the dependencies change or the cache is cleared,
+    /// so the render an answer causes does not fetch again.
+    expires_at: Option<Instant>,
 }
+
+/// The key of `options_cache` and `options_in_flight`:
+/// `(provider_id, field_id, dep_hash)`.
+type OptionsKey = (String, String, u64);
 
 pub(super) struct AuthProfilesSection {
     app_state: Entity<AppStateEntity>,
@@ -71,7 +78,21 @@ pub(super) struct AuthProfilesSection {
     /// Generic dynamic-select dropdowns keyed by field id.
     dynamic_dropdowns: HashMap<String, Entity<Dropdown>>,
     /// Cached options indexed by `(provider_id, field_id, dep_hash)`.
-    options_cache: HashMap<(String, String, u64), CachedOptions>,
+    options_cache: HashMap<OptionsKey, CachedOptions>,
+    /// Fetches that were started and have not answered yet, by the key of
+    /// `options_cache`. The value identifies the fetch, so the answer of a
+    /// fetch the form let go of does not clear the entry of a newer one.
+    options_in_flight: HashMap<OptionsKey, u64>,
+    options_fetch_sequence: u64,
+    /// Advances when the form drops its options (`clear_options`), so the
+    /// answer of a fetch started before is ignored when it arrives.
+    options_generation: u64,
+    /// Keys whose last fetch failed. Like an answer without a lifetime, a
+    /// failure lasts until the next refresh trigger of its field, so the
+    /// repaint the error causes does not fetch again.
+    options_failed: HashSet<OptionsKey>,
+    /// The dependency hash each `(provider_id, field_id)` last rendered with.
+    options_last_dependencies: HashMap<(String, String), u64>,
     /// Per-field re-login hint shown below the dropdown when the last fetch
     /// returned `NeedsLogin` or `SessionExpired`.
     ///
@@ -414,7 +435,7 @@ impl AuthProfilesSection {
                     });
                 }
 
-                this.options_cache.clear();
+                this.clear_options();
                 this.field_login_hint.clear();
                 this.release_login_of_replaced_form(cx);
 
@@ -442,6 +463,11 @@ impl AuthProfilesSection {
             provider_dropdown,
             dynamic_dropdowns: HashMap::new(),
             options_cache: HashMap::new(),
+            options_in_flight: HashMap::new(),
+            options_fetch_sequence: 0,
+            options_generation: 0,
+            options_failed: HashSet::new(),
+            options_last_dependencies: HashMap::new(),
             field_login_hint: HashMap::new(),
             pending_login_complete_refresh: false,
             pending_sso_url: None,
@@ -498,6 +524,90 @@ impl AuthProfilesSection {
                 )
             })
             .collect()
+    }
+
+    /// Forgets the cached options and the fetches in flight, so the form
+    /// fetches again and the answer of an earlier fetch leaves no mark.
+    fn clear_options(&mut self) {
+        self.options_cache.clear();
+        self.options_in_flight.clear();
+        self.options_failed.clear();
+        self.options_last_dependencies.clear();
+        self.options_generation = self.options_generation.wrapping_add(1);
+    }
+
+    /// Drops what lasts only until the next refresh trigger of a field: the
+    /// answers without a lifetime and the failures. Answers with a lifetime
+    /// keep it.
+    fn invalidate_untimed_options(&mut self, provider_id: &str, field_id: &str) {
+        let of_field = |key: &OptionsKey| key.0 == provider_id && key.1 == field_id;
+        self.options_cache
+            .retain(|key, cached| !(of_field(key) && cached.expires_at.is_none()));
+        self.options_failed.retain(|key| !of_field(key));
+    }
+
+    /// The field gained focus: a `RefreshTrigger::OnFocus` field fetches
+    /// again, unless its answer has a lifetime that is still running.
+    fn refresh_options_on_focus(&mut self, field_id: &str, cx: &App) {
+        let Some(provider) = self.selected_provider(cx) else {
+            return;
+        };
+        let refreshes_on_focus = provider
+            .form_def()
+            .tabs
+            .iter()
+            .flat_map(|tab| tab.sections.iter())
+            .flat_map(|section| section.fields.iter())
+            .any(|field| {
+                field.id == field_id
+                    && matches!(
+                        field.kind,
+                        FormFieldKind::DynamicSelect {
+                            refresh: RefreshTrigger::OnFocus,
+                            ..
+                        }
+                    )
+            });
+        let provider_id = provider.provider_id().to_string();
+        if refreshes_on_focus {
+            self.invalidate_untimed_options(&provider_id, field_id);
+        } else {
+            // Enter on a field runs `focus_current_field`, which lands here:
+            // that is the keyboard way to retry a failed field. A failure
+            // waits for the next trigger, and this is one. The next render
+            // fetches again when `needs_fetch` allows it (no fetch in flight,
+            // no valid cached answer, and a session if the provider needs one).
+            self.retry_failed_options(&provider_id, field_id);
+        }
+    }
+
+    /// The Retry button of a failed field: forgets its failures and repaints.
+    fn retry_options(&mut self, field_id: &str, cx: &mut Context<Self>) {
+        if let Some(provider_id) = self.selected_provider_id.clone() {
+            self.retry_failed_options(&provider_id, field_id);
+            cx.notify();
+        }
+    }
+
+    /// Forgets the failures of a field. The next render of the form fetches
+    /// the field again when `needs_fetch` allows it (no fetch in flight, no
+    /// valid cached answer, and a session if the provider needs one).
+    fn retry_failed_options(&mut self, provider_id: &str, field_id: &str) {
+        self.options_failed
+            .retain(|key| !(key.0 == provider_id && key.1 == field_id));
+    }
+
+    fn dependency_hash(&self, depends_on: &[String], cx: &App) -> u64 {
+        let deps: HashMap<String, String> = depends_on
+            .iter()
+            .filter_map(|dep_id| {
+                self.form_inputs
+                    .get(dep_id)
+                    .map(|input| (dep_id.clone(), input.read(cx).value().to_string()))
+            })
+            .collect();
+
+        Self::hash_deps(&deps)
     }
 
     fn selected_provider(&self, cx: &App) -> Option<Arc<dyn datatab_core::DynAuthProvider>> {
@@ -758,34 +868,58 @@ impl AuthProfilesSection {
         let dep_hash = Self::hash_deps(&deps);
         let cache_key = (provider_id.clone(), field.id.clone(), dep_hash);
 
+        // A change of the dependencies is the refresh trigger of this field:
+        // what lasted only until it is gone, including the entry of an
+        // earlier value of the dependencies.
+        if matches!(refresh, RefreshTrigger::OnDependencyChange) {
+            let previous = self
+                .options_last_dependencies
+                .insert((provider_id.clone(), field.id.clone()), dep_hash);
+            if previous.is_some_and(|previous| previous != dep_hash) {
+                self.invalidate_untimed_options(&provider_id, &field.id);
+            }
+        }
+        let failed = self.options_failed.contains(&cache_key);
+
         // Determine whether we need to (re-)fetch.
         let needs_fetch = match refresh {
             // Manual fields are never auto-refetched.  They fetch exactly once
             // on the first render (cache miss) and then require an explicit
             // user gesture (cache invalidation) to refetch.
-            RefreshTrigger::Manual => !self.options_cache.contains_key(&cache_key),
+            RefreshTrigger::Manual => !failed && !self.options_cache.contains_key(&cache_key),
             // OnLoginComplete fields refresh right after a successful login
             // OR on the first render when a session is available (cache miss).
             // Without the cache-miss branch the user would have to re-click
             // Login every time they reopen the editor to see options.
             RefreshTrigger::OnLoginComplete => {
-                login_just_completed || !self.options_cache.contains_key(&cache_key)
+                login_just_completed || (!failed && !self.options_cache.contains_key(&cache_key))
             }
             RefreshTrigger::OnDependencyChange | RefreshTrigger::OnFocus => {
                 match self.options_cache.get(&cache_key) {
-                    None => true,
-                    Some(cached) => Instant::now() > cached.expires_at,
+                    None => !failed,
+                    Some(cached) => {
+                        !failed
+                            && cached
+                                .expires_at
+                                .is_some_and(|expires_at| Instant::now() > expires_at)
+                    }
                 }
             }
         };
 
-        if !needs_fetch {
+        if !needs_fetch || self.options_in_flight.contains_key(&cache_key) {
             return;
         }
 
         let Some(provider) = self.selected_provider(cx) else {
             return;
         };
+
+        self.options_fetch_sequence = self.options_fetch_sequence.wrapping_add(1);
+        let fetch_id = self.options_fetch_sequence;
+        let generation = self.options_generation;
+        let depends_on = depends_on.clone();
+        self.options_in_flight.insert(cache_key.clone(), fetch_id);
 
         let field_id = field.id.clone();
         let this = cx.entity().clone();
@@ -848,15 +982,25 @@ impl AuthProfilesSection {
 
             cx.update(|cx| {
                 this.update(cx, |this, cx| {
+                    let answered_key = (provider_id.clone(), field_id.clone(), dep_hash);
+                    if this.options_in_flight.get(&answered_key) == Some(&fetch_id) {
+                        this.options_in_flight.remove(&answered_key);
+                    }
+
+                    // An answer of a form, provider or dependencies that are
+                    // no longer current changes nothing.
+                    let current = this.options_generation == generation
+                        && this.selected_provider_id.as_deref() == Some(provider_id.as_str())
+                        && this.dependency_hash(&depends_on, cx) == dep_hash;
+                    if !current {
+                        return;
+                    }
+
                     match result {
                         Ok(response) => {
                             let ttl_secs = response.cache_hint_seconds.unwrap_or(0) as u64;
-                            let expires_at = Instant::now()
-                                + std::time::Duration::from_secs(if ttl_secs == 0 {
-                                    0
-                                } else {
-                                    ttl_secs
-                                });
+                            let expires_at = (ttl_secs > 0)
+                                .then(|| Instant::now() + std::time::Duration::from_secs(ttl_secs));
 
                             let options = response.options;
 
@@ -897,6 +1041,7 @@ impl AuthProfilesSection {
                             }
                         }
                         Err(error) => {
+                            this.options_failed.insert(answered_key);
                             this.apply_fetch_error(&field_id, error, cx);
                         }
                     }
@@ -923,6 +1068,7 @@ impl AuthProfilesSection {
     ) -> impl IntoElement {
         let field_id = field.id.clone();
         let label = field.label.clone();
+        let field_label = label.clone();
 
         // Build the dropdown if it was not yet created (e.g. if rebuild_form_inputs
         // was not called before the first render — defensive path only).
@@ -997,6 +1143,19 @@ impl AuthProfilesSection {
         }
 
         let login_hint = self.field_login_hint.get(&field_id).cloned();
+        // Only a failure of the dependencies the dropdown holds now counts.
+        let current_dependencies = match &field.kind {
+            FormFieldKind::DynamicSelect { depends_on, .. } => {
+                Some(self.dependency_hash(depends_on, cx))
+            }
+            _ => None,
+        };
+        let load_failed = login_hint.is_none()
+            && self.options_failed.iter().any(|key| {
+                key.1 == field_id
+                    && self.selected_provider_id.as_deref() == Some(key.0.as_str())
+                    && Some(key.2) == current_dependencies
+            });
         let help = field.help.clone();
 
         layout::form_row(
@@ -1013,6 +1172,38 @@ impl AuthProfilesSection {
                 .when_some(help, |column, help| column.child(layout::help_text(help)))
                 .when_some(login_hint, |column, hint| {
                     column.child(Text::body(hint).font_size(FormMetrics::HELP_FONT).warning())
+                })
+                .when(load_failed, |column| {
+                    let retry_field_id = field_id.clone();
+                    let retry_field_label = field_label.clone();
+                    column.child(
+                        layout::inline_controls()
+                            .child(
+                                Text::body(datatab_i18n::t!(
+                                    "settings.auth_profiles.options_failed_hint"
+                                ))
+                                .font_size(FormMetrics::HELP_FONT)
+                                .warning(),
+                            )
+                            .child(
+                                Button::new(
+                                    SharedString::from(format!(
+                                        "auth-options-retry-{retry_field_id}"
+                                    )),
+                                    datatab_i18n::t!("settings.auth_profiles.options_retry"),
+                                )
+                                .aria_label(datatab_i18n::t!(
+                                    "settings.auth_profiles.options_retry_label",
+                                    field = retry_field_label.clone()
+                                ))
+                                .secondary()
+                                .on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.retry_options(&retry_field_id, cx);
+                                    },
+                                )),
+                            ),
+                    )
                 }),
             None,
         )
@@ -1119,7 +1310,7 @@ impl AuthProfilesSection {
 
         // Clear the dynamic-select options cache so stale options are not shown
         // for a new/reset profile.
-        self.options_cache.clear();
+        self.clear_options();
         self.field_login_hint.clear();
 
         self.release_login_of_replaced_form(cx);
@@ -1366,7 +1557,7 @@ impl AuthProfilesSection {
 
         // Clear options cache so DynamicSelect dropdowns are re-fetched for
         // the newly loaded profile's field values.
-        self.options_cache.clear();
+        self.clear_options();
         self.field_login_hint.clear();
 
         // A login still in flight belongs to the form as it was: its result
@@ -1635,7 +1826,7 @@ impl AuthProfilesSection {
                         .as_ref()
                         .is_some_and(|status| status.1)
                     {
-                        this.options_cache.clear();
+                        this.clear_options();
                         this.field_login_hint.clear();
                         this.pending_login_complete_refresh = true;
                     }
@@ -2527,6 +2718,9 @@ impl FormSection for AuthProfilesSection {
                     .update(cx, |state, cx| state.focus(window, cx));
             }
             AuthFormField::DynamicField(idx) => {
+                if let Some(field_id) = self.provider_field_order.get(idx).cloned() {
+                    self.refresh_options_on_focus(&field_id, cx);
+                }
                 if let Some(field_id) = self.provider_field_order.get(idx)
                     && let Some(dropdown) = self.dynamic_dropdowns.get(field_id).cloned()
                 {
@@ -3053,7 +3247,7 @@ mod tests {
                     cached_options_key.clone(),
                     CachedOptions {
                         options: Vec::new(),
-                        expires_at: Instant::now(),
+                        expires_at: Some(Instant::now()),
                     },
                 );
             })
@@ -3177,7 +3371,7 @@ mod tests {
                     cached_options_key.clone(),
                     CachedOptions {
                         options: Vec::new(),
-                        expires_at: Instant::now(),
+                        expires_at: Some(Instant::now()),
                     },
                 );
             })
@@ -3221,7 +3415,7 @@ mod tests {
                     cached_options_key.clone(),
                     CachedOptions {
                         options: Vec::new(),
-                        expires_at: Instant::now(),
+                        expires_at: Some(Instant::now()),
                     },
                 );
             })
@@ -3583,7 +3777,7 @@ mod tests {
             cache_key.clone(),
             CachedOptions {
                 options: vec![],
-                expires_at: Instant::now() + std::time::Duration::from_secs(300),
+                expires_at: Some(Instant::now() + std::time::Duration::from_secs(300)),
             },
         );
         let needs_fetch_on_hit = !cache_with_entry.contains_key(&cache_key);
@@ -3763,10 +3957,10 @@ mod tests {
     fn expired_cache_entry_is_detected() {
         let expired = CachedOptions {
             options: vec![],
-            expires_at: Instant::now() - std::time::Duration::from_secs(1),
+            expires_at: Some(Instant::now() - std::time::Duration::from_secs(1)),
         };
         assert!(
-            Instant::now() > expired.expires_at,
+            Some(Instant::now()) > expired.expires_at,
             "expired entry must be older than now"
         );
     }
@@ -3776,10 +3970,10 @@ mod tests {
     fn fresh_cache_entry_is_not_expired() {
         let fresh = CachedOptions {
             options: vec![],
-            expires_at: Instant::now() + std::time::Duration::from_secs(300),
+            expires_at: Some(Instant::now() + std::time::Duration::from_secs(300)),
         };
         assert!(
-            Instant::now() <= fresh.expires_at,
+            Some(Instant::now()) <= fresh.expires_at,
             "fresh entry must not be expired"
         );
     }
@@ -3978,5 +4172,597 @@ mod tests {
         let hint = crate::labels::auth_profiles_inherited_hint("proxy_id", Some("corporate-proxy"));
 
         assert_eq!(hint, "Inherited from proxy_id 'corporate-proxy'.");
+    }
+
+    // --- Dynamic-options fetches in flight (#385) ---
+
+    const OPTIONS_PROVIDER_ID: &str = "options-auth";
+
+    #[derive(Default)]
+    struct OptionsGateState {
+        open: bool,
+        wakers: Vec<std::task::Waker>,
+    }
+
+    /// A provider whose option fetches answer only when the test opens the
+    /// gate, as an RPC provider answers after its round trip.
+    struct OptionsProvider {
+        form: datatab_core::auth::AuthFormDef,
+        cache_hint_seconds: Option<u32>,
+        fails: bool,
+        fetches: std::sync::atomic::AtomicUsize,
+        gate: std::sync::Mutex<OptionsGateState>,
+    }
+
+    impl OptionsProvider {
+        fn new(cache_hint_seconds: Option<u32>) -> Arc<Self> {
+            Self::with(
+                cache_hint_seconds,
+                RefreshTrigger::OnDependencyChange,
+                false,
+            )
+        }
+
+        /// The `account` field depends on the text field `region`.
+        fn with(
+            cache_hint_seconds: Option<u32>,
+            refresh: RefreshTrigger,
+            fails: bool,
+        ) -> Arc<Self> {
+            let region = datatab_core::field("region", "Region", FormFieldKind::Text, "");
+            let field = datatab_core::field(
+                "account",
+                "Account",
+                FormFieldKind::DynamicSelect {
+                    depends_on: vec!["region".to_string()],
+                    refresh,
+                    requires_session: false,
+                    allow_freeform: false,
+                },
+                "",
+            );
+            Arc::new(Self {
+                form: datatab_core::auth::AuthFormDef {
+                    tabs: vec![datatab_core::FormTab {
+                        id: "main".to_string(),
+                        label: "Main".to_string(),
+                        sections: vec![datatab_core::FormSection {
+                            title: "Main".to_string(),
+                            icon: None,
+                            fields: vec![region, field],
+                        }],
+                    }],
+                },
+                cache_hint_seconds,
+                fails,
+                fetches: std::sync::atomic::AtomicUsize::new(0),
+                gate: std::sync::Mutex::new(OptionsGateState::default()),
+            })
+        }
+
+        fn fetch_count(&self) -> usize {
+            self.fetches.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        /// Lets every fetch, started or later, answer.
+        fn answer(&self) {
+            let mut gate = self.gate.lock().expect("options gate");
+            gate.open = true;
+            for waker in gate.wakers.drain(..) {
+                waker.wake();
+            }
+        }
+
+        async fn gate_open(&self) {
+            std::future::poll_fn(|context| {
+                let mut gate = self.gate.lock().expect("options gate");
+                if gate.open {
+                    std::task::Poll::Ready(())
+                } else {
+                    gate.wakers.push(context.waker().clone());
+                    std::task::Poll::Pending
+                }
+            })
+            .await
+        }
+    }
+
+    type ProviderFuture<'a, T> =
+        std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+    /// `async_trait` written out: this crate does not depend on it.
+    impl datatab_core::DynAuthProvider for OptionsProvider {
+        fn provider_id(&self) -> &str {
+            OPTIONS_PROVIDER_ID
+        }
+        fn display_name(&self) -> &str {
+            "Options provider"
+        }
+        fn form_def(&self) -> &datatab_core::auth::AuthFormDef {
+            &self.form
+        }
+        fn validate_session<'a, 'b, 'c>(
+            &'a self,
+            _: &'b AuthProfile,
+        ) -> ProviderFuture<'c, Result<datatab_core::AuthSessionState, datatab_core::DbError>>
+        where
+            'a: 'c,
+            'b: 'c,
+        {
+            Box::pin(async { Ok(datatab_core::AuthSessionState::LoginRequired) })
+        }
+        fn login<'a, 'b, 'c>(
+            &'a self,
+            _: &'b AuthProfile,
+            _: datatab_core::auth::UrlCallback,
+        ) -> ProviderFuture<'c, Result<datatab_core::AuthSession, datatab_core::DbError>>
+        where
+            'a: 'c,
+            'b: 'c,
+        {
+            Box::pin(async { Err(datatab_core::DbError::connection_failed("no login")) })
+        }
+        fn resolve_credentials<'a, 'b, 'c>(
+            &'a self,
+            _: &'b AuthProfile,
+        ) -> ProviderFuture<'c, Result<datatab_core::ResolvedCredentials, datatab_core::DbError>>
+        where
+            'a: 'c,
+            'b: 'c,
+        {
+            Box::pin(async { Ok(datatab_core::ResolvedCredentials::default()) })
+        }
+        fn fetch_dynamic_options<'a, 'b, 'c>(
+            &'a self,
+            _: &'b AuthProfile,
+            _: FetchOptionsRequest,
+        ) -> ProviderFuture<
+            'c,
+            Result<datatab_core::FetchOptionsResponse, datatab_core::FetchOptionsError>,
+        >
+        where
+            'a: 'c,
+            'b: 'c,
+        {
+            self.fetches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                self.gate_open().await;
+                if self.fails {
+                    return Err(datatab_core::FetchOptionsError::Transient(
+                        "down".to_string(),
+                    ));
+                }
+                Ok(datatab_core::FetchOptionsResponse {
+                    options: vec![datatab_core::SelectOption::new("one", "One")],
+                    cache_hint_seconds: self.cache_hint_seconds,
+                })
+            })
+        }
+    }
+
+    fn section_with_options_provider(
+        provider: Arc<OptionsProvider>,
+        cx: &mut TestAppContext,
+    ) -> (Entity<AuthProfilesSection>, &mut VisualTestContext) {
+        cx.update(gpui_component::init);
+        cx.update(datatab_components::theme::init);
+        let app_state = cx.update(|cx| {
+            cx.new(|_| {
+                let runtime =
+                    datatab_storage::bootstrap::StorageRuntime::in_memory().expect("storage");
+                let mut state =
+                    AppStateEntity::new_with_storage_runtime(runtime).expect("app state");
+                state.register_auth_provider_for_test(provider);
+                state
+            })
+        });
+        let slot = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let (_, window) = cx.add_window_view({
+            let slot = slot.clone();
+            move |window, cx| {
+                let section = cx.new(|cx| AuthProfilesSection::new(app_state, window, cx));
+                slot.replace(Some(section.clone()));
+                gpui_component::Root::new(section, window, cx)
+            }
+        });
+        let section = slot.borrow().clone().expect("section");
+
+        (section, window)
+    }
+
+    fn render_again(section: &Entity<AuthProfilesSection>, window: &mut VisualTestContext) {
+        window.update(|_, cx| section.update(cx, |_, cx| cx.notify()));
+        window.run_until_parked();
+    }
+
+    /// Every render before the first answer used to start another request.
+    #[gpui::test]
+    fn renders_before_the_first_answer_start_one_fetch(cx: &mut TestAppContext) {
+        let provider = OptionsProvider::new(Some(60));
+        let (section, window) = section_with_options_provider(provider.clone(), cx);
+        window.run_until_parked();
+
+        for _ in 0..3 {
+            render_again(&section, window);
+        }
+
+        assert_eq!(provider.fetch_count(), 1, "one fetch while it is in flight");
+        window.read(|cx| {
+            assert_eq!(section.read(cx).options_in_flight.len(), 1);
+        });
+
+        provider.answer();
+        window.run_until_parked();
+
+        window.read(|cx| {
+            let section = section.read(cx);
+            assert!(section.options_in_flight.is_empty(), "the answer ends it");
+            assert_eq!(section.options_cache.len(), 1);
+        });
+        assert_eq!(
+            provider.fetch_count(),
+            1,
+            "a fresh answer is not fetched again"
+        );
+    }
+
+    /// An answer with a zero lifetime expired on the render it caused, which
+    /// started the next fetch.
+    #[gpui::test]
+    fn an_answer_with_ttl_zero_does_not_start_a_fetch_on_its_render(cx: &mut TestAppContext) {
+        let provider = OptionsProvider::new(Some(0));
+        let (section, window) = section_with_options_provider(provider.clone(), cx);
+        window.run_until_parked();
+        provider.answer();
+        window.run_until_parked();
+
+        for _ in 0..3 {
+            render_again(&section, window);
+        }
+
+        assert_eq!(provider.fetch_count(), 1);
+    }
+
+    /// The form replaced while a fetch is in flight: the key is free at once,
+    /// and the late answer of the old fetch does not free the new fetch's key.
+    #[gpui::test]
+    fn clearing_the_form_frees_the_key_of_a_fetch_in_flight(cx: &mut TestAppContext) {
+        let provider = OptionsProvider::new(Some(60));
+        let (section, window) = section_with_options_provider(provider.clone(), cx);
+        window.run_until_parked();
+        assert_eq!(provider.fetch_count(), 1);
+
+        window
+            .update(|window, cx| section.update(cx, |section, cx| section.clear_form(window, cx)));
+        window.run_until_parked();
+        assert_eq!(provider.fetch_count(), 2, "the new form fetches for itself");
+
+        provider.answer();
+        window.run_until_parked();
+
+        window.read(|cx| {
+            assert!(section.read(cx).options_in_flight.is_empty());
+        });
+        assert_eq!(provider.fetch_count(), 2);
+    }
+
+    fn set_region(
+        section: &Entity<AuthProfilesSection>,
+        value: &str,
+        window: &mut VisualTestContext,
+    ) {
+        window.update(|window, cx| {
+            section.update(cx, |section, cx| {
+                let input = section
+                    .form_inputs
+                    .get("region")
+                    .expect("region input")
+                    .clone();
+                input.update(cx, |input, cx| input.set_value(value, window, cx));
+                cx.notify();
+            })
+        });
+        window.run_until_parked();
+    }
+
+    /// The answer of a form that was dropped while the fetch was in flight
+    /// changes nothing: no cache entry, and no render that fetches again.
+    #[gpui::test]
+    fn a_stale_answer_after_the_form_is_dropped_changes_nothing(cx: &mut TestAppContext) {
+        let provider = OptionsProvider::new(Some(60));
+        let (section, window) = section_with_options_provider(provider.clone(), cx);
+        window.run_until_parked();
+        assert_eq!(provider.fetch_count(), 1);
+
+        window.update(|_, cx| section.update(cx, |section, _| section.clear_options()));
+        provider.answer();
+        window.run_until_parked();
+
+        window.read(|cx| {
+            let section = section.read(cx);
+            assert!(section.options_cache.is_empty(), "no cache write");
+            assert!(section.options_in_flight.is_empty());
+        });
+        assert_eq!(provider.fetch_count(), 1);
+    }
+
+    /// The answer for dependencies that were changed meanwhile changes nothing.
+    #[gpui::test]
+    fn a_stale_answer_for_changed_dependencies_changes_nothing(cx: &mut TestAppContext) {
+        let provider = OptionsProvider::new(Some(60));
+        let (section, window) = section_with_options_provider(provider.clone(), cx);
+        window.run_until_parked();
+
+        set_region(&section, "b", window);
+        assert_eq!(provider.fetch_count(), 2);
+        provider.answer();
+        window.run_until_parked();
+
+        window.read(|cx| {
+            let section = section.read(cx);
+            assert_eq!(section.options_cache.len(), 1, "only the current answer");
+            assert!(section.options_in_flight.is_empty());
+        });
+    }
+
+    /// An answer with no lifetime lasts until the dependencies change: going
+    /// from A to B and back to A fetches for A again.
+    #[gpui::test]
+    fn a_dependency_change_invalidates_an_answer_without_lifetime(cx: &mut TestAppContext) {
+        let provider = OptionsProvider::new(None);
+        let (section, window) = section_with_options_provider(provider.clone(), cx);
+        provider.answer();
+        window.run_until_parked();
+        assert_eq!(provider.fetch_count(), 1);
+
+        set_region(&section, "b", window);
+        assert_eq!(provider.fetch_count(), 2);
+        set_region(&section, "", window);
+        assert_eq!(provider.fetch_count(), 3, "A is fetched again after B");
+        render_again(&section, window);
+        assert_eq!(provider.fetch_count(), 3);
+    }
+
+    /// The field gaining focus is the refresh trigger of an `OnFocus` field.
+    #[gpui::test]
+    fn focus_fetches_again_an_answer_without_lifetime(cx: &mut TestAppContext) {
+        let provider = OptionsProvider::with(Some(0), RefreshTrigger::OnFocus, false);
+        let (section, window) = section_with_options_provider(provider.clone(), cx);
+        provider.answer();
+        window.run_until_parked();
+        render_again(&section, window);
+        assert_eq!(provider.fetch_count(), 1, "renders do not fetch");
+
+        window.update(|window, cx| {
+            section.update(cx, |section, cx| {
+                let index = section
+                    .provider_field_order
+                    .iter()
+                    .position(|id| id == "account")
+                    .expect("account field");
+                section.auth_form_field = AuthFormField::DynamicField(index);
+                section.focus_current_field(window, cx);
+            })
+        });
+        window.run_until_parked();
+
+        assert_eq!(provider.fetch_count(), 2, "focus fetches again");
+    }
+
+    /// A failing provider is asked once per trigger, not once per render.
+    #[gpui::test]
+    fn a_failed_fetch_is_not_repeated_by_the_renders_after_it(cx: &mut TestAppContext) {
+        let provider = OptionsProvider::with(Some(60), RefreshTrigger::OnDependencyChange, true);
+        let (section, window) = section_with_options_provider(provider.clone(), cx);
+        provider.answer();
+        window.run_until_parked();
+        for _ in 0..3 {
+            render_again(&section, window);
+        }
+        assert_eq!(provider.fetch_count(), 1);
+
+        set_region(&section, "b", window);
+        assert_eq!(provider.fetch_count(), 2, "the next trigger retries");
+        render_again(&section, window);
+        assert_eq!(provider.fetch_count(), 2);
+    }
+
+    /// The failure of an expired entry with a lifetime waits for the next
+    /// trigger like any other: the error repaint does not fetch again.
+    #[gpui::test]
+    fn a_failed_refresh_of_an_expired_entry_is_not_repeated_by_renders(cx: &mut TestAppContext) {
+        let provider = OptionsProvider::with(Some(60), RefreshTrigger::OnDependencyChange, true);
+        let (section, window) = section_with_options_provider(provider.clone(), cx);
+        provider.answer();
+        window.run_until_parked();
+        assert_eq!(provider.fetch_count(), 1);
+
+        window.update(|_, cx| {
+            section.update(cx, |section, _| {
+                let key = section
+                    .options_failed
+                    .iter()
+                    .next()
+                    .cloned()
+                    .expect("a failure");
+                section.options_cache.insert(
+                    key,
+                    CachedOptions {
+                        options: Vec::new(),
+                        expires_at: Some(Instant::now() - std::time::Duration::from_secs(1)),
+                    },
+                );
+            })
+        });
+        for _ in 0..3 {
+            render_again(&section, window);
+        }
+        assert_eq!(provider.fetch_count(), 1, "renders do not retry");
+
+        set_region(&section, "b", window);
+        assert_eq!(provider.fetch_count(), 2, "the next trigger retries");
+    }
+
+    /// A failed `Manual` field retries when the user asks for it.
+    #[gpui::test]
+    fn a_failed_manual_field_retries_on_the_retry_action(cx: &mut TestAppContext) {
+        let provider = OptionsProvider::with(None, RefreshTrigger::Manual, true);
+        let (section, window) = section_with_options_provider(provider.clone(), cx);
+        provider.answer();
+        window.run_until_parked();
+        render_again(&section, window);
+        assert_eq!(provider.fetch_count(), 1, "renders do not retry");
+
+        window.update(|_, cx| {
+            section.update(cx, |section, cx| {
+                section.retry_failed_options(OPTIONS_PROVIDER_ID, "account");
+                cx.notify();
+            })
+        });
+        render_again(&section, window);
+        assert_eq!(provider.fetch_count(), 2, "retry asks the provider again");
+        render_again(&section, window);
+        assert_eq!(provider.fetch_count(), 2);
+    }
+
+    /// Focusing a failed field by keyboard retries it, whatever its trigger.
+    #[gpui::test]
+    fn focusing_a_failed_manual_field_retries_it(cx: &mut TestAppContext) {
+        let provider = OptionsProvider::with(None, RefreshTrigger::Manual, true);
+        let (section, window) = section_with_options_provider(provider.clone(), cx);
+        provider.answer();
+        window.run_until_parked();
+        assert_eq!(provider.fetch_count(), 1);
+
+        window.update(|window, cx| {
+            section.update(cx, |section, cx| {
+                let index = section
+                    .provider_field_order
+                    .iter()
+                    .position(|id| id == "account")
+                    .expect("account field");
+                section.auth_form_field = AuthFormField::DynamicField(index);
+                section.focus_current_field(window, cx);
+            })
+        });
+        window.run_until_parked();
+        assert_eq!(provider.fetch_count(), 2);
+    }
+
+    const RETRY_ID: &str = "auth-options-retry-account";
+
+    fn current_hash() -> u64 {
+        AuthProfilesSection::hash_deps(&HashMap::from([("region".to_string(), String::new())]))
+    }
+
+    fn failure_key(field: &str, hash: u64) -> OptionsKey {
+        (OPTIONS_PROVIDER_ID.to_string(), field.to_string(), hash)
+    }
+
+    fn retry_button_bounds(window: &mut VisualTestContext) -> Option<gpui::Bounds<gpui::Pixels>> {
+        let capture = datatab_ui_base::keyboard_coverage::FrameCapture::observe(window);
+        let frame = capture.frame(window);
+        frame
+            .nodes()
+            .find(|(_, node)| node.id() == RETRY_ID)
+            .map(|(_, node)| node.bounds())
+    }
+
+    fn click_retry(section: &Entity<AuthProfilesSection>, window: &mut VisualTestContext) {
+        assert!(
+            retry_button_bounds(window).is_some(),
+            "the Retry button is drawn"
+        );
+        window
+            .update(|_, cx| section.update(cx, |section, cx| section.retry_options("account", cx)));
+        window.run_until_parked();
+    }
+
+    /// A failure of dependencies the dropdown no longer holds shows no hint.
+    #[gpui::test]
+    fn a_failure_of_superseded_dependencies_shows_no_retry(cx: &mut TestAppContext) {
+        let provider = OptionsProvider::new(Some(60));
+        let (section, window) = section_with_options_provider(provider.clone(), cx);
+        provider.answer();
+        window.run_until_parked();
+
+        window.update(|_, cx| {
+            section.update(cx, |section, _| {
+                section
+                    .options_failed
+                    .insert(failure_key("account", current_hash().wrapping_add(1)));
+            })
+        });
+        render_again(&section, window);
+        assert!(retry_button_bounds(window).is_none(), "stale failure");
+
+        window.update(|_, cx| {
+            section.update(cx, |section, _| {
+                section
+                    .options_failed
+                    .insert(failure_key("account", current_hash()));
+            })
+        });
+        render_again(&section, window);
+        assert!(retry_button_bounds(window).is_some(), "current failure");
+
+        let capture = datatab_ui_base::keyboard_coverage::FrameCapture::observe(window);
+        let frame = capture.frame(window);
+        let (_, node) = frame
+            .nodes()
+            .find(|(_, node)| node.id() == RETRY_ID)
+            .expect("the Retry button is drawn");
+        let name = frame
+            .accessibility_node(node)
+            .and_then(|node| node.label().map(str::to_string));
+        assert_eq!(name.as_deref(), Some("Retry loading Account"));
+    }
+
+    /// Clicking the Retry button asks the provider once, and a repaint does
+    /// not ask again. The failure of another field stays.
+    #[gpui::test]
+    fn the_retry_button_fetches_once_and_keeps_another_fields_failure(cx: &mut TestAppContext) {
+        let provider = OptionsProvider::with(None, RefreshTrigger::Manual, true);
+        let (section, window) = section_with_options_provider(provider.clone(), cx);
+        provider.answer();
+        window.run_until_parked();
+        assert_eq!(provider.fetch_count(), 1);
+        let other = failure_key("other", current_hash());
+        window.update(|_, cx| {
+            section.update(cx, |section, _| {
+                section.options_failed.insert(other.clone());
+            })
+        });
+        render_again(&section, window);
+
+        click_retry(&section, window);
+        assert_eq!(provider.fetch_count(), 2, "one fetch per click");
+        render_again(&section, window);
+        assert_eq!(provider.fetch_count(), 2);
+        window.update(|_, cx| {
+            assert!(section.read(cx).options_failed.contains(&other));
+        });
+    }
+
+    /// Retry while a fetch of the field is in flight starts no second one.
+    #[gpui::test]
+    fn the_retry_button_starts_no_second_fetch_while_one_is_in_flight(cx: &mut TestAppContext) {
+        let provider = OptionsProvider::with(None, RefreshTrigger::Manual, true);
+        let (section, window) = section_with_options_provider(provider.clone(), cx);
+        provider.answer();
+        window.run_until_parked();
+        assert_eq!(provider.fetch_count(), 1);
+
+        window.update(|_, cx| {
+            section.update(cx, |section, _| {
+                section
+                    .options_in_flight
+                    .insert(failure_key("account", current_hash()), u64::MAX);
+            })
+        });
+        render_again(&section, window);
+        click_retry(&section, window);
+        assert_eq!(provider.fetch_count(), 1, "the fetch in flight is enough");
     }
 }

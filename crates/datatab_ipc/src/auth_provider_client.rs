@@ -33,12 +33,37 @@ const MIN_STARTUP_TIMEOUT_MS: u64 = 1;
 /// How long a request other than `Login` may take before the caller gets an error.
 const REQUEST_DEADLINE: Duration = Duration::from_secs(60);
 
+/// How long the startup `Hello` may take once the service is running. The service's own
+/// startup timeout is added when DataTab launches it, so a slow start keeps its budget.
+const PROBE_DEADLINE: Duration = Duration::from_secs(5);
+
 /// How long a `Login` may take: the provider answers only after the user finished the
 /// browser step. It matches `SSO_LOGIN_TIMEOUT` in `datatab_ui`'s login modal
 /// (`crates/datatab_ui/src/ui/overlays/login_modal.rs`) and `LOGIN_BUDGET` in
 /// `datatab_mcp_server` (`src/server/connect_deadline/mod.rs`); `datatab_ipc` cannot depend on
 /// either crate, so keep the three equal by hand.
 const LOGIN_DEADLINE: Duration = Duration::from_secs(300);
+
+fn probe_deadline(launch: Option<&IpcServiceLaunchConfig>) -> Duration {
+    PROBE_DEADLINE + launch.map_or(Duration::ZERO, |config| config.startup_timeout)
+}
+
+#[allow(clippy::result_large_err)]
+fn receive_probe_result(
+    receiver: std::sync::mpsc::Receiver<Result<NormalizedAuthProviderHelloResponse, DbError>>,
+    deadline: Duration,
+    socket_id: &str,
+) -> Result<NormalizedAuthProviderHelloResponse, DbError> {
+    match receiver.recv_timeout(deadline) {
+        Ok(result) => result,
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(DbError::connection_failed(
+            format!("auth-provider service '{socket_id}' did not answer Hello within {deadline:?}"),
+        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(DbError::connection_failed(
+            format!("auth-provider service '{socket_id}' probe worker ended without a result"),
+        )),
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct IpcServiceLaunchConfig {
@@ -144,11 +169,82 @@ impl RpcAuthProvider {
         }))
     }
 
+    /// Probes services concurrently and returns results in input order.
+    pub fn probe_many(
+        services: &[(String, Option<IpcServiceLaunchConfig>)],
+    ) -> Vec<Result<Self, Box<DbError>>> {
+        Self::probe_many_with(services, |socket_id, launch| {
+            Self::probe(socket_id, launch.clone()).map_err(Box::new)
+        })
+    }
+
+    fn probe_many_with<F>(
+        services: &[(String, Option<IpcServiceLaunchConfig>)],
+        probe: F,
+    ) -> Vec<Result<Self, Box<DbError>>>
+    where
+        F: Fn(&str, &Option<IpcServiceLaunchConfig>) -> Result<Self, Box<DbError>> + Sync,
+    {
+        thread::scope(|scope| {
+            let workers: Vec<_> = services
+                .iter()
+                .map(|(socket_id, launch)| {
+                    let probe = &probe;
+                    thread::Builder::new().spawn_scoped(scope, move || probe(socket_id, launch))
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| match worker {
+                    Ok(worker) => worker.join().unwrap_or_else(|_| {
+                        Err(Box::new(DbError::connection_failed(
+                            "Auth-provider probe worker panicked",
+                        )))
+                    }),
+                    Err(error) => Err(Box::new(DbError::connection_failed(format!(
+                        "Could not start auth-provider probe: {error}"
+                    )))),
+                })
+                .collect()
+        })
+    }
+
     #[allow(clippy::result_large_err)]
     pub fn probe(socket_id: &str, launch: Option<IpcServiceLaunchConfig>) -> Result<Self, DbError> {
+        let deadline = probe_deadline(launch.as_ref());
+        Self::probe_within(socket_id, launch, deadline)
+    }
+
+    /// Like `probe`, but gives up after `deadline`. The `Hello` runs on its own thread, so a
+    /// provider that accepts the connection and never answers cannot hold the caller. The
+    /// thread ends when the provider answers or closes the socket. A provider that never
+    /// does either keeps one worker thread and socket until the app quits, once per service.
+    #[allow(clippy::result_large_err)]
+    fn probe_within(
+        socket_id: &str,
+        launch: Option<IpcServiceLaunchConfig>,
+        deadline: Duration,
+    ) -> Result<Self, DbError> {
         validate_socket_id(socket_id)?;
 
-        let hello = Self::perform_hello(socket_id, launch.as_ref())?;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_socket_id = socket_id.to_string();
+        let worker_launch = launch.clone();
+        thread::Builder::new()
+            .name(format!("datatab-auth-provider-probe-{socket_id}"))
+            .spawn(move || {
+                let hello = Self::perform_hello(&worker_socket_id, worker_launch.as_ref());
+                if sender.send(hello).is_err() {
+                    log::debug!("Auth-provider probe on '{worker_socket_id}' was abandoned");
+                }
+            })
+            .map_err(|error| {
+                DbError::connection_failed(format!(
+                    "Could not start the auth-provider probe worker: {error}"
+                ))
+            })?;
+
+        let hello = receive_probe_result(receiver, deadline, socket_id)?;
 
         Ok(Self {
             socket_id: socket_id.to_string(),
@@ -1913,6 +2009,7 @@ mod tests {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum SilentOn {
         Nothing,
+        Hello,
         Login,
         FetchOptions,
         /// Answers `Login` after `release_login`, sending the URL frame only then.
@@ -2011,6 +2108,7 @@ mod tests {
                     };
 
                     let silent = match request.body {
+                        AuthProviderRequestBody::Hello(_) => silent_on == SilentOn::Hello,
                         AuthProviderRequestBody::Login(_) => silent_on == SilentOn::Login,
                         AuthProviderRequestBody::FetchDynamicOptions(_) => {
                             silent_on == SilentOn::FetchOptions
@@ -2703,6 +2801,84 @@ mod tests {
             format!("{error:?}").contains("did not answer within"),
             "unexpected error: {error:?}"
         );
+    }
+
+    #[test]
+    fn probe_worker_disconnect_is_not_reported_as_timeout() {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        drop(sender);
+        let error = receive_probe_result(receiver, Duration::from_secs(1), "test")
+            .expect_err("worker ended without a result");
+        assert!(error.to_string().contains("worker ended without a result"));
+    }
+
+    #[test]
+    fn probe_deadline_includes_managed_service_startup_timeout() {
+        let launch = IpcServiceLaunchConfig {
+            program: "provider".into(),
+            args: vec![],
+            env: vec![],
+            startup_timeout: Duration::from_secs(7),
+        };
+        assert_eq!(probe_deadline(None), PROBE_DEADLINE);
+        assert_eq!(
+            probe_deadline(Some(&launch)),
+            PROBE_DEADLINE + Duration::from_secs(7)
+        );
+    }
+
+    #[test]
+    fn multiple_probes_finish_together_and_keep_input_order() {
+        let first = FakeProviderServer::start_silent(SilentOn::Hello);
+        let responsive = FakeProviderServer::start_silent(SilentOn::Nothing);
+        let last = FakeProviderServer::start_silent(SilentOn::Hello);
+        let sockets = vec![first.socket_id, responsive.socket_id, last.socket_id];
+        let (sender, receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let services: Vec<_> = sockets.into_iter().map(|socket| (socket, None)).collect();
+            let results = RpcAuthProvider::probe_many_with(&services, |socket, _| {
+                RpcAuthProvider::probe_within(socket, None, Duration::from_secs(1))
+                    .map_err(Box::new)
+            });
+            sender.send(results).expect("send results");
+        });
+        let results = receiver
+            .recv_timeout(Duration::from_millis(1_800))
+            .expect("all probes must finish within one deadline");
+        assert!(results[0].is_err());
+        assert_eq!(
+            results[1]
+                .as_ref()
+                .expect("responsive provider")
+                .provider_id,
+            "test-auth"
+        );
+        assert!(results[2].is_err());
+    }
+
+    #[test]
+    fn a_probe_the_provider_never_answers_fails_at_the_probe_deadline() {
+        let server = FakeProviderServer::start_silent(SilentOn::Hello);
+
+        let started = Instant::now();
+        let error = RpcAuthProvider::probe_within(&server.socket_id, None, SHORT_TEST_DEADLINE)
+            .err()
+            .expect("a provider that never answers Hello must hit the probe deadline");
+
+        assert!(started.elapsed() < LONG_TEST_DEADLINE);
+        assert!(
+            format!("{error:?}").contains("did not answer Hello within"),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[test]
+    fn a_probe_the_provider_answers_registers_within_the_deadline() {
+        let server = FakeProviderServer::start_silent(SilentOn::Nothing);
+
+        let provider = RpcAuthProvider::probe_within(&server.socket_id, None, LONG_TEST_DEADLINE)
+            .expect("a provider that answers Hello probes");
+        assert_eq!(provider.provider_id, "test-auth");
     }
 
     #[test]

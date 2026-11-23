@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -46,6 +46,9 @@ pub enum DbKind {
     /// [`Self::ReservedDynamoDb`].
     #[doc(hidden)]
     ReservedAwsSecrets,
+    /// Cassandra and ScyllaDB, which both speak CQL. One `BuiltIn` driver
+    /// serves both, as one crate serves MySQL and MariaDB.
+    Cassandra,
 }
 
 impl DbKind {
@@ -63,6 +66,7 @@ impl DbKind {
             DbKind::ClickHouse => "ClickHouse",
             DbKind::Turso => "TursoDB",
             DbKind::DuckDB => "DuckDB",
+            DbKind::Cassandra => "Cassandra / ScyllaDB",
             DbKind::ReservedDynamoDb
             | DbKind::ReservedCloudWatchLogs
             | DbKind::ReservedS3
@@ -82,7 +86,59 @@ impl DbKind {
                 | DbKind::ReservedAwsSecrets
         )
     }
+
+    /// The driver identifier a built-in connection of this kind reports.
+    ///
+    /// Reserved kinds return their wire placeholder id, which no driver
+    /// registers, so [`Self::is_builtin_driver_id`] never accepts it.
+    pub fn driver_id(&self) -> &'static str {
+        match self {
+            DbKind::Postgres => "postgres",
+            DbKind::SQLite => "sqlite",
+            DbKind::MySQL => "mysql",
+            DbKind::MariaDB => "mariadb",
+            DbKind::MongoDB => "mongodb",
+            DbKind::Redis => "redis",
+            DbKind::InfluxDB => "influxdb",
+            DbKind::SqlServer => "mssql",
+            DbKind::Redshift => "redshift",
+            DbKind::ClickHouse => "clickhouse",
+            DbKind::Turso => "turso",
+            DbKind::DuckDB => "duckdb",
+            DbKind::Cassandra => "cassandra",
+            DbKind::ReservedDynamoDb => "reserved:dynamodb",
+            DbKind::ReservedCloudWatchLogs => "reserved:cloudwatch-logs",
+            DbKind::ReservedS3 => "reserved:s3",
+            DbKind::ReservedAwsSecrets => "reserved:aws-secrets",
+        }
+    }
+
+    /// Whether `id` is the identifier of a driver that ships in this build.
+    ///
+    /// This is a closed list on purpose: a diagnostic report may name a
+    /// built-in driver and nothing else. A reserved kind's placeholder id is
+    /// refused, and an external driver's `rpc:<socket_id>` is not built in.
+    pub fn is_builtin_driver_id(id: &str) -> bool {
+        BUILTIN_KIND_LIST.iter().any(|kind| kind.driver_id() == id)
+    }
 }
+
+/// The kinds a real driver serves. Reserved wire slots are left out.
+const BUILTIN_KIND_LIST: &[DbKind] = &[
+    DbKind::Postgres,
+    DbKind::SQLite,
+    DbKind::MySQL,
+    DbKind::MariaDB,
+    DbKind::MongoDB,
+    DbKind::Redis,
+    DbKind::InfluxDB,
+    DbKind::SqlServer,
+    DbKind::Redshift,
+    DbKind::ClickHouse,
+    DbKind::Turso,
+    DbKind::DuckDB,
+    DbKind::Cassandra,
+];
 
 /// InfluxDB API version.
 ///
@@ -603,6 +659,15 @@ pub enum DbConfig {
         /// `http://` endpoint. Off by default: HTTP Basic auth is clear text.
         #[serde(default, skip_serializing_if = "is_false")]
         allow_insecure_http_password: bool,
+        /// Absent selects legacy system-root and hostname verification.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssl_mode: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssl_root_cert_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssl_client_cert_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssl_client_key_path: Option<String>,
     },
     /// Remote Turso endpoint; its auth token is only stored in the canonical keyring slot.
     Turso { url: String },
@@ -621,6 +686,38 @@ pub enum DbConfig {
         /// `CREATE SECRET ... (PROVIDER credential_chain)`, settings).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         init_sql: Option<String>,
+    },
+    /// Cassandra or ScyllaDB over CQL. The driver pins its session to one node,
+    /// so a tunneled connection uses the first contact point only.
+    Cassandra {
+        /// Contact points as hostnames or IP addresses, comma-separated.
+        contact_points: String,
+        port: u16,
+        /// Datacenter the session prefers for routing.
+        datacenter: String,
+        /// Keyspace selected on connect; empty leaves the cluster's default.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        keyspace: String,
+        user: String,
+        /// TLS mode: `disable`, `require`, `verify-ca` or `verify-full`.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_ssl_mode_option"
+        )]
+        ssl_mode: Option<String>,
+        /// Path to the root CA certificate file for `verify-ca` / `verify-full`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssl_root_cert_path: Option<String>,
+        /// Path to the client certificate file for mutual TLS.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssl_client_cert_path: Option<String>,
+        /// Path to the client private key file for mutual TLS.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ssl_client_key_path: Option<String>,
+        ssh_tunnel: Option<SshTunnelConfig>,
+        #[serde(default)]
+        ssh_tunnel_profile_id: Option<Uuid>,
     },
     /// Generic config for external RPC drivers.
     External {
@@ -648,6 +745,7 @@ impl DbConfig {
             DbConfig::ClickHouse { .. } => DbKind::ClickHouse,
             DbConfig::Turso { .. } => DbKind::Turso,
             DbConfig::DuckDB { .. } => DbKind::DuckDB,
+            DbConfig::Cassandra { .. } => DbKind::Cassandra,
             DbConfig::External { kind, .. } => *kind,
         }
     }
@@ -798,6 +896,26 @@ impl DbConfig {
             database: "default".to_string(),
             request_timeout_seconds: None,
             allow_insecure_http_password: false,
+            ssl_mode: None,
+            ssl_root_cert_path: None,
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
+        }
+    }
+
+    pub fn default_cassandra() -> Self {
+        DbConfig::Cassandra {
+            contact_points: "localhost".to_string(),
+            port: 9042,
+            datacenter: String::new(),
+            keyspace: String::new(),
+            user: String::new(),
+            ssl_mode: Some("disable".to_string()),
+            ssl_root_cert_path: None,
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
+            ssh_tunnel: None,
+            ssh_tunnel_profile_id: None,
         }
     }
 
@@ -808,7 +926,8 @@ impl DbConfig {
             | DbConfig::MongoDB { ssh_tunnel, .. }
             | DbConfig::Redis { ssh_tunnel, .. }
             | DbConfig::SqlServer { ssh_tunnel, .. }
-            | DbConfig::Redshift { ssh_tunnel, .. } => ssh_tunnel.as_ref(),
+            | DbConfig::Redshift { ssh_tunnel, .. }
+            | DbConfig::Cassandra { ssh_tunnel, .. } => ssh_tunnel.as_ref(),
             DbConfig::SQLite { .. }
             | DbConfig::InfluxDB { .. }
             | DbConfig::ClickHouse { .. }
@@ -842,6 +961,10 @@ impl DbConfig {
                 ..
             }
             | DbConfig::Redshift {
+                ssh_tunnel_profile_id,
+                ..
+            }
+            | DbConfig::Cassandra {
                 ssh_tunnel_profile_id,
                 ..
             } => *ssh_tunnel_profile_id,
@@ -890,6 +1013,11 @@ impl DbConfig {
                 ssh_tunnel: tunnel,
                 ssh_tunnel_profile_id: profile_id,
                 ..
+            }
+            | DbConfig::Cassandra {
+                ssh_tunnel: tunnel,
+                ssh_tunnel_profile_id: profile_id,
+                ..
             } => {
                 *tunnel = ssh_tunnel;
                 *profile_id = ssh_tunnel_profile_id;
@@ -935,6 +1063,11 @@ impl DbConfig {
                 ssh_tunnel,
                 ssh_tunnel_profile_id,
                 ..
+            }
+            | DbConfig::Cassandra {
+                ssh_tunnel,
+                ssh_tunnel_profile_id,
+                ..
             } => ssh_tunnel.is_some() || ssh_tunnel_profile_id.is_some(),
             DbConfig::SQLite { .. }
             | DbConfig::InfluxDB { .. }
@@ -954,6 +1087,18 @@ impl DbConfig {
             | DbConfig::Redis { host, port, .. }
             | DbConfig::SqlServer { host, port, .. }
             | DbConfig::Redshift { host, port, .. } => Some((host, *port)),
+            // A tunnel pins Cassandra to one node, so only the first contact
+            // point is forwarded.
+            DbConfig::Cassandra {
+                contact_points,
+                port,
+                ..
+            } => contact_points
+                .split(',')
+                .next()
+                .map(str::trim)
+                .filter(|host| !host.is_empty())
+                .map(|host| (host, *port)),
             DbConfig::SQLite { .. }
             | DbConfig::InfluxDB { .. }
             | DbConfig::ClickHouse { .. }
@@ -1006,6 +1151,16 @@ impl DbConfig {
                 *port = tunnel_port;
                 *use_uri = false;
             }
+            // The tunnel carries one node, so the tunneled session keeps one
+            // contact point instead of the configured list.
+            DbConfig::Cassandra {
+                contact_points,
+                port,
+                ..
+            } => {
+                *contact_points = "127.0.0.1".to_string();
+                *port = tunnel_port;
+            }
             DbConfig::SQLite { .. }
             | DbConfig::InfluxDB { .. }
             | DbConfig::ClickHouse { .. }
@@ -1043,6 +1198,7 @@ impl DbConfig {
             | DbConfig::ClickHouse { .. }
             | DbConfig::Turso { .. }
             | DbConfig::DuckDB { .. }
+            | DbConfig::Cassandra { .. }
             | DbConfig::External { .. } => {
                 return None;
             }
@@ -1078,6 +1234,13 @@ impl DbConfig {
             DbConfig::InfluxDB { default_bucket, .. } => default_bucket.clone(),
             DbConfig::ClickHouse { database, .. } => Some(database.clone()),
             DbConfig::Turso { .. } => None,
+            DbConfig::Cassandra { keyspace, .. } => {
+                if keyspace.is_empty() {
+                    None
+                } else {
+                    Some(keyspace.clone())
+                }
+            }
             DbConfig::External { .. } => None,
         }
     }
@@ -1268,6 +1431,10 @@ impl DbConfig {
                 user,
                 request_timeout_seconds,
                 allow_insecure_http_password,
+                ssl_mode,
+                ssl_root_cert_path,
+                ssl_client_cert_path,
+                ssl_client_key_path,
                 ..
             } => Ok(DbConfig::ClickHouse {
                 url,
@@ -1275,6 +1442,10 @@ impl DbConfig {
                 database: database.to_string(),
                 request_timeout_seconds,
                 allow_insecure_http_password,
+                ssl_mode,
+                ssl_root_cert_path,
+                ssl_client_cert_path,
+                ssl_client_key_path,
             }),
             _ => Err("Changing database is not supported for this database type".to_string()),
         }
@@ -1526,6 +1697,12 @@ pub struct ConnectionProfile {
     /// it lists only the database the connection is configured with.
     #[serde(default = "default_show_all_databases")]
     pub show_all_databases: bool,
+
+    /// Ids of the secret-kind form fields, other than the primary password,
+    /// whose value lives in the OS keyring under `connection_field_secret_ref`.
+    /// Only the ids are stored; the values never reach the database.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub keyring_secret_fields: BTreeSet<String>,
 }
 
 fn default_show_all_databases() -> bool {
@@ -1555,6 +1732,7 @@ impl ConnectionProfile {
             environment: None,
             navigator_view: NavigatorView::Advanced,
             show_all_databases: true,
+            keyring_secret_fields: BTreeSet::new(),
         }
     }
 
@@ -1583,6 +1761,7 @@ impl ConnectionProfile {
             navigator_view: NavigatorView::Advanced,
             show_all_databases: true,
             mcp_governance: None,
+            keyring_secret_fields: BTreeSet::new(),
         }
     }
 
@@ -1613,6 +1792,7 @@ impl ConnectionProfile {
             environment: None,
             navigator_view: NavigatorView::Advanced,
             show_all_databases: true,
+            keyring_secret_fields: BTreeSet::new(),
         }
     }
 
@@ -1649,6 +1829,7 @@ impl ConnectionProfile {
             environment: None,
             navigator_view: NavigatorView::Advanced,
             show_all_databases: true,
+            keyring_secret_fields: BTreeSet::new(),
         }
     }
 
@@ -1691,27 +1872,13 @@ impl ConnectionProfile {
         self.environment
     }
 
+    /// The driver identifier of a built-in connection of `kind`.
+    ///
+    /// No driver registers under a reserved kind's id (built-in ids are fixed
+    /// names and external ids start with `rpc:`), so a reserved kind is refused
+    /// as an unregistered driver.
     pub fn builtin_driver_id_for_kind(kind: DbKind) -> &'static str {
-        match kind {
-            DbKind::Postgres => "postgres",
-            DbKind::SQLite => "sqlite",
-            DbKind::MySQL => "mysql",
-            DbKind::MariaDB => "mariadb",
-            DbKind::MongoDB => "mongodb",
-            DbKind::Redis => "redis",
-            DbKind::InfluxDB => "influxdb",
-            DbKind::SqlServer => "mssql",
-            DbKind::Redshift => "redshift",
-            DbKind::ClickHouse => "clickhouse",
-            DbKind::Turso => "turso",
-            DbKind::DuckDB => "duckdb",
-            // No driver registers under these ids (built-in ids are fixed
-            // names and external ids start with `rpc:`), so a reserved kind is refused as an unregistered driver.
-            DbKind::ReservedDynamoDb => "reserved:dynamodb",
-            DbKind::ReservedCloudWatchLogs => "reserved:cloudwatch-logs",
-            DbKind::ReservedS3 => "reserved:s3",
-            DbKind::ReservedAwsSecrets => "reserved:aws-secrets",
-        }
+        kind.driver_id()
     }
 
     pub fn secret_ref(&self) -> String {
@@ -1870,6 +2037,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn builtin_driver_id_list_accepts_only_real_drivers() {
+        for id in [
+            "postgres",
+            "sqlite",
+            "mysql",
+            "mariadb",
+            "mongodb",
+            "redis",
+            "influxdb",
+            "mssql",
+            "redshift",
+            "clickhouse",
+            "turso",
+            "duckdb",
+            "cassandra",
+        ] {
+            assert!(DbKind::is_builtin_driver_id(id), "{id} must be built in");
+        }
+
+        for id in [
+            "reserved:s3",
+            "rpc",
+            "rpc:/run/user/1000/datatab/peer.sock",
+            "unknown-driver",
+            "",
+        ] {
+            assert!(
+                !DbKind::is_builtin_driver_id(id),
+                "{id} must not be built in"
+            );
+        }
+    }
+
+    #[test]
+    fn kind_driver_id_matches_the_profile_helper() {
+        for kind in super::BUILTIN_KIND_LIST {
+            assert_eq!(
+                ConnectionProfile::builtin_driver_id_for_kind(*kind),
+                kind.driver_id()
+            );
+        }
+    }
+
     fn sqlite_profile() -> ConnectionProfile {
         ConnectionProfile::new("test-sqlite", DbConfig::default_sqlite())
     }
@@ -1891,6 +2102,52 @@ mod tests {
     }
 
     #[test]
+    fn clickhouse_tls_paths_survive_database_switch_and_legacy_serde() {
+        let legacy: DbConfig = serde_json::from_value(serde_json::json!({
+            "ClickHouse": {"url": "https://localhost:8443", "user": "default", "database": "default"}
+        })).unwrap();
+        assert!(matches!(
+            legacy,
+            DbConfig::ClickHouse { ssl_mode: None, .. }
+        ));
+        let mut config = legacy;
+        if let DbConfig::ClickHouse {
+            ssl_mode,
+            ssl_root_cert_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
+            ..
+        } = &mut config
+        {
+            *ssl_mode = Some("verify-full".into());
+            *ssl_root_cert_path = Some("/test-ca.pem".into());
+            *ssl_client_cert_path = Some("/test-client.pem".into());
+            *ssl_client_key_path = Some("/test-key.pem".into());
+        }
+        let mut profile = ConnectionProfile::new("paths", config.clone());
+        let form = crate::DriverFormDef { tabs: vec![] };
+        let result =
+            crate::storage::secret_manager::profile_with_keyring_fields(&profile, &form, |_| {
+                panic!("certificate paths must not read a secret store")
+            })
+            .expect("native config passes unchanged");
+        assert!(result.is_none());
+        profile
+            .keyring_secret_fields
+            .insert("ssl_client_key_path".into());
+        assert!(
+            crate::storage::secret_manager::profile_with_keyring_fields(&profile, &form, |_| {
+                panic!("a path cannot be resolved from the keyring")
+            })
+            .is_err()
+        );
+        let mut expected = serde_json::to_value(&config).unwrap();
+        let switched = config.with_database("events").expect("database switch");
+        expected["ClickHouse"]["database"] = "events".into();
+        assert_eq!(serde_json::to_value(switched).unwrap(), expected);
+    }
+
+    #[test]
     fn default_clickhouse_uses_http_defaults_without_ssh() {
         let config = DbConfig::default_clickhouse();
 
@@ -1900,6 +2157,11 @@ mod tests {
             database,
             request_timeout_seconds,
             allow_insecure_http_password,
+            ssl_mode,
+            ssl_root_cert_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
+            ..
         } = &config
         else {
             panic!("expected DbConfig::ClickHouse");
@@ -1910,6 +2172,10 @@ mod tests {
         assert_eq!(database, "default");
         assert_eq!(*request_timeout_seconds, None);
         assert!(!allow_insecure_http_password);
+        assert_eq!(ssl_mode, &None, "default keeps legacy TLS verification");
+        assert_eq!(ssl_root_cert_path, &None);
+        assert_eq!(ssl_client_cert_path, &None);
+        assert_eq!(ssl_client_key_path, &None);
         assert_eq!(config.kind(), DbKind::ClickHouse);
         assert!(!config.has_ssh_tunnel());
         assert_eq!(config.host_port(), None);
@@ -1918,6 +2184,74 @@ mod tests {
             ConnectionProfile::builtin_driver_id_for_kind(DbKind::ClickHouse),
             "clickhouse"
         );
+    }
+
+    #[test]
+    fn default_cassandra_uses_native_port_and_first_contact_point() {
+        let config = DbConfig::default_cassandra();
+
+        let DbConfig::Cassandra {
+            contact_points,
+            port,
+            keyspace,
+            ssl_mode,
+            ssh_tunnel,
+            ..
+        } = &config
+        else {
+            panic!("expected DbConfig::Cassandra");
+        };
+
+        assert_eq!(contact_points, "localhost");
+        assert_eq!(*port, 9042);
+        assert!(keyspace.is_empty());
+        assert_eq!(ssl_mode.as_deref(), Some("disable"));
+        assert!(ssh_tunnel.is_none());
+        assert_eq!(config.kind(), DbKind::Cassandra);
+        assert_eq!(DbKind::Cassandra.display_name(), "Cassandra / ScyllaDB");
+        assert_eq!(config.host_port(), Some(("localhost", 9042)));
+        assert_eq!(config.database(), None);
+        assert_eq!(
+            ConnectionProfile::builtin_driver_id_for_kind(DbKind::Cassandra),
+            "cassandra"
+        );
+    }
+
+    #[test]
+    fn cassandra_tunnel_keeps_one_contact_point_and_its_port() {
+        let mut config = DbConfig::Cassandra {
+            contact_points: " node-a.example.com , node-b.example.com ".to_string(),
+            port: 9042,
+            datacenter: "dc1".to_string(),
+            keyspace: "app".to_string(),
+            user: "reader".to_string(),
+            ssl_mode: Some("verify-ca".to_string()),
+            ssl_root_cert_path: Some("/etc/ca.pem".to_string()),
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
+            ssh_tunnel: None,
+            ssh_tunnel_profile_id: None,
+        };
+
+        assert_eq!(
+            config.host_port(),
+            Some(("node-a.example.com", 9042)),
+            "a tunnel targets the first contact point"
+        );
+        assert_eq!(config.database().as_deref(), Some("app"));
+
+        config.redirect_to_tunnel(50001);
+
+        let DbConfig::Cassandra {
+            contact_points,
+            port,
+            ..
+        } = &config
+        else {
+            panic!("expected DbConfig::Cassandra");
+        };
+        assert_eq!(contact_points, "127.0.0.1");
+        assert_eq!(*port, 50001);
     }
 
     #[test]
@@ -2237,6 +2571,10 @@ mod tests {
             database: "events".to_string(),
             request_timeout_seconds: None,
             allow_insecure_http_password: true,
+            ssl_mode: None,
+            ssl_root_cert_path: None,
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
         };
 
         let json = serde_json::to_string(&config).expect("serialize");
@@ -2420,6 +2758,10 @@ mod tests {
             database: "default".to_string(),
             request_timeout_seconds: None,
             allow_insecure_http_password: false,
+            ssl_mode: None,
+            ssl_root_cert_path: None,
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
         };
 
         let extracted = config.strip_uri_password();

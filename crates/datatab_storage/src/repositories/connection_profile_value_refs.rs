@@ -253,6 +253,25 @@ impl ConnectionProfileValueRefsRepository {
         Ok(())
     }
 
+    /// Deletes the value ref of one field of a connection profile.
+    pub fn delete_for_profile_key(
+        &self,
+        profile_id: &str,
+        ref_key: &str,
+    ) -> Result<(), StorageError> {
+        self.conn()
+            .execute(
+                "DELETE FROM cfg_connection_profile_value_refs WHERE profile_id = ?1 AND ref_key = ?2",
+                [profile_id, ref_key],
+            )
+            .map_err(|source| StorageError::Sqlite {
+                path: "datatab.db".into(),
+                source,
+            })?;
+
+        Ok(())
+    }
+
     /// Replaces all value refs for a profile (delete old, insert new).
     pub fn replace_for_profile(
         &self,

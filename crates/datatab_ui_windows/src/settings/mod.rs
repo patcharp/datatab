@@ -55,7 +55,9 @@ use ssh_tunnels_section::SshTunnelsSection;
 use updates_section::UpdatesSection;
 
 pub use self::auth_profiles_section::SettingsLoginHandle;
-pub use self::open_window::open_or_focus_settings;
+pub use self::open_window::{
+    SettingsEventForwarder, open_or_focus_settings, set_settings_event_forwarder,
+};
 pub use self::section_trait::{SettingsSection, SettingsSectionId};
 
 const SETTINGS_SIDEBAR_DEFAULT_WIDTH: Pixels = crate::tokens::SettingsMetrics::NAV_WIDTH;

@@ -43,9 +43,6 @@ fn input(profile: ConnectionProfile, access_manager: Arc<dyn AccessManager>) -> 
 
 fn assert_refused_before_access(kind: AccessKind) {
     let profiles = [
-        sentinel_profile("localhost", None, None, None, true),
-        sentinel_profile("127.0.0.1", None, Some("on"), None, false),
-        sentinel_profile("::1", None, Some("verify"), None, false),
         sentinel_profile(
             "127.0.0.1",
             Some("rediss://127.0.0.1:1/"),
@@ -73,7 +70,7 @@ fn assert_refused_before_access(kind: AccessKind) {
         };
         assert_eq!(error.stage, "driver_connect");
         assert!(matches!(error.source, DbError::InvalidProfile(message)
-            if message.contains("cannot reach the Sentinel master over TLS yet")));
+            if message.contains("Redis Sentinel TLS requires manual mode")));
     }
 }
 
@@ -98,7 +95,13 @@ fn sentinel_pipeline_refuses_proxy_before_access() {
 
 #[test]
 fn sentinel_pipeline_refuses_before_secret_resolution() {
-    let mut profile = sentinel_profile("127.0.0.1", None, Some("on"), None, false);
+    let mut profile = sentinel_profile(
+        "127.0.0.1",
+        Some("rediss://localhost:1/"),
+        None,
+        None,
+        false,
+    );
     profile.value_refs.insert(
         "password".into(),
         ValueRef::secret("unavailable", "unused", None),
@@ -118,7 +121,7 @@ fn sentinel_pipeline_refuses_before_secret_resolution() {
 }
 
 #[test]
-fn sentinel_validation_does_not_read_certificates() {
+fn sentinel_validation_accepts_manual_tls_without_reading_certificates() {
     let mut profile = sentinel_profile("::1", None, Some("verify"), None, false);
     if let DbConfig::Redis {
         ssl_root_cert_path, ..
@@ -126,9 +129,9 @@ fn sentinel_validation_does_not_read_certificates() {
     {
         *ssl_root_cert_path = Some("/nonexistent/datatab-test-ca.pem".into());
     }
-    assert!(matches!(RedisDriver::new().validate_profile(&profile),
-        Err(DbError::InvalidProfile(message))
-            if message.contains("cannot reach the Sentinel master over TLS yet")));
+    RedisDriver::new()
+        .validate_profile(&profile)
+        .expect("manual Sentinel TLS must be accepted without reading certificate files");
 }
 
 #[test]
@@ -155,11 +158,11 @@ fn sentinel_pipeline_refuses_unknown_mode_before_access() {
 }
 
 #[test]
-fn sentinel_validation_refuses_legacy_tls_true_without_ssl_mode() {
+fn sentinel_validation_accepts_legacy_tls_true_without_ssl_mode() {
     let profile = sentinel_profile("localhost", None, None, None, true);
-    assert!(matches!(RedisDriver::new().validate_profile(&profile),
-        Err(DbError::InvalidProfile(message))
-            if message.contains("cannot reach the Sentinel master over TLS yet")));
+    RedisDriver::new()
+        .validate_profile(&profile)
+        .expect("legacy TLS uses mode on");
 }
 
 struct ForbiddenAuth;
@@ -193,7 +196,13 @@ impl datatab_core::auth::AuthProvider for ForbiddenAuth {
 
 #[test]
 fn sentinel_pipeline_refuses_before_authentication() {
-    let profile = sentinel_profile("localhost", None, Some("on"), None, false);
+    let profile = sentinel_profile(
+        "localhost",
+        Some("rediss://localhost:1/"),
+        None,
+        None,
+        false,
+    );
     let mut input = input(profile, Arc::new(ForbiddenAccess));
     input.auth_provider = Some(Box::new(ForbiddenAuth));
     input.auth_profile = Some(datatab_core::AuthProfile::new(
@@ -309,5 +318,121 @@ fn standalone_and_cluster_tls_remain_accepted_through_pipeline() {
             ))
             .expect("supported TLS topology must pass the pipeline without reading certificates");
         }
+    }
+}
+
+#[test]
+fn sentinel_tls_refuses_every_ssh_profile_before_access() {
+    for (mode, legacy) in [(Some("on"), false), (Some("verify"), false), (None, true)] {
+        let mut profiles = Vec::new();
+        let mut unified = sentinel_profile("::1", None, mode, None, legacy);
+        unified.access_kind = Some(AccessKind::Ssh {
+            ssh_tunnel_profile_id: uuid::Uuid::new_v4(),
+        });
+        profiles.push(unified);
+        let mut stored = sentinel_profile("localhost", None, mode, None, legacy);
+        if let DbConfig::Redis {
+            ssh_tunnel_profile_id,
+            ..
+        } = &mut stored.config
+        {
+            *ssh_tunnel_profile_id = Some(uuid::Uuid::new_v4());
+        }
+        profiles.push(stored);
+        profiles.push(sentinel_profile(
+            "localhost",
+            None,
+            mode,
+            Some(SshTunnelConfig {
+                host: "localhost".into(),
+                port: 22,
+                user: "fixture-user".into(),
+                auth_method: datatab_core::SshAuthMethod::Password,
+                ssh_config_host: None,
+            }),
+            legacy,
+        ));
+        for profile in profiles {
+            let (sender, _watcher) = pipeline_state_channel();
+            let error = match run_ready(run_pipeline(
+                input(profile, Arc::new(ForbiddenAccess)),
+                &sender,
+            )) {
+                Err(error) => error,
+                Ok(_) => panic!("TLS Sentinel over SSH was accepted"),
+            };
+            assert!(matches!(error.source, DbError::InvalidProfile(message)
+                if message.contains("requires Direct access")));
+        }
+    }
+}
+
+#[test]
+fn sentinel_tls_refuses_every_proxy_profile_before_access() {
+    for (mode, legacy) in [(Some("on"), false), (Some("verify"), false), (None, true)] {
+        let proxy_id = uuid::Uuid::new_v4();
+        for (access, legacy_proxy) in [
+            (
+                Some(AccessKind::Proxy {
+                    proxy_profile_id: proxy_id,
+                }),
+                None,
+            ),
+            (None, Some(proxy_id)),
+            (Some(AccessKind::Direct), Some(proxy_id)),
+        ] {
+            let mut profile = sentinel_profile("localhost", None, mode, None, legacy);
+            profile.access_kind = access;
+            profile.proxy_profile_id = legacy_proxy;
+            assert_tls_access_refused(profile);
+        }
+    }
+}
+
+#[test]
+fn sentinel_tls_refuses_every_managed_profile_before_access() {
+    for (mode, legacy) in [(Some("on"), false), (Some("verify"), false), (None, true)] {
+        let mut profile = sentinel_profile("localhost", None, mode, None, legacy);
+        profile.access_kind = Some(AccessKind::Managed {
+            provider: "fixture".into(),
+            params: HashMap::new(),
+        });
+        assert_tls_access_refused(profile);
+    }
+}
+
+fn assert_tls_access_refused(profile: ConnectionProfile) {
+    let (sender, _watcher) = pipeline_state_channel();
+    let error = match run_ready(run_pipeline(
+        input(profile, Arc::new(ForbiddenAccess)),
+        &sender,
+    )) {
+        Err(error) => error,
+        Ok(_) => panic!("TLS Sentinel with non-Direct access was accepted"),
+    };
+    assert_eq!(error.stage, "driver_connect");
+    assert!(matches!(error.source, DbError::InvalidProfile(message)
+        if message.contains("requires Direct access")));
+}
+
+#[test]
+fn sentinel_manual_tls_passes_pipeline_without_certificate_reads() {
+    for mode in ["on", "verify"] {
+        let mut profile = sentinel_profile("localhost", None, Some(mode), None, false);
+        if let DbConfig::Redis {
+            port,
+            ssl_root_cert_path,
+            ..
+        } = &mut profile.config
+        {
+            *port = 6380;
+            *ssl_root_cert_path = Some("/nonexistent/datatab-test-ca.pem".into());
+        }
+        let (sender, _watcher) = pipeline_state_channel();
+        run_ready(run_pipeline(
+            input(profile, Arc::new(ExpectedAccess(AccessKind::Direct))),
+            &sender,
+        ))
+        .expect("manual TLS must reach direct access without certificate reads");
     }
 }

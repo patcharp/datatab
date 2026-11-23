@@ -48,6 +48,22 @@ pub enum ClassDecision {
     Deny,
 }
 
+/// The permission ladder, from least to most restricted, in the order
+/// [`ExecutionClassification::max`] ranks its variants.
+///
+/// [`ToolPolicy::validate_class_sets`] reads a policy's class sets against
+/// this order, and the test `permission_ladder_matches_the_max_order` pins the
+/// two together, so the ladder cannot drift away from `max`.
+const PERMISSION_LADDER: [ExecutionClassification; 7] = [
+    ExecutionClassification::Metadata,
+    ExecutionClassification::Read,
+    ExecutionClassification::Write,
+    ExecutionClassification::Destructive,
+    ExecutionClassification::AdminSafe,
+    ExecutionClassification::Admin,
+    ExecutionClassification::AdminDestructive,
+];
+
 /// A tool allowlist plus a decision for each execution class.
 ///
 /// The decision per class is encoded in two lists so policies serialized
@@ -66,6 +82,18 @@ pub struct ToolPolicy {
     pub approval_classes: Vec<ExecutionClassification>,
 }
 
+impl ClassDecision {
+    /// How much a decision grants, so two decisions can be ordered: `Allow`
+    /// grants more than `Ask`, which grants more than `Deny`.
+    fn permissiveness(self) -> u8 {
+        match self {
+            Self::Allow => 2,
+            Self::Ask => 1,
+            Self::Deny => 0,
+        }
+    }
+}
+
 impl ToolPolicy {
     pub fn class_decision(&self, classification: ExecutionClassification) -> ClassDecision {
         if self.approval_classes.contains(&classification) {
@@ -76,6 +104,71 @@ impl ToolPolicy {
             ClassDecision::Deny
         }
     }
+
+    /// Refuses class sets that decide a class below on the permission ladder
+    /// more strictly than a class above it.
+    ///
+    /// [`class_decision`](Self::class_decision) is an exact-set match, so the
+    /// two lists are the whole grant and nothing else keeps them in the classes'
+    /// own order. A policy that allows `AdminDestructive` while it only asks
+    /// about `Admin` and `AdminSafe` lets an operation that composes to the top
+    /// class run with no approval, although every milder class it composes from
+    /// would be queued (#490). The same hole opens one class lower, and a gap in
+    /// the middle of a set opens it for every class above the gap.
+    ///
+    /// The rule: a class may not be decided more strictly than any class below
+    /// it. An allowed class therefore needs every class below it allowed, an
+    /// asked class needs every class below it allowed or asked, and asking on a
+    /// class above an allowed one stays valid, because it is the stricter
+    /// decision.
+    ///
+    /// Applied once, in this function, at both boundaries that decide what the
+    /// engine may grant: when a stored or received policy is parsed
+    /// (`TryFrom<ToolPolicyDto>` in `datatab_mcp`) and when a person saves one
+    /// from Settings.
+    pub fn validate_class_sets(&self) -> Result<(), ClassSetError> {
+        for (index, higher) in PERMISSION_LADDER.iter().enumerate() {
+            let higher_decision = self.class_decision(*higher);
+            if higher_decision == ClassDecision::Deny {
+                continue;
+            }
+
+            for lower in PERMISSION_LADDER.iter().take(index) {
+                let lower_decision = self.class_decision(*lower);
+                if lower_decision.permissiveness() >= higher_decision.permissiveness() {
+                    continue;
+                }
+
+                return Err(ClassSetError {
+                    policy_id: self.id.clone(),
+                    higher: *higher,
+                    higher_decision,
+                    lower: *lower,
+                    lower_decision,
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Why a policy's class sets contradict the permission ladder.
+///
+/// Names the offending pair: the class that is decided more permissively and
+/// the class below it that is decided more strictly.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "policy '{policy_id}' decides {higher_decision:?} for {higher:?} but {lower_decision:?} for \
+     {lower:?}, which sits below it on the permission ladder: a lower class may not be decided \
+     more strictly than a higher one"
+)]
+pub struct ClassSetError {
+    pub policy_id: String,
+    pub higher: ExecutionClassification,
+    pub higher_decision: ClassDecision,
+    pub lower: ExecutionClassification,
+    pub lower_decision: ClassDecision,
 }
 
 #[derive(Debug, Error)]
@@ -187,8 +280,8 @@ mod tests {
     use crate::classification::ExecutionClassification;
 
     use super::{
-        ClassDecision, PolicyDecision, PolicyDecisionReason, PolicyEngine, PolicyEngineError,
-        PolicyEvaluationRequest, PolicyRole, ToolPolicy,
+        ClassDecision, PERMISSION_LADDER, PolicyDecision, PolicyDecisionReason, PolicyEngine,
+        PolicyEngineError, PolicyEvaluationRequest, PolicyRole, ToolPolicy,
     };
 
     const ALL_CLASSES: [ExecutionClassification; 7] = [
@@ -669,5 +762,178 @@ mod tests {
             policy.class_decision(ExecutionClassification::Write),
             ClassDecision::Deny
         );
+    }
+
+    /// A policy with the given class sets and the read tool.
+    fn policy_with_classes(
+        allowed_classes: Vec<ExecutionClassification>,
+        approval_classes: Vec<ExecutionClassification>,
+    ) -> ToolPolicy {
+        ToolPolicy {
+            id: "custom".to_string(),
+            allowed_tools: vec!["read_query".to_string()],
+            allowed_classes,
+            approval_classes,
+        }
+    }
+
+    /// The ladder `validate_class_sets` reads is the one `max` ranks, so the
+    /// two cannot drift apart. Ordering each earlier entry below every later
+    /// one also fails on a duplicate or a missing entry.
+    #[test]
+    fn permission_ladder_matches_the_max_order() {
+        for class in ALL_CLASSES {
+            assert!(
+                PERMISSION_LADDER.contains(&class),
+                "{class:?} must appear on the permission ladder"
+            );
+        }
+
+        for (higher_index, higher) in PERMISSION_LADDER.iter().enumerate() {
+            for lower in PERMISSION_LADDER.iter().take(higher_index) {
+                assert_eq!(
+                    higher.max(*lower),
+                    *higher,
+                    "max must rank {higher:?} above {lower:?}"
+                );
+                assert_eq!(lower.max(*higher), *higher);
+            }
+        }
+    }
+
+    /// The shape #490 refuses: the top class is allowed while the two classes
+    /// below it are only asked about, so a buffer that composes to
+    /// `AdminDestructive` would run with no approval.
+    #[test]
+    fn an_allowed_class_over_asked_classes_is_refused_with_the_pair() {
+        let policy = policy_with_classes(
+            vec![
+                ExecutionClassification::Metadata,
+                ExecutionClassification::Read,
+                ExecutionClassification::Write,
+                ExecutionClassification::Destructive,
+                ExecutionClassification::AdminDestructive,
+            ],
+            vec![
+                ExecutionClassification::AdminSafe,
+                ExecutionClassification::Admin,
+            ],
+        );
+
+        let error = policy
+            .validate_class_sets()
+            .expect_err("an allowed class over asked classes must be refused");
+
+        assert_eq!(error.policy_id, "custom");
+        assert_eq!(error.higher, ExecutionClassification::AdminDestructive);
+        assert_eq!(error.higher_decision, ClassDecision::Allow);
+        assert_eq!(error.lower, ExecutionClassification::AdminSafe);
+        assert_eq!(error.lower_decision, ClassDecision::Ask);
+
+        let message = error.to_string();
+        for expected in ["custom", "AdminDestructive", "AdminSafe"] {
+            assert!(message.contains(expected), "{message} must name {expected}");
+        }
+    }
+
+    /// A gap in the middle of the allowed set leaves every class above it
+    /// allowed, so the classes above the gap can run with no approval.
+    #[test]
+    fn a_gap_in_the_middle_of_the_allowed_set_is_refused() {
+        let policy = policy_with_classes(
+            vec![
+                ExecutionClassification::Metadata,
+                ExecutionClassification::Read,
+                ExecutionClassification::Admin,
+            ],
+            Vec::new(),
+        );
+
+        let error = policy
+            .validate_class_sets()
+            .expect_err("a gap in the allowed set must be refused");
+
+        assert_eq!(error.higher, ExecutionClassification::Admin);
+        assert_eq!(error.higher_decision, ClassDecision::Allow);
+        assert_eq!(error.lower, ExecutionClassification::Write);
+        assert_eq!(error.lower_decision, ClassDecision::Deny);
+    }
+
+    /// The issue's second rule: a class in the approval list needs every class
+    /// below it allowed or asked. Asking on `Admin` while `Write` is denied is
+    /// therefore refused, and the pair names both classes.
+    #[test]
+    fn an_asked_class_over_a_denied_class_is_refused_with_the_pair() {
+        let policy = policy_with_classes(
+            vec![
+                ExecutionClassification::Metadata,
+                ExecutionClassification::Read,
+            ],
+            vec![ExecutionClassification::Admin],
+        );
+
+        let error = policy
+            .validate_class_sets()
+            .expect_err("an asked class over a denied class must be refused");
+
+        assert_eq!(error.higher, ExecutionClassification::Admin);
+        assert_eq!(error.higher_decision, ClassDecision::Ask);
+        assert_eq!(error.lower, ExecutionClassification::Write);
+        assert_eq!(error.lower_decision, ClassDecision::Deny);
+
+        let message = error.to_string();
+        for expected in ["Admin", "Write"] {
+            assert!(message.contains(expected), "{message} must name {expected}");
+        }
+    }
+
+    /// Asking on a class above an allowed one is the stricter decision, so it
+    /// is accepted: the built-in `admin` policy has this shape.
+    #[test]
+    fn asking_above_an_allowed_class_is_accepted() {
+        let policy = policy_with_classes(
+            vec![
+                ExecutionClassification::Metadata,
+                ExecutionClassification::Read,
+            ],
+            vec![
+                ExecutionClassification::Write,
+                ExecutionClassification::Destructive,
+                ExecutionClassification::AdminSafe,
+                ExecutionClassification::Admin,
+                ExecutionClassification::AdminDestructive,
+            ],
+        );
+
+        assert_eq!(policy.validate_class_sets(), Ok(()));
+    }
+
+    /// A policy that has not been given a class yet grants nothing, which is
+    /// coherent: every class is denied.
+    #[test]
+    fn a_policy_that_grants_nothing_is_accepted() {
+        let policy = policy_with_classes(Vec::new(), Vec::new());
+
+        assert_eq!(policy.validate_class_sets(), Ok(()));
+    }
+
+    /// A class in both lists is Ask, the stricter decision, so it does not make
+    /// the classes below it incoherent.
+    #[test]
+    fn a_class_listed_in_both_sets_is_read_as_asked() {
+        let policy = policy_with_classes(
+            vec![
+                ExecutionClassification::Metadata,
+                ExecutionClassification::Read,
+                ExecutionClassification::Write,
+            ],
+            vec![ExecutionClassification::Write],
+        );
+
+        assert_eq!(
+            policy.class_decision(ExecutionClassification::Write),
+            ClassDecision::Ask
+        );
+        assert_eq!(policy.validate_class_sets(), Ok(()));
     }
 }

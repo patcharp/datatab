@@ -1113,11 +1113,7 @@ impl DataGridPanel {
             return false;
         };
         let (_, _, filter_items, _) = self.build_filter_items(menu, backend, cx);
-        let mut actions = vec![
-            ContextMenuAction::Order(datatab_core::SortDirection::Ascending),
-            ContextMenuAction::Order(datatab_core::SortDirection::Descending),
-            ContextMenuAction::RemoveOrdering,
-        ];
+        let mut actions = Self::column_header_menu_fixed_actions().to_vec();
         actions.extend(filter_items.into_iter().map(|(_, action)| action));
 
         match cmd {
@@ -1729,8 +1725,12 @@ impl DataGridPanel {
             let table_queries = self.offers_table_query_actions();
             let has_filter =
                 table_queries && self.has_filter_submenu(backend, is_document_view, cx);
-            let has_order =
-                table_queries && matches!(backend, Some(FilterBackend::Sql)) && !is_document_view;
+            // A driver that cannot sort offers no order: the row menu's Order
+            // submenu would ask for an order it cannot express (ruling 4).
+            let has_order = table_queries
+                && matches!(backend, Some(FilterBackend::Sql))
+                && !is_document_view
+                && self.table_sort_unavailable(cx).is_none();
             let separators = QueryGroupSeparators::new(
                 has_filter,
                 has_order,
@@ -1943,6 +1943,11 @@ impl DataGridPanel {
             }
             ContextMenuAction::RemoveOrdering => {
                 self.handle_sort_clear(cx);
+            }
+            ContextMenuAction::CopyColumnName => {
+                if let Some(column) = self.result.columns.get(menu.col) {
+                    cx.write_to_clipboard(ClipboardItem::new_string(column.name.clone()));
+                }
             }
             ContextMenuAction::InspectRow => {
                 self.open_row_inspector(menu.row, menu.col, cx);
@@ -4752,10 +4757,28 @@ mod tests {
         let labels = labels(&items);
 
         assert!(labels.contains(&item_label("document.data.context_menu.item.add_row")));
+        assert!(labels.contains(&item_label(
+            "document.data.context_menu.item.copy_column_name"
+        )));
         assert!(!labels.contains(&item_label("document.data.context_menu.item.edit")));
         assert!(!labels.contains(&item_label("document.data.context_menu.item.edit_in_modal")));
         assert!(!labels.contains(&item_label("document.data.context_menu.item.duplicate_row")));
         assert!(!labels.contains(&item_label("document.data.context_menu.item.delete_row")));
+    }
+
+    #[test]
+    fn copy_column_name_follows_copy_in_the_table_menu_only() {
+        let table = DataGridPanel::build_context_menu_items(false, false, true, false, true);
+        assert_eq!(
+            table[1].action,
+            Some(datatab_components::components::data_table::ContextMenuAction::CopyColumnName)
+        );
+
+        let document = DataGridPanel::build_context_menu_items(true, true, true, false, true);
+        assert!(!document.iter().any(|item| item.action
+            == Some(
+                datatab_components::components::data_table::ContextMenuAction::CopyColumnName
+            )));
     }
 
     #[test]
@@ -4764,7 +4787,10 @@ mod tests {
 
         assert_eq!(
             labels(&items),
-            vec![item_label("document.data.context_menu.item.copy")]
+            vec![
+                item_label("document.data.context_menu.item.copy"),
+                item_label("document.data.context_menu.item.copy_column_name")
+            ]
         );
     }
 

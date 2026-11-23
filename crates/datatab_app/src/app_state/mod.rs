@@ -42,6 +42,13 @@ use std::sync::RwLock;
 use uuid::Uuid;
 
 mod bootstrap;
+mod external_secrets;
+
+pub use crate::config_loader::ProfileSaveError;
+
+pub use external_secrets::{
+    SecretFieldChanges, SecretFieldKeyringError, SecretFieldWrite, SecretFieldsMayHaveChanged,
+};
 
 use crate::auth_provider_registry::{AuthProviderRegistry, RegistryAuthProviderWrapper};
 use crate::config_loader::EditableGlobalHook;
@@ -1155,7 +1162,6 @@ impl AppState {
         self.facade.secrets.is_available()
     }
 
-    #[allow(dead_code)]
     pub fn secret_store(&self) -> Arc<RwLock<Box<dyn SecretStore>>> {
         self.facade.secrets.secret_store_arc()
     }
@@ -1269,6 +1275,7 @@ impl AppState {
 
     pub fn remove_profile(&mut self, idx: usize) -> Option<ConnectionProfile> {
         let removed = self.facade.remove_profile(idx)?;
+        self.delete_external_secret_fields(&removed);
         self.facade.connections.clear_connect_failure(removed.id);
         self.value_ref_diagnostics.remove(&removed.id);
 
@@ -1310,6 +1317,33 @@ impl AppState {
                 Some(_) => true,
             }
             || !profile.save_password
+            || self
+                .driver_for_profile(profile)
+                .is_some_and(|driver| !driver.requires_password())
+    }
+
+    /// The refusals the connection manager applies before it writes any
+    /// secret. `password` is the literal password input, empty when the
+    /// source is not literal.
+    #[allow(clippy::result_large_err)]
+    pub fn check_connection_manager_save(
+        &self,
+        profile: &ConnectionProfile,
+        password: &str,
+    ) -> Result<(), ProfileSaveError> {
+        Self::check_profile_can_be_saved(profile)?;
+        if !self.connection_manager_password_is_resolved(profile, password) {
+            return Err(datatab_core::DbError::InvalidProfile(
+                "Choose a new source for the password or turn off Save password.".into(),
+            )
+            .into());
+        }
+        if external_secrets::secret_field_ids(profile, &self.facade.connections.drivers).is_none()
+            && crate::config_loader::has_new_literal_value_refs(&self.storage_runtime, profile)?
+        {
+            return Err(ProfileSaveError::UnknownFormLiteral { profiles: 1 });
+        }
+        Ok(())
     }
 
     /// Refuses a profile whose kind is a reserved driver-wire slot, for
@@ -1334,13 +1368,7 @@ impl AppState {
         profile: ConnectionProfile,
         password: &str,
     ) -> Result<(), datatab_core::DbError> {
-        Self::check_profile_can_be_saved(&profile)?;
-        if !self.connection_manager_password_is_resolved(&profile, password) {
-            return Err(datatab_core::DbError::InvalidProfile(
-                "The broken password source needs a value or a source, or save password must be turned off."
-                    .into(),
-            ));
-        }
+        self.check_connection_manager_save(&profile, password)?;
         self.value_ref_diagnostics.remove(&profile.id);
         self.update_profile(profile);
         Ok(())
@@ -1382,14 +1410,49 @@ impl AppState {
         self.save_profiles();
     }
 
-    pub fn save_profiles(&self) {
+    pub fn save_profiles(&mut self) {
+        let unknown_form_ids = self
+            .facade
+            .profiles
+            .profiles
+            .iter()
+            .filter(|profile| {
+                external_secrets::secret_field_ids(profile, &self.facade.connections.drivers)
+                    .is_none()
+            })
+            .map(|profile| profile.id)
+            .collect();
+        let preservation = match self.value_ref_preservation_for_save(&unknown_form_ids) {
+            Ok(preservation) => preservation,
+            Err(error) => {
+                log::error!("Connection profiles were not saved: {error}");
+                return;
+            }
+        };
+        // Secret values never reach the database, whatever path put them in
+        // a profile: not an external driver's, and not a literal value ref
+        // on a secret field of any driver.
+        let mut profiles = std::mem::take(&mut self.facade.profiles.profiles);
+        let mut persistence_profiles = Vec::with_capacity(profiles.len());
+        let mut settled = external_secrets::LoadMigration::default();
+        let drivers = self.facade.connections.drivers.clone();
+        for profile in &mut profiles {
+            self.settle_literal_secret_refs(profile, &drivers, &mut settled);
+            settled.dropped += external_secrets::strip_literal_secret_refs(profile, &drivers);
+            let mut persistence_profile = profile.clone();
+            external_secrets::strip_external_secret_values(&mut persistence_profile, &drivers);
+            persistence_profiles.push(persistence_profile);
+        }
+        self.facade.profiles.profiles = profiles;
+        settled.log_counts();
         if let Err(e) = crate::config_loader::save_profiles_preserving_value_refs(
             &self.storage_runtime,
-            &self.facade.profiles.profiles,
-            &self.value_ref_diagnostics,
+            &persistence_profiles,
+            &preservation,
+            &unknown_form_ids,
         ) {
             match e {
-                datatab_storage::error::StorageError::Data(_) => {
+                ProfileSaveError::Storage(datatab_storage::error::StorageError::Data(_)) => {
                     log::error!(
                         "Some connection profiles were refused at save, the others were saved: {e}"
                     );
@@ -2856,6 +2919,11 @@ impl AppState {
             return Err("Built-in policies cannot be modified".to_string());
         }
 
+        // Refused here as well as when a policy is parsed: a policy that grants
+        // a class while a class below it is decided more strictly could run an
+        // operation above an approval ceiling it never authorised (#490).
+        datatab_mcp::validate_policy_class_sets(&policy)?;
+
         self.mcp_runtime
             .upsert_policy_mut(policy)
             .map_err(|error| error.to_string())?;
@@ -2897,7 +2965,6 @@ impl AppState {
         Ok(())
     }
 
-    #[allow(clippy::result_large_err)]
     pub fn persist_mcp_governance(&mut self) -> Result<(), String> {
         let repo = self.storage_runtime.governance_settings();
 
@@ -3250,7 +3317,10 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     mod access_secrets;
+    mod external_secrets;
     mod managed_access;
+    #[cfg(feature = "mcp")]
+    mod mcp_policies;
     mod refusal;
     mod value_refs;
     use super::*;
@@ -3618,6 +3688,62 @@ mod tests {
 
         assert!(registry.get("rpc-auth").is_some());
         assert!(registry.get("rpc:svc-socket").is_none());
+    }
+
+    #[test]
+    fn batch_auth_probes_keep_each_result_with_its_descriptor() {
+        let mut first = test_service(RpcServiceKind::AuthProvider);
+        first.socket_id = "first".to_string();
+        let mut second = test_service(RpcServiceKind::AuthProvider);
+        second.socket_id = "second".to_string();
+        let mut registry = AuthProviderRegistry::new();
+
+        let first_provider: Arc<dyn DynAuthProvider> = Arc::new(TestAuthProvider::new("shared"));
+        let second_provider: Arc<dyn DynAuthProvider> = Arc::new(TestAuthProvider::new("shared"));
+
+        AppState::launch_rpc_auth_providers_batch_with(
+            &mut registry,
+            vec![first, second],
+            |inputs| {
+                assert_eq!(
+                    inputs
+                        .iter()
+                        .map(|input| input.0.as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["first", "second"]
+                );
+                vec![Ok(first_provider.clone()), Ok(second_provider.clone())]
+            },
+        );
+
+        let registered = registry.get("shared").expect("registered provider");
+        assert!(Arc::ptr_eq(&registered, &first_provider));
+    }
+
+    #[test]
+    fn batch_auth_probe_failure_does_not_consume_the_next_result() {
+        let mut first = test_service(RpcServiceKind::AuthProvider);
+        first.socket_id = "first".to_string();
+        let mut second = test_service(RpcServiceKind::AuthProvider);
+        second.socket_id = "second".to_string();
+        let mut registry = AuthProviderRegistry::new();
+        let second_provider: Arc<dyn DynAuthProvider> = Arc::new(TestAuthProvider::new("second"));
+
+        AppState::launch_rpc_auth_providers_batch_with(
+            &mut registry,
+            vec![first, second],
+            |inputs| {
+                assert_eq!(inputs.len(), 2);
+                vec![
+                    Err(Box::new(DbError::connection_failed("probe failed"))),
+                    Ok(second_provider.clone()),
+                ]
+            },
+        );
+
+        assert!(registry.get("first").is_none());
+        let registered = registry.get("second").expect("second provider registered");
+        assert!(Arc::ptr_eq(&registered, &second_provider));
     }
 
     #[test]
@@ -4022,6 +4148,22 @@ mod tests {
             key, "builtin:influxdb",
             "driver_key() must be 'builtin:influxdb'"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "cassandra")]
+    fn cassandra_registration_present_when_feature_enabled() {
+        let drivers = AppState::build_builtin_drivers();
+        assert!(
+            drivers.contains_key("cassandra"),
+            "driver map must contain the 'cassandra' key when the cassandra feature is enabled"
+        );
+
+        let driver = drivers
+            .get("cassandra")
+            .expect("cassandra driver must be registered");
+        assert_eq!(driver.driver_key(), "builtin:cassandra");
+        assert_eq!(driver.kind(), datatab_core::DbKind::Cassandra);
     }
 
     #[test]

@@ -268,7 +268,7 @@ fn cold_cache_upgrades_to_editable_on_table_details_arrival(cx: &mut TestAppCont
             );
             let connected = ConnectedProfile {
                 profile,
-                connection: Arc::new(StubConnection) as Arc<dyn datatab_core::Connection>,
+                connection: Arc::new(StubConnection::new()) as Arc<dyn datatab_core::Connection>,
                 schema: None,
                 mutation_policy: MutationPolicy::default(),
                 read_only_reason: None,
@@ -404,6 +404,11 @@ fn cold_cache_upgrades_to_editable_on_table_details_arrival(cx: &mut TestAppCont
 /// details that are already cached instead of failing on the populated key.
 /// Leading with `active_database` left the second open of a table read-only
 /// even though its primary key was cached.
+///
+/// The first panel is opened the way the tree opens one, through
+/// `new_for_table`, so the lookup under test is the one that path makes. The
+/// connection declares `SORTING`, because the table is read in key order and
+/// this test asserts the `ORDER BY` the first page carries.
 #[gpui::test]
 fn reopened_table_finds_cached_primary_key_without_an_active_database(cx: &mut TestAppContext) {
     use datatab_core::{ColumnInfo, TableInfo};
@@ -428,7 +433,8 @@ fn reopened_table_finds_cached_primary_key_without_an_active_database(cx: &mut T
             );
             let connected = ConnectedProfile {
                 profile,
-                connection: Arc::new(StubConnection) as Arc<dyn datatab_core::Connection>,
+                connection: Arc::new(StubConnection::sorting())
+                    as Arc<dyn datatab_core::Connection>,
                 schema: None,
                 mutation_policy: MutationPolicy::default(),
                 read_only_reason: None,
@@ -479,42 +485,29 @@ fn reopened_table_finds_cached_primary_key_without_an_active_database(cx: &mut T
         });
     });
 
-    let found = Rc::new(RefCell::new(Vec::new()));
-    let found_handle = found.clone();
     let panel_holder = Rc::new(RefCell::new(None));
     let panel_handle = panel_holder.clone();
     let fetch_panel_holder = Rc::new(RefCell::new(None));
     let fetch_panel_handle = fetch_panel_holder.clone();
+    let app_state_for_panel = app_state.clone();
+    let users_for_panel = users.clone();
 
-    let (_, window) = cx.add_window_view(|window, cx| {
-        // `new_for_table` builds this panel from the cached details; it cannot
-        // be called here because its refresh needs a driver dialect, so the
-        // lookup it makes is invoked directly.
+    let (_, window) = cx.add_window_view(move |window, cx| {
+        // The tree's own open: the panel looks the key up under the table's
+        // database, and the connection is asked for the first page in that key
+        // order.
         let panel = cx.new(|cx| {
-            let order_by = DataGridPanel::get_primary_key_columns(
-                &app_state,
+            let mut panel = DataGridPanel::new_for_table(
                 profile_id,
-                Some("testdb"),
-                &users,
+                users_for_panel.clone(),
+                Some("testdb".to_string()),
+                app_state_for_panel.clone(),
+                window,
                 cx,
             );
-            let pk_columns: Vec<String> = order_by
-                .iter()
-                .map(|order| order.column.name.clone())
-                .collect();
-            found_handle.borrow_mut().extend(pk_columns.clone());
-
-            let source = DataSource::Table {
-                profile_id,
-                database: Some("testdb".to_string()),
-                table: users.clone(),
-                pagination: Pagination::default(),
-                order_by,
-                total_rows: None,
-            };
-            let mut panel =
-                DataGridPanel::new_internal(source, app_state.clone(), pk_columns, window, cx);
-            panel.result = id_result();
+            // The stub answers no query, so no page can land; the rows the
+            // assertions below read are staged here.
+            panel.set_result(id_result(), cx);
             panel
         });
 
@@ -525,14 +518,14 @@ fn reopened_table_finds_cached_primary_key_without_an_active_database(cx: &mut T
             let source = DataSource::Table {
                 profile_id,
                 database: Some("testdb".to_string()),
-                table: users.clone(),
+                table: users_for_panel.clone(),
                 pagination: Pagination::default(),
                 order_by: Vec::new(),
                 total_rows: None,
             };
             let mut panel =
                 DataGridPanel::new_internal(source, app_state.clone(), Vec::new(), window, cx);
-            panel.fetch_table_details_for_pk(profile_id, &users, cx);
+            panel.fetch_table_details_for_pk(profile_id, &users_for_panel, cx);
             panel
         });
 
@@ -540,17 +533,18 @@ fn reopened_table_finds_cached_primary_key_without_an_active_database(cx: &mut T
         fetch_panel_handle.replace(Some(fetch_panel.clone()));
         Root::new(panel, window, cx)
     });
-
-    assert_eq!(
-        *found.borrow(),
-        vec!["id".to_string()],
-        "cached details must be found under the table's database, not the active one"
-    );
+    window.run_until_parked();
 
     let panel = panel_holder
         .borrow()
         .clone()
         .expect("panel should be created");
+    let opened_pk_columns = window.update(|_, app| panel.read(app).pk_columns.clone());
+    assert_eq!(
+        opened_pk_columns,
+        vec!["id".to_string()],
+        "opening the table must find the cached key under the table's database, not the active one"
+    );
     let edits_allowed = window.update(|_, app| panel.read(app).mutations_enabled());
     assert!(
         edits_allowed,
@@ -664,7 +658,8 @@ fn first_open_requeries_with_the_primary_key_order_it_learned(cx: &mut TestAppCo
             );
             let connected = ConnectedProfile {
                 profile,
-                connection: Arc::new(StubConnection) as Arc<dyn datatab_core::Connection>,
+                connection: Arc::new(StubConnection::sorting())
+                    as Arc<dyn datatab_core::Connection>,
                 schema: None,
                 mutation_policy: MutationPolicy::default(),
                 read_only_reason: None,

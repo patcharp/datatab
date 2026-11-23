@@ -10,9 +10,9 @@ use datatab_core::{
     ExecutionSession, ExecutionSessionFactory, ExplainRequest, ForeignKeyInfo, IndexData,
     IndexInfo, KeyValueConnection, QueryCancelHandle, QueryGenerator, QueryHandle, QueryRequest,
     QueryResult, RelationalConnection, RelationalSchema, Row, RowDelete, RowInsert, RowPatch,
-    SchemaForeignKeyInfo, SchemaIndexInfo, SchemaLoadingStrategy, SchemaSnapshot, SqlDialect,
-    SqlMutationGenerator, SqlQueryBuilder, TableInfo, TableProfile, TableRef, TableViewFeatures,
-    Value, ViewInfo,
+    SchemaColumnInfo, SchemaForeignKeyInfo, SchemaIndexInfo, SchemaLoadingStrategy, SchemaSnapshot,
+    SqlDialect, SqlMutationGenerator, SqlQueryBuilder, TableInfo, TableProfile, TableRef,
+    TableViewFeatures, Value, ViewInfo,
 };
 use duckdb::arrow::datatypes::{DataType, TimeUnit as ArrowTimeUnit};
 use duckdb::types::{TimeUnit, Value as DuckValue};
@@ -465,21 +465,10 @@ impl DuckDbConnection {
             )?
             .rows
             .into_iter()
-            .filter_map(|row| match <[Value; 4]>::try_from(row) {
-                Ok([Value::Text(name), Value::Text(type_name), nullable, default]) => {
-                    Some(ColumnInfo {
-                        is_primary_key: primary_key.contains(&name),
-                        name,
-                        type_name,
-                        nullable: nullable != Value::Bool(false),
-                        default_value: match default {
-                            Value::Text(default) => Some(default),
-                            _ => None,
-                        },
-                        enum_values: None,
-                    })
-                }
-                _ => None,
+            .filter_map(|row| {
+                let values = <[Value; 4]>::try_from(row).ok()?;
+                let primary = matches!(&values[0], Value::Text(name) if primary_key.contains(name));
+                column_from_values(values, primary)
             })
             .collect())
     }
@@ -851,6 +840,44 @@ impl Connection for DuckDbConnection {
         ))
     }
 
+    fn schema_columns(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+    ) -> Result<Vec<SchemaColumnInfo>, DbError> {
+        let (filter, _) = self.schema_filter(database, schema);
+        let rows = self.run(
+            &format!(
+                "SELECT c.table_name, c.column_name, c.data_type, c.is_nullable, c.column_default, \
+                 EXISTS (SELECT 1 FROM duckdb_constraints() k \
+                         WHERE k.database_name = c.database_name AND k.schema_name = c.schema_name \
+                           AND k.table_name = c.table_name AND k.constraint_type = 'PRIMARY KEY' \
+                           AND k.constraint_name IS NOT NULL \
+                           AND list_contains(k.constraint_column_names, c.column_name)) \
+                 FROM duckdb_columns() c WHERE {filter} ORDER BY c.table_name, c.column_index"
+            ),
+            &[],
+            None,
+        )?.rows;
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| match <[Value; 6]>::try_from(row) {
+                Ok(
+                    [
+                        Value::Text(table_name),
+                        name,
+                        type_name,
+                        nullable,
+                        default,
+                        Value::Bool(primary),
+                    ],
+                ) => column_from_values([name, type_name, nullable, default], primary)
+                    .map(|column| SchemaColumnInfo { table_name, column }),
+                _ => None,
+            })
+            .collect())
+    }
+
     fn schema_indexes(
         &self,
         database: &str,
@@ -1033,6 +1060,56 @@ impl Connection for DuckDbConnection {
             ),
         };
         self.run(&format!("EXPLAIN {query}"), &[], None)
+    }
+
+    fn code_generators(&self) -> Vec<datatab_core::CodeGeneratorInfo> {
+        vec![
+            datatab_core::CodeGeneratorInfo {
+                id: "create_table".into(),
+                label: "CREATE TABLE".into(),
+                scope: datatab_core::CodeGenScope::Table,
+                order: 10,
+                destructive: false,
+            },
+            datatab_core::CodeGeneratorInfo {
+                id: "drop_table".into(),
+                label: "DROP TABLE".into(),
+                scope: datatab_core::CodeGenScope::Table,
+                order: 20,
+                destructive: true,
+            },
+        ]
+    }
+
+    fn code_gen_capabilities(&self) -> datatab_core::CodeGenCapabilities {
+        datatab_core::CodeGenCapabilities::CREATE_TABLE
+            | datatab_core::CodeGenCapabilities::DROP_TABLE
+    }
+
+    fn generate_code(&self, generator_id: &str, table: &TableInfo) -> Result<String, DbError> {
+        match generator_id {
+            "create_table" => {
+                if let Some(foreign_key) = table.foreign_keys.as_deref().unwrap_or_default().first()
+                {
+                    return Err(DbError::NotSupported(format!(
+                        "CREATE TABLE cannot express foreign key '{}'",
+                        foreign_key.name
+                    )));
+                }
+                if let Some(constraint) = table.constraints.as_deref().unwrap_or_default().first() {
+                    return Err(DbError::NotSupported(format!(
+                        "CREATE TABLE cannot express constraint '{}'",
+                        constraint.name
+                    )));
+                }
+                Ok(datatab_core::generate_create_table(&DUCKDB_DIALECT, table))
+            }
+            "drop_table" => Ok(datatab_core::generate_drop_table(&DUCKDB_DIALECT, table)),
+            _ => Err(DbError::NotSupported(format!(
+                "Code generator '{}' not supported",
+                generator_id
+            ))),
+        }
     }
 
     fn dialect(&self) -> &dyn SqlDialect {
@@ -1229,6 +1306,23 @@ fn primary_key_index(table: &str, primary_key: Vec<String>) -> Option<IndexInfo>
     })
 }
 
+fn column_from_values(values: [Value; 4], primary: bool) -> Option<ColumnInfo> {
+    match values {
+        [Value::Text(name), Value::Text(type_name), nullable, default] => Some(ColumnInfo {
+            is_primary_key: primary,
+            name,
+            type_name,
+            nullable: nullable != Value::Bool(false),
+            default_value: match default {
+                Value::Text(default) => Some(default),
+                _ => None,
+            },
+            enum_values: None,
+        }),
+        _ => None,
+    }
+}
+
 fn text_list(value: Value) -> Vec<String> {
     match value {
         Value::Array(items) => items
@@ -1419,6 +1513,9 @@ fn column_kind(data_type: &DataType) -> ColumnKind {
 
 #[cfg(test)]
 mod tests {
+    mod bulk;
+    mod schema_diff;
+
     use super::*;
     use crate::DuckDbDriver;
     use datatab_core::{ConnectionProfile, DbConfig, DbDriver, RowIdentity, RowPatch};

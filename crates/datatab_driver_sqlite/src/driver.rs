@@ -14,17 +14,18 @@ use datatab_core::{
     DatabaseCategory, DbConfig, DbDriver, DbError, DbKind, DbSchemaInfo, DdlCapabilities,
     DdlRejection, DeploymentClass, DescribeRequest, DocumentConnection, DriverCapabilities,
     DriverFormDef, DriverLimits, DriverMetadata, DropColumnRequest, DropIndexRequest,
-    ExecutionSourceContext, ExplainRequest, ForeignKeyInfo, FormSection, FormTab, FormValues,
-    FormattedError, Icon, IndexData, IndexInfo, IsolationLevel, KeyValueConnection, LogErr,
-    MutationCapabilities, PaginationStyle, PlaceholderStyle, QueryCancelHandle, QueryCapabilities,
-    QueryErrorFormatter, QueryGenerator, QueryHandle, QueryLanguage, QueryRequest, QueryResult,
-    ReindexRequest, RelationalConnection, RelationalSchema, Row, RowDelete, RowInsert, RowPatch,
-    SchemaForeignKeyInfo, SchemaIndexInfo, SchemaLoadingStrategy, SchemaSnapshot, SemanticPlan,
-    SemanticPlanKind, SemanticRequest, SortDirection, SqlDialect, SqlMutationGenerator,
-    SqlQueryBuilder, SyntaxInfo, TableInfo, TransactionCapabilities, TransactionStateNote,
-    TransferFamily, Value, ViewInfo, WhereOperator, field_file_path, generate_delete_template,
-    generate_drop_table, generate_insert_template, generate_select_star, generate_update_template,
-    render_semantic_filter_sql, strip_leading_comments, validate_ddl_fragment,
+    ErrorPosition, ExecutionSourceContext, ExplainRequest, ForeignKeyInfo, FormSection, FormTab,
+    FormValues, FormattedError, Icon, IndexData, IndexInfo, IsolationLevel, KeyValueConnection,
+    LogErr, MutationCapabilities, PaginationStyle, PlaceholderStyle, QueryCancelHandle,
+    QueryCapabilities, QueryErrorFormatter, QueryGenerator, QueryHandle, QueryLanguage,
+    QueryRequest, QueryResult, ReindexRequest, RelationalConnection, RelationalSchema, Row,
+    RowDelete, RowInsert, RowPatch, SchemaColumnInfo, SchemaForeignKeyInfo, SchemaIndexInfo,
+    SchemaLoadingStrategy, SchemaSnapshot, SemanticPlan, SemanticPlanKind, SemanticRequest,
+    SortDirection, SqlDialect, SqlMutationGenerator, SqlQueryBuilder, SyntaxInfo, TableInfo,
+    TransactionCapabilities, TransactionStateNote, TransferFamily, Value, ViewInfo, WhereOperator,
+    field_file_path, generate_delete_template, generate_drop_table, generate_insert_template,
+    generate_select_star, generate_update_template, render_semantic_filter_sql,
+    strip_leading_comments, validate_ddl_fragment,
 };
 use rusqlite::{Connection as RusqliteConnection, InterruptHandle, OptionalExtension};
 
@@ -1049,6 +1050,41 @@ impl Connection for SqliteConnection {
         })
     }
 
+    fn schema_columns(
+        &self,
+        _database: &str,
+        _schema: Option<&str>,
+    ) -> Result<Vec<SchemaColumnInfo>, DbError> {
+        let conn = self.lock_connection()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT m.name, c.name, c.type, c.\"notnull\", c.dflt_value, c.pk \
+             FROM sqlite_master m JOIN pragma_table_xinfo(m.name) c \
+             WHERE m.type IN ('table', 'view') AND m.name NOT LIKE 'sqlite_%' \
+               AND c.hidden = 0 ORDER BY m.name, c.cid",
+            )
+            .map_err(|error| format_sqlite_query_error(&error))?;
+        let rows = statement
+            .query_map([], |row| {
+                let notnull: i32 = row.get(3).unwrap_or(1);
+                let primary: i32 = row.get(5).unwrap_or(0);
+                Ok(SchemaColumnInfo {
+                    table_name: row.get(0)?,
+                    column: ColumnInfo {
+                        name: row.get(1)?,
+                        type_name: row.get::<_, String>(2).unwrap_or_default(),
+                        nullable: notnull == 0 && primary == 0,
+                        is_primary_key: primary > 0,
+                        default_value: row.get::<_, Option<String>>(4).unwrap_or(None),
+                        enum_values: None,
+                    },
+                })
+            })
+            .map_err(|error| format_sqlite_query_error(&error))?;
+        rows.collect::<Result<_, _>>()
+            .map_err(|error| format_sqlite_query_error(&error))
+    }
+
     fn schema_indexes(
         &self,
         _database: &str,
@@ -1756,19 +1792,18 @@ impl SqliteConnection {
                 .prepare("SELECT seq, name, \"unique\", origin FROM pragma_index_list(?1)")
                 .map_err(|e| format_sqlite_query_error(&e))?;
 
-            let index_list: Vec<(String, bool, String)> = stmt
+            let index_list: Vec<(String, bool)> = stmt
                 .query_map([&table_name], |row| {
                     Ok((
                         row.get::<_, String>(1)?,   // name
                         row.get::<_, i32>(2)? == 1, // unique
-                        row.get::<_, String>(3)?,   // origin
                     ))
                 })
                 .map_err(|e| format_sqlite_query_error(&e))?
                 .collect::<Result<_, _>>()
                 .map_err(|e| format_sqlite_query_error(&e))?;
 
-            for (index_name, is_unique, origin) in index_list {
+            for (index_name, is_unique) in index_list {
                 let columns = index_columns(conn, &index_name)?;
 
                 all_indexes.push(SchemaIndexInfo {
@@ -1776,7 +1811,7 @@ impl SqliteConnection {
                     table_name: table_name.clone(),
                     columns,
                     is_unique,
-                    is_primary: origin == "pk",
+                    is_primary: false,
                 });
             }
         }
@@ -1808,7 +1843,7 @@ impl SqliteConnection {
             let mut fk_map: HashMap<i32, SchemaForeignKeyInfo> = HashMap::new();
             for (id, ref_table, from_col, to_col, on_update, on_delete) in fk_rows {
                 let entry = fk_map.entry(id).or_insert_with(|| SchemaForeignKeyInfo {
-                    name: format!("{}_fk_{}", table_name, id),
+                    name: format!("fk_{}", id),
                     table_name: table_name.clone(),
                     columns: Vec::new(),
                     referenced_schema: None,
@@ -2313,6 +2348,26 @@ pub struct SqliteErrorFormatter;
 impl SqliteErrorFormatter {
     fn format_sqlite_error(e: &rusqlite::Error) -> FormattedError {
         match e {
+            // A statement SQLite could not parse names the token that broke
+            // it: `offset` is a byte offset into `sql`, which is exactly the
+            // text this run submitted. It is the only place a SQLite error
+            // knows where it happened.
+            rusqlite::Error::SqlInputError {
+                error,
+                msg,
+                sql,
+                offset,
+            } => {
+                let mut formatted = FormattedError::new(msg.clone())
+                    .with_code(format!("{:?} ({})", error.code, error.extended_code));
+
+                if let Ok(offset) = usize::try_from(*offset) {
+                    formatted =
+                        formatted.with_position(ErrorPosition::from_byte_offset(sql, offset));
+                }
+
+                formatted
+            }
             rusqlite::Error::SqliteFailure(err, msg) => {
                 let message = msg.clone().unwrap_or_else(|| format!("{:?}", err.code));
 
@@ -2925,6 +2980,8 @@ fn resolve_relation_name(conn: &RusqliteConnection, table: &str) -> Result<Strin
 
 #[cfg(test)]
 mod tests {
+    mod bulk;
+
     use super::{
         RusqliteConnection, SqliteConnectionState, SqliteDialect, SqliteDriver, kind_from_decltype,
         plan_sqlite_semantic_request, sqlite_generate_create_table,
@@ -2973,6 +3030,48 @@ mod tests {
                 .expect("SQLite has a version query"),
             "SELECT sqlite_version()"
         );
+    }
+
+    /// A statement SQLite cannot parse names the token that broke it. This
+    /// goes through the real prepare path of the driver, so it checks the
+    /// `SqlInputError` the engine raises, not a hand-made error value.
+    ///
+    /// The literal holds a multi-byte character before the bad token, so the
+    /// byte offset SQLite reports and the character offset the editor needs
+    /// are different numbers: a conversion that kept bytes would land two
+    /// characters past `FROM`.
+    #[test]
+    fn a_syntax_error_carries_the_position_of_the_bad_token() {
+        use super::{SqliteConnection, SqliteConnectionState};
+        use datatab_core::{Connection, QueryRequest};
+        use std::sync::{Arc, Mutex};
+
+        let raw = RusqliteConnection::open_in_memory().expect("open in-memory SQLite");
+        let connection =
+            SqliteConnection::for_test(Arc::new(Mutex::new(SqliteConnectionState::new(raw))));
+
+        let statement = "SELECT 'é' AS id, FROM t";
+        let error = connection
+            .execute(&QueryRequest::new(statement))
+            .expect_err("a stray comma is a syntax error");
+
+        let position = error
+            .formatted()
+            .expect("the driver formats its own query errors")
+            .position
+            .expect("SQLite names the token it stopped on");
+
+        assert_eq!(
+            position.character_offset,
+            Some(18),
+            "the offset must count characters, not the 19 bytes before FROM"
+        );
+        assert_eq!(
+            position.resolve_character_offset(statement),
+            Some(18),
+            "the offset must land on FROM, the token SQLite stopped on"
+        );
+        assert_eq!(position.line, None, "SQLite reports no line");
     }
 
     /// `table_details` declares `rowid`, `oid` and `_rowid_` only for rowid

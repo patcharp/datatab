@@ -394,7 +394,24 @@ pub fn ssh_tab() -> FormTab {
 // Impl blocks
 // ---------------------------------------------------------------------------
 
+impl FormFieldKind {
+    /// Whether a field of this kind holds a secret that must never be stored
+    /// in the DataTab database.
+    pub fn is_secret(&self) -> bool {
+        matches!(self, FormFieldKind::Password | FormFieldKind::WriteOnly)
+    }
+}
+
 impl DriverFormDef {
+    /// The fields of this form whose kind is secret, in form order.
+    pub fn secret_fields(&self) -> impl Iterator<Item = &FormFieldDef> {
+        self.tabs
+            .iter()
+            .flat_map(|tab| tab.sections.iter())
+            .flat_map(|section| section.fields.iter())
+            .filter(|field| field.kind.is_secret())
+    }
+
     pub fn main_tab(&self) -> Option<&FormTab> {
         self.tabs.first()
     }

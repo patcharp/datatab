@@ -13,6 +13,9 @@ use crate::bootstrap::OwnedConnection;
 use crate::error::StorageError;
 
 const CLICKHOUSE_INSECURE_HTTP_PASSWORD_KEY: &str = "allow_insecure_http_password";
+/// Datacenter name, kept in the external values column the other kinds write
+/// their extras to, so the table needs no migration for this driver.
+const CASSANDRA_DATACENTER_KEY: &str = "datacenter";
 
 /// DTO for connection driver config (native columns for DbConfig).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +76,8 @@ pub struct ConnectionDriverConfigDto {
     pub redis_topology: Option<String>,
     pub redis_sentinel_master_name: Option<String>,
     pub redis_additional_nodes: Option<String>,
+    #[serde(default)]
+    pub clickhouse_ssl_mode: Option<String>,
 }
 
 impl ConnectionDriverConfigDto {
@@ -120,6 +125,7 @@ impl ConnectionDriverConfigDto {
             redis_topology: None,
             redis_sentinel_master_name: None,
             redis_additional_nodes: None,
+            clickhouse_ssl_mode: None,
         }
     }
 
@@ -348,7 +354,15 @@ impl ConnectionDriverConfigDto {
                 database,
                 request_timeout_seconds,
                 allow_insecure_http_password,
+                ssl_mode,
+                ssl_root_cert_path,
+                ssl_client_cert_path,
+                ssl_client_key_path,
             } => {
+                dto.clickhouse_ssl_mode = ssl_mode.clone();
+                dto.ssl_ca = ssl_root_cert_path.clone();
+                dto.ssl_cert = ssl_client_cert_path.clone();
+                dto.ssl_key = ssl_client_key_path.clone();
                 dto.uri = Some(url.clone());
                 dto.user = Some(user.clone());
                 dto.database_name = Some(database.clone());
@@ -382,6 +396,38 @@ impl ConnectionDriverConfigDto {
                 .collect();
                 dto.external_values_json = Some(serde_json::to_string(&extras).unwrap_or_default());
             }
+            // The datacenter name rides in the external values column, which
+            // already carries the other kinds' extras, so no migration is due.
+            DbConfig::Cassandra {
+                contact_points,
+                port,
+                datacenter,
+                keyspace,
+                user,
+                ssl_mode,
+                ssl_root_cert_path,
+                ssl_client_cert_path,
+                ssl_client_key_path,
+                ssh_tunnel,
+                ..
+            } => {
+                dto.host = Some(contact_points.clone());
+                dto.port = Some(*port as i32);
+                dto.user = Some(user.clone());
+                dto.database_name = Some(keyspace.clone());
+                dto.ssl_mode = ssl_mode_to_str(ssl_mode);
+                dto.ssl_ca = ssl_root_cert_path.clone();
+                dto.ssl_cert = ssl_client_cert_path.clone();
+                dto.ssl_key = ssl_client_key_path.clone();
+                if !datacenter.is_empty() {
+                    dto.external_values_json = Some(
+                        serde_json::json!({ CASSANDRA_DATACENTER_KEY: datacenter }).to_string(),
+                    );
+                }
+                if let Some(tunnel) = ssh_tunnel {
+                    fill_ssh_tunnel_fields(&mut dto, tunnel);
+                }
+            }
             DbConfig::External { kind, values } => {
                 dto.external_kind = Some(db_kind_to_str(*kind));
                 dto.external_values_json = Some(serde_json::to_string(values).unwrap_or_default());
@@ -394,6 +440,21 @@ impl ConnectionDriverConfigDto {
     /// Converts this DTO back to a DbConfig.
     pub fn to_db_config(&self) -> Option<DbConfig> {
         let kind = str_to_db_kind(&self.config_key)?;
+
+        // `external_kind` is written only for `DbConfig::External`; the config
+        // key then holds the driver's declared kind, which must not select a
+        // built-in config.
+        if let Some(external_kind) = self.external_kind.as_deref() {
+            let values = self
+                .external_values_json
+                .as_deref()
+                .and_then(|json| serde_json::from_str(json).ok())
+                .unwrap_or_default();
+            return Some(DbConfig::External {
+                kind: str_to_db_kind(external_kind).unwrap_or(kind),
+                values,
+            });
+        }
 
         match kind {
             DbKind::Postgres => {
@@ -600,6 +661,10 @@ impl ConnectionDriverConfigDto {
                     .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
                     .and_then(|values| values.get(CLICKHOUSE_INSECURE_HTTP_PASSWORD_KEY)?.as_bool())
                     .unwrap_or(false),
+                ssl_mode: self.clickhouse_ssl_mode.clone(),
+                ssl_root_cert_path: self.ssl_ca.clone(),
+                ssl_client_cert_path: self.ssl_cert.clone(),
+                ssl_client_key_path: self.ssl_key.clone(),
             }),
             DbKind::Turso => Some(DbConfig::Turso {
                 url: self.uri.clone().unwrap_or_default(),
@@ -615,6 +680,40 @@ impl ConnectionDriverConfigDto {
                     ducklake_catalog: extras.remove("ducklake_catalog"),
                     ducklake_data_path: extras.remove("ducklake_data_path"),
                     init_sql: extras.remove("init_sql"),
+                })
+            }
+            DbKind::Cassandra => {
+                let ssh_tunnel = build_ssh_tunnel(self);
+                let datacenter = self
+                    .external_values_json
+                    .as_deref()
+                    .and_then(|json| serde_json::from_str::<serde_json::Value>(json).ok())
+                    .and_then(|values| {
+                        values
+                            .get(CASSANDRA_DATACENTER_KEY)?
+                            .as_str()
+                            .map(str::to_string)
+                    })
+                    .unwrap_or_default();
+                Some(DbConfig::Cassandra {
+                    contact_points: self
+                        .host
+                        .clone()
+                        .filter(|hosts| !hosts.is_empty())
+                        .unwrap_or_else(|| "localhost".to_string()),
+                    port: self
+                        .port
+                        .and_then(|port| u16::try_from(port).ok())
+                        .unwrap_or(9042),
+                    datacenter,
+                    keyspace: self.database_name.clone().unwrap_or_default(),
+                    user: self.user.clone().unwrap_or_default(),
+                    ssl_mode: str_to_ssl_mode_opt(&self.ssl_mode),
+                    ssl_root_cert_path: self.ssl_ca.clone(),
+                    ssl_client_cert_path: self.ssl_cert.clone(),
+                    ssl_client_key_path: self.ssl_key.clone(),
+                    ssh_tunnel,
+                    ssh_tunnel_profile_id: None,
                 })
             }
         }
@@ -639,6 +738,7 @@ fn db_kind_to_str(kind: DbKind) -> String {
         DbKind::ClickHouse => "ClickHouse",
         DbKind::Turso => "Turso",
         DbKind::DuckDB => "DuckDB",
+        DbKind::Cassandra => "Cassandra",
         // A reserved wire slot has no stored name. `str_to_db_kind` does not
         // parse this one, and the app refuses to save such a profile.
         DbKind::ReservedDynamoDb
@@ -663,6 +763,7 @@ fn str_to_db_kind(s: &str) -> Option<DbKind> {
         "ClickHouse" => Some(DbKind::ClickHouse),
         "Turso" => Some(DbKind::Turso),
         "DuckDB" => Some(DbKind::DuckDB),
+        "Cassandra" => Some(DbKind::Cassandra),
         // The names of the removed AWS drivers ("DynamoDB", "CloudWatchLogs",
         // "S3", "AwsSecrets") are unknown like any other string.
         _ => None,
@@ -795,7 +896,7 @@ impl ConnectionDriverConfigsRepository {
                     mssql_instance, mssql_trust_server_certificate,
                     s3_access_key_id, s3_path_style,
                     redis_topology, redis_sentinel_master_name, redis_additional_nodes,
-                    ssh_config_host
+                    ssh_config_host, clickhouse_ssl_mode
                 FROM cfg_connection_driver_configs
                 WHERE profile_id = ?1
                 "#,
@@ -848,6 +949,7 @@ impl ConnectionDriverConfigsRepository {
                 redis_sentinel_master_name: row.get(38)?,
                 redis_additional_nodes: row.get(39)?,
                 ssh_config_host: row.get(40)?,
+                clickhouse_ssl_mode: row.get(41)?,
             })
         });
 
@@ -880,7 +982,7 @@ impl ConnectionDriverConfigsRepository {
                     mssql_instance, mssql_trust_server_certificate,
                     s3_access_key_id, s3_path_style,
                     redis_topology, redis_sentinel_master_name, redis_additional_nodes,
-                    ssh_config_host
+                    ssh_config_host, clickhouse_ssl_mode
                 ) VALUES (
                     ?1, ?2, ?3,
                     ?4, ?5, ?6, ?7, ?8, ?9,
@@ -895,7 +997,7 @@ impl ConnectionDriverConfigsRepository {
                     ?34, ?35,
                     ?36, ?37,
                     ?38, ?39, ?40,
-                    ?41
+                    ?41, ?42
                 )
                 "#,
                 params![
@@ -940,6 +1042,7 @@ impl ConnectionDriverConfigsRepository {
                     config.redis_sentinel_master_name,
                     config.redis_additional_nodes,
                     config.ssh_config_host,
+                    config.clickhouse_ssl_mode,
                 ],
             )
             .map_err(|source| StorageError::Sqlite {
@@ -969,7 +1072,7 @@ impl ConnectionDriverConfigsRepository {
                     mssql_instance, mssql_trust_server_certificate,
                     s3_access_key_id, s3_path_style,
                     redis_topology, redis_sentinel_master_name, redis_additional_nodes,
-                    ssh_config_host
+                    ssh_config_host, clickhouse_ssl_mode
                 ) VALUES (
                     ?1, ?2, ?3,
                     ?4, ?5, ?6, ?7, ?8, ?9,
@@ -984,7 +1087,7 @@ impl ConnectionDriverConfigsRepository {
                     ?34, ?35,
                     ?36, ?37,
                     ?38, ?39, ?40,
-                    ?41
+                    ?41, ?42
                 )
                 ON CONFLICT(profile_id) DO UPDATE SET
                     config_key = excluded.config_key,
@@ -1025,7 +1128,8 @@ impl ConnectionDriverConfigsRepository {
                     redis_topology = excluded.redis_topology,
                     redis_sentinel_master_name = excluded.redis_sentinel_master_name,
                     redis_additional_nodes = excluded.redis_additional_nodes,
-                    ssh_config_host = excluded.ssh_config_host
+                    ssh_config_host = excluded.ssh_config_host,
+                    clickhouse_ssl_mode = excluded.clickhouse_ssl_mode
                 "#,
                 params![
                     config.id,
@@ -1069,6 +1173,7 @@ impl ConnectionDriverConfigsRepository {
                     config.redis_sentinel_master_name,
                     config.redis_additional_nodes,
                     config.ssh_config_host,
+                    config.clickhouse_ssl_mode,
                 ],
             )
             .map_err(|source| StorageError::Sqlite {
@@ -1322,6 +1427,53 @@ mod tests {
     }
 
     #[test]
+    fn clickhouse_tls_modes_and_paths_round_trip_without_rewriting_legacy() {
+        let (_temp_dir, repo) = temp_repo();
+        let profile_id = uuid::Uuid::new_v4().to_string();
+        repo.conn().execute(
+            "INSERT INTO cfg_connection_profiles (id, name, driver_id, kind, created_at, updated_at)
+             VALUES (?1, 'TLS', 'clickhouse', 'ClickHouse', datetime('now'), datetime('now'))",
+            params![profile_id],
+        ).expect("profile");
+        for mode in [
+            None,
+            Some("disable"),
+            Some("require"),
+            Some("verify-ca"),
+            Some("verify-full"),
+            Some("unknown"),
+        ] {
+            let config = DbConfig::ClickHouse {
+                url: "https://localhost:8443".into(),
+                user: "default".into(),
+                database: "events".into(),
+                request_timeout_seconds: None,
+                allow_insecure_http_password: true,
+                ssl_mode: mode.map(str::to_string),
+                ssl_root_cert_path: Some("/test-ca.pem".into()),
+                ssl_client_cert_path: Some("/test-client.pem".into()),
+                ssl_client_key_path: Some("/test-key.pem".into()),
+            };
+            let dto = ConnectionDriverConfigDto::from_db_config(profile_id.clone(), &config);
+            repo.upsert(&dto).expect("save TLS paths");
+            let stored = repo
+                .get_for_profile(&profile_id)
+                .expect("load")
+                .expect("row");
+            assert_eq!(stored.clickhouse_ssl_mode.as_deref(), mode);
+            assert_eq!(
+                serde_json::to_value(stored.to_db_config().expect("config")).unwrap(),
+                serde_json::to_value(&config).unwrap()
+            );
+            let raw: Option<String> = repo.conn().query_row(
+                "SELECT clickhouse_ssl_mode FROM cfg_connection_driver_configs WHERE profile_id = ?1",
+                params![profile_id], |row| row.get(0),
+            ).expect("raw mode after read");
+            assert_eq!(raw.as_deref(), mode, "a read must not rewrite the mode");
+        }
+    }
+
+    #[test]
     fn clickhouse_driver_config_roundtrips_through_repository() {
         let (_temp_dir, repo) = temp_repo();
         let profile_id = uuid::Uuid::new_v4().to_string();
@@ -1343,6 +1495,10 @@ mod tests {
             database: "events".to_string(),
             request_timeout_seconds: Some(45),
             allow_insecure_http_password: false,
+            ssl_mode: None,
+            ssl_root_cert_path: None,
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
         };
 
         let dto = ConnectionDriverConfigDto::from_db_config(profile_id.clone(), &config);
@@ -1360,6 +1516,7 @@ mod tests {
                 database,
                 request_timeout_seconds,
                 allow_insecure_http_password,
+                ..
             } => {
                 assert_eq!(url, "https://clickhouse.example.com:8443");
                 assert_eq!(user, "analytics");
@@ -1394,6 +1551,10 @@ mod tests {
             database: "events".to_string(),
             request_timeout_seconds: None,
             allow_insecure_http_password: true,
+            ssl_mode: None,
+            ssl_root_cert_path: None,
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
         };
 
         let dto = ConnectionDriverConfigDto::from_db_config(profile_id.clone(), &config);
@@ -1430,6 +1591,10 @@ mod tests {
             database: "default".to_string(),
             request_timeout_seconds: Some(i32::MAX as u64 + 1),
             allow_insecure_http_password: false,
+            ssl_mode: None,
+            ssl_root_cert_path: None,
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
         };
 
         let dto = ConnectionDriverConfigDto::from_db_config("profile".to_string(), &config);
@@ -1600,5 +1765,136 @@ mod tests {
                     && ducklake_data_path.is_none()
                     && init_sql.as_deref() == Some("INSTALL httpfs;")
         ));
+    }
+    #[test]
+    fn cassandra_driver_config_roundtrips_contact_points_keyspace_datacenter_and_tls() {
+        let config = DbConfig::Cassandra {
+            contact_points: "10.0.0.1,10.0.0.2".to_string(),
+            port: 9042,
+            datacenter: "dc1".to_string(),
+            keyspace: "app".to_string(),
+            user: "reader".to_string(),
+            ssl_mode: Some("verify-ca".to_string()),
+            ssl_root_cert_path: Some("/etc/ca.pem".to_string()),
+            ssl_client_cert_path: Some("/etc/client.pem".to_string()),
+            ssl_client_key_path: Some("/etc/client.key".to_string()),
+            ssh_tunnel: None,
+            ssh_tunnel_profile_id: None,
+        };
+        let dto = ConnectionDriverConfigDto::from_db_config("profile".to_string(), &config);
+
+        assert_eq!(dto.config_key, "Cassandra");
+        assert_eq!(dto.host.as_deref(), Some("10.0.0.1,10.0.0.2"));
+        assert_eq!(dto.port, Some(9042));
+        assert_eq!(dto.database_name.as_deref(), Some("app"));
+        assert_eq!(dto.user.as_deref(), Some("reader"));
+        assert_eq!(dto.ssl_ca.as_deref(), Some("/etc/ca.pem"));
+        // The datacenter has no column of its own and rides in the extras.
+        assert!(
+            dto.external_values_json
+                .as_deref()
+                .is_some_and(|extras| extras.contains("\"datacenter\":\"dc1\""))
+        );
+
+        assert!(matches!(
+            dto.to_db_config(),
+            Some(DbConfig::Cassandra {
+                contact_points,
+                port,
+                datacenter,
+                keyspace,
+                user,
+                ssl_mode,
+                ssl_root_cert_path,
+                ssl_client_cert_path,
+                ssl_client_key_path,
+                ..
+            }) if contact_points == "10.0.0.1,10.0.0.2"
+                && port == 9042
+                && datacenter == "dc1"
+                && keyspace == "app"
+                && user == "reader"
+                && ssl_mode.as_deref() == Some("verify-ca")
+                && ssl_root_cert_path.as_deref() == Some("/etc/ca.pem")
+                && ssl_client_cert_path.as_deref() == Some("/etc/client.pem")
+                && ssl_client_key_path.as_deref() == Some("/etc/client.key")
+        ));
+    }
+
+    #[test]
+    fn cassandra_config_without_a_datacenter_leaves_the_extras_empty() {
+        let config = DbConfig::Cassandra {
+            contact_points: "localhost".to_string(),
+            port: 9042,
+            datacenter: String::new(),
+            keyspace: String::new(),
+            user: String::new(),
+            ssl_mode: Some("disable".to_string()),
+            ssl_root_cert_path: None,
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
+            ssh_tunnel: None,
+            ssh_tunnel_profile_id: None,
+        };
+        let dto = ConnectionDriverConfigDto::from_db_config("profile".to_string(), &config);
+
+        assert!(dto.external_values_json.is_none());
+        assert!(matches!(
+            dto.to_db_config(),
+            Some(DbConfig::Cassandra { datacenter, keyspace, .. })
+                if datacenter.is_empty() && keyspace.is_empty()
+        ));
+    }
+
+    #[test]
+    fn external_driver_config_roundtrips_as_external_for_every_kind() {
+        for kind in [
+            DbKind::Postgres,
+            DbKind::MySQL,
+            DbKind::SQLite,
+            DbKind::Redis,
+        ] {
+            let (_temp_dir, repo) = temp_repo();
+            let profile_id = uuid::Uuid::new_v4().to_string();
+            repo.conn()
+                .execute(
+                    r#"
+                    INSERT INTO cfg_connection_profiles (
+                        id, name, driver_id, kind, created_at, updated_at
+                    ) VALUES (?1, 'RPC', 'rpc:sock', ?2, datetime('now'), datetime('now'))
+                    "#,
+                    params![profile_id, db_kind_to_str(kind)],
+                )
+                .expect("insert profile");
+
+            let mut values = datatab_core::FormValues::new();
+            values.insert("host".to_string(), "rpc.internal".to_string());
+            values.insert("region".to_string(), "eu".to_string());
+            let config = DbConfig::External {
+                kind,
+                values: values.clone(),
+            };
+
+            let dto = ConnectionDriverConfigDto::from_db_config(profile_id.clone(), &config);
+            repo.insert(&dto).expect("insert config");
+
+            let restored = repo
+                .get_for_profile(&profile_id)
+                .expect("load config")
+                .expect("stored config")
+                .to_db_config()
+                .expect("db config");
+
+            match restored {
+                DbConfig::External {
+                    kind: restored_kind,
+                    values: restored_values,
+                } => {
+                    assert_eq!(restored_kind, kind);
+                    assert_eq!(restored_values, values, "{kind:?}");
+                }
+                other => panic!("{kind:?} reloaded as {other:?}"),
+            }
+        }
     }
 }

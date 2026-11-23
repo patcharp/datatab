@@ -1234,6 +1234,10 @@ pub trait Connection: Send + Sync {
     ///
     /// This should be called after a query is cancelled to ensure
     /// the connection is in a clean state (e.g., rollback any open transaction).
+    ///
+    /// This can block: a driver may reconnect over the network or wait for an
+    /// in-flight cancel to finish. Never call it on the UI thread; run it on a
+    /// background executor.
     fn cleanup_after_cancel(&self) -> Result<(), DbError> {
         Ok(())
     }

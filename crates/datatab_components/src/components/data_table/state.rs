@@ -72,6 +72,10 @@ pub struct DataTableState {
     /// Current sort state.
     sort: Option<SortState>,
 
+    /// Why the header cannot sort, when the rows' source cannot order them.
+    /// `None` when the host offers sorting or has not said.
+    sort_blocked: Option<SharedString>,
+
     /// Viewport size (updated on layout).
     viewport_size: Size<Pixels>,
 
@@ -192,6 +196,7 @@ impl DataTableState {
             auto_width_metrics,
             column_offsets,
             sort: None,
+            sort_blocked: None,
             viewport_size: Size::default(),
             selection: SelectionState::new(),
             focus_handle: cx.focus_handle(),
@@ -305,6 +310,15 @@ impl DataTableState {
             return MIN_COLUMN_WIDTH;
         };
 
+        // One mono cell per character, a mark included. Thai renders in the
+        // bundled fallback: its base letters average one cell and its combining
+        // marks take none, but four of them (ญ ณ ฌ ฒ) reach 0.91 em, so a run
+        // of wide consonants is up to half again as wide as the estimate (0.91
+        // em against a 0.6 em cell) and clips early. #532 kept the estimate:
+        // there is no shaping here to measure with, the drag and the ellipsis
+        // cover the shortfall, and a Thai factor would narrow every mark-heavy
+        // column to fix a rare one
+        // (`crates/bolt/tests/typography_contract.rs` pins these facts).
         let cell_char = metrics.cell_char_advance;
         let type_char = metrics.type_char_advance;
         let padding = f32::from(CELL_PADDING_X) * 2.0;
@@ -613,6 +627,20 @@ impl DataTableState {
 
     pub fn sort(&self) -> Option<&SortState> {
         self.sort.as_ref()
+    }
+
+    /// Why the header cannot sort, when the rows' source cannot order them.
+    ///
+    /// Set by a host whose driver has no `SORTING` capability: the header then
+    /// offers no sort and says why, instead of asking the database for an order
+    /// it cannot express and moving a header arrow over rows that are not
+    /// ordered.
+    pub fn sort_blocked(&self) -> Option<&SharedString> {
+        self.sort_blocked.as_ref()
+    }
+
+    pub fn set_sort_blocked(&mut self, reason: Option<SharedString>) {
+        self.sort_blocked = reason;
     }
 
     pub fn set_sort(&mut self, sort: Option<SortState>, cx: &mut Context<Self>) {

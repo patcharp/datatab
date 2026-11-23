@@ -76,6 +76,8 @@ struct RenderState {
     show_grouped_warning: bool,
     show_pk_warning: bool,
     show_builder_readonly_hint: bool,
+    /// A free-form query result that cannot be edited says why above its grid.
+    show_free_form_readonly_hint: bool,
     show_edit_toolbar: bool,
     result_view_mode: ResultViewMode,
     /// The source is a collection on a document connection.
@@ -576,6 +578,12 @@ impl DataGridPanel {
             && !is_grouped_result
             && self.builder.current_visual_spec.is_some()
             && self.builder.builder_editable_binding.is_none();
+        // A free-form result has no table to address a row by, so nothing
+        // explains why its cells take no edits; the host that knows the rows
+        // came from the editor's own statement marked them, and the result's
+        // own words say why instead of leaving the footer alone.
+        let show_free_form_readonly_hint =
+            self.free_form_query_result && shows_table_content && !is_editable;
         // Similar rows keep the edit controls drawn, disabled, so the header
         // does not change shape when the search lands.
         let show_edit_toolbar =
@@ -615,6 +623,7 @@ impl DataGridPanel {
             show_grouped_warning,
             show_pk_warning,
             show_builder_readonly_hint,
+            show_free_form_readonly_hint,
             show_edit_toolbar,
             result_view_mode,
             document_collection,
@@ -639,9 +648,10 @@ impl DataGridPanel {
         .size_full()
     }
 
-    /// Renders the three informational banners (grouped-result, no-PK, builder
-    /// read-only). Each banner is conditionally included; the wrapper div is
-    /// always emitted so the call site never needs a conditional.
+    /// Renders the four informational banners (grouped-result, no-PK, builder
+    /// read-only, free-form read-only). Each banner is conditionally included;
+    /// the wrapper div is always emitted so the call site never needs a
+    /// conditional.
     fn render_warning_banners(&self, st: &RenderState) -> impl IntoElement {
         div()
             .when(st.show_grouped_warning, |d| {
@@ -710,6 +720,41 @@ impl DataGridPanel {
                                 "document.data.grid.editing.not_single_table"
                             ))
                             .color(st.theme.muted_foreground),
+                        ),
+                )
+            })
+            .when(st.show_free_form_readonly_hint, |d| {
+                let hint = datatab_i18n::t!("document.data.grid.editing.free_form_read_only");
+
+                d.child(
+                    div()
+                        .id("free-form-readonly-banner")
+                        .role(Role::Note)
+                        .aria_label(hint.clone())
+                        .flex()
+                        .items_center()
+                        .gap(Spacing::SM)
+                        .h(Heights::ROW_COMPACT)
+                        .px(Spacing::SM)
+                        .bg(st.theme.muted.opacity(0.15))
+                        .border_b_1()
+                        .border_color(st.theme.border)
+                        .child(
+                            Icon::new(AppIcon::TriangleAlert)
+                                .small()
+                                .color(st.theme.muted_foreground),
+                        )
+                        .child(
+                            // The banner's own name is this sentence, so the
+                            // caption is hidden from assistive technology: it
+                            // would otherwise be read after the name. It clips
+                            // rather than growing the row past its height.
+                            div()
+                                .id("free-form-readonly-caption")
+                                .min_w(px(0.0))
+                                .truncate()
+                                .aria_hidden(true)
+                                .child(Text::caption(hint).color(st.theme.muted_foreground)),
                         ),
                 )
             })
@@ -4207,6 +4252,7 @@ mod tests {
         "document.data.grid.editing.aggregated",
         "document.data.grid.editing.no_primary_key",
         "document.data.grid.editing.not_single_table",
+        "document.data.grid.editing.free_form_read_only",
         "document.data.grid.loading",
         "document.data.grid.empty",
         "document.data.grid.views.table",

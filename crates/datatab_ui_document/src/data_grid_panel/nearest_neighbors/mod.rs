@@ -698,14 +698,13 @@ impl DataGridPanel {
         cx.spawn(async move |_this, cx| {
             let result = task.await;
 
+            let mut needs_cleanup = false;
             let failure = cx.update(|cx| {
                 // A refresh or another search started since: its answer is
                 // the one the grid shows.
                 if cancel_token.is_cancelled() {
                     log::info!("Nearest-neighbor search was superseded, discarding result");
-                    if let Err(error) = connection_for_cleanup.cleanup_after_cancel() {
-                        log::warn!("Cleanup after cancel failed: {}", error);
-                    }
+                    needs_cleanup = true;
                     return None;
                 }
 
@@ -733,6 +732,15 @@ impl DataGridPanel {
                     }
                 })
             });
+
+            if needs_cleanup {
+                crate::cancel_cleanup::cleanup_after_cancel_in_background(
+                    connection_for_cleanup,
+                    "Nearest-neighbor search",
+                    cx,
+                )
+                .await;
+            }
 
             if let Some(failure) = failure {
                 report_error_async(failure, cx);

@@ -119,7 +119,7 @@ impl ConnectionProfileRepository {
                        auth_profile_id, proxy_profile_id,
                        ssh_tunnel_profile_id,
                        created_at, updated_at, environment, navigator_view,
-                       show_all_databases, read_only
+                       show_all_databases, read_only, keyring_secret_fields
                 FROM cfg_connection_profiles
                 ORDER BY name ASC
                 "#,
@@ -152,6 +152,7 @@ impl ConnectionProfileRepository {
                     navigator_view: row.get(17)?,
                     show_all_databases: row.get::<_, i32>(18)? != 0,
                     read_only: row.get::<_, i32>(19)? != 0,
+                    keyring_secret_fields: row.get(20)?,
                 })
             })
             .map_err(|source| StorageError::Sqlite {
@@ -189,7 +190,7 @@ impl ConnectionProfileRepository {
                        auth_profile_id, proxy_profile_id,
                        ssh_tunnel_profile_id,
                        created_at, updated_at, environment, navigator_view,
-                       show_all_databases, read_only
+                       show_all_databases, read_only, keyring_secret_fields
                 FROM cfg_connection_profiles
                 WHERE id = ?1
                 "#,
@@ -221,6 +222,7 @@ impl ConnectionProfileRepository {
                 navigator_view: row.get(17)?,
                 show_all_databases: row.get::<_, i32>(18)? != 0,
                 read_only: row.get::<_, i32>(19)? != 0,
+                keyring_secret_fields: row.get(20)?,
             })
         });
 
@@ -244,10 +246,10 @@ impl ConnectionProfileRepository {
                     save_password, kind, access_kind, access_provider,
                     auth_profile_id, proxy_profile_id,
                     ssh_tunnel_profile_id, environment, navigator_view, show_all_databases,
-                    read_only, created_at, updated_at
+                    read_only, keyring_secret_fields, created_at, updated_at
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                    datetime('now'), datetime('now')
+                    ?19, datetime('now'), datetime('now')
                 )
                 "#,
                 params![
@@ -269,6 +271,7 @@ impl ConnectionProfileRepository {
                     profile.navigator_view,
                     profile.show_all_databases as i32,
                     profile.read_only as i32,
+                    profile.keyring_secret_fields,
                 ],
             )
             .map_err(|source| StorageError::Sqlite {
@@ -304,6 +307,7 @@ impl ConnectionProfileRepository {
                     navigator_view = ?16,
                     show_all_databases = ?17,
                     read_only = ?18,
+                    keyring_secret_fields = ?19,
                     updated_at = datetime('now')
                 WHERE id = ?1
                 "#,
@@ -326,6 +330,7 @@ impl ConnectionProfileRepository {
                     profile.navigator_view,
                     profile.show_all_databases as i32,
                     profile.read_only as i32,
+                    profile.keyring_secret_fields,
                 ],
             )
             .map_err(|source| StorageError::Sqlite {
@@ -352,10 +357,10 @@ impl ConnectionProfileRepository {
                     save_password, kind, access_kind, access_provider,
                     auth_profile_id, proxy_profile_id,
                     ssh_tunnel_profile_id, environment, navigator_view, show_all_databases,
-                    read_only, created_at, updated_at
+                    read_only, keyring_secret_fields, created_at, updated_at
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-                    datetime('now'), datetime('now')
+                    ?19, datetime('now'), datetime('now')
                 )
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name,
@@ -375,6 +380,7 @@ impl ConnectionProfileRepository {
                     navigator_view = excluded.navigator_view,
                     show_all_databases = excluded.show_all_databases,
                     read_only = excluded.read_only,
+                    keyring_secret_fields = excluded.keyring_secret_fields,
                     updated_at = datetime('now')
                 "#,
                 params![
@@ -396,6 +402,7 @@ impl ConnectionProfileRepository {
                     profile.navigator_view,
                     profile.show_all_databases as i32,
                     profile.read_only as i32,
+                    profile.keyring_secret_fields,
                 ],
             )
             .map_err(|source| StorageError::Sqlite {
@@ -464,6 +471,9 @@ pub struct ConnectionProfileDto {
     pub show_all_databases: bool,
     /// Whether mutations are forbidden for this connection.
     pub read_only: bool,
+    /// JSON array of the secret form field ids whose value the OS keyring
+    /// holds; `None` when there are none. Never the values.
+    pub keyring_secret_fields: Option<String>,
 }
 
 impl ConnectionProfileDto {
@@ -490,6 +500,7 @@ impl ConnectionProfileDto {
             navigator_view: "advanced".to_string(),
             show_all_databases: true,
             read_only: false,
+            keyring_secret_fields: None,
         }
     }
 }

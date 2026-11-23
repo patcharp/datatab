@@ -122,7 +122,7 @@ All six layers run inside the server process on every `tools/call` request. None
 | Scripts | `update_script` | write | Overwrite an existing saved script |
 | Scripts | `delete_script` | admin | Permanently remove a script |
 | Scripts | `execute_script` | computed | Execute a saved database-query script against a connection. Classification is derived from the script body. Lua, Python and Bash scripts are rejected (see below) |
-| Approval | `request_execution` | admin | Queue a call for approval by a person. Once approved, call the tool itself with the same arguments to run it once |
+| Approval | `request_execution` | the requested tool's class, raised to at least `admin` | Queue a call for approval by a person. Once approved, call the tool itself with the same arguments to run it once |
 | Approval | `list_pending_executions` | read | View all executions awaiting approval |
 | Approval | `get_pending_execution` | read | Retrieve details of a specific pending execution. A rejected one returns `status: "rejected"` and the reason the person gave |
 | Approval | `approve_execution` | — | Always denied over MCP. A person approves in DataTab |
@@ -157,7 +157,7 @@ Policies gate tools at two levels: the tool ID itself and the execution classifi
 | `metadata` | Schema inspection — listing databases, tables, and describing objects |
 | `read` | Running read-only queries, fetching data, and read-only previews |
 | `write` | Inserting, updating, or running scripts that modify data |
-| `destructive` | DELETE, DROP, TRUNCATE and other irreversible operations |
+| `destructive` | DELETE, DROP, TRUNCATE and other irreversible operations. A `DELETE` or `UPDATE` with no `WHERE` is `destructive`, whatever the tool and even inside a procedure body: it can touch every row, while a `WHERE`-ed one stays `write` |
 | `admin_safe` | Safe DDL operations such as additive schema changes and index creation |
 | `admin` | Risky DDL operations, audit export, and privileged actions |
 | `admin_destructive` | Irreversible admin operations such as dropping or truncating schema objects |
@@ -178,7 +178,7 @@ One approval runs one call. Repeating the call again queues a new request, and s
 
 After a rejection, `get_pending_execution` returns `status: "rejected"` and a `reason` field with the text the person typed when rejecting, trimmed and capped at 500 characters, or `null` when they gave none. The same reason is recorded in the `mcp_reject_execution` audit event.
 
-`request_execution` queues a call explicitly, with the same result as calling the tool under Ask. `request_execution`, `list_pending_executions` and `get_pending_execution` only create or read queue entries, so under Ask they run without being queued themselves.
+`request_execution` queues a call explicitly, with the same result as calling the tool under Ask. The pending request itself carries the requested tool's class, raised to at least `admin`, so a removal requested this way is queued as `admin_destructive` and needs a policy that decides that class. `request_execution`, `list_pending_executions` and `get_pending_execution` only create or read queue entries, so under Ask they run without being queued themselves.
 
 MCP clients can never approve or reject: `approve_execution` and `reject_execution` are denied over MCP whatever the policies say, with the error code `self_approval_forbidden`, and each attempt is audited. Only a person resolves pending executions, in the DataTab UI.
 
@@ -233,6 +233,8 @@ Reading is allowed by default and every mutating class a built-in grants asks fo
 
 Classes a built-in does not list are denied.
 
+Every policy, built-in or custom, has to keep its class decisions in the classes' own order: a class may not be decided more strictly than a class below it on the permission ladder (`metadata`, `read`, `write`, `destructive`, `admin_safe`, `admin`, `admin_destructive`), so an allowed class needs every class below it allowed, and an asked class needs every class below it allowed or asked. A policy in any other shape is refused when it is saved, with a message that names the pair, and a policy already stored in that shape grants nothing.
+
 ### Policies created before Ask existed
 
 Before the Ask decision, a policy could only allow a class, so allowing a mutating class was never an explicit choice to run it without approval. The storage migration that introduced Ask (`034_cfg_tool_policy_approval_classes`) rewrites existing custom policies accordingly: an allowed mutating class becomes Ask, an allowed `metadata` or `read` class stays Allow, and a class that was not allowed stays Deny. To let an agent run mutating calls without approval again, choose **Allow all without approval** on the policy.
@@ -260,6 +262,7 @@ Configure governance in the DataTab GUI before starting the MCP server.
 3. **Settings → MCP → Policies tab**
    - Built-in policies appear at the top and cannot be modified.
    - Create custom policies by selecting tools and choosing Allow, Ask, or Deny for each execution class. With the keyboard, `enter` on a class row moves it to the next decision.
+   - A set that decides a class more strictly than a class below it is refused when you save it, the toast names the pair, and nothing is stored.
    - **Allow all without approval** sets every mutating class to Allow. The agent can then run any mutating call, including `DROP DATABASE`, without asking.
 
 4. **Connection Manager → MCP tab**

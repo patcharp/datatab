@@ -82,6 +82,97 @@ fn mysql_live_connect_ping_query_and_schema() -> Result<(), DbError> {
 
 #[test]
 #[ignore = "requires Docker daemon"]
+fn mysql_bulk_schema_metadata_matches_table_details() -> Result<(), DbError> {
+    containers::with_mysql_url(|uri| {
+        let (connection, _) = connect_mysql(uri)?;
+        connection.set_active_database(Some("testdb"))?;
+        for statement in [
+            "CREATE TABLE bulk_parent (id INT PRIMARY KEY, email VARCHAR(255) NOT NULL, INDEX idx_email (email), INDEX idx_lower ((LOWER(email))))",
+            "CREATE TABLE bulk_child (first_id INT, second_id INT, CONSTRAINT fk_first FOREIGN KEY (first_id) REFERENCES bulk_parent(id), CONSTRAINT fk_second FOREIGN KEY (second_id) REFERENCES bulk_parent(id))",
+        ] {
+            connection.execute(&QueryRequest::new(statement))?;
+        }
+
+        let schema_indexes = connection.schema_indexes("testdb", None)?;
+        let schema_keys = connection.schema_foreign_keys("testdb", None)?;
+        for table_name in ["bulk_parent", "bulk_child"] {
+            let table = connection.table_details("testdb", None, table_name)?;
+            let datatab_core::IndexData::Relational(indexes) =
+                table.indexes.expect("indexes should be loaded")
+            else {
+                panic!("expected relational indexes");
+            };
+            let mut expected_indexes: Vec<_> = indexes
+                .iter()
+                .map(|index| {
+                    (
+                        &index.name,
+                        &index.columns,
+                        index.is_unique,
+                        index.is_primary,
+                    )
+                })
+                .collect();
+            expected_indexes.sort_by(|left, right| left.0.cmp(right.0));
+            let actual_indexes: Vec<_> = schema_indexes
+                .iter()
+                .filter(|index| index.table_name == table_name)
+                .map(|index| {
+                    (
+                        &index.name,
+                        &index.columns,
+                        index.is_unique,
+                        index.is_primary,
+                    )
+                })
+                .collect();
+            assert_eq!(actual_indexes, expected_indexes);
+            if table_name == "bulk_parent" {
+                assert!(actual_indexes.iter().any(|index| index.0 == "idx_email"));
+                assert!(actual_indexes.iter().any(|index| index.0 == "idx_lower"));
+            }
+
+            let keys = table.foreign_keys.expect("foreign keys should be loaded");
+            let expected_keys: Vec<_> = keys
+                .iter()
+                .map(|key| {
+                    (
+                        &key.name,
+                        &key.columns,
+                        &key.referenced_schema,
+                        &key.referenced_table,
+                        &key.referenced_columns,
+                        &key.on_update,
+                        &key.on_delete,
+                    )
+                })
+                .collect();
+            let actual_keys: Vec<_> = schema_keys
+                .iter()
+                .filter(|key| key.table_name == table_name)
+                .map(|key| {
+                    (
+                        &key.name,
+                        &key.columns,
+                        &key.referenced_schema,
+                        &key.referenced_table,
+                        &key.referenced_columns,
+                        &key.on_update,
+                        &key.on_delete,
+                    )
+                })
+                .collect();
+            assert_eq!(actual_keys, expected_keys);
+            if table_name == "bulk_child" {
+                assert_eq!(actual_keys.len(), 2);
+            }
+        }
+        Ok(())
+    })
+}
+
+#[test]
+#[ignore = "requires Docker daemon"]
 fn mysql_fetch_dependents_lists_views_and_foreign_key_children() -> Result<(), DbError> {
     containers::with_mysql_url(|uri| {
         let (connection, _) = connect_mysql(uri)?;

@@ -145,30 +145,24 @@ pub trait ScriptOperationHost: Send {
     fn dispatch(&self, op: &ScriptOperation) -> Result<ScriptOperationOutcome, crate::DbError>;
 }
 
-/// Total ordering used to compare a script-run ceiling against a dispatched
-/// operation's classification. An exhaustive `match` with no `_` arm, so
-/// adding a new [`ExecutionClassification`] variant fails the build instead
-/// of silently defaulting to permitted.
-fn severity_rank(c: ExecutionClassification) -> u8 {
-    match c {
-        ExecutionClassification::Metadata => 0,
-        ExecutionClassification::Read => 1,
-        ExecutionClassification::Write => 2,
-        ExecutionClassification::Destructive => 3,
-        ExecutionClassification::AdminSafe => 4,
-        ExecutionClassification::Admin => 5,
-        ExecutionClassification::AdminDestructive => 6,
-    }
-}
-
 /// Returns whether `op`'s classification is permitted under `ceiling`.
+///
+/// A ceiling names the most of each ladder it authorises, so `op` must sit at
+/// or below `ceiling` on both: on the permission ladder and on the data-risk
+/// ladder (see [`ExecutionClassification::permits`]). An `AdminSafe` or
+/// `Admin` ceiling therefore refuses `Destructive` — an object-change grant
+/// does not carry a row removal.
+///
+/// The rule itself lives in `datatab_policy` and this delegates to it, so
+/// every ceiling check in the app reads one implementation. Do not compare
+/// classifications at a call site.
 ///
 /// An absent ceiling is never represented here — callers resolving a
 /// `None` `confirmed_ceiling` must default to [`ExecutionClassification::Read`]
 /// before calling this (see `QueryRequest::confirmed_ceiling`'s doc comment):
 /// an omitted ceiling refuses a destructive op, it never permits one.
 pub fn ceiling_permits(ceiling: ExecutionClassification, op: ExecutionClassification) -> bool {
-    severity_rank(op) <= severity_rank(ceiling)
+    ceiling.permits(op)
 }
 
 #[cfg(test)]
@@ -333,25 +327,59 @@ mod tests {
         ));
     }
 
+    /// Every class in declaration order; [`CEILING_PERMITS`] is indexed by it.
+    const CLASSES: [ExecutionClassification; 7] = [
+        ExecutionClassification::Metadata,
+        ExecutionClassification::Read,
+        ExecutionClassification::Write,
+        ExecutionClassification::Destructive,
+        ExecutionClassification::AdminSafe,
+        ExecutionClassification::Admin,
+        ExecutionClassification::AdminDestructive,
+    ];
+
+    /// `ceiling_permits(ceiling, op)` for every pair, one row per ceiling in
+    /// [`CLASSES`] order and one column per operation in the same order.
+    ///
+    /// Written out as literals, not derived from a ladder: an operation is
+    /// within a ceiling only at or below it on both ladders, so an `AdminSafe`
+    /// or `Admin` ceiling refuses `Destructive` even though the permission
+    /// ladder alone ranks both admin classes above it (#487).
+    const CEILING_PERMITS: [[bool; 7]; 7] = [
+        /* Metadata        */ [true, false, false, false, false, false, false],
+        /* Read            */ [true, true, false, false, false, false, false],
+        /* Write           */ [true, true, true, false, false, false, false],
+        /* Destructive     */ [true, true, true, true, false, false, false],
+        /* AdminSafe       */ [true, true, true, false, true, false, false],
+        /* Admin           */ [true, true, true, false, true, true, false],
+        /* AdminDestructive*/ [true, true, true, true, true, true, true],
+    ];
+
     #[test]
-    fn ceiling_permits_refuses_higher_severity_for_every_pair() {
-        const ORDER: [ExecutionClassification; 7] = [
-            ExecutionClassification::Metadata,
-            ExecutionClassification::Read,
-            ExecutionClassification::Write,
-            ExecutionClassification::Destructive,
-            ExecutionClassification::AdminSafe,
-            ExecutionClassification::Admin,
-            ExecutionClassification::AdminDestructive,
-        ];
-        for (ceiling_idx, ceiling) in ORDER.iter().enumerate() {
-            for (op_idx, op) in ORDER.iter().enumerate() {
+    fn ceiling_permits_pair_table_matches_every_class_against_every_class() {
+        for (ceiling_index, ceiling) in CLASSES.iter().enumerate() {
+            for (op_index, op) in CLASSES.iter().enumerate() {
                 assert_eq!(
                     ceiling_permits(*ceiling, *op),
-                    op_idx <= ceiling_idx,
+                    CEILING_PERMITS[ceiling_index][op_index],
                     "ceiling_permits({ceiling:?}, {op:?}) mismatch"
                 );
             }
         }
+    }
+
+    /// The unsafe old answer this issue removes: a ceiling that names an
+    /// object change used to admit a row removal, because the ceiling was read
+    /// on the permission ladder alone.
+    #[test]
+    fn ceiling_permits_refuses_a_row_removal_under_an_object_change_ceiling() {
+        assert!(!ceiling_permits(
+            ExecutionClassification::AdminSafe,
+            ExecutionClassification::Destructive
+        ));
+        assert!(!ceiling_permits(
+            ExecutionClassification::Admin,
+            ExecutionClassification::Destructive
+        ));
     }
 }

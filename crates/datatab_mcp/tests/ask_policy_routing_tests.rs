@@ -516,20 +516,28 @@ fn authorize_without_a_queue_reports_approval_required_and_audits_pending() {
 
 #[test]
 fn ask_decisions_survive_the_dto_round_trip_used_by_settings_and_storage() {
+    // A coherent policy: the allowed classes form the foot of the permission
+    // ladder and the asked classes sit above them (#490).
     let dto = ToolPolicyDto {
         id: "analyst".to_string(),
         allowed_tools: vec!["update_records".to_string()],
-        allowed_classes: vec!["read".to_string()],
-        approval_classes: vec!["write".to_string(), "admin_destructive".to_string()],
+        allowed_classes: vec!["metadata".to_string(), "read".to_string()],
+        approval_classes: vec!["write".to_string(), "destructive".to_string()],
     };
 
     let policy = ToolPolicy::try_from(dto.clone()).expect("dto should convert");
-    assert_eq!(policy.allowed_classes, vec![ExecutionClassification::Read]);
+    assert_eq!(
+        policy.allowed_classes,
+        vec![
+            ExecutionClassification::Metadata,
+            ExecutionClassification::Read
+        ]
+    );
     assert_eq!(
         policy.approval_classes,
         vec![
             ExecutionClassification::Write,
-            ExecutionClassification::AdminDestructive
+            ExecutionClassification::Destructive
         ]
     );
     assert_eq!(ToolPolicyDto::from(policy), dto);

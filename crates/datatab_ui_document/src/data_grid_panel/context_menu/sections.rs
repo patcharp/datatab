@@ -84,10 +84,31 @@ fn action_shortcut(action: ContextMenuAction, cx: &App) -> Option<SharedString> 
         .map(|chord| chord_display_parts(chord).join(" ").into())
 }
 
+/// How one context-menu row is drawn: destructive, offered or not, and why not.
+///
+/// Kept together because a row can be both (an ordering row a driver cannot
+/// run), and the builder already carries the row's other facts. A refused row
+/// carries its reason into the menu so assistive technology announces it and
+/// the user sees why the row is muted.
+#[derive(Clone, Default)]
+struct RowLook {
+    is_danger: bool,
+    disabled: bool,
+    reason: Option<SharedString>,
+}
+
 impl DataGridPanel {
+    pub(in crate::data_grid_panel) fn column_header_menu_fixed_actions() -> [ContextMenuAction; 4] {
+        [
+            ContextMenuAction::CopyColumnName,
+            ContextMenuAction::Order(datatab_core::SortDirection::Ascending),
+            ContextMenuAction::Order(datatab_core::SortDirection::Descending),
+            ContextMenuAction::RemoveOrdering,
+        ]
+    }
+
     /// Render the DBeaver-style flat menu opened from a column header.
-    /// Ordering actions are listed first, followed by all filter operators in
-    /// the same panel (no nested flyouts).
+    /// Copy the name first, followed by ordering and filter operators.
     pub(super) fn render_column_header_menu_items(
         &self,
         menu: &TableContextMenu,
@@ -104,47 +125,56 @@ impl DataGridPanel {
         let order_title = datatab_i18n::t!("document.data.context_menu.order.title");
         let filter_title = datatab_i18n::t!("document.data.context_menu.filter.title");
         let (_, _, filter_items, value_ops_count) = self.build_filter_items(menu, backend, cx);
+        // The ordering rows stay in the menu for every source so its shape does
+        // not move; a source that cannot sort shows them disabled.
+        let sort_unavailable = self.table_sort_unavailable(cx);
 
         let mut rows: Vec<AnyElement> = Vec::new();
-        rows.push(
-            render_menu_header(
-                &MenuItem::header(order_title).icon(AppIcon::ArrowUpDown),
-                cx,
-            )
-            .into_any_element(),
-        );
-
         let mut action_index = 0usize;
-        let order_items = [
-            (
-                format!("{} ASC", col_name),
-                ContextMenuAction::Order(datatab_core::SortDirection::Ascending),
-                AppIcon::ArrowUp,
-                false,
-            ),
-            (
-                format!("{} DESC", col_name),
-                ContextMenuAction::Order(datatab_core::SortDirection::Descending),
-                AppIcon::ArrowDown,
-                false,
-            ),
-            (
-                remove_ordering,
-                ContextMenuAction::RemoveOrdering,
-                AppIcon::X,
-                true,
-            ),
-        ];
-
-        for (idx, (label, action, icon, is_danger)) in order_items.into_iter().enumerate() {
-            if idx == 2 {
-                rows.push(render_separator(cx).into_any_element());
+        for action in Self::column_header_menu_fixed_actions() {
+            let (label, icon, is_danger) = match action {
+                ContextMenuAction::CopyColumnName => (
+                    datatab_i18n::t!("document.data.context_menu.item.copy_column_name"),
+                    AppIcon::Copy,
+                    false,
+                ),
+                ContextMenuAction::Order(datatab_core::SortDirection::Ascending) => {
+                    (format!("{} ASC", col_name), AppIcon::ArrowUp, false)
+                }
+                ContextMenuAction::Order(datatab_core::SortDirection::Descending) => {
+                    (format!("{} DESC", col_name), AppIcon::ArrowDown, false)
+                }
+                _ => (remove_ordering.clone(), AppIcon::X, true),
+            };
+            match action {
+                ContextMenuAction::Order(datatab_core::SortDirection::Ascending) => {
+                    rows.push(render_separator(cx).into_any_element());
+                    rows.push(
+                        render_menu_header(
+                            &MenuItem::header(order_title.clone()).icon(AppIcon::ArrowUpDown),
+                            cx,
+                        )
+                        .into_any_element(),
+                    );
+                }
+                ContextMenuAction::RemoveOrdering => {
+                    rows.push(render_separator(cx).into_any_element())
+                }
+                _ => {}
             }
+            let ordering = matches!(
+                action,
+                ContextMenuAction::Order(_) | ContextMenuAction::RemoveOrdering
+            );
             rows.push(Self::column_menu_action_row(
                 label,
                 action,
                 icon,
-                is_danger,
+                RowLook {
+                    is_danger,
+                    disabled: ordering && sort_unavailable.is_some(),
+                    reason: ordering.then(|| sort_unavailable.clone()).flatten(),
+                },
                 action_index,
                 menu.selected_index,
                 cx,
@@ -175,7 +205,10 @@ impl DataGridPanel {
                 } else {
                     AppIcon::ListFilter
                 },
-                is_danger,
+                RowLook {
+                    is_danger,
+                    ..RowLook::default()
+                },
                 action_index,
                 menu.selected_index,
                 cx,
@@ -190,16 +223,25 @@ impl DataGridPanel {
         label: String,
         action: ContextMenuAction,
         icon: AppIcon,
-        is_danger: bool,
+        look: RowLook,
         action_index: usize,
         selected_index: usize,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let mut item = MenuItem::new(label).icon(icon);
-        if is_danger {
+        if look.is_danger {
             item = item.danger();
         }
+        if look.disabled {
+            item = item.disabled();
+            if let Some(reason) = look.reason.clone() {
+                item = item.detail(reason);
+            }
+        }
 
+        // The reason is drawn as the row's second line, which the menu row's
+        // content-based name carries into assistive technology, so it is not
+        // repeated as a description on top of it.
         menu_row(
             SharedString::from(format!("column-menu-action-{action_index}")),
             &item,

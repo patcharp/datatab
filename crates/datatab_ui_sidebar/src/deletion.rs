@@ -4,14 +4,20 @@ use crate::root_sections::PendingRootSectionAction;
 
 impl Sidebar {
     pub fn request_delete_selected(&mut self, cx: &mut Context<Self>) {
+        let multi_ids = self.deletable_multi_selection();
         if self.pending_delete_item.is_some() {
+            if multi_ids.len() > 1
+                && self.refuse_delete_while_editing(multi_ids.iter().map(String::as_str), cx)
+            {
+                self.cancel_pending_delete(cx);
+                return;
+            }
             self.confirm_pending_delete(cx);
             return;
         }
 
         // Batch path: more than one item is multi-selected → open the modal
         // with the full set so a single confirmation deletes them all.
-        let multi_ids = self.deletable_multi_selection();
         if multi_ids.len() > 1 {
             self.show_delete_confirm_modal_for_many(multi_ids, cx);
             return;
@@ -31,6 +37,9 @@ impl Sidebar {
                 | SchemaNodeKind::ScriptFile
                 | SchemaNodeKind::ScriptsFolder
         ) {
+            if self.refuse_delete_while_editing(std::iter::once(item_id.as_str()), cx) {
+                return;
+            }
             // Don't allow deleting the scripts root folder
             if let Some(SchemaNodeId::ScriptsFolder { path: None }) = parse_node_id(&item_id) {
                 return;
@@ -94,6 +103,9 @@ impl Sidebar {
     }
 
     pub fn show_delete_confirm_modal(&mut self, item_id: &str, cx: &mut Context<Self>) {
+        if self.refuse_delete_while_editing(std::iter::once(item_id), cx) {
+            return;
+        }
         let state = self.app_state.read(cx);
 
         match parse_node_id(item_id) {
@@ -202,6 +214,9 @@ impl Sidebar {
         ids: Vec<String>,
         cx: &mut Context<Self>,
     ) {
+        if self.refuse_delete_while_editing(ids.iter().map(String::as_str), cx) {
+            return;
+        }
         let count = ids.len();
         let anchor_id = ids.first().cloned().unwrap_or_default();
 
@@ -305,6 +320,7 @@ impl Sidebar {
         };
 
         self.delete_modal_focus.restore(cx);
+        cx.notify();
 
         log::debug!(
             "confirm_modal_delete: item_id={}, name={}, is_ddl={}, multi={}, delegated={}",
@@ -321,6 +337,10 @@ impl Sidebar {
         }
 
         if !modal.multi_item_ids.is_empty() {
+            if self.refuse_delete_while_editing(modal.multi_item_ids.iter().map(String::as_str), cx)
+            {
+                return;
+            }
             for id in &modal.multi_item_ids {
                 self.execute_delete(id, cx);
             }
@@ -475,5 +495,21 @@ impl Sidebar {
         }
 
         self.refresh_tree(cx);
+    }
+
+    fn refuse_delete_while_editing<'a>(
+        &self,
+        item_ids: impl IntoIterator<Item = &'a str>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.app_state.update(cx, |state, cx| {
+            item_ids.into_iter().any(|item_id| {
+                if let Some(SchemaNodeId::Profile { profile_id }) = parse_node_id(item_id) {
+                    state.refuse_connection_delete(profile_id, cx)
+                } else {
+                    false
+                }
+            })
+        })
     }
 }

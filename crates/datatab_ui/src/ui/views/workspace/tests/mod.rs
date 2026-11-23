@@ -16,6 +16,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 mod close_flush;
+mod connection_edit;
 mod document_focus;
 mod sidebar_seam;
 

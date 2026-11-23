@@ -77,24 +77,32 @@ pub const METRIC_FIELDS: &[(&str, &str, &str, &str, InstanceMetricUnit)] = &[
     (
         "boltdb_reads_total",
         "influx.boltdb_reads_total",
-        "BoltDB reads (cumulative)",
+        "BoltDB reads / sec",
         "Storage",
-        InstanceMetricUnit::Count,
+        InstanceMetricUnit::PerSecond,
     ),
     (
         "boltdb_writes_total",
         "influx.boltdb_writes_total",
-        "BoltDB writes (cumulative)",
+        "BoltDB writes / sec",
         "Storage",
-        InstanceMetricUnit::Count,
+        InstanceMetricUnit::PerSecond,
     ),
     (
         "http_api_requests_total",
         "influx.http_api_requests_total",
-        "HTTP API requests (cumulative)",
+        "HTTP API requests / sec",
         "HTTP",
-        InstanceMetricUnit::Count,
+        InstanceMetricUnit::PerSecond,
     ),
+];
+
+/// Metrics whose `/metrics` value is a total since server start. They are
+/// counters charted per second; every other metric reads a current value.
+pub const CUMULATIVE_METRIC_IDS: &[&str] = &[
+    "influx.boltdb_reads_total",
+    "influx.boltdb_writes_total",
+    "influx.http_api_requests_total",
 ];
 
 // The query-controller family (`qc_all_active`, `qc_requests_total`) is
@@ -220,7 +228,11 @@ impl InfluxInstanceCatalog {
                 display_name: display_name.to_string(),
                 group: group.to_string(),
                 unit: *unit,
-                kind: datatab_core::InstanceMetricKind::Gauge,
+                kind: if CUMULATIVE_METRIC_IDS.contains(id) {
+                    datatab_core::InstanceMetricKind::Counter
+                } else {
+                    datatab_core::InstanceMetricKind::Gauge
+                },
                 description: None,
                 default_refresh_secs: 15,
             })
@@ -554,16 +566,6 @@ pub fn influxdb_advertises_instance_capabilities() -> bool {
 mod tests {
     use super::*;
 
-    #[test]
-    fn per_second_metrics_are_gauges() {
-        assert!(
-            InfluxInstanceCatalog::static_metrics()
-                .iter()
-                .filter(|metric| metric.unit == InstanceMetricUnit::PerSecond)
-                .all(|metric| metric.kind == datatab_core::InstanceMetricKind::Gauge)
-        );
-    }
-
     const FIXTURE_METRICS: &str = r#"
 # HELP go_goroutines Number of goroutines that currently exist.
 # TYPE go_goroutines gauge
@@ -682,6 +684,25 @@ boltdb_reads_total 512
             assert!(
                 !metric_ids.contains(id),
                 "inspector id {id} collides with a metric id"
+            );
+        }
+    }
+
+    #[test]
+    fn cumulative_metrics_are_per_second_counters() {
+        let metrics = InfluxInstanceCatalog::static_metrics();
+        let counters: Vec<_> = metrics
+            .iter()
+            .filter(|metric| metric.kind == datatab_core::InstanceMetricKind::Counter)
+            .collect();
+        let ids: Vec<&str> = counters.iter().map(|metric| metric.id.as_str()).collect();
+        assert_eq!(ids, CUMULATIVE_METRIC_IDS);
+        for metric in counters {
+            assert_eq!(
+                metric.unit,
+                InstanceMetricUnit::PerSecond,
+                "counter {:?} must be charted per second",
+                metric.id
             );
         }
     }

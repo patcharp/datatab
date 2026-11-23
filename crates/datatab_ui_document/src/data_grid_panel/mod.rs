@@ -899,6 +899,11 @@ pub struct DataGridPanel {
     view_config: super::data_view::DataViewConfig,
     context_menu: Option<TableContextMenu>,
     is_active_tab: bool,
+    /// The result rows are the editor's own free-form query result, so the grid
+    /// explains why they cannot be edited. Set by the host that knows the query
+    /// text came from the editor; a result the instance inspector or any other
+    /// host reads leaves it off.
+    free_form_query_result: bool,
     /// The hosting document hands this grid's side panels (the chart stats
     /// rail) to the workspace through `side_panels`, so the grid does not
     /// dock them inside itself.
@@ -982,9 +987,16 @@ impl DataGridPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let order_by =
+        // The key columns come from the table's details, never from the order:
+        // a driver that cannot sort browses in its natural order and sends no
+        // `order_by` (ruling 4), and its rows must still be editable.
+        let key_columns =
             Self::get_primary_key_columns(&app_state, profile_id, database.as_deref(), &table, cx);
-        let pk_columns: Vec<String> = order_by.iter().map(|c| c.column.name.clone()).collect();
+        let pk_columns: Vec<String> = key_columns
+            .iter()
+            .map(|column| column.column.name.clone())
+            .collect();
+        let order_by = Self::browse_order(&app_state, profile_id, key_columns, cx);
         let pagination = Pagination::default();
 
         let source = DataSource::Table {
@@ -1499,6 +1511,7 @@ impl DataGridPanel {
             view_config,
             context_menu: None,
             is_active_tab: true,
+            free_form_query_result: false,
             side_panels_hosted: false,
             pending: PendingActions::default(),
             pending_delete_confirm: None,

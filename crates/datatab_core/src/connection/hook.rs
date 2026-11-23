@@ -549,6 +549,26 @@ fn profile_config_context(config: &DbConfig) -> (Option<String>, Option<u16>, Op
             database,
             ..
         } => (Some(host.clone()), Some(*port), Some(database.clone())),
+        // A tunnel carries one node, so the hook probes the first contact point.
+        DbConfig::Cassandra {
+            contact_points,
+            port,
+            keyspace,
+            ..
+        } => (
+            contact_points
+                .split(',')
+                .next()
+                .map(str::trim)
+                .filter(|host| !host.is_empty())
+                .map(str::to_string),
+            Some(*port),
+            if keyspace.is_empty() {
+                None
+            } else {
+                Some(keyspace.clone())
+            },
+        ),
         DbConfig::External { values, .. } => {
             let host = values.get("host").cloned();
             let port = values
@@ -2154,6 +2174,10 @@ mod tests {
                 database: "default".to_string(),
                 request_timeout_seconds: None,
                 allow_insecure_http_password: false,
+                ssl_mode: None,
+                ssl_root_cert_path: None,
+                ssl_client_cert_path: None,
+                ssl_client_key_path: None,
             },
         );
 

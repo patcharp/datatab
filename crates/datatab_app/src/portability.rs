@@ -33,7 +33,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-use datatab_core::secrecy::SecretString;
+use datatab_core::secrecy::{ExposeSecret, SecretString};
 use datatab_core::{
     AuthProfile, ConnectionProfile, DbDriver, ExportFieldHint, FieldExportTransform, FormValues,
     ProxyProfile, SecretStore, SshTunnelProfile,
@@ -42,6 +42,22 @@ use datatab_portability::{
     ConnectionWithValues, DestSnapshot, ExportGraph, ExportTransformResolver, FieldHintResolver,
     ImportActions, ImportPlan, ParsedBundle, ResolutionChoices, SecretReader,
 };
+
+fn export_driver<'a>(
+    profile: &ConnectionProfile,
+    drivers: &'a HashMap<String, Arc<dyn DbDriver>>,
+) -> Option<&'a Arc<dyn DbDriver>> {
+    // A built-in profile without a driver id uses its kind's driver; an
+    // external one without an id has no form to look up.
+    if matches!(profile.config, datatab_core::DbConfig::External { .. }) {
+        profile
+            .driver_id
+            .as_deref()
+            .and_then(|driver_id| drivers.get(driver_id))
+    } else {
+        drivers.get(&profile.driver_id())
+    }
+}
 
 // ---------------------------------------------------------------------------
 // FieldHintResolver — backed by a driver snapshot
@@ -71,12 +87,12 @@ impl FieldHintResolver for AppFieldHintResolver {
         field_id: &str,
         values: &FormValues,
     ) -> ExportFieldHint {
-        let Some(driver_id) = profile.driver_id.as_deref() else {
-            return ExportFieldHint::Include;
-        };
-
-        let Some(driver) = self.drivers.get(driver_id) else {
-            return ExportFieldHint::Include;
+        let Some(driver) = export_driver(profile, &self.drivers) else {
+            // Without the driver's form nothing says which values are
+            // secret, so none of them is written as a value, and a literal
+            // value ref is never exported either: every field is a required
+            // reference.
+            return ExportFieldHint::Secret;
         };
 
         driver.export_field_hint(field_id, values)
@@ -109,11 +125,7 @@ impl ExportTransformResolver for AppExportTransformResolver {
         field_id: &str,
         values: &FormValues,
     ) -> FieldExportTransform {
-        let Some(driver_id) = profile.driver_id.as_deref() else {
-            return FieldExportTransform::None;
-        };
-
-        let Some(driver) = self.drivers.get(driver_id) else {
+        let Some(driver) = export_driver(profile, &self.drivers) else {
             return FieldExportTransform::None;
         };
 
@@ -261,7 +273,8 @@ pub enum ConnectionInsertResult {
 
 /// Seam for inserting entities into the repository, used by `apply_import`.
 ///
-/// The production implementation delegates to `AppState`; tests supply fakes.
+/// Production uses an owned `ImportSession` for background secret work and
+/// foreground state commits; tests can supply other implementations.
 pub trait ImportPersistence {
     fn add_auth_profile(&mut self, profile: AuthProfile);
     fn add_ssh_tunnel(&mut self, tunnel: SshTunnelProfile);
@@ -277,24 +290,346 @@ pub trait ImportPersistence {
     /// NOT persisted with a broken placeholder config.
     fn add_connection(&mut self, profile: ConnectionProfile) -> ConnectionInsertResult;
 
+    /// Insert a connection with the secret for its password slot
+    /// (`connection_secret_ref`), when the bundle carries one.
+    ///
+    /// An implementation that writes the password itself, in one step with
+    /// the profile's other keyring entries, returns `None` for it: a write
+    /// that fails then fails the connection, and nothing of it is saved. The
+    /// default inserts the connection and hands the password back, and
+    /// `persist_import_actions` writes it with the other secrets.
+    fn add_connection_with_password(
+        &mut self,
+        profile: ConnectionProfile,
+        password: Option<SecretString>,
+    ) -> (ConnectionInsertResult, Option<SecretString>) {
+        (self.add_connection(profile), password)
+    }
+
     /// Write a secret under an explicit keyring reference.
     ///
     /// Returns `true` on success, `false` when the keyring is unavailable or
     /// rejected the write.
     fn write_secret(&self, secret_ref: &str, secret: &SecretString) -> bool;
 
+    /// The secret fields this connection keeps in their own keyring entries
+    /// instead of the connection password slot: the secret-kind fields other
+    /// than `password` of a registered driver that builds an external config.
+    ///
+    /// A supplied secret for one of these fields is handed to
+    /// `add_connection` in the profile's values, which stores it in that
+    /// field's entry or refuses the connection. The default keeps every
+    /// supplied secret in the password slot.
+    fn keyring_secret_field_ids(&self, _profile: &ConnectionProfile) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Every secret-kind field of this connection's driver form, the primary
+    /// `password` included; empty when the driver is not registered.
+    ///
+    /// A `Literal` value ref the bundle carries for one of these fields is the
+    /// secret itself. The import takes it out of the profile and stores it like
+    /// a supplied secret (see `take_literal_secret_refs`), so it never reaches
+    /// the database.
+    fn secret_field_ids(&self, _profile: &ConnectionProfile) -> Vec<String> {
+        Vec::new()
+    }
+
     /// Populate the in-memory `secret_fields` for an auth profile after its secrets
     /// have been written to the keyring.
     ///
     /// Called immediately after `add_auth_profile` for newly created (non-Reuse/MapTo)
     /// profiles so they authenticate in the current session without a restart (H3 / ADR-4).
-    /// The production implementation looks up the profile in the profile manager and
-    /// sets `secret_fields` directly on the in-memory copy.
+    /// Production updates the session snapshot and queues hydration of the live
+    /// in-memory profile for the foreground `ImportSession::commit`.
     fn hydrate_auth_secret_fields(
         &mut self,
         auth_id: uuid::Uuid,
         fields: HashMap<String, SecretString>,
     );
+
+    /// The driver form values that choosing this auth profile sets, or `None`
+    /// when the destination no longer holds the profile.
+    ///
+    /// The connection ID lets the session re-check this choice at commit.
+    /// Asked for a profile the user chose in the import panel, which may have
+    /// been deleted since the panel listed it. The values are the ones the
+    /// connection form writes on the same choice
+    /// (`datatab_core::auth_profile_form_values`); they are empty when the
+    /// driver is unknown or declares no `AuthProfileRef` field.
+    fn chosen_auth_profile_values(
+        &mut self,
+        connection_id: uuid::Uuid,
+        driver_id: &str,
+        auth_id: uuid::Uuid,
+    ) -> Option<FormValues>;
+}
+
+/// Owned import work. Run the persistence functions with this session on a
+/// background executor, then commit its accepted rows on the foreground.
+/// Driver and auth snapshots carry no UI entities; the shared keyring is the
+/// only external state touched before commit.
+pub struct ImportSession {
+    drivers: HashMap<String, Arc<dyn DbDriver>>,
+    auth_profiles: Vec<AuthProfile>,
+    secrets: datatab_core::SecretManager,
+    writes: Vec<ImportStateWrite>,
+    chosen_auth_profiles: HashMap<uuid::Uuid, uuid::Uuid>,
+    field_changes: HashMap<uuid::Uuid, crate::app_state::SecretFieldChanges>,
+    rejected_connections: Vec<(
+        Box<ConnectionProfile>,
+        uuid::Uuid,
+        crate::app_state::SecretFieldChanges,
+    )>,
+    password_keyring_failed: String,
+}
+
+enum ImportStateWrite {
+    Auth(Box<AuthProfile>),
+    Ssh(Box<SshTunnelProfile>),
+    Proxy(Box<ProxyProfile>),
+    Connection(Box<ConnectionProfile>),
+    Hydrate(uuid::Uuid, HashMap<String, SecretString>),
+}
+
+fn missing_chosen_auth_profile(auth_id: uuid::Uuid) -> String {
+    format!("the chosen auth profile {auth_id} no longer exists")
+}
+
+impl ImportSession {
+    pub fn new(state: &crate::AppState, password_keyring_failed: String) -> Self {
+        Self {
+            drivers: state.drivers().clone(),
+            auth_profiles: state.list_auth_profiles(),
+            secrets: state.facade.secrets.clone(),
+            writes: Vec::new(),
+            chosen_auth_profiles: HashMap::new(),
+            field_changes: HashMap::new(),
+            rejected_connections: Vec::new(),
+            password_keyring_failed,
+        }
+    }
+
+    /// Commit only rows accepted by the secret phase, in dependency order.
+    pub fn commit(&mut self, state: &mut crate::AppState) {
+        for write in self.writes.drain(..) {
+            match write {
+                ImportStateWrite::Auth(profile) => {
+                    state.add_auth_profile(*profile);
+                }
+                ImportStateWrite::Ssh(profile) => state.add_ssh_tunnel(*profile),
+                ImportStateWrite::Proxy(profile) => state.add_proxy(*profile),
+                ImportStateWrite::Connection(profile) => {
+                    let changes = self.field_changes.remove(&profile.id).unwrap_or_default();
+                    if let Some(auth_id) = self.chosen_auth_profiles.remove(&profile.id)
+                        && !state
+                            .facade
+                            .auth_profiles
+                            .items
+                            .iter()
+                            .any(|auth| auth.id == auth_id)
+                    {
+                        self.rejected_connections.push((profile, auth_id, changes));
+                        continue;
+                    }
+                    state.add_profile_in_folder(*profile, None);
+                }
+                ImportStateWrite::Hydrate(id, fields) => {
+                    if let Some(profile) = state
+                        .facade
+                        .auth_profiles
+                        .items
+                        .iter_mut()
+                        .find(|profile| profile.id == id)
+                    {
+                        profile.secret_fields = fields;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Restore secrets of rows refused at commit. Run on the background executor
+    /// and replace these rows' successes with the returned config failures.
+    pub fn rollback_rejected(&mut self, cleanup_failed: &str) -> Vec<(uuid::Uuid, String, String)> {
+        self.rejected_connections
+            .drain(..)
+            .map(|(profile, auth_id, changes)| {
+                let mut reason = missing_chosen_auth_profile(auth_id);
+                let restore_result = changes.restore(&self.secrets.secret_store_arc());
+                if self
+                    .secrets
+                    .try_delete_by_ref(&datatab_core::connection_secret_ref(&profile.id))
+                    .is_err()
+                {
+                    reason = cleanup_failed.to_string();
+                }
+                if let Err(may_have_changed) = restore_result {
+                    reason.push(' ');
+                    reason.push_str(&may_have_changed.to_string());
+                }
+                (profile.id, profile.name, reason)
+            })
+            .collect()
+    }
+}
+
+impl ImportPersistence for ImportSession {
+    fn add_auth_profile(&mut self, profile: AuthProfile) {
+        self.auth_profiles.push(profile.clone());
+        self.writes.push(ImportStateWrite::Auth(Box::new(profile)));
+    }
+
+    fn add_ssh_tunnel(&mut self, tunnel: SshTunnelProfile) {
+        self.writes.push(ImportStateWrite::Ssh(Box::new(tunnel)));
+    }
+
+    fn add_proxy(&mut self, proxy: ProxyProfile) {
+        self.writes.push(ImportStateWrite::Proxy(Box::new(proxy)));
+    }
+
+    fn add_connection(&mut self, profile: ConnectionProfile) -> ConnectionInsertResult {
+        let (result, _password) = self.add_connection_with_password(profile, None);
+        result
+    }
+
+    fn add_connection_with_password(
+        &mut self,
+        profile: ConnectionProfile,
+        password: Option<SecretString>,
+    ) -> (ConnectionInsertResult, Option<SecretString>) {
+        let driver_id = profile.driver_id().to_string();
+        let Some(driver) = self.drivers.get(&driver_id).cloned() else {
+            return (ConnectionInsertResult::NeedsDriver, password);
+        };
+
+        let datatab_core::DbConfig::External { values, .. } = &profile.config else {
+            self.writes
+                .push(ImportStateWrite::Connection(Box::new(profile)));
+            return (ConnectionInsertResult::Ok, password);
+        };
+        match driver.build_config(values) {
+            Ok(config) => {
+                let mut rebuilt = profile;
+                rebuilt.config = config;
+                self.add_built_connection(rebuilt, password)
+            }
+            Err(e) => (
+                ConnectionInsertResult::ConfigFailed(e.to_string()),
+                password,
+            ),
+        }
+    }
+
+    fn write_secret(&self, secret_ref: &str, secret: &SecretString) -> bool {
+        self.secrets.set_by_ref(secret_ref, secret)
+    }
+
+    fn keyring_secret_field_ids(&self, profile: &ConnectionProfile) -> Vec<String> {
+        crate::AppState::imported_keyring_field_ids_with(profile, &self.drivers)
+    }
+
+    fn secret_field_ids(&self, profile: &ConnectionProfile) -> Vec<String> {
+        crate::AppState::secret_field_ids_with(profile, &self.drivers)
+    }
+
+    fn chosen_auth_profile_values(
+        &mut self,
+        connection_id: uuid::Uuid,
+        driver_id: &str,
+        auth_id: uuid::Uuid,
+    ) -> Option<datatab_core::FormValues> {
+        let profile = self
+            .auth_profiles
+            .iter()
+            .find(|profile| profile.id == auth_id)?;
+        let values = self
+            .drivers
+            .get(driver_id)
+            .map(|driver| datatab_core::auth_profile_form_values(driver.form_definition(), profile))
+            .unwrap_or_default();
+        self.chosen_auth_profiles.insert(connection_id, auth_id);
+        Some(values)
+    }
+
+    fn hydrate_auth_secret_fields(
+        &mut self,
+        auth_id: uuid::Uuid,
+        fields: HashMap<String, SecretString>,
+    ) {
+        if let Some(profile) = self.auth_profiles.iter_mut().find(|p| p.id == auth_id) {
+            profile.secret_fields = fields.clone();
+            self.writes.push(ImportStateWrite::Hydrate(auth_id, fields));
+        }
+    }
+}
+
+impl ImportSession {
+    /// Saves a profile whose config the driver built. An external profile
+    /// whose secret fields this import wrote to the keyring is saved in one
+    /// step with its password slot: when the password cannot be written, the
+    /// field entries are put back and the profile is not saved. Any other
+    /// profile hands its password back, so it is written with the other
+    /// secrets after every connection, as before.
+    fn add_built_connection(
+        &mut self,
+        mut profile: ConnectionProfile,
+        password: Option<SecretString>,
+    ) -> (ConnectionInsertResult, Option<SecretString>) {
+        // The registered driver may declare a reserved kind; such a profile
+        // could not be loaded again.
+        if let Err(error) = crate::AppState::check_profile_can_be_saved(&profile) {
+            return (
+                ConnectionInsertResult::ConfigFailed(error.to_string()),
+                password,
+            );
+        }
+        // A secret field value in the bundle goes to the keyring like a typed
+        // one; the new profile has no entries yet.
+        profile.keyring_secret_fields.clear();
+        // A refused store leaves no entry behind, or names the fields it may
+        // have changed.
+        let changes = match crate::AppState::prepare_external_secret_fields_with(
+            &mut profile,
+            &self.drivers,
+            self.secrets.secret_store_arc(),
+        )
+        .apply()
+        {
+            Ok(changes) => changes,
+            Err(error) => {
+                return (
+                    ConnectionInsertResult::ConfigFailed(error.to_string()),
+                    password,
+                );
+            }
+        };
+        // Only a profile whose secret fields this import wrote has entries
+        // to roll back; any other keeps the old path, where a refused
+        // password is a secret failure of a saved profile.
+        if !matches!(profile.config, datatab_core::DbConfig::External { .. }) || changes.is_empty()
+        {
+            self.field_changes.insert(profile.id, changes);
+            self.writes
+                .push(ImportStateWrite::Connection(Box::new(profile)));
+            return (ConnectionInsertResult::Ok, password);
+        }
+        if let Some(password) = password {
+            let password_ref = datatab_core::connection_secret_ref(&profile.id);
+            if !self.secrets.set_by_ref(&password_ref, &password) {
+                let mut reason = self.password_keyring_failed.clone();
+                if let Err(may_have_changed) = changes.restore(&self.secrets.secret_store_arc()) {
+                    reason.push(' ');
+                    reason.push_str(&may_have_changed.to_string());
+                }
+                return (ConnectionInsertResult::ConfigFailed(reason), None);
+            }
+        }
+        self.field_changes.insert(profile.id, changes);
+        self.writes
+            .push(ImportStateWrite::Connection(Box::new(profile)));
+        (ConnectionInsertResult::Ok, None)
+    }
 }
 
 /// Run the pure `datatab_portability::apply()` and persist the resulting
@@ -410,12 +745,66 @@ pub fn persist_import_actions(
     let mut skipped_conn_ids: std::collections::HashSet<uuid::Uuid> =
         std::collections::HashSet::new();
 
-    for conn in actions.connections {
+    let mut field_secrets_by_connection: HashMap<uuid::Uuid, Vec<(String, SecretString)>> =
+        HashMap::new();
+    for (connection_id, field_id, secret) in actions.connection_field_secrets {
+        field_secrets_by_connection
+            .entry(connection_id)
+            .or_default()
+            .push((field_id, secret));
+    }
+    let mut password_slot_writes: Vec<(String, SecretString)> = Vec::new();
+    let mut secret_writes = actions.secret_writes;
+
+    for mut conn in actions.connections {
         let name = conn.name.clone();
         let driver_id = conn.driver_id().to_string();
         let conn_id = conn.id;
 
-        match deps.add_connection(conn) {
+        take_literal_secret_refs(&mut conn, deps, &mut password_slot_writes);
+        route_supplied_field_secrets(
+            &mut conn,
+            field_secrets_by_connection
+                .remove(&conn_id)
+                .unwrap_or_default(),
+            deps,
+            &mut password_slot_writes,
+        );
+
+        if let Some((_, auth_id)) = actions
+            .chosen_auth_profiles
+            .iter()
+            .find(|(connection_id, _)| *connection_id == conn_id)
+        {
+            match deps.chosen_auth_profile_values(conn_id, &driver_id, *auth_id) {
+                Some(values) => {
+                    if let datatab_core::DbConfig::External {
+                        values: form_values,
+                        ..
+                    } = &mut conn.config
+                    {
+                        form_values.extend(values);
+                    }
+                }
+                None => {
+                    outcome
+                        .config_failures
+                        .push((name, missing_chosen_auth_profile(*auth_id)));
+                    skipped_conn_ids.insert(conn_id);
+                    continue;
+                }
+            }
+        }
+
+        let password_ref = datatab_core::connection_secret_ref(&conn_id);
+        let password =
+            take_password_slot_write(&password_ref, &mut secret_writes, &mut password_slot_writes);
+        let (result, password) = deps.add_connection_with_password(conn, password);
+        if let Some(password) = password {
+            password_slot_writes.push((password_ref, password));
+        }
+
+        match result {
             ConnectionInsertResult::Ok => {
                 outcome.succeeded.push(name);
             }
@@ -439,7 +828,7 @@ pub fn persist_import_actions(
         .map(datatab_core::connection_secret_ref)
         .collect();
 
-    for (secret_ref, secret) in actions.secret_writes {
+    for (secret_ref, secret) in secret_writes.into_iter().chain(password_slot_writes) {
         // Skip secrets belonging to connections that were not persisted.
         let is_skipped = skipped_conn_refs
             .iter()
@@ -457,6 +846,110 @@ pub fn persist_import_actions(
     }
 
     outcome
+}
+
+/// Takes every write to one connection's password slot out of the pending
+/// writes and returns the one that would have landed last, so the
+/// connection can be saved in one step with it.
+fn take_password_slot_write(
+    password_ref: &str,
+    secret_writes: &mut Vec<(String, SecretString)>,
+    password_slot_writes: &mut Vec<(String, SecretString)>,
+) -> Option<SecretString> {
+    let mut password = None;
+    for writes in [secret_writes, password_slot_writes] {
+        let (matching, rest): (Vec<_>, Vec<_>) = std::mem::take(writes)
+            .into_iter()
+            .partition(|(secret_ref, _)| secret_ref == password_ref);
+        *writes = rest;
+        if let Some((_, secret)) = matching.into_iter().last() {
+            password = Some(secret);
+        }
+    }
+    password
+}
+
+/// Takes the `Literal` value refs on secret-kind fields out of an imported
+/// profile and stores each value like a typed one: the password goes to the
+/// connection password slot, and a field the driver keeps in its own keyring
+/// entry goes into the profile's values, where `add_connection` writes it to
+/// that entry. A literal on any other secret field has no slot and is
+/// dropped. The count is logged, never a value. A literal on a field that is
+/// not secret stays a value ref.
+fn take_literal_secret_refs(
+    profile: &mut ConnectionProfile,
+    deps: &dyn ImportPersistence,
+    password_slot_writes: &mut Vec<(String, SecretString)>,
+) {
+    let secret_fields = deps.secret_field_ids(profile);
+    let keyring_fields = deps.keyring_secret_field_ids(profile);
+    let literal_fields: Vec<String> = profile
+        .value_refs
+        .iter()
+        .filter(|(field_id, value_ref)| {
+            matches!(value_ref, datatab_core::ValueRef::Literal { .. })
+                && secret_fields.contains(field_id)
+        })
+        .map(|(field_id, _)| field_id.clone())
+        .collect();
+    let mut dropped = 0;
+    for field_id in literal_fields {
+        let Some(datatab_core::ValueRef::Literal { value }) = profile.value_refs.remove(&field_id)
+        else {
+            continue;
+        };
+        if value.is_empty() {
+            continue;
+        }
+        if field_id == "password" {
+            if profile.save_password {
+                password_slot_writes.push((
+                    datatab_core::connection_secret_ref(&profile.id),
+                    SecretString::from(value),
+                ));
+            } else {
+                dropped += 1;
+            }
+        } else if keyring_fields.contains(&field_id)
+            && let datatab_core::DbConfig::External { values, .. } = &mut profile.config
+        {
+            values.insert(field_id, value);
+        } else {
+            // Defensive: the bundle carries a literal only for a field with
+            // a slot, and the exporter never writes one. A hand-edited
+            // bundle could, so the value has nowhere to go and is dropped.
+            dropped += 1;
+        }
+    }
+    if dropped > 0 {
+        log::warn!("Dropped {dropped} literal secret value(s) of an imported connection");
+    }
+}
+
+/// Routes the secrets the user supplied for one connection. A field the
+/// driver keeps in its own keyring entry goes into the profile's values, so
+/// `add_connection` stores it there (or refuses the connection) before the
+/// profile is written; it never reaches the password slot. Any other field
+/// goes to the connection password slot, as before.
+fn route_supplied_field_secrets(
+    profile: &mut ConnectionProfile,
+    field_secrets: Vec<(String, SecretString)>,
+    deps: &dyn ImportPersistence,
+    password_slot_writes: &mut Vec<(String, SecretString)>,
+) {
+    if field_secrets.is_empty() {
+        return;
+    }
+    let keyring_fields = deps.keyring_secret_field_ids(profile);
+    for (field_id, secret) in field_secrets {
+        if keyring_fields.contains(&field_id)
+            && let datatab_core::DbConfig::External { values, .. } = &mut profile.config
+        {
+            values.insert(field_id, secret.expose_secret().to_string());
+        } else {
+            password_slot_writes.push((datatab_core::connection_secret_ref(&profile.id), secret));
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -885,25 +1378,262 @@ mod tests {
         assert_eq!(hint, ExportFieldHint::Include);
     }
 
+    /// An unregistered RPC driver has no form that says which of its values
+    /// are secret, so every value is hinted `Secret` (#411 ruling 2 item 3).
+    /// So does a built-in config of an unknown driver id (#415).
     #[test]
-    fn hint_resolver_falls_back_to_include_for_unknown_driver() {
+    fn hint_resolver_fails_closed_for_an_unknown_external_driver() {
         let resolver = AppFieldHintResolver::new(HashMap::new());
         let profile = make_profile("totally-unknown-driver");
         let values = FormValues::default();
 
         let hint = resolver.hint(&profile, "secret_password", &values);
-        assert_eq!(hint, ExportFieldHint::Include);
+        assert_eq!(hint, ExportFieldHint::Secret);
+
+        let mut built_in = ConnectionProfile::new("test", DbConfig::default_postgres());
+        built_in.driver_id = Some("totally-unknown-driver".to_string());
+        assert_eq!(
+            resolver.hint(&built_in, "host", &values),
+            ExportFieldHint::Secret
+        );
     }
 
+    /// An RPC profile with no driver id has no known form either, so every
+    /// value is hinted `Secret` (#411 triage round 2, point 4). A built-in
+    /// config with no driver id and no registered driver does too (#415).
     #[test]
-    fn hint_resolver_falls_back_to_include_when_driver_id_is_none() {
+    fn hint_resolver_fails_closed_for_an_external_profile_without_a_driver_id() {
         let resolver = AppFieldHintResolver::new(HashMap::new());
         let mut profile = make_profile("fake");
         profile.driver_id = None;
         let values = FormValues::default();
 
         let hint = resolver.hint(&profile, "secret_password", &values);
-        assert_eq!(hint, ExportFieldHint::Include);
+        assert_eq!(hint, ExportFieldHint::Secret);
+
+        let mut built_in = ConnectionProfile::new("test", DbConfig::default_postgres());
+        built_in.driver_id = None;
+        assert_eq!(
+            resolver.hint(&built_in, "host", &values),
+            ExportFieldHint::Secret
+        );
+    }
+
+    /// A profile whose form is unknown exports no literal value ref: not a
+    /// built-in one whose driver is not registered, and not one without a
+    /// driver id (#415).
+    #[test]
+    fn export_of_a_profile_with_an_unknown_form_carries_no_literal_value() {
+        use datatab_portability::{EncryptionChoice, IncludeExclude};
+
+        let mut unregistered = ConnectionProfile::new("a", DbConfig::default_postgres());
+        unregistered.driver_id = Some("totally-unknown-driver".to_string());
+        let mut without_id = ConnectionProfile::new("b", DbConfig::default_postgres());
+        without_id.driver_id = None;
+        for mut profile in [unregistered, without_id] {
+            profile.value_refs.insert(
+                "password".into(),
+                datatab_core::ValueRef::literal("sentinel-unknown-form-3d71"),
+            );
+            let inputs = ExportInputs {
+                connections_with_values: vec![(profile, FormValues::default())],
+                auth_profiles: vec![],
+                ssh_tunnels: vec![],
+                proxies: vec![],
+            };
+            let graph = build_export_graph(&inputs);
+            let opts = datatab_portability::ExportOptions {
+                include_hooks: false,
+                include_settings_overrides: false,
+                embed_ssh_keys: false,
+                encryption: EncryptionChoice::Plaintext { forced: true },
+                connection_password: IncludeExclude::Include,
+                proxy_credentials: IncludeExclude::Exclude,
+                ssh_password: IncludeExclude::Exclude,
+                auth_modes: Default::default(),
+                per_secret_overrides: Default::default(),
+            };
+            let (bytes, report) = datatab_portability::export::export(
+                &graph,
+                &opts,
+                &AppFieldHintResolver::new(HashMap::new()),
+                &AppExportTransformResolver::new(HashMap::new()),
+                &AppSecretReader::new(make_store_arc(FakeSecretStore::empty())),
+            )
+            .expect("export");
+
+            let text = String::from_utf8(bytes).expect("utf8");
+            assert!(!text.contains("sentinel-unknown-form-3d71"), "{text}");
+            assert_eq!(report.required_ref_count, 1);
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "postgres")]
+    fn export_hint_uses_registered_builtin_when_driver_id_is_none() {
+        use datatab_core::ValueRef;
+        use datatab_portability::{EncryptionChoice, IncludeExclude};
+
+        let driver: Arc<dyn DbDriver> = Arc::new(datatab_driver_postgres::PostgresDriver::new());
+        let drivers = HashMap::from([(driver.metadata().id.to_string(), driver.clone())]);
+        let mut profile = ConnectionProfile::new("builtin", DbConfig::default_postgres());
+        profile.driver_id = None;
+        profile
+            .value_refs
+            .insert("password".into(), ValueRef::literal("literal-secret-433"));
+        profile
+            .value_refs
+            .insert("user".into(), ValueRef::literal("ordinary-user-433"));
+        let mut values = driver.extract_values(&profile.config);
+        values.insert("host".into(), "ordinary-host-433".into());
+        let hints = AppFieldHintResolver::new(drivers.clone());
+        assert_eq!(
+            hints.hint(&profile, "host", &values),
+            ExportFieldHint::Include
+        );
+        assert_eq!(
+            hints.hint(&profile, "password", &values),
+            ExportFieldHint::Secret
+        );
+        let inputs = ExportInputs {
+            connections_with_values: vec![(profile, values)],
+            auth_profiles: vec![],
+            ssh_tunnels: vec![],
+            proxies: vec![],
+        };
+        let graph = build_export_graph(&inputs);
+        let options = datatab_portability::ExportOptions {
+            include_hooks: false,
+            include_settings_overrides: false,
+            embed_ssh_keys: false,
+            encryption: EncryptionChoice::Plaintext { forced: true },
+            connection_password: IncludeExclude::Include,
+            proxy_credentials: IncludeExclude::Exclude,
+            ssh_password: IncludeExclude::Exclude,
+            auth_modes: Default::default(),
+            per_secret_overrides: Default::default(),
+        };
+        let (bytes, report) = datatab_portability::export::export(
+            &graph,
+            &options,
+            &hints,
+            &AppExportTransformResolver::new(drivers),
+            &AppSecretReader::new(make_store_arc(FakeSecretStore::empty())),
+        )
+        .expect("export");
+        assert!(!String::from_utf8_lossy(&bytes).contains("literal-secret-433"));
+        let parsed = datatab_portability::import::parse(&bytes).expect("parse export");
+        let connection = &parsed.bundle.connections[0];
+        assert_eq!(
+            connection.fields.get("host").map(String::as_str),
+            Some("ordinary-host-433")
+        );
+        assert!(!connection.value_refs.contains_key("password"));
+        assert!(connection.value_refs.contains_key("user"));
+        assert_eq!(report.required_ref_count, 1);
+        assert_eq!(connection.required_refs.len(), 1);
+        assert_eq!(connection.required_refs[0].field, "password");
+    }
+
+    #[test]
+    #[cfg(feature = "postgres")]
+    fn external_uri_without_a_registered_driver_exports_only_a_required_ref() {
+        use datatab_portability::{EncryptionChoice, IncludeExclude};
+
+        let driver: Arc<dyn DbDriver> = Arc::new(datatab_driver_postgres::PostgresDriver::new());
+        let drivers = HashMap::from([(driver.metadata().id.to_string(), driver)]);
+        let values = FormValues::from([
+            ("use_uri".into(), "true".into()),
+            (
+                "uri".into(),
+                "postgres://reader:uri-secret-433@localhost/example".into(),
+            ),
+        ]);
+        for driver_id in [None, Some("unregistered".to_string())] {
+            let mut profile = ConnectionProfile::new(
+                "external URI",
+                DbConfig::External {
+                    kind: DbKind::Postgres,
+                    values: values.clone(),
+                },
+            );
+            profile.driver_id = driver_id;
+            let transforms = AppExportTransformResolver::new(drivers.clone());
+            let transform_is_none = matches!(
+                transforms.transform(&profile, "uri", &values),
+                FieldExportTransform::None
+            );
+            let inputs = ExportInputs {
+                connections_with_values: vec![(profile, values.clone())],
+                ..Default::default()
+            };
+            let options = datatab_portability::ExportOptions {
+                include_hooks: false,
+                include_settings_overrides: false,
+                embed_ssh_keys: false,
+                encryption: EncryptionChoice::Plaintext { forced: true },
+                connection_password: IncludeExclude::Include,
+                proxy_credentials: IncludeExclude::Exclude,
+                ssh_password: IncludeExclude::Exclude,
+                auth_modes: Default::default(),
+                per_secret_overrides: Default::default(),
+            };
+            let (bytes, report) = datatab_portability::export::export(
+                &build_export_graph(&inputs),
+                &options,
+                &AppFieldHintResolver::new(drivers.clone()),
+                &transforms,
+                &AppSecretReader::new(make_store_arc(FakeSecretStore::empty())),
+            )
+            .expect("export");
+            let parsed = datatab_portability::import::parse(&bytes).expect("parse export");
+            let connection = &parsed.bundle.connections[0];
+            assert_eq!(
+                (transform_is_none, connection.fields.contains_key("uri")),
+                (true, false),
+                "an unknown external form must not transform or export a URI value"
+            );
+            assert!(!String::from_utf8_lossy(&bytes).contains("uri-secret-433"));
+            assert!(!connection.value_refs.contains_key("uri"));
+            assert_eq!(report.required_ref_count, 2);
+            assert_eq!(connection.required_refs.len(), 2);
+            assert!(
+                connection
+                    .required_refs
+                    .iter()
+                    .any(|reference| reference.field == "uri")
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "postgres")]
+    fn uri_transform_uses_registered_builtin_when_driver_id_is_none() {
+        let driver: Arc<dyn DbDriver> = Arc::new(datatab_driver_postgres::PostgresDriver::new());
+        let drivers = HashMap::from([(driver.metadata().id.to_string(), driver.clone())]);
+        let values = FormValues::from([
+            ("use_uri".into(), "true".into()),
+            (
+                "uri".into(),
+                "postgres://reader:uri-secret-433@localhost/example".into(),
+            ),
+        ]);
+        let config = driver.build_config(&values).expect("URI config");
+        let mut profile = ConnectionProfile::new("builtin URI", config);
+        profile.driver_id = None;
+        let resolver = AppExportTransformResolver::new(drivers);
+
+        let transform = resolver.transform(&profile, "uri", &values);
+
+        let FieldExportTransform::SplitSecret { skeleton, secret } = transform else {
+            panic!("a registered builtin without a stored driver id must split URI credentials");
+        };
+        assert_eq!(skeleton, "postgres://reader:@localhost/example");
+        assert_eq!(secret.expose_secret(), "uri-secret-433");
+        assert!(matches!(
+            resolver.transform(&profile, "host", &values),
+            FieldExportTransform::None
+        ));
     }
 
     #[test]
@@ -1094,6 +1824,10 @@ mod tests {
         /// for tests where the exact ref cannot be known ahead of time (e.g.
         /// a freshly generated connection id).
         fail_all_secrets: bool,
+        /// The secret-kind fields every connection's driver declares.
+        secret_fields: Vec<String>,
+        /// How many value refs each added connection still carried.
+        added_value_ref_counts: Vec<usize>,
     }
 
     impl FakePersistence {
@@ -1106,6 +1840,8 @@ mod tests {
                 conn_names: Vec::new(),
                 secret_outcomes: HashMap::new(),
                 fail_all_secrets: false,
+                secret_fields: Vec::new(),
+                added_value_ref_counts: Vec::new(),
             }
         }
 
@@ -1145,7 +1881,12 @@ mod tests {
                 return ConnectionInsertResult::NeedsDriver;
             }
             self.conn_names.push(profile.name.clone());
+            self.added_value_ref_counts.push(profile.value_refs.len());
             ConnectionInsertResult::Ok
+        }
+
+        fn secret_field_ids(&self, _profile: &ConnectionProfile) -> Vec<String> {
+            self.secret_fields.clone()
         }
 
         fn write_secret(&self, secret_ref: &str, _secret: &SecretString) -> bool {
@@ -1156,6 +1897,15 @@ mod tests {
                 .get(secret_ref)
                 .copied()
                 .unwrap_or(true)
+        }
+
+        fn chosen_auth_profile_values(
+            &mut self,
+            _connection_id: uuid::Uuid,
+            _driver_id: &str,
+            _auth_id: uuid::Uuid,
+        ) -> Option<FormValues> {
+            Some(FormValues::new())
         }
 
         fn hydrate_auth_secret_fields(
@@ -1177,6 +1927,8 @@ mod tests {
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
             value_ref_failures: vec![],
+            chosen_auth_profiles: vec![],
+            connection_field_secrets: vec![],
         }
     }
 
@@ -1190,6 +1942,93 @@ mod tests {
         );
         p.driver_id = Some(driver_id.to_string());
         p
+    }
+
+    /// A secret supplied for a connection's required reference, with the
+    /// default `keyring_secret_field_ids`, goes to the connection password
+    /// slot of an inserted connection and is not written for a skipped one
+    /// (#411 triage round 2, point 3).
+    #[test]
+    fn persist_routes_a_supplied_secret_to_the_password_slot_by_default() {
+        let inserted = make_conn_profile("Inserted", "postgres");
+        let skipped = make_conn_profile("Skipped", "unregistered");
+        let inserted_ref = datatab_core::connection_secret_ref(&inserted.id);
+        let skipped_ref = datatab_core::connection_secret_ref(&skipped.id);
+        // A failing write is recorded, which shows whether it was attempted.
+        let mut deps = FakePersistence::with_drivers(&["postgres"])
+            .with_keyring_failure(&inserted_ref)
+            .with_keyring_failure(&skipped_ref);
+        let mut actions = make_import_actions_empty();
+        actions.connection_field_secrets = vec![
+            (
+                inserted.id,
+                "password".to_string(),
+                SecretString::from("supplied"),
+            ),
+            (
+                skipped.id,
+                "password".to_string(),
+                SecretString::from("supplied"),
+            ),
+        ];
+        actions.connections = vec![inserted, skipped];
+
+        let outcome = persist_import_actions(actions, &mut deps);
+
+        let attempted: Vec<&str> = outcome
+            .secret_failures
+            .iter()
+            .map(|(_, secret_ref)| secret_ref.as_str())
+            .collect();
+        assert_eq!(attempted, [inserted_ref.as_str()]);
+    }
+
+    /// A literal value ref on the password in a bundle is the password: it is
+    /// taken out of the profile and written to the password slot (#415).
+    #[test]
+    fn persist_moves_a_literal_password_ref_to_the_password_slot() {
+        let mut profile = make_conn_profile("Literal", "postgres");
+        profile.value_refs.insert(
+            "password".into(),
+            datatab_core::ValueRef::literal("sentinel"),
+        );
+        profile
+            .value_refs
+            .insert("host".into(), datatab_core::ValueRef::literal("db.example"));
+        let password_ref = datatab_core::connection_secret_ref(&profile.id);
+        let mut deps =
+            FakePersistence::with_drivers(&["postgres"]).with_keyring_failure(&password_ref);
+        deps.secret_fields = vec!["password".to_string()];
+        let mut actions = make_import_actions_empty();
+        actions.connections = vec![profile];
+
+        let outcome = persist_import_actions(actions, &mut deps);
+
+        // The failing write shows the password slot was written.
+        assert_eq!(outcome.secret_failures.len(), 1);
+        assert_eq!(deps.added_value_ref_counts, [1]);
+    }
+
+    /// The user chose not to save the password: the literal is dropped.
+    #[test]
+    fn persist_drops_a_literal_password_ref_when_the_password_is_not_saved() {
+        let mut profile = make_conn_profile("Literal", "postgres");
+        profile.save_password = false;
+        profile.value_refs.insert(
+            "password".into(),
+            datatab_core::ValueRef::literal("sentinel"),
+        );
+        let password_ref = datatab_core::connection_secret_ref(&profile.id);
+        let mut deps =
+            FakePersistence::with_drivers(&["postgres"]).with_keyring_failure(&password_ref);
+        deps.secret_fields = vec!["password".to_string()];
+        let mut actions = make_import_actions_empty();
+        actions.connections = vec![profile];
+
+        let outcome = persist_import_actions(actions, &mut deps);
+
+        assert!(outcome.secret_failures.is_empty());
+        assert_eq!(deps.added_value_ref_counts, [0]);
     }
 
     #[test]
@@ -1246,6 +2085,8 @@ mod tests {
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
             value_ref_failures: vec![],
+            chosen_auth_profiles: vec![],
+            connection_field_secrets: vec![],
         };
 
         let outcome = persist_import_actions(actions, &mut deps);
@@ -1273,6 +2114,8 @@ mod tests {
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
             value_ref_failures: vec![],
+            chosen_auth_profiles: vec![],
+            connection_field_secrets: vec![],
         };
 
         let outcome = persist_import_actions(actions, &mut deps);
@@ -1298,6 +2141,8 @@ mod tests {
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
             value_ref_failures: vec![],
+            chosen_auth_profiles: vec![],
+            connection_field_secrets: vec![],
         };
 
         let outcome = persist_import_actions(actions, &mut deps);
@@ -1324,6 +2169,8 @@ mod tests {
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
             value_ref_failures: vec![],
+            chosen_auth_profiles: vec![],
+            connection_field_secrets: vec![],
         };
 
         let outcome = persist_import_actions(actions, &mut deps);
@@ -1351,6 +2198,8 @@ mod tests {
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
             value_ref_failures: vec![],
+            chosen_auth_profiles: vec![],
+            connection_field_secrets: vec![],
         };
 
         let outcome = persist_import_actions(actions, &mut deps);
@@ -1398,6 +2247,8 @@ mod tests {
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
             value_ref_failures: vec![],
+            chosen_auth_profiles: vec![],
+            connection_field_secrets: vec![],
         };
 
         let outcome = persist_import_actions(actions, &mut deps);
@@ -1440,6 +2291,15 @@ mod tests {
                 true
             }
 
+            fn chosen_auth_profile_values(
+                &mut self,
+                _connection_id: uuid::Uuid,
+                _driver_id: &str,
+                _auth_id: uuid::Uuid,
+            ) -> Option<FormValues> {
+                Some(FormValues::new())
+            }
+
             fn hydrate_auth_secret_fields(
                 &mut self,
                 _auth_id: uuid::Uuid,
@@ -1476,6 +2336,8 @@ mod tests {
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
             value_ref_failures: vec![],
+            chosen_auth_profiles: vec![],
+            connection_field_secrets: vec![],
         };
 
         persist_import_actions(actions, &mut recorder);
@@ -1522,6 +2384,15 @@ mod tests {
             true
         }
 
+        fn chosen_auth_profile_values(
+            &mut self,
+            _connection_id: uuid::Uuid,
+            _driver_id: &str,
+            _auth_id: uuid::Uuid,
+        ) -> Option<FormValues> {
+            Some(FormValues::new())
+        }
+
         fn hydrate_auth_secret_fields(
             &mut self,
             _auth_id: uuid::Uuid,
@@ -1548,6 +2419,8 @@ mod tests {
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
             value_ref_failures: vec![],
+            chosen_auth_profiles: vec![],
+            connection_field_secrets: vec![],
         };
 
         let outcome = persist_import_actions(actions, &mut deps);
@@ -1600,6 +2473,15 @@ mod tests {
             true
         }
 
+        fn chosen_auth_profile_values(
+            &mut self,
+            _connection_id: uuid::Uuid,
+            _driver_id: &str,
+            _auth_id: uuid::Uuid,
+        ) -> Option<FormValues> {
+            Some(FormValues::new())
+        }
+
         fn hydrate_auth_secret_fields(
             &mut self,
             _auth_id: uuid::Uuid,
@@ -1648,6 +2530,8 @@ mod tests {
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
             value_ref_failures: vec![],
+            chosen_auth_profiles: vec![],
+            connection_field_secrets: vec![],
         };
 
         let outcome = persist_import_actions(actions, &mut deps);
@@ -1880,6 +2764,15 @@ mod tests {
             fn write_secret(&self, _: &str, _: &SecretString) -> bool {
                 true
             }
+            fn chosen_auth_profile_values(
+                &mut self,
+                _connection_id: uuid::Uuid,
+                _driver_id: &str,
+                _auth_id: uuid::Uuid,
+            ) -> Option<FormValues> {
+                Some(FormValues::new())
+            }
+
             fn hydrate_auth_secret_fields(
                 &mut self,
                 auth_id: uuid::Uuid,
@@ -1913,6 +2806,8 @@ mod tests {
             kind_failures: vec![],
             unresolved_ref_connections: vec![],
             value_ref_failures: vec![],
+            chosen_auth_profiles: vec![],
+            connection_field_secrets: vec![],
         };
 
         let mut tracker = HydrationTracker {

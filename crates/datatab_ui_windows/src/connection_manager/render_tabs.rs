@@ -26,6 +26,20 @@ use gpui_component::scroll::ScrollableElement;
 use super::navigation::ENVIRONMENT_CHIPS;
 use super::{ActiveTab, ConnectionManagerWindow, EditState, FormFocus, cm_setting_id};
 
+/// Whether the Main tab carries the canonical secret input.
+///
+/// A driver that declares a `password` field in its form always gets it, so an
+/// optional password can be typed; drivers without a password field get the
+/// input only when they say they need one.
+fn shows_secret_input(requires_password: bool, main_tab: &datatab_core::FormTab) -> bool {
+    requires_password
+        || main_tab
+            .sections
+            .iter()
+            .flat_map(|section| section.fields.iter())
+            .any(|field| field.id == "password")
+}
+
 impl ConnectionManagerWindow {
     pub(super) fn render_tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_tab = self.active_tab;
@@ -152,7 +166,11 @@ impl ConnectionManagerWindow {
             .find(|f| f.id == "password")
             .and_then(|f| f.help.clone());
 
-        let mut password_field = requires_password.then(|| {
+        // The secret input is drawn when the driver needs a password to
+        // connect, and also when its form declares a password field the user
+        // may fill in: a driver whose password is optional (a cluster that
+        // allows anonymous access) still has to offer the input.
+        let mut password_field = shows_secret_input(requires_password, &main_tab).then(|| {
             let secret_label = self.secret_field_label(cx);
 
             self.render_password_field(
@@ -1395,6 +1413,41 @@ impl ConnectionManagerWindow {
 
 // The `file_picker_label` helper and its tests moved to
 // `datatab_components::primitives::file_picker` together with the `FilePicker`
+
+#[cfg(test)]
+mod secret_input_tests {
+    use super::shows_secret_input;
+    use datatab_core::{FormFieldKind, FormSection, FormTab, field};
+
+    fn tab_with(fields: Vec<datatab_core::FormFieldDef>) -> FormTab {
+        FormTab {
+            id: "main".into(),
+            label: "Main".into(),
+            sections: vec![FormSection {
+                title: "Connection".into(),
+                icon: None,
+                fields,
+            }],
+        }
+    }
+
+    #[test]
+    fn a_declared_password_field_draws_the_secret_input_even_when_it_is_optional() {
+        let tab = tab_with(vec![
+            field("host", "Host", FormFieldKind::Text, ""),
+            field("password", "Password", FormFieldKind::Password, ""),
+        ]);
+        assert!(shows_secret_input(false, &tab));
+        assert!(shows_secret_input(true, &tab));
+    }
+
+    #[test]
+    fn a_driver_without_a_password_field_follows_requires_password() {
+        let tab = tab_with(vec![field("path", "Path", FormFieldKind::Text, "")]);
+        assert!(shows_secret_input(true, &tab));
+        assert!(!shows_secret_input(false, &tab));
+    }
+}
 
 #[cfg(test)]
 mod connection_overrides_i18n_tests {

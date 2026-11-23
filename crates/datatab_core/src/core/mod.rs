@@ -10,8 +10,10 @@ pub(crate) mod value;
 
 pub use error::{DbError, TransactionStateNote};
 pub use error_formatter::{
-    ConnectionErrorFormatter, DefaultErrorFormatter, ErrorLocation, FormattedError,
-    QueryErrorFormatter, redact_uri_credentials, sanitize_uri,
+    ConnectionErrorFormatter, DefaultErrorFormatter, ErrorLocation, ErrorPosition, FormattedError,
+    LIBPQ_PUBLIC_KEYS, LIBPQ_SECRET_KEYS, QueryErrorFormatter, is_libpq_public_key,
+    libpq_value_end, redact_libpq_secret_values, redact_uri_credentials, redact_userinfo_passwords,
+    sanitize_uri,
 };
 pub use execution_session::ExecutionSessionScope;
 pub use log_err::LogErr;

@@ -11,7 +11,7 @@ use std::rc::Rc;
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Bounds, Context, Hsla, PathBuilder, Pixels, Point, Render, ShapedLine,
-    SharedString, TextRun, Window, canvas, div, fill, font, point,
+    SharedString, TextRun, Window, canvas, div, fill, point,
 };
 use gpui_component::ActiveTheme;
 
@@ -1473,7 +1473,7 @@ impl Render for ChartView {
 
         // Resolve per-theme chrome colors for the readout overlay.
         let readout_colors = ChartColors::for_current(cx);
-        let readout_family = crate::fonts::editor_family(cx);
+        let readout_font = crate::fonts::editor_font(cx);
 
         let plot_bounds_for_hover = plot_bounds_rc.clone();
 
@@ -1548,7 +1548,7 @@ impl Render for ChartView {
 
                                 let theme = cx.theme();
                                 let tick_color = theme.muted_foreground;
-                                let tick_font = font(crate::fonts::editor_family(cx));
+                                let tick_font = crate::fonts::editor_font(cx);
                                 let tick_size = gpui::px(10.5);
                                 let line_height = gpui::px(13.0);
                                 let gridline_color = theme.border;
@@ -1684,7 +1684,7 @@ impl Render for ChartView {
                         .size_full()
                     })
                     .when_some(readout, |container, r| {
-                        container.child(readout_overlay(r, readout_colors, readout_family))
+                        container.child(readout_overlay(r, readout_colors, readout_font))
                     }),
             )
             // Legend row (below canvas)
@@ -3284,8 +3284,9 @@ pub use bolt::chart::format::{format_x_value, format_x_value_in, format_y_value}
 /// Build the absolute-positioned overlay div that shows the multi-series readout.
 ///
 /// `colors` is derived from `ChartColors::for_current(cx)` at the render call site
-/// so the overlay matches the active theme.
-fn readout_overlay(r: HoverReadout, colors: ChartColors, family: SharedString) -> impl IntoElement {
+/// so the overlay matches the active theme. `font` is the resolved data font, so
+/// a Thai series name in the readout finds its glyphs in the bundled face.
+fn readout_overlay(r: HoverReadout, colors: ChartColors, font: gpui::Font) -> impl IntoElement {
     const PANEL_MIN_WIDTH: f32 = 200.0;
     const PANEL_GAP: f32 = 12.0;
 
@@ -3311,7 +3312,7 @@ fn readout_overlay(r: HoverReadout, colors: ChartColors, family: SharedString) -
         .gap(gpui::px(5.0))
         .px(gpui::px(12.0))
         .py(gpui::px(10.0))
-        .font_family(family)
+        .font(font)
         .text_size(gpui::px(12.0))
         .overflow_hidden()
         // P1Chart tooltip: the input cut on the raised fill with the strong

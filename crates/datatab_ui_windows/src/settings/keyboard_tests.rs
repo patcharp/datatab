@@ -552,8 +552,7 @@ fn keybindings_keys_open_the_context_filter_and_reset_everything(cx: &mut TestAp
     );
 }
 
-/// The About page has one link, Report a bug. J, K and Tab have nowhere else to
-/// go, and Enter opens a mail to the contact address.
+/// Navigation returns to Report a bug and Enter opens the contact address.
 #[gpui::test]
 fn about_report_bug_opens_the_contact_address(cx: &mut TestAppContext) {
     let (settings, window) = open_settings(cx, SettingsSectionId::About);
@@ -564,6 +563,26 @@ fn about_report_bug_opens_the_contact_address(cx: &mut TestAppContext) {
 
     window.simulate_keystrokes("enter");
     assert_eq!(window.opened_url().as_deref(), Some("mailto:me@pcplab.me"));
+}
+
+#[gpui::test]
+fn about_view_source_is_keyboard_reachable(cx: &mut TestAppContext) {
+    use datatab_components::accessibility::{FrameCapture, accessible_name};
+
+    let (settings, window) = open_settings(cx, SettingsSectionId::About);
+    let capture = FrameCapture::observe(window);
+    assert_eq!(
+        accessible_name(&capture.frame(window), "about-link-source"),
+        Some("View source".into()),
+    );
+    focus_content(&settings, window);
+    window.simulate_keystrokes("tab");
+    assert_eq!(window.opened_url(), None);
+    window.simulate_keystrokes("enter");
+    assert_eq!(
+        window.opened_url().as_deref(),
+        Some("https://github.com/patcharp/datatab")
+    );
 }
 
 /// TRADEMARK.md asks a modified build to say it is derived and unofficial. The

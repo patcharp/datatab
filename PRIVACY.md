@@ -11,8 +11,10 @@ in practice.
 
 1. The application sends data only to the database servers you configure, and
    only what is needed to run the queries you ask for.
-2. There is no telemetry, no crash reporting, no usage analytics, and no
-   account. Nothing phones home.
+2. There is no telemetry, no usage analytics, and no account. The one message
+   that can reach us is a crash or error report, and only by hand: the app shows
+   you every byte first and sends nothing until you press **Send**. See
+   [Crash and error reports](#crash-and-error-reports).
 3. The website and documentation are static pages. They set no cookies, load
    no third-party script, and keep no record of individual visitors.
 
@@ -20,9 +22,9 @@ in practice.
 
 | Question | Answer |
 |----------|--------|
-| Does DataTab send usage data anywhere? | No. There is no telemetry and no crash reporter. |
+| Does DataTab send usage data anywhere? | No. There is no telemetry and no usage analytics. A crash or error report is sent only when you press **Send** in its window, one report at a time. |
 | Does it check for updates? | No. |
-| What network connections does it open? | Only the ones you configure: database servers, SSH tunnels, proxies, and cloud APIs for the drivers you use. |
+| What network connections does it open? | Only the ones you configure: database servers, SSH tunnels, proxies, and cloud APIs for the drivers you use. A report you send yourself goes to `reports.datatab.pcplab.me` over HTTPS, and nothing else does. |
 | Where does my data live? | On your machine, in one SQLite file plus the operating system keyring for secrets. |
 | Does it keep a record of what I do? | Only the audit log, on your machine. It records connections, queries, and hook runs so you can review them, and it never leaves the computer it was written on. |
 | Is anything shared with the project? | No. Bug reports and logs reach the project only when you send them yourself. |
@@ -30,6 +32,74 @@ in practice.
 Connections to a database, an SSH host, a proxy, or a cloud provider go
 directly from your machine to the server you named. The project operates none
 of those servers and has no visibility into that traffic.
+
+## Crash and error reports
+
+When DataTab panics, or an operation fails in a way it reports, it can offer you
+a report. Nothing leaves your machine until you press **Send**, one report at a
+time, and you can always decline.
+
+### What you see first
+
+The window shows the exact bytes that will be sent, so you can read the report
+before deciding. **Don't send** is the default button. **Save as file** writes the
+same bytes to a file you choose and sends nothing. Declining keeps the report on
+your machine and the app does not ask you about it again.
+
+A waiting report lives in the app's data folder, next to the database file, and
+at most five are kept. You can review them, send them or decline them in
+**Settings → About**; declining marks the report decided and leaves the file on
+disk.
+
+### What a report holds
+
+| Field | Value |
+|-------|-------|
+| Report id | A random identifier, new for each report |
+| Schema | The report format's version, `1` |
+| Kind | Panic or error |
+| App version and channel | The version you run, and whether it is stable, RC or Nightly |
+| System | Your operating system's name, version where the platform reports one, and architecture |
+| Time | The UTC hour the report was created, rounded down |
+| Error | The kind and severity; the driver id and the server's error code when there is one |
+| Panic message | Only when it is fixed text written into DataTab's own source; a formatted message is replaced with a note that text was dropped |
+| Location | The `file:line` of the panic, shortened: a path inside DataTab's source keeps `crates/…`, a dependency keeps its crate folder, and anything else reads `<external>` |
+| Frames | Up to 64 stack frames: function name when it can be read, source file name without its folder, and an offset |
+| Recent activity | The last 10 audit events, as category, action, outcome, driver id and seconds before the report — never query text or data |
+
+A report is at most 64 KiB, and unknown fields are refused by the receiver.
+
+### What a report never holds
+
+No query text, no rows or values you looked at, no table or column names, no
+connection strings, no passwords or other secrets, no file paths outside the
+shortened source location, and no host names or addresses it can recognise, nor
+email addresses. The values above pass through a scrubber that drops anything
+that looks like a credential, a host with a port, a path, an address or an email
+before the report is written.
+
+### Where it goes, and for how long
+
+A report you send goes over HTTPS to `reports.datatab.pcplab.me`, a service the
+project runs. It is kept for 90 days and then deleted automatically. Only the
+project's maintainer reads reports. To have one deleted sooner, use Settings →
+About and choose Delete from the server, which also works while reports are
+off; if the report no longer has its delete token — for instance one sent
+before DataTab kept tokens — write to `me@pcplab.me` with its report id.
+
+### Turning it off
+
+Any one of these is enough, and none of them can turn reports back on:
+
+| Source | Value |
+|--------|-------|
+| Setting | **General → Offer to send a report**, off |
+| Environment variable | `DATATAB_DISABLE_ERROR_REPORTS` set to anything other than empty, `0`, `false`, `no` or `off` |
+| Managed file | An empty `error-reports-disabled` file in the app's data folder, `/etc/datatab/` on Linux, `%ProgramData%\DataTab\` on Windows, or `/Library/Application Support/DataTab/` on macOS |
+
+With reports off, the app shows no Send button and sends nothing. A panic still
+writes its report to the data folder, where the app keeps it and never offers
+it while reports are off.
 
 [Your data on this machine](#your-data-on-this-machine) documents the files
 DataTab writes, what the audit log records, how secrets are stored, and how to

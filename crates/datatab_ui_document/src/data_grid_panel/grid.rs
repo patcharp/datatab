@@ -289,6 +289,9 @@ impl DataGridPanel {
         );
         let document_presentation = self.document_presentation();
         let enum_options = enum_options_for_result(&self.result, column_details.as_deref());
+        // The table state's header offers sorting on every surface; this is
+        // the one place that says when the rows' source cannot sort.
+        let sort_unavailable = self.table_sort_unavailable(cx);
 
         if let Some(table_state) = self.grid_table.table_state.clone() {
             // A reload reuses the state entity, so column widths, sort, scroll
@@ -323,6 +326,7 @@ impl DataGridPanel {
                 state.set_fk_columns(fk_indices);
                 state.set_readonly_columns(readonly_indices);
                 state.set_document_presentation(document_presentation, cx);
+                state.set_sort_blocked(sort_unavailable.clone());
 
                 for (col_ix, options) in enum_options {
                     state.set_enum_options(col_ix, options);
@@ -356,6 +360,7 @@ impl DataGridPanel {
             state.set_reference_row(read_only_keys);
             state.set_insertable(is_insertable);
             state.set_document_presentation(document_presentation, cx);
+            state.set_sort_blocked(sort_unavailable.clone());
 
             if !fk_indices.is_empty() {
                 state.set_fk_columns(fk_indices);

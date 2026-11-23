@@ -36,6 +36,15 @@ impl ReleaseChannel {
         }
     }
 
+    /// Stable name of the channel, as a report and a log line carry it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Rc => "rc",
+            Self::Nightly => "nightly",
+        }
+    }
+
     /// Platform application identifier (GPUI `app_id`: Wayland app id / X11
     /// `WM_CLASS`). Nightly gets a distinct id so it coexists with stable
     /// instead of sharing its taskbar entry and icon association.
@@ -144,6 +153,13 @@ mod tests {
             nightly.db_file_name(),
             ReleaseChannel::Stable.db_file_name()
         );
+    }
+
+    #[test]
+    fn channel_names_are_stable_strings() {
+        assert_eq!(ReleaseChannel::Stable.as_str(), "stable");
+        assert_eq!(ReleaseChannel::Rc.as_str(), "rc");
+        assert_eq!(ReleaseChannel::Nightly.as_str(), "nightly");
     }
 
     #[test]

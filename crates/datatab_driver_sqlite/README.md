@@ -10,6 +10,7 @@ Embedded file-based database.
 
 ## Features
 
+- Bulk schema column reads use one catalog query without a table-count parameter limit.
 - Embedded SQLite relational driver using file-based database paths.
 - Native console (`NATIVE_CONSOLE`): tables dock a console, and a database's sidebar menu opens one in its own tab, that runs one SQL statement line at a time through `Connection::execute` with the editor's validation, dangerous-query confirmation, audit rows and query history. The driver enforces `QueryRequest::limit` (`REQUEST_ROW_LIMIT`), so console commands carry the editor row limit.
 - Supports SQL execution, schema discovery, views, indexes, foreign keys, check constraints, and unique constraints.

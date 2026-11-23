@@ -144,6 +144,7 @@ impl GeneralSection {
             GeneralFormRow::ObjectPreviewLimit,
             GeneralFormRow::KeyValueSizeLimit,
             GeneralFormRow::ToastTimeout,
+            GeneralFormRow::SendErrorReports,
         ];
 
         // The shared-database toggle only makes sense on nightly, which is the
@@ -316,6 +317,10 @@ impl GeneralSection {
             Some(GeneralFormRow::ToastTimeout) => {
                 self.dropdown_toast_timeout
                     .update(cx, |dropdown, cx| dropdown.toggle_open(cx));
+                cx.notify();
+            }
+            Some(GeneralFormRow::SendErrorReports) => {
+                self.gen_settings.send_error_reports = !self.gen_settings.send_error_reports;
                 cx.notify();
             }
             Some(GeneralFormRow::PauseRefreshOnError) => {
@@ -1253,6 +1258,15 @@ impl GeneralSection {
                 Some(datatab_i18n::t!("settings.general.toast_timeout.hint")),
                 self.dropdown_toast_timeout.clone(),
                 GeneralFormRow::ToastTimeout,
+                cx,
+            ))
+            .child(self.render_gen_checkbox(
+                "offer-error-reports",
+                datatab_i18n::t!("settings.general.send_error_reports.label"),
+                Some(datatab_i18n::t!("settings.general.send_error_reports.hint")),
+                self.gen_settings.send_error_reports,
+                GeneralFormRow::SendErrorReports,
+                |this, value, _cx| this.gen_settings.send_error_reports = value,
                 cx,
             ));
 

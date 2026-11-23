@@ -18,6 +18,9 @@ datatab_i18n.workspace = true
 datatab_ui_base.workspace = true
 datatab_ui_document.workspace = true
 datatab_ui_windows.workspace = true
+# The send window shows and posts the report itself: it needs the report type
+# that holds the exact bytes, not a copy of it (ADR 0008 § 2).
+datatab_diagnostics.workspace = true
 datatab_ui_sidebar.workspace = true
 datatab_core.workspace = true
 datatab_storage.workspace = true
@@ -50,8 +53,12 @@ vendored-openssl = ["datatab_ssh/vendored-openssl"]
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+tempfile = "3"
 datatab_ui_base = { workspace = true, features = ["test-support"] }
 datatab_ui_document = { workspace = true, features = ["test-support"] }
+# The accessibility checks the send window's tests read live behind this
+# feature, the same gate the other UI crates use.
+datatab_components = { workspace = true, features = ["test-support"] }
 parquet.workspace = true
 arrow-array.workspace = true
 arrow-schema.workspace = true

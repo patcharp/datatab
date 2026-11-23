@@ -36,8 +36,12 @@ fn broken_value_ref_export_refuses_before_reading_or_writing(cx: &mut TestAppCon
         "password".into(),
         datatab_core::ValueRef::dotenv("unused", "PASSWORD"),
     );
-    datatab_app::config_loader::save_profiles(&runtime, std::slice::from_ref(&profile))
-        .expect("save");
+    datatab_app::config_loader::save_profiles(
+        &runtime,
+        std::slice::from_ref(&profile),
+        &std::collections::HashSet::new(),
+    )
+    .expect("save");
     runtime
         .open_datatab_db()
         .expect("db")

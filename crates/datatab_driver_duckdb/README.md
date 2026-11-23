@@ -20,6 +20,10 @@ Embedded analytical database, with optional DuckLake catalogs.
 
 ## Features
 
+- Schema diff generates whole-table CREATE and DROP statements.
+
+- Bulk schema column reads use one catalog query per schema, including primary-key membership.
+
 - Bundled DuckDB engine with the Parquet and JSON extensions built in; other
   extensions (`ducklake`, `httpfs`, `postgres`, ...) install on demand.
 - DuckLake: the catalog is attached with `ATTACH IF NOT EXISTS 'ducklake:...'`
@@ -58,6 +62,8 @@ Embedded analytical database, with optional DuckLake catalogs.
   audit log. See [Columns and Partitions](../../docs/TABLE_VIEWS.md).
 
 ## Limitations
+
+- Schema-diff CREATE refuses foreign keys and other constraints that its generator cannot include, naming the constraint.
 
 - Read-only enforcement (MCP reads, editor auto-refresh) accepts SELECT
   statements only, checked with DuckDB's own parser, and runs them in a

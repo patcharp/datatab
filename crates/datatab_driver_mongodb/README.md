@@ -40,16 +40,16 @@ MongoDB document driver for DataTab.
 
 Exposes a curated set of live server metrics sourced from the MongoDB `serverStatus` command. Metrics are extracted via BSON dotted-path traversal:
 
-- `mongo.connections_current` — current open connections
-- `mongo.connections_available` — available connection slots
-- `mongo.opcounters_insert` — insert operations since startup
-- `mongo.opcounters_query` — query operations since startup
-- `mongo.opcounters_update` — update operations since startup
-- `mongo.opcounters_delete` — delete operations since startup
-- `mongo.opcounters_getmore` — getMore operations since startup
-- `mongo.mem_resident` — resident memory in MB
-- `mongo.mem_virtual` — virtual memory in MB
-- `mongo.network_bytes_in` — bytes received since startup
+- `mongo.opcounters.query` — queries per second (counter)
+- `mongo.opcounters.insert` — inserts per second (counter)
+- `mongo.opcounters.update` — updates per second (counter)
+- `mongo.opcounters.delete` — deletes per second (counter)
+- `mongo.connections.current` — current open connections
+- `mongo.connections.available` — available connection slots
+- `mongo.mem.resident` — resident memory in bytes (`serverStatus` reports MB; the driver scales it)
+- `mongo.global_lock.queue` — operations queued on the global lock
+- `mongo.wt.cache_bytes` — bytes currently in the WiredTiger cache
+- `mongo.wt.pages_evicted` — WiredTiger unmodified pages evicted per second (counter)
 
 Each metric is returned as a single `(timestamp_ms, value)` row for live charting.
 

@@ -19,6 +19,11 @@ pub struct FormattedError {
     /// Location information if available.
     pub location: Option<ErrorLocation>,
 
+    /// Where in the submitted statement the error points, when the driver can
+    /// say. Left at `None` by a driver that reports no position, and the
+    /// editor then leaves the cursor where it is.
+    pub position: Option<ErrorPosition>,
+
     /// Whether the error is retriable (e.g., transient network issues).
     pub retriable: bool,
 }
@@ -48,6 +53,11 @@ impl FormattedError {
 
     pub fn with_location(mut self, location: ErrorLocation) -> Self {
         self.location = Some(location);
+        self
+    }
+
+    pub fn with_position(mut self, position: ErrorPosition) -> Self {
+        self.position = Some(position);
         self
     }
 
@@ -139,6 +149,85 @@ impl From<String> for FormattedError {
 impl From<&str> for FormattedError {
     fn from(message: &str) -> Self {
         Self::new(message)
+    }
+}
+
+/// Where in the submitted statement an error points, as far as the driver can
+/// say.
+///
+/// The two fields are independent and optional: a driver fills the one its
+/// engine reports and leaves the other at `None`. All `None` means "this
+/// driver did not say", which is not the same as "the error is at the start".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ErrorPosition {
+    /// Offset of the failing character from the start of the submitted
+    /// statement, counted in Unicode scalar values rather than bytes, so it
+    /// means the same on every engine.
+    pub character_offset: Option<usize>,
+
+    /// Line of the failing text in the submitted statement, 1-based, for a
+    /// server that reports a line without an offset.
+    pub line: Option<u32>,
+}
+
+impl ErrorPosition {
+    /// A position from a server that counts the first character of the
+    /// statement as 1, the way PostgreSQL's and Redshift's `position` field
+    /// does. This is the one place that removes the leading one.
+    ///
+    /// A server that sends 0 has no position to report, so the result carries
+    /// no offset.
+    pub fn from_one_based_character(one_based: u32) -> Self {
+        Self {
+            character_offset: one_based.checked_sub(1).map(|offset| offset as usize),
+            line: None,
+        }
+    }
+
+    /// A position from a 0-based byte offset into `statement`, the way SQLite
+    /// counts `sqlite3_error_offset`. The byte offset becomes a character
+    /// offset here, against the same statement text, and is clamped to it, so
+    /// a number that points outside the statement cannot panic a caller.
+    pub fn from_byte_offset(statement: &str, byte_offset: usize) -> Self {
+        let mut byte = byte_offset.min(statement.len());
+        while !statement.is_char_boundary(byte) {
+            byte -= 1;
+        }
+        Self {
+            character_offset: Some(statement[..byte].chars().count()),
+            line: None,
+        }
+    }
+
+    /// A position from a 1-based line alone, the way MySQL states a syntax
+    /// error. A line of 0 has nothing to report.
+    pub fn from_line(line: u32) -> Self {
+        Self {
+            character_offset: None,
+            line: (line > 0).then_some(line),
+        }
+    }
+
+    /// Resolves this position against the statement the driver ran into a
+    /// 0-based character offset into it.
+    ///
+    /// An offset wins over a line, since it is the more precise of the two.
+    /// Either is clamped to the statement, so a position past its end lands on
+    /// the end rather than nowhere. `None` when neither field is known.
+    pub fn resolve_character_offset(&self, statement: &str) -> Option<usize> {
+        if let Some(offset) = self.character_offset {
+            return Some(offset.min(statement.chars().count()));
+        }
+
+        let line = self.line?;
+        let mut line_start = 0;
+        for _ in 1..line {
+            match statement[line_start..].find('\n') {
+                Some(newline) => line_start += newline + 1,
+                None => return Some(statement.chars().count()),
+            }
+        }
+        Some(statement[..line_start].chars().count())
     }
 }
 
@@ -332,7 +421,220 @@ const SENSITIVE_URI_PARAMETERS: &[&str] = &[
     "session_token",
     "x-amz-security-token",
     "x-amz-signature",
+    "sslpassword",
+    "oauth_client_secret",
+    "scram_client_key",
+    "scram_server_key",
 ];
+
+/// libpq keys whose value is itself a secret. Every key is also in
+/// `SENSITIVE_URI_PARAMETERS`; a test guards that. The masking pass does not
+/// read this list: it masks every key that is not in `LIBPQ_PUBLIC_KEYS`.
+pub const LIBPQ_SECRET_KEYS: [&str; 5] = [
+    "password",
+    "sslpassword",
+    "oauth_client_secret",
+    "scram_client_key",
+    "scram_server_key",
+];
+
+/// libpq connection parameters whose value is safe to show in an error or a
+/// log line (host names, ports, modes, file paths). A secret key never belongs
+/// here; a test checks that the two lists do not overlap.
+pub const LIBPQ_PUBLIC_KEYS: [&str; 44] = [
+    "host",
+    "hostaddr",
+    "port",
+    "dbname",
+    "user",
+    "passfile",
+    "connect_timeout",
+    "client_encoding",
+    "application_name",
+    "fallback_application_name",
+    "keepalives",
+    "keepalives_idle",
+    "keepalives_interval",
+    "keepalives_count",
+    "keepalives_retries",
+    "tcp_user_timeout",
+    "sslmode",
+    "sslnegotiation",
+    "sslcompression",
+    "sslcert",
+    "sslkey",
+    "sslkeylogfile",
+    "sslrootcert",
+    "sslcrl",
+    "sslcrldir",
+    "sslsni",
+    "requirepeer",
+    "ssl_min_protocol_version",
+    "ssl_max_protocol_version",
+    "krbsrvname",
+    "gsslib",
+    "gssencmode",
+    "gssdelegation",
+    "channel_binding",
+    "require_auth",
+    "service",
+    "target_session_attrs",
+    "load_balance_hosts",
+    "replication",
+    "oauth_issuer",
+    "oauth_client_id",
+    "oauth_scope",
+    "min_protocol_version",
+    "max_protocol_version",
+];
+
+/// Masks the password of the userinfo of every `scheme://` in `text`, before
+/// any other pass can change where the userinfo ends.
+///
+/// The userinfo runs from after `://` to the LAST `@` before the next
+/// whitespace (or the end of the text), and everything after its first `:`
+/// becomes `replacement`. `;`, `&`, `=` and `?` are legal inside a password and
+/// do not end it. When a `/`, `?` or `#` comes before that `@`, the `@` may
+/// belong to the path or the query, so everything after the first `:` up to the
+/// whitespace is masked, the host included. It masks too much; it never shows
+/// part of a password. A userinfo without `:` is left as it is.
+pub fn redact_userinfo_passwords(text: &str, replacement: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+
+    while let Some(offset) = text[cursor..].find("://") {
+        let start = cursor + offset + 3;
+        let end = text[start..]
+            .find(char::is_whitespace)
+            .map_or(text.len(), |length| start + length);
+        let userinfo_end = text[start..end].rfind('@').map(|at| start + at);
+        let colon = userinfo_end.and_then(|at| text[start..at].find(':').map(|c| start + c));
+
+        let (Some(at), Some(colon)) = (userinfo_end, colon) else {
+            output.push_str(&text[cursor..start]);
+            cursor = start;
+            continue;
+        };
+        output.push_str(&text[cursor..=colon]);
+        output.push_str(replacement);
+        // An `@` after a `/`, `?` or `#` may sit in the path or the query, so
+        // the real userinfo end is unknown: mask to the end of the token.
+        let may_be_path = text[start..at].contains(['/', '?', '#']);
+        cursor = if may_be_path { end } else { at };
+    }
+
+    output.push_str(&text[cursor..]);
+    output
+}
+
+/// Whether `key` is a libpq parameter whose value may be shown, compared
+/// case-insensitively. Every other key, a misspelled one included, is masked.
+pub fn is_libpq_public_key(key: &str) -> bool {
+    LIBPQ_PUBLIC_KEYS
+        .iter()
+        .any(|public_key| key.eq_ignore_ascii_case(public_key))
+}
+
+/// Byte length of the libpq keyword value at the start of `input`.
+///
+/// A value that starts with `'` runs to its closing unescaped `'`. An unquoted
+/// value ends only at whitespace or the end of the text. A backslash escapes
+/// the next character in both forms. `;`, `&` and `'` are legal inside a
+/// password, so they never end an unquoted value.
+pub fn libpq_value_end(input: &str) -> usize {
+    libpq_value_scan(input).0
+}
+
+/// Like `libpq_value_end`, and whether a quoted value ended at its own
+/// unescaped closing `'`. An unquoted or unclosed value reports `false`.
+fn libpq_value_scan(input: &str) -> (usize, bool) {
+    let quoted = input.starts_with('\'');
+    let mut escaped = false;
+    for (offset, character) in input.char_indices().skip(usize::from(quoted)) {
+        if escaped {
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if quoted && character == '\'' {
+            return (offset + character.len_utf8(), true);
+        } else if !quoted && character.is_whitespace() {
+            return (offset, false);
+        }
+    }
+    (input.len(), false)
+}
+
+/// Masks every value in `text` that is not provably public. It is fail-closed.
+///
+/// A key is the whole run of characters before an `=` (spaces around the `=`
+/// are allowed), back to the nearest delimiter: whitespace, `?`, `&`, `;`, `'`,
+/// `"` or the start of the text. Its characters do not matter. It is compared
+/// case-insensitively with `LIBPQ_PUBLIC_KEYS`.
+///
+/// A value is shown only when its key is public and the value holds no `=`. A
+/// quoted value runs to its closing unescaped `'`; any other value runs to
+/// whitespace or the end of the text (`;`, `&` and `'` are legal inside a
+/// password). Every other value is replaced up to that end, and the quotes of a
+/// quoted value stay. So `?sslmode=require&password=x` becomes `?sslmode=***`:
+/// the pass masks too much rather than too little.
+///
+/// Run it on the original text, before `sanitize_uri`: nothing is skipped
+/// because it looks masked.
+pub fn redact_libpq_secret_values(text: &str, replacement: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let mut index = 0;
+
+    while index < text.len() {
+        let Some(character) = text[index..].chars().next() else {
+            break;
+        };
+        if is_key_delimiter(character) {
+            index += character.len_utf8();
+            continue;
+        }
+        let key_end = text[index..]
+            .find(|c: char| is_key_delimiter(c) || c == '=')
+            .map_or(text.len(), |length| index + length);
+        let Some(after_equals) = text[key_end..].trim_start().strip_prefix('=') else {
+            index = key_end.max(index + character.len_utf8());
+            continue;
+        };
+        let value_start = text.len() - after_equals.trim_start().len();
+        let (inner_start, inner_end, value_end) = value_bounds(text, value_start);
+        let shown = is_libpq_public_key(&text[index..key_end])
+            && !text[inner_start..inner_end].contains('=');
+        if !shown && inner_end > inner_start {
+            output.push_str(&text[cursor..inner_start]);
+            output.push_str(replacement);
+            cursor = inner_end;
+        }
+        index = value_end.max(value_start);
+    }
+
+    output.push_str(&text[cursor..]);
+    output
+}
+
+fn is_key_delimiter(character: char) -> bool {
+    character.is_whitespace() || matches!(character, '?' | '&' | ';' | '\'' | '"')
+}
+
+/// For the value that starts at `value_start`: the byte range of its content
+/// (inside the quotes of a quoted value) and the byte offset where it ends.
+fn value_bounds(text: &str, value_start: usize) -> (usize, usize, usize) {
+    let rest = &text[value_start..];
+    let (length, closed) = libpq_value_scan(rest);
+    let value_end = value_start + length;
+    if !rest.starts_with('\'') {
+        return (value_start, value_end, value_end);
+    }
+    (
+        value_start + 1,
+        if closed { value_end - 1 } else { value_end },
+        value_end,
+    )
+}
 
 /// Redacts credentials from every URL embedded in `text`, whatever its scheme.
 ///
@@ -610,6 +912,291 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_uri_masks_each_libpq_secret_query_key() {
+        for key in [
+            "sslpassword",
+            "oauth_client_secret",
+            "scram_client_key",
+            "scram_server_key",
+        ] {
+            let output = sanitize_uri(&format!(
+                "postgresql://db.example.com/db?{key}=hunter2&sslmode=require"
+            ));
+            assert!(!output.contains("hunter2"), "{key}: {output}");
+            assert_eq!(
+                output,
+                format!("postgresql://db.example.com/db?{key}=***&sslmode=require")
+            );
+        }
+    }
+
+    #[test]
+    fn uri_parameter_list_covers_every_libpq_secret_key() {
+        for key in LIBPQ_SECRET_KEYS {
+            assert!(
+                SENSITIVE_URI_PARAMETERS.contains(&key),
+                "{key} is missing from SENSITIVE_URI_PARAMETERS"
+            );
+        }
+    }
+
+    fn libpq(text: &str) -> String {
+        sanitize_uri(&redact_libpq_secret_values(text, "***"))
+    }
+
+    fn assert_hides(input: &str, secrets: &[&str]) -> String {
+        let output = libpq(input);
+        for secret in secrets {
+            assert!(
+                !output.contains(secret),
+                "{secret:?} shown in {output:?} for {input:?}"
+            );
+        }
+        output
+    }
+
+    #[test]
+    fn libpq_pass_masks_an_escaped_final_apostrophe_of_an_unclosed_value() {
+        assert_eq!(
+            assert_hides("postgresql://db.example.com/db?x='alpha\\'", &["alpha"]),
+            "postgresql://db.example.com/db?x='***"
+        );
+        assert_eq!(
+            assert_hides("host=db.example.com x='alpha\\'", &["alpha"]),
+            "host=db.example.com x='***"
+        );
+        assert_eq!(libpq("host=h x='alpha'"), "host=h x='***'");
+    }
+
+    #[test]
+    fn libpq_pass_masks_a_quoted_key() {
+        assert_eq!(
+            assert_hides("host=h 'password=hunter2'", &["hunter2"]),
+            "host=h 'password=***"
+        );
+        assert_hides("host=h 'sslpassword=hunter2'", &["hunter2"]);
+    }
+
+    #[test]
+    fn libpq_pass_masks_a_semicolon_separated_string() {
+        assert_eq!(
+            assert_hides("host=h;password=hunter2", &["hunter2"]),
+            "host=***"
+        );
+        assert_hides("host=h;sslpassword=hunter2", &["hunter2"]);
+    }
+
+    #[test]
+    fn libpq_pass_masks_keyword_text_after_a_url() {
+        assert_eq!(
+            assert_hides(
+                "postgresql://db.example.com/db password=hunter2",
+                &["hunter2"]
+            ),
+            "postgresql://db.example.com/db password=***"
+        );
+        assert_hides(
+            "postgresql://db.example.com/db sslpassword=hunter2",
+            &["hunter2"],
+        );
+    }
+
+    #[test]
+    fn libpq_pass_masks_oauth_and_scram_keys_and_spaces_around_equals() {
+        for key in [
+            "oauth_client_secret",
+            "scram_client_key",
+            "scram_server_key",
+            "SSLPassword",
+        ] {
+            assert_hides(&format!("host=h {key}=hunter2"), &["hunter2"]);
+            assert_hides(&format!("host=h {key} = hunter2"), &["hunter2"]);
+        }
+    }
+
+    #[test]
+    fn libpq_pass_masks_secrets_with_value_characters() {
+        assert_hides("host=h password=hun;ter&2'x", &["hun", "ter", "2'x"]);
+        assert_hides(
+            "host=h password='hun;ter&2 \\' x' dbname=app",
+            &["hun", "ter", "x'"],
+        );
+        assert_hides(
+            "host=h password=hunter\\ two dbname=app",
+            &["hunter", "two"],
+        );
+        assert_hides("host=h sslpassword=a;b&c'd", &["a;b", "b&c", "c'd"]);
+    }
+
+    #[test]
+    fn libpq_pass_masks_every_value_to_whitespace_in_a_url() {
+        for input in [
+            "postgresql://db.example.com/db?sslpassword=alpha;bravo",
+            "postgresql://db.example.com/db?sslpassword=alpha&bravo",
+        ] {
+            let output = assert_hides(input, &["alpha", "bravo"]);
+            assert_eq!(output, "postgresql://db.example.com/db?sslpassword=***");
+        }
+    }
+
+    #[test]
+    fn libpq_pass_masks_a_password_that_looks_masked() {
+        for input in [
+            "postgresql://db.example.com/db?password=***;rest",
+            "postgresql://db.example.com/db?password=***&rest",
+            "host=h password=***;rest",
+            "host=h password=***&rest dbname=a",
+        ] {
+            assert_hides(input, &["rest"]);
+        }
+    }
+
+    #[test]
+    fn libpq_pass_masks_a_misspelled_or_unknown_key() {
+        assert_hides("host=h pasword=hunter2", &["hunter2"]);
+        assert_hides(
+            "postgresql://db.example.com/db?sslmode=require&pasword=hunter2",
+            &["hunter2"],
+        );
+        assert_hides(
+            "postgresql://db.example.com/db?sslmode=require;pasword=hunter2",
+            &["hunter2"],
+        );
+        assert_hides("host=h xpassword=hunter2", &["hunter2"]);
+        assert_hides("host=h my_password = hunter2", &["hunter2"]);
+    }
+
+    #[test]
+    fn libpq_pass_keeps_public_keys_readable() {
+        for input in [
+            "host=h port=5432 sslmode=require",
+            "host=h sslkey=k.pem passfile=pgpass sslkeylogfile=/tmp/keys",
+            "host=h dbname='my db' user = app",
+        ] {
+            assert_eq!(libpq(input), input);
+        }
+        assert_eq!(
+            libpq("postgresql://db.example.com/db?sslmode=require&connect_timeout=5"),
+            "postgresql://db.example.com/db?sslmode=***"
+        );
+        assert_eq!(
+            libpq("host=h sslkey=k.pem passfile=pgpass password=hunter2"),
+            "host=h sslkey=k.pem passfile=pgpass password=***"
+        );
+    }
+
+    #[test]
+    fn userinfo_passwords_are_masked_up_to_the_last_at() {
+        for input in [
+            "postgresql://u:alpha&password=x@db.example.com/db",
+            "postgresql://u:alpha;bravo@db.example.com/db",
+            "see postgresql://u:alpha@bravo.example.com@db.example.com/db?sslmode=require now",
+        ] {
+            let output = redact_userinfo_passwords(input, "***");
+            for secret in ["alpha", "bravo", "x@"] {
+                assert!(!output.contains(secret), "{secret:?} in {output}");
+            }
+            assert!(output.contains("u:***@db.example.com/db"), "{output}");
+        }
+        for input in [
+            "postgresql://u:p@db.example.com/db?password=alpha@bravo.example.com",
+            "postgresql://u:p@db.example.com/db?options=-c%20app.api_token%3Dalpha@bravo.example.com",
+        ] {
+            let output = redact_userinfo_passwords(input, "***");
+            assert_eq!(output, "postgresql://u:***", "{output}");
+        }
+        assert_eq!(
+            redact_userinfo_passwords("postgresql://u:secret@db.example.com/db", "***"),
+            "postgresql://u:***@db.example.com/db"
+        );
+        assert_eq!(
+            redact_userinfo_passwords("postgresql://u@db.example.com/db", "***"),
+            "postgresql://u@db.example.com/db"
+        );
+        assert_eq!(
+            redact_userinfo_passwords("postgresql://db.example.com/db", "***"),
+            "postgresql://db.example.com/db"
+        );
+    }
+
+    #[test]
+    fn libpq_pass_masks_a_public_value_that_holds_a_secret_key() {
+        let output = assert_hides(
+            r"host=h application_name='password=\'alpha bravo\'' port=5432",
+            &["alpha", "bravo"],
+        );
+        assert_eq!(output, "host=h application_name='***' port=5432");
+        assert_hides(
+            r"application_name='x pasword=\'alpha bravo\' y' dbname=app",
+            &["alpha", "bravo"],
+        );
+        assert_hides(
+            r"application_name='password=\'alpha bravo\'",
+            &["alpha", "bravo"],
+        );
+        assert_eq!(
+            libpq("application_name='my app' dbname='a b'"),
+            "application_name='my app' dbname='a b'"
+        );
+    }
+
+    #[test]
+    fn libpq_pass_masks_non_ascii_keys() {
+        let output = assert_hides(
+            "postgresql://u@db.example.com/db?密码=hunter2&sslmode=require",
+            &["hunter2"],
+        );
+        assert!(output.contains("u@db.example.com/db?密码=***"), "{output}");
+        assert_hides("host=h 密码=hunter2", &["hunter2"]);
+        assert_hides("host=h pässword=hunter2 port=1", &["hunter2"]);
+        assert_hides(
+            "postgresql://db.example.com/db?密码=alpha@bravo.example.com",
+            &["alpha", "bravo"],
+        );
+    }
+
+    #[test]
+    fn libpq_pass_masks_any_key_that_is_not_public() {
+        for input in [
+            "postgresql://db.example.com/db?🔑=hunter2",
+            "postgresql://db.example.com/db?x\u{301}=hunter2",
+            "postgresql://db.example.com/db?x-host=hunter2",
+            "postgresql://db.example.com/db?-=hunter2",
+            "postgresql://db.example.com/db?host-port=hunter2",
+            "postgresql://u@db.example.com/db?🔑=alpha@bravo.example.com",
+            "host=h application_name=password='alpha'bravo",
+        ] {
+            assert_hides(input, &["hunter2", "alpha", "bravo"]);
+        }
+    }
+
+    #[test]
+    fn libpq_pass_shows_a_public_value_only_when_it_holds_no_equals_sign() {
+        assert_eq!(
+            libpq("postgresql://db.example.com/db?sslmode=require&password=x"),
+            "postgresql://db.example.com/db?sslmode=***"
+        );
+        let readable = "host=h port=5432 sslmode=require";
+        assert_eq!(libpq(readable), readable);
+    }
+
+    #[test]
+    fn libpq_pass_masks_options() {
+        assert_hides("host=h options='-c app.api_token=hunter2'", &["hunter2"]);
+        assert_hides(
+            "postgresql://db.example.com/db?options=-c%20app.api_token%3Dhunter2",
+            &["hunter2"],
+        );
+    }
+
+    #[test]
+    fn secret_and_public_libpq_key_lists_do_not_overlap() {
+        for key in LIBPQ_SECRET_KEYS {
+            assert!(!is_libpq_public_key(key), "{key} is secret");
+        }
+    }
+
+    #[test]
     fn test_sanitize_uri_without_password() {
         let uri = "postgres://localhost:5432/db";
         assert_eq!(sanitize_uri(uri), "postgres://localhost:5432/db");
@@ -681,7 +1268,7 @@ mod tests {
     fn leaves_uris_without_password_unchanged() {
         for input in [
             "postgres://u@h.example.com:5432/db",
-            "postgresql://h/db",
+            "postgresql://db.example.com/db",
             "mongodb://h:27017/db?replicaSet=rs0",
             "redis://[::1]:6379",
             "https://example.com/a@b",
@@ -716,8 +1303,8 @@ mod tests {
     #[test]
     fn redacts_sensitive_query_and_jdbc_parameters() {
         assert_eq!(
-            redact("postgresql://h/db?user=u&password=pw&sslmode=require"),
-            "postgresql://h/db?user=u&password=***&sslmode=require"
+            redact("postgresql://db.example.com/db?user=u&password=pw&sslmode=require"),
+            "postgresql://db.example.com/db?user=u&password=***&sslmode=require"
         );
         assert_eq!(
             redact("https://h/api?Token=abc#frag"),
@@ -760,5 +1347,115 @@ mod tests {
     fn test_error_location_is_empty() {
         assert!(ErrorLocation::new().is_empty());
         assert!(!ErrorLocation::new().with_table("users").is_empty());
+    }
+
+    /// A server that counts the first character as 1 must land on 0, so the
+    /// editor's cursor sits on the character the server named.
+    #[test]
+    fn one_based_character_position_loses_its_leading_one() {
+        assert_eq!(
+            ErrorPosition::from_one_based_character(1).character_offset,
+            Some(0)
+        );
+        assert_eq!(
+            ErrorPosition::from_one_based_character(8).character_offset,
+            Some(7)
+        );
+    }
+
+    /// A server that sends no position (0) must not be read as "the start of
+    /// the statement".
+    #[test]
+    fn zero_one_based_position_reports_nothing() {
+        assert_eq!(
+            ErrorPosition::from_one_based_character(0).character_offset,
+            None
+        );
+        assert_eq!(ErrorPosition::from_one_based_character(0).line, None);
+    }
+
+    /// SQLite counts bytes, so an offset after a multibyte character must
+    /// become the character count, not stay a byte count.
+    #[test]
+    fn byte_offset_becomes_a_character_offset() {
+        let statement = "SELECT 'é' FROM";
+        // "SELECT '" is 8 bytes and 8 characters; the 'é' starts at byte 8.
+        assert_eq!(
+            ErrorPosition::from_byte_offset(statement, 8).character_offset,
+            Some(8),
+            "a byte offset inside ASCII is also its character offset"
+        );
+        // The closing quote sits after the 2-byte 'é'.
+        assert_eq!(
+            ErrorPosition::from_byte_offset(statement, 10).character_offset,
+            Some(9),
+            "a byte offset past a multibyte character counts as one character"
+        );
+    }
+
+    /// An offset a driver got wrong must clamp, never slice past the end.
+    #[test]
+    fn byte_offset_past_the_end_clamps() {
+        assert_eq!(
+            ErrorPosition::from_byte_offset("SELECT 1", 400).character_offset,
+            Some(8)
+        );
+        assert_eq!(
+            ErrorPosition::from_byte_offset("SELECT 'é'", 9).character_offset,
+            Some(8),
+            "an offset inside a multibyte character moves back to its start"
+        );
+    }
+
+    #[test]
+    fn line_only_position_resolves_to_the_start_of_that_line() {
+        let statement = "SELECT 1;\nSELECT 2;\nSELECT 3;";
+        let position = ErrorPosition::from_line(2);
+
+        assert_eq!(position.resolve_character_offset(statement), Some(10));
+        assert_eq!(
+            ErrorPosition::from_line(0).resolve_character_offset(statement),
+            None,
+            "line 0 has nothing to report"
+        );
+    }
+
+    #[test]
+    fn a_position_past_the_end_resolves_to_the_end() {
+        let statement = "SELECT 1";
+        let past_end = ErrorPosition {
+            character_offset: Some(400),
+            line: None,
+        };
+        assert_eq!(past_end.resolve_character_offset(statement), Some(8));
+
+        let line_past_the_end = ErrorPosition::from_line(9);
+        assert_eq!(
+            line_past_the_end.resolve_character_offset(statement),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn a_driver_that_reports_no_position_resolves_to_nothing() {
+        assert_eq!(
+            ErrorPosition::default().resolve_character_offset("SELECT 1"),
+            None
+        );
+        assert_eq!(FormattedError::new("boom").position, None);
+    }
+
+    /// An offset is more precise than a line, so it wins when a driver gives
+    /// both.
+    #[test]
+    fn an_offset_wins_over_a_line() {
+        let position = ErrorPosition {
+            character_offset: Some(3),
+            line: Some(2),
+        };
+        assert_eq!(
+            position.resolve_character_offset("SELECT 1;\nSELECT 2;"),
+            Some(3)
+        );
     }
 }

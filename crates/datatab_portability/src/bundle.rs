@@ -145,8 +145,9 @@ pub struct ConnectionEntry {
     /// Import uses this to set the correct `DbConfig::External { kind, .. }` so
     /// the profile never silently carries the wrong database kind.
     ///
-    /// `None` in bundles written before this field was introduced; those bundles
-    /// fall back to deriving the kind from `driver_id` via `builtin_driver_id_for_kind`.
+    /// `None` in bundles written before this field was introduced; import
+    /// rejects those connections as kind failures and does not derive a kind
+    /// from `driver_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kind: Option<String>,
 

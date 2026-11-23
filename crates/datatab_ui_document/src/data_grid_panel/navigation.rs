@@ -5,12 +5,69 @@ use super::{
 };
 use datatab_app::keymap::Command;
 use datatab_components::components::data_table::{Direction, Edge, SortState as TableSortState};
-use datatab_core::{OrderByColumn, Pagination, SortDirection, TableRef};
+use datatab_core::{DriverCapabilities, OrderByColumn, Pagination, SortDirection, TableRef};
+use datatab_ui_base::AppStateEntity;
 use gpui::*;
 use std::cmp::Ordering;
+use uuid::Uuid;
+
+/// Whether the driver behind `profile_id` can order a view on the server.
+///
+/// A profile that is not connected answers `true`: there is no driver to ask,
+/// and the rows on screen were loaded by one that was.
+fn driver_sorts(app_state: &Entity<AppStateEntity>, profile_id: Uuid, cx: &App) -> bool {
+    app_state
+        .read(cx)
+        .connections()
+        .get(&profile_id)
+        .map(|connected| {
+            connected
+                .connection
+                .metadata()
+                .capabilities
+                .contains(DriverCapabilities::SORTING)
+        })
+        .unwrap_or(true)
+}
 
 impl DataGridPanel {
     // === Sorting ===
+
+    /// Why the header cannot sort these rows, when it cannot.
+    ///
+    /// A table whose driver has no `SORTING` capability cannot express the
+    /// order a header click asks for (ruling 4), so the grid offers no sort for
+    /// it: no server `order_by` on open or on a click, and the header says why.
+    /// Every other source — a query result, a collection, a table on a profile
+    /// that is not connected — keeps the sorting it had.
+    pub(super) fn table_sort_unavailable(&self, cx: &App) -> Option<SharedString> {
+        let DataSource::Table { profile_id, .. } = &self.source else {
+            return None;
+        };
+        if driver_sorts(&self.app_state, *profile_id, cx) {
+            return None;
+        }
+        Some(crate::labels::sort_unavailable().into())
+    }
+
+    /// The order a table browse carries: the key columns for a driver that
+    /// sorts, and none for one that cannot.
+    ///
+    /// A driver without `SORTING` sorts in the grid itself, and asking it for
+    /// an order would be a statement it cannot run or a claim its rows do not
+    /// keep.
+    pub(super) fn browse_order(
+        app_state: &Entity<AppStateEntity>,
+        profile_id: Uuid,
+        order: Vec<OrderByColumn>,
+        cx: &App,
+    ) -> Vec<OrderByColumn> {
+        if driver_sorts(app_state, profile_id, cx) {
+            order
+        } else {
+            Vec::new()
+        }
+    }
 
     /// Refuses a server-side sort, which re-queries the rows, while unsaved
     /// edits exist. The table has already moved its header arrow to the
@@ -77,6 +134,12 @@ impl DataGridPanel {
         direction: SortDirection,
         cx: &mut Context<Self>,
     ) {
+        // A grid whose driver cannot sort offers no sort, so a request from a
+        // path that is not the header (the context menu) does nothing.
+        if self.table_sort_unavailable(cx).is_some() {
+            return;
+        }
+
         if self.server_sort_blocked(cx) {
             return;
         }
@@ -165,6 +228,10 @@ impl DataGridPanel {
         reason = "current indexes original_order, which apply_local_sort builds and apply_result_search filters in step with result.rows; the order and sort state are reset wherever the rows are replaced"
     )]
     pub(super) fn handle_sort_clear(&mut self, cx: &mut Context<Self>) {
+        if self.table_sort_unavailable(cx).is_some() {
+            return;
+        }
+
         if self.server_sort_blocked(cx) {
             return;
         }
@@ -179,11 +246,16 @@ impl DataGridPanel {
                 total_rows,
                 ..
             } => {
-                let pk_order = Self::get_primary_key_columns(
+                let pk_order = Self::browse_order(
                     &self.app_state,
                     *profile_id,
-                    database.as_deref(),
-                    table,
+                    Self::get_primary_key_columns(
+                        &self.app_state,
+                        *profile_id,
+                        database.as_deref(),
+                        table,
+                        cx,
+                    ),
                     cx,
                 );
                 Some((

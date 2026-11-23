@@ -179,6 +179,11 @@ pub enum DangerousQueryKind {
     /// into a collection
     MongoAggregateWrite,
 
+    // Cassandra / ScyllaDB (CQL) patterns
+    /// A `DELETE` whose `WHERE` does not constrain every primary-key column
+    /// with `=`: it removes a whole partition or a range of rows, not one row.
+    CqlPartialKeyDelete,
+
     // Redis patterns
     /// FLUSHALL — wipes all databases
     RedisFlushAll,
@@ -210,6 +215,9 @@ impl DangerousQueryKind {
             Self::MongoDropDatabase => "dropDatabase() will permanently remove the entire database",
             Self::MongoAggregateWrite => {
                 "aggregate() with $out or $merge will write its result into a collection"
+            }
+            Self::CqlPartialKeyDelete => {
+                "DELETE without the full primary key removes a whole partition or range"
             }
             Self::RedisFlushAll => "FLUSHALL will delete all keys in all databases",
             Self::RedisFlushDb => "FLUSHDB will delete all keys in the current database",
@@ -304,9 +312,9 @@ pub fn classify_query_for_language(
 /// script's dispatch-boundary classification (computed method names, ops
 /// reached only inside a loop or conditional) reaches governance instead of
 /// the core text heuristic, which cannot see past source text. Every other
-/// language — `Custom(_)` as well as the fixed non-SQL variants that still have
-/// no shared core heuristic (`CloudWatchLogsInsightsQl`, `OpenSearchPpl`,
-/// `OpenSearchSql`, `InfluxQuery`, `Flux`) — also consults
+/// language — `Cql`, `Custom(_)` as well as the fixed non-SQL variants that
+/// still have no shared core heuristic (`CloudWatchLogsInsightsQl`,
+/// `OpenSearchPpl`, `OpenSearchSql`, `InfluxQuery`, `Flux`) — also consults
 /// `service.classify_execution` (when present) first, so a driver-defined
 /// surface is classified by the driver rather than dead-ending at a
 /// conservative default. With no service, or when the service's
@@ -327,9 +335,12 @@ pub fn classify_query_for_language_with_service(
             .unwrap_or_else(|| classify_mongo_query(query)),
         QueryLanguage::RedisCommands => classify_redis_query(query),
 
-        // The reserved wire slots are no language of their own and take the
-        // conservative default of a custom language.
-        QueryLanguage::InfluxQuery
+        // Driver-owned languages with no shared core heuristic are classified
+        // by the driver's service; a service that stays silent leaves the
+        // conservative default. The reserved wire slots are no language of
+        // their own and take that same default.
+        QueryLanguage::Cql
+        | QueryLanguage::InfluxQuery
         | QueryLanguage::Flux
         | QueryLanguage::Custom(_)
         | QueryLanguage::ReservedCloudWatchLogsInsightsQl
@@ -506,6 +517,26 @@ pub trait LanguageService: Send + Sync {
     ) -> Vec<CodeAction> {
         Vec::new()
     }
+
+    /// Whether this service can reformat query text.
+    ///
+    /// The editor's Format command, its toolbar button and its palette entry
+    /// ask this before offering the action, so a language whose rules live
+    /// with a driver that ships no formatter keeps them unavailable instead of
+    /// rewriting the buffer. Defaults to `false`.
+    fn can_format(&self) -> bool {
+        false
+    }
+
+    /// Reformat the statements in `range` of `text`, with the rules of the
+    /// "Format statement" code action.
+    ///
+    /// Returns the edit that replaces `range`, or `None` when the service has
+    /// no formatter, the range is empty, or formatting would change nothing —
+    /// so a caller never pushes an empty edit onto the undo stack.
+    fn format(&self, _text: &str, _range: std::ops::Range<usize>) -> Option<CodeActionEdit> {
+        None
+    }
 }
 
 /// Default SQL language service that handles standard SQL dangerous-query detection.
@@ -535,6 +566,32 @@ impl LanguageService for SqlLanguageService {
     ) -> Vec<CodeAction> {
         sql_code_actions(query, offset, schema)
     }
+
+    fn can_format(&self) -> bool {
+        true
+    }
+
+    fn format(&self, text: &str, range: std::ops::Range<usize>) -> Option<CodeActionEdit> {
+        // `get` rejects a range that is out of bounds or splits a character,
+        // so a caller's offsets can never panic the formatter.
+        let statement = text.get(range.clone())?;
+        format_statement_edit(statement, range)
+    }
+}
+
+/// The core's own language service for `language`, when it ships one.
+///
+/// Only SQL does: every other language's rules live with its driver, so an
+/// editor tab with no connection can format SQL but must ask its driver for
+/// the rest. A caller that has a connection uses
+/// [`crate::Connection::language_service`] instead, so a driver-owned dialect
+/// is formatted by its driver.
+pub fn default_language_service(language: &QueryLanguage) -> Option<&'static dyn LanguageService> {
+    if matches!(language, QueryLanguage::Sql) {
+        return Some(&SqlLanguageService);
+    }
+
+    None
 }
 
 /// Byte range of the SQL identifier touching `offset` in `statement`, or
@@ -767,6 +824,18 @@ fn qualify_column_actions(
 /// defaults (2-space indent, uppercase keywords), unless it is already
 /// formatted that way.
 fn format_statement_action(statement: &str, range: std::ops::Range<usize>) -> Option<CodeAction> {
+    Some(CodeAction {
+        title: "Format statement".to_string(),
+        edit: format_statement_edit(statement, range)?,
+    })
+}
+
+/// The edit that reformats `statement` over `range` in the buffer, or `None`
+/// when the statement is blank or already formatted that way.
+///
+/// Shared by the code action and [`SqlLanguageService::format`], so the
+/// command formats exactly what the code action offers.
+fn format_statement_edit(statement: &str, range: std::ops::Range<usize>) -> Option<CodeActionEdit> {
     if statement.trim().is_empty() {
         return None;
     }
@@ -783,15 +852,12 @@ fn format_statement_action(statement: &str, range: std::ops::Range<usize>) -> Op
         return None;
     }
 
-    Some(CodeAction {
-        title: "Format statement".to_string(),
-        edit: CodeActionEdit {
-            range: TextRange {
-                start: range.start,
-                end: range.end,
-            },
-            new_text: formatted,
+    Some(CodeActionEdit {
+        range: TextRange {
+            start: range.start,
+            end: range.end,
         },
+        new_text: formatted,
     })
 }
 
@@ -1282,36 +1348,16 @@ fn collect_error_nodes(node: Node, source: &str, diagnostics: &mut Vec<EditorDia
 
 /// Detect dangerous SQL queries using heuristic pattern matching.
 ///
+/// The scan reads the same statements the class reads — the `;`-delimited
+/// chunks, the statements a procedural body opens inside one, and the
+/// `DELETE`/`UPDATE` a data-modifying CTE holds — so the hard-confirm dialog
+/// and the policy decision agree on the same input (#507, #513).
+/// `safety::detect_dangerous_sql` owns that reading.
+///
 /// For multi-statement scripts (containing `;`), returns `Script` if any
 /// statement is dangerous. Not a full parser — may have false positives.
 pub fn detect_dangerous_sql(query: &str) -> Option<DangerousQueryKind> {
-    let clean = strip_leading_comments(query);
-    if clean.is_empty() {
-        return None;
-    }
-
-    let statements: Vec<&str> = clean
-        .split(';')
-        .map(strip_leading_comments)
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    if statements.is_empty() {
-        return None;
-    }
-
-    if statements.len() > 1 {
-        for stmt in &statements {
-            if detect_dangerous_single(stmt).is_some() {
-                return Some(DangerousQueryKind::Script);
-            }
-        }
-        return None;
-    }
-
-    statements
-        .first()
-        .and_then(|&statement| detect_dangerous_single(statement))
+    super::safety::detect_dangerous_sql(query)
 }
 
 /// Unified entry point for shared SQL dangerous-query checks.
@@ -1319,7 +1365,16 @@ pub fn detect_dangerous_query(query: &str) -> Option<DangerousQueryKind> {
     detect_dangerous_sql(query)
 }
 
-fn detect_dangerous_single(sql: &str) -> Option<DangerousQueryKind> {
+/// The text rules for one statement: a `WHERE`-less `DELETE`/`UPDATE`, a
+/// `TRUNCATE`, a `DROP` or an `ALTER` names its pattern.
+///
+/// `safety::detect_dangerous_sql` decides which statements reach here, so the
+/// rules read the same text the class reads. They stay text-based on purpose: a
+/// `WHERE` only a subquery holds is in the statement's text, and the dialog
+/// leaves that shape to the class (#489). A data-modifying CTE reaches these
+/// rules as the statement it holds, with its text cut where its parenthesis
+/// closes, so `skip_cte_prefix` never decides whether the body is read (#513).
+pub(crate) fn detect_dangerous_single(sql: &str) -> Option<DangerousQueryKind> {
     let normalized = sql.trim().to_lowercase();
     let main_stmt = skip_cte_prefix(&normalized);
 
@@ -1871,6 +1926,49 @@ mod tests {
         );
     }
 
+    /// #513: a data-modifying CTE is a statement of its own, so the dialog
+    /// names the pattern its body holds instead of walking past it to the
+    /// trailing `SELECT`.
+    #[test]
+    fn data_modifying_cte_body_names_its_pattern() {
+        assert_eq!(
+            detect_dangerous_query("WITH d AS (DELETE FROM t) SELECT 1"),
+            Some(DangerousQueryKind::DeleteNoWhere)
+        );
+        assert_eq!(
+            detect_dangerous_query("WITH u AS (UPDATE t SET a = 1) SELECT 1"),
+            Some(DangerousQueryKind::UpdateNoWhere)
+        );
+        assert_eq!(
+            detect_dangerous_query("WITH d AS (DELETE FROM t WHERE id = 1) SELECT 1"),
+            None
+        );
+    }
+
+    /// #515: `EXPLAIN ANALYZE` executes what it wraps, so the class refuses it
+    /// and the dialog must name the pattern instead of reading the chunk's
+    /// `EXPLAIN` word and stopping.
+    #[test]
+    fn explain_analyze_names_the_pattern_it_runs() {
+        assert_eq!(
+            detect_dangerous_query("EXPLAIN ANALYZE DELETE FROM t"),
+            Some(DangerousQueryKind::DeleteNoWhere)
+        );
+        assert_eq!(
+            detect_dangerous_query("EXPLAIN ANALYZE UPDATE t SET a = 1"),
+            Some(DangerousQueryKind::UpdateNoWhere)
+        );
+        assert_eq!(
+            detect_dangerous_query("EXPLAIN ANALYZE DELETE FROM t WHERE id = 1"),
+            None
+        );
+        assert_eq!(detect_dangerous_query("EXPLAIN DELETE FROM t"), None);
+        assert_eq!(
+            detect_dangerous_query("EXPLAIN ANALYZE WITH d AS (DELETE FROM t) SELECT 1"),
+            Some(DangerousQueryKind::DeleteNoWhere)
+        );
+    }
+
     #[test]
     fn cte_with_newline_before_delete_is_dangerous() {
         let sql = "WITH cte AS (SELECT 1)\nDELETE FROM users";
@@ -1938,6 +2036,7 @@ mod tests {
         assert!(!DangerousQueryKind::MongoDropCollection.message().is_empty());
         assert!(!DangerousQueryKind::MongoDropDatabase.message().is_empty());
         assert!(!DangerousQueryKind::MongoAggregateWrite.message().is_empty());
+        assert!(!DangerousQueryKind::CqlPartialKeyDelete.message().is_empty());
         assert!(!DangerousQueryKind::RedisFlushAll.message().is_empty());
         assert!(!DangerousQueryKind::RedisFlushDb.message().is_empty());
         assert!(!DangerousQueryKind::RedisMultiDelete.message().is_empty());
@@ -2398,6 +2497,69 @@ END $$;"#;
                 ExecutionClassification::Write
             );
         }
+    }
+
+    // ==================== CQL delegates to the driver's LanguageService ====================
+    // DEC — `QueryLanguage::Cql` joins the fixed non-SQL delegation group. It
+    // used to fall to the group's `Write` fallback, so a Cassandra `SELECT`
+    // reached governance as a write.
+
+    #[test]
+    fn cql_delegates_to_service_when_it_classifies() {
+        // A driver service that rates every statement a read, as the CQL
+        // service does for a `SELECT`.
+        struct SelectReadService;
+
+        impl LanguageService for SelectReadService {
+            fn validate(&self, _query: &str) -> ValidationResult {
+                ValidationResult::Valid
+            }
+
+            fn detect_dangerous(&self, _query: &str) -> Option<DangerousQueryKind> {
+                None
+            }
+
+            fn classify_execution(&self, _query: &str) -> Option<ExecutionClassification> {
+                Some(ExecutionClassification::Read)
+            }
+        }
+
+        assert_eq!(
+            classify_query_for_language_with_service(
+                &QueryLanguage::Cql,
+                "SELECT release_version FROM system.local",
+                Some(&SelectReadService),
+            ),
+            ExecutionClassification::Read,
+            "a CQL SELECT is a read when the driver classifies it"
+        );
+
+        assert_eq!(
+            classify_query_for_language_with_service(
+                &QueryLanguage::Cql,
+                "DROP TABLE users",
+                Some(&DestructiveOnDropService),
+            ),
+            ExecutionClassification::Destructive,
+            "the driver's verdict must win over the language default"
+        );
+    }
+
+    #[test]
+    fn cql_without_a_service_keeps_the_write_fallback() {
+        assert_eq!(
+            classify_query_for_language(&QueryLanguage::Cql, "SELECT * FROM users"),
+            ExecutionClassification::Write
+        );
+        assert_eq!(
+            classify_query_for_language_with_service(
+                &QueryLanguage::Cql,
+                "SELECT * FROM users",
+                Some(&NeverOverridesService),
+            ),
+            ExecutionClassification::Write,
+            "a service with no bespoke classifier leaves the conservative default"
+        );
     }
 
     // ==================== MongoQuery delegates to the driver's LanguageService ====================
@@ -2957,6 +3119,60 @@ END $$;"#;
             );
             let titles = action_titles(&query, query.len());
             assert!(!titles.contains(&"Format statement".to_string()));
+        }
+
+        /// The editor's Format command formats through this method, so it must
+        /// return the same edit the code action applies, over the range the
+        /// caller asked for.
+        #[test]
+        fn format_returns_the_code_action_edit_for_the_given_range() {
+            let text = "SELECT 1; select id,name from   users";
+            let statement = crate::QueryLanguage::Sql.statement_bounds_at(text, text.len());
+
+            let action = SqlLanguageService
+                .code_actions(text, text.len())
+                .into_iter()
+                .find(|action| action.title == "Format statement")
+                .expect("a messy statement offers the format action");
+
+            assert_eq!(
+                SqlLanguageService.format(text, statement),
+                Some(action.edit)
+            );
+        }
+
+        /// A buffer the formatter cannot change returns no edit, so a caller
+        /// never pushes an empty edit onto the undo stack.
+        #[test]
+        fn format_changes_nothing_for_an_already_formatted_statement() {
+            let text = sqlformat::format(
+                "SELECT id, name FROM users",
+                &sqlformat::QueryParams::None,
+                &sqlformat::FormatOptions {
+                    indent: sqlformat::Indent::Spaces(2),
+                    uppercase: Some(true),
+                    ..sqlformat::FormatOptions::default()
+                },
+            );
+
+            assert!(SqlLanguageService.format(&text, 0..text.len()).is_none());
+        }
+
+        /// An offset that splits a character, or a range outside the buffer,
+        /// is refused instead of panicking.
+        #[test]
+        fn format_refuses_an_unusable_range() {
+            let text = "SELECT '🚀'";
+
+            assert!(SqlLanguageService.format(text, 0..text.len() + 5).is_none());
+            assert!(SqlLanguageService.format(text, 8..10).is_none());
+        }
+
+        #[test]
+        fn only_sql_can_format_and_the_core_has_its_service() {
+            assert!(SqlLanguageService.can_format());
+            assert!(default_language_service(&crate::QueryLanguage::Sql).is_some());
+            assert!(default_language_service(&crate::QueryLanguage::Lua).is_none());
         }
 
         // ==================== No-action cases ====================

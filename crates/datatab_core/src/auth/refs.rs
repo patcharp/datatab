@@ -16,7 +16,51 @@ use uuid::Uuid;
 
 use crate::auth::AuthFormDef;
 use crate::auth::types::AuthProfile;
-use crate::driver::form::FormFieldKind;
+use crate::driver::form::{DriverFormDef, FormFieldKind, FormValues};
+
+/// Returns the `id` of the first `AuthProfileRef` field in a driver form, or
+/// `None` when the form has no such field.
+pub fn auth_profile_ref_field_id_from_form(form: &DriverFormDef) -> Option<String> {
+    form.tabs
+        .iter()
+        .flat_map(|tab| &tab.sections)
+        .flat_map(|section| &section.fields)
+        .find(|field| matches!(&field.kind, FormFieldKind::AuthProfileRef { .. }))
+        .map(|field| field.id.clone())
+}
+
+/// Driver form values that choosing `profile` for a connection sets.
+///
+/// The connection form and the connection import both use this, so a profile
+/// chosen in either lands in the same fields. The driver's `AuthProfileRef`
+/// field gets the profile's `profile_name` field, or its name when that is
+/// absent, and a `region` field of the form gets the profile's `region`. A
+/// form without an `AuthProfileRef` field gets nothing.
+pub fn auth_profile_form_values(form: &DriverFormDef, profile: &AuthProfile) -> FormValues {
+    let mut values = FormValues::new();
+    let Some(ref_field_id) = auth_profile_ref_field_id_from_form(form) else {
+        return values;
+    };
+
+    let profile_name = profile
+        .fields
+        .get("profile_name")
+        .cloned()
+        .unwrap_or_else(|| profile.name.clone());
+    values.insert(ref_field_id, profile_name);
+
+    let form_has_region = form
+        .tabs
+        .iter()
+        .flat_map(|tab| &tab.sections)
+        .flat_map(|section| &section.fields)
+        .any(|field| field.id == "region");
+    if form_has_region && let Some(region) = profile.fields.get("region") {
+        values.insert("region".to_string(), region.clone());
+    }
+
+    values
+}
 
 /// Lookup function: resolves a profile UUID to the persisted `AuthProfile`.
 ///

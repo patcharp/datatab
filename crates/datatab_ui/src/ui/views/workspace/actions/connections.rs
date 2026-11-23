@@ -55,6 +55,12 @@ impl Workspace {
     ) {
         let app_state = self.app_state.clone();
 
+        if app_state.update(cx, |state, cx| {
+            state.focus_connection_edit_window(profile_id, cx)
+        }) {
+            return;
+        }
+
         let profile = app_state
             .read(cx)
             .profiles()
@@ -88,14 +94,23 @@ impl Workspace {
         );
         platform::apply_shell_titlebar_options(&mut options);
 
-        if let Err(error) = cx.open_window(options, |window, cx| {
+        let app_state_for_window = app_state.clone();
+        match cx.open_window(options, |window, cx| {
             datatab_ui_base::ui_automation::install(window, cx);
 
-            let manager =
-                cx.new(|cx| ConnectionManagerWindow::new_for_edit(app_state, &profile, window, cx));
+            let manager = cx.new(|cx| {
+                ConnectionManagerWindow::new_for_edit(app_state_for_window, &profile, window, cx)
+            });
             cx.new(|cx| Root::new(manager, window, cx))
         }) {
-            log::warn!("Failed to open connection editor window: {:?}", error);
+            Ok(handle) => {
+                app_state.update(cx, |state, cx| {
+                    state.register_connection_edit_window(profile_id, handle, cx);
+                });
+            }
+            Err(error) => {
+                log::warn!("Failed to open connection editor window: {:?}", error);
+            }
         }
     }
 

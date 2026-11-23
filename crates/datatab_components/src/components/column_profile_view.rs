@@ -1056,7 +1056,7 @@ impl ColumnProfileView {
                                 .child(
                                     div()
                                         .truncate()
-                                        .font_family(crate::fonts::editor_family(cx))
+                                        .font(crate::fonts::editor_font(cx))
                                         .text_color(theme.foreground)
                                         .child(value.clone()),
                                 )
@@ -1180,7 +1180,7 @@ impl ColumnProfileView {
                         .h(ROW_HEIGHT)
                         .border_b_1()
                         .border_color(palette.border)
-                        .font_family(crate::fonts::editor_family(cx))
+                        .font(crate::fonts::editor_font(cx))
                         .text_size(GridMetrics::FONT)
                         .when(at_cursor, |row| row.bg(palette.cursor_wash))
                         .children(eye)
@@ -1998,6 +1998,41 @@ mod tests {
                 "row {index} ends with the header: cell {cell:?}, header {header:?}"
             );
         }
+    }
+
+    /// A Thai column name and range draw in the mono cells of the profile: the
+    /// frame a Thai name and a Thai range go through is drawn here, and the
+    /// cells and the row are laid out. The font itself is not asserted — that
+    /// the cells take the resolved font is the style guardrail's
+    /// `data_surfaces_take_the_resolved_font_with_the_thai_fallback`.
+    #[gpui::test]
+    fn a_thai_column_frame_lays_out_its_mono_cells(cx: &mut TestAppContext) {
+        let thai = ColumnProfile {
+            range: Some(ValueRange {
+                min: "กรุงเทพมหานคร".into(),
+                max: "เชียงใหม่".into(),
+                exact: true,
+            }),
+            ..known("ชื่อจังหวัด", "UTF8", 2048)
+        };
+        let (_owner, window) = setup(Some(Arc::new(table(vec![thai]))), cx);
+        window.run_until_parked();
+
+        let name = window
+            .debug_bounds("column-profile-name-0")
+            .expect("the Thai column name renders");
+        let row = window
+            .debug_bounds("column-profile-row-0")
+            .expect("the Thai row renders");
+
+        assert!(
+            name.size.width > gpui::px(0.0),
+            "the Thai name's cell has width: {name:?}"
+        );
+        assert!(
+            row.size.width > name.left() - row.left(),
+            "the row is wide enough for the name cell: row {row:?}, name {name:?}"
+        );
     }
 
     #[gpui::test]

@@ -913,8 +913,8 @@ impl ConnectionManagerWindow {
         }
     }
 
-    /// In the import view, Esc returns to the driver picker; everything else is
-    /// handled by the panel's own click affordances.
+    /// In the import view, Esc returns to the driver picker only when no
+    /// parse or import is running.
     fn handle_import_command(
         &mut self,
         command: Command,
@@ -923,6 +923,9 @@ impl ConnectionManagerWindow {
     ) -> bool {
         match command {
             Command::Cancel => {
+                if self.import_panel.read(cx).is_busy() {
+                    return true;
+                }
                 self.view = View::DriverSelect;
                 window.focus(&self.focus_handle, cx);
                 cx.notify();

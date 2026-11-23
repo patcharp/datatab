@@ -70,8 +70,9 @@ impl QueryCompletionProvider {
     /// from its `DriverMetadata::editor_profile()`.
     ///
     /// This keys completion-style routing off a generic capability signal rather
-    /// than a driver id: any driver whose editor mode is `"sql"` (relational SQL
-    /// drivers and SQL-style document drivers alike) gets SQL-style completion.
+    /// than a driver id. An editor mode of `"sql"` marks an SQL-style editor
+    /// surface; `should_use_sql_completion` decides the routing from it, the
+    /// query language and the driver's category.
     /// Falls back to deriving the mode from the provider's `QueryLanguage` when
     /// the connection is absent or its language no longer matches (a
     /// source-context query-mode override).
@@ -2382,7 +2383,7 @@ mod tests {
     /// Mirrors a collection such a driver's `schema()` emits: a named
     /// collection with `sample_fields: None`. Per-attribute data is NOT carried
     /// here; it arrives via the lazily-fetched `table_details` `TableInfo`.
-    fn dynamo_schema_collection() -> CollectionInfo {
+    fn document_schema_collection() -> CollectionInfo {
         CollectionInfo {
             name: "Orders".to_string(),
             database: Some("default".to_string()),
@@ -2397,23 +2398,23 @@ mod tests {
         }
     }
 
-    fn dynamo_document_snapshot() -> SchemaSnapshot {
+    fn document_snapshot() -> SchemaSnapshot {
         SchemaSnapshot::document(DocumentSchema {
             databases: vec![DatabaseInfo {
                 name: "default".to_string(),
                 is_current: true,
             }],
             current_database: Some("default".to_string()),
-            collections: vec![dynamo_schema_collection()],
+            collections: vec![document_schema_collection()],
         })
     }
 
     /// Mirrors the `TableInfo` such a driver's `table_details()` builds: `columns:
     /// None` with the key-schema attributes carried in `sample_fields`.
-    fn dynamo_table_details() -> TableInfo {
+    fn document_table_details() -> TableInfo {
         TableInfo {
             name: "Orders".to_string(),
-            schema: Some("dynamodb".to_string()),
+            schema: Some("document_schema".to_string()),
             columns: None,
             indexes: None,
             foreign_keys: None,
@@ -2434,7 +2435,7 @@ mod tests {
     fn dynamo_document_completion_offers_table_after_from() {
         // Document-category: the collection NAME folds as a table candidate
         // even though its `sample_fields` are `None`.
-        let snapshot = dynamo_document_snapshot();
+        let snapshot = document_snapshot();
         let metadata = build_sql_completion_metadata(
             Some(&snapshot),
             std::iter::empty::<&DbSchemaInfo>(),
@@ -2456,8 +2457,8 @@ mod tests {
         // Document-driver path: the document snapshot collection has no
         // `sample_fields`; the WHERE-position attributes (pk/sk) come from the
         // lazily-fetched `table_details` `TableInfo` folded by `add_table`.
-        let snapshot = dynamo_document_snapshot();
-        let table_details = [dynamo_table_details()];
+        let snapshot = document_snapshot();
+        let table_details = [document_table_details()];
         let metadata = build_sql_completion_metadata(
             Some(&snapshot),
             std::iter::empty::<&DbSchemaInfo>(),
@@ -3551,7 +3552,7 @@ mod tests {
     }
 
     #[test]
-    fn sql_completion_routing_preserves_main_and_adds_dynamodb() {
+    fn sql_completion_routing_preserves_main_and_adds_document_sql_editor() {
         // Languages that took the SQL path on main: always SQL, any category.
         assert!(should_use_sql_completion(
             &QueryLanguage::Sql,

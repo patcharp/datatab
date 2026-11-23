@@ -1,0 +1,191 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://reports.datatab.pcplab.me/schema/error-report-v1.json",
+  "title": "DataTab error and panic report, schema 1",
+  "description": "The only fields a diagnostic report may carry (ADR 0008). A field not named here is never sent, and the server rejects a body that adds one.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "report_id",
+    "kind",
+    "app_version",
+    "channel",
+    "os",
+    "arch",
+    "created_hour",
+    "frames",
+    "trail"
+  ],
+  "properties": {
+    "schema": {
+      "description": "Document version. The server accepts 1 and nothing else.",
+      "const": 1
+    },
+    "report_id": {
+      "description": "Random UUID v4, new for every report. Never the audit correlation id.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "kind": {
+      "description": "What produced the report.",
+      "enum": ["panic", "error"]
+    },
+    "app_version": {
+      "description": "The workspace version the binary was built from.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "channel": {
+      "description": "Release channel derived from app_version.",
+      "enum": ["stable", "rc", "nightly"]
+    },
+    "os": {
+      "description": "Operating system family, as std::env::consts::OS names it.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32
+    },
+    "os_version": {
+      "description": "Human OS release name, when the platform tells us one.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "arch": {
+      "description": "CPU architecture, as std::env::consts::ARCH names it.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32
+    },
+    "created_hour": {
+      "description": "UTC time rounded down to the hour.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:00:00Z$"
+    },
+    "error_kind": {
+      "description": "ErrorKind of a user-facing error. Absent on a panic.",
+      "enum": ["storage", "network", "auth", "hook", "driver", "user", "config"]
+    },
+    "severity": {
+      "description": "EventSeverity of a user-facing error. Absent on a panic.",
+      "enum": ["trace", "debug", "info", "warn", "error", "fatal"]
+    },
+    "driver_id": {
+      "description": "A built-in driver id, or rpc for any external driver. Never rpc:<socket_id>.",
+      "enum": [
+        "postgres",
+        "sqlite",
+        "mysql",
+        "mariadb",
+        "mongodb",
+        "redis",
+        "influxdb",
+        "mssql",
+        "redshift",
+        "clickhouse",
+        "turso",
+        "duckdb",
+        "cassandra",
+        "rpc"
+      ]
+    },
+    "error_code": {
+      "description": "Driver or error code, if it is a short closed token.",
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.-]{1,16}$"
+    },
+    "panic_message": {
+      "description": "A &'static str panic payload after scrubbing, or <dropped: N chars> for a formatted String.",
+      "type": "string",
+      "maxLength": 528
+    },
+    "location": {
+      "description": "Reduced panic location: crates/..., a dependency crate path, or <external>, then :line.",
+      "type": "string",
+      "maxLength": 256
+    },
+    "frames": {
+      "description": "Stack frames, innermost first. Names kept, directories removed.",
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "function": {
+            "type": "string",
+            "maxLength": 512
+          },
+          "module": {
+            "description": "The module's file name, with no directory.",
+            "type": "string",
+            "maxLength": 128
+          },
+          "offset": {
+            "description": "Bytes from the start of the function to the frame's address.",
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    },
+    "trail": {
+      "description": "The last audit events, oldest first, reduced to closed fields.",
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["category", "action", "outcome", "seconds_before"],
+        "properties": {
+          "category": {
+            "enum": [
+              "config",
+              "connection",
+              "query",
+              "hook",
+              "script",
+              "system",
+              "mcp",
+              "governance",
+              "object_storage"
+            ]
+          },
+          "action": {
+            "description": "A built-in audit action constant, or other.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 48
+          },
+          "outcome": {
+            "enum": ["success", "failure", "cancelled", "pending"]
+          },
+          "driver_id": {
+            "enum": [
+              "postgres",
+              "sqlite",
+              "mysql",
+              "mariadb",
+              "mongodb",
+              "redis",
+              "influxdb",
+              "mssql",
+              "redshift",
+              "clickhouse",
+              "turso",
+              "duckdb",
+              "cassandra",
+              "rpc"
+            ]
+          },
+          "seconds_before": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    }
+  }
+}

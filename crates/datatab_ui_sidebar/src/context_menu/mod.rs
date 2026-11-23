@@ -72,7 +72,9 @@ pub(crate) fn node_kind_has_context_menu(kind: SchemaNodeKind) -> bool {
         | SchemaNodeKind::InstanceInspectorsFolder
         | SchemaNodeKind::InstanceInspectorLeaf
         | SchemaNodeKind::InstanceOverviewLeaf
-        | SchemaNodeKind::RootSectionItem => true,
+        | SchemaNodeKind::RootSectionItem
+        | SchemaNodeKind::Column
+        | SchemaNodeKind::CollectionField => true,
 
         SchemaNodeKind::Loading
         | SchemaNodeKind::EmptyDatabasesFolder
@@ -94,13 +96,11 @@ pub(crate) fn node_kind_has_context_menu(kind: SchemaNodeKind) -> bool {
         | SchemaNodeKind::ForeignKeysFolder
         | SchemaNodeKind::ConstraintsFolder
         | SchemaNodeKind::StorageHintsFolder
-        | SchemaNodeKind::Column
         | SchemaNodeKind::Constraint
         | SchemaNodeKind::StorageHintItem
         | SchemaNodeKind::Routine
         | SchemaNodeKind::DatabaseIndexesFolder
         | SchemaNodeKind::CollectionFieldsFolder
-        | SchemaNodeKind::CollectionField
         | SchemaNodeKind::CollectionIndexesFolder
         | SchemaNodeKind::CollectionIndex
         | SchemaNodeKind::EnumValue
@@ -393,8 +393,11 @@ impl Sidebar {
     }
 
     /// Whether the connection/database node supports the schema-diff workflow.
-    /// Gated on `DatabaseCategory::Relational` — never a driver id — so any
-    /// current or future relational driver picks it up for free.
+    ///
+    /// The workflow applies SQL DDL, so it needs a relational driver that speaks
+    /// SQL. Gated on those two metadata facts — never a driver id — so a
+    /// relational driver whose language is not SQL (CQL, for one) is refused
+    /// instead of being offered a diff that cannot be applied.
     fn node_supports_schema_diff(&self, item_id: &str, cx: &App) -> bool {
         let profile_id = match parse_node_id(item_id) {
             Some(SchemaNodeId::Profile { profile_id }) => profile_id,
@@ -406,15 +409,13 @@ impl Sidebar {
             .read(cx)
             .connections()
             .get(&profile_id)
-            .is_some_and(|connected| {
-                connected.connection.metadata().category
-                    == datatab_core::DatabaseCategory::Relational
-            })
+            .is_some_and(|connected| connected.connection.metadata().supports_schema_diff())
     }
 
     /// Emits `SidebarEvent::RequestSchemaDiff` for a connection or database
-    /// node. Non-relational nodes get an explicit "unsupported" toast rather
-    /// than a silent no-op.
+    /// node. A node whose connection cannot support a SQL DDL diff (not
+    /// relational, or relational without SQL) gets an explicit "unsupported"
+    /// toast rather than a silent no-op.
     fn open_schema_diff_from_context(&mut self, item_id: &str, cx: &mut Context<Self>) {
         let (profile_id, database) = match parse_node_id(item_id) {
             Some(SchemaNodeId::Profile { profile_id }) => {
@@ -1369,6 +1370,18 @@ impl Sidebar {
                 items
             }
 
+            SchemaNodeKind::Column | SchemaNodeKind::CollectionField => {
+                let label = if node_kind == SchemaNodeKind::Column {
+                    datatab_i18n::t!("sidebar.menu.copy_column_name")
+                } else {
+                    datatab_i18n::t!("sidebar.menu.copy_field_name")
+                };
+                vec![ContextMenuItem::item(
+                    label,
+                    ContextMenuAction::CopyColumnName,
+                )]
+            }
+
             SchemaNodeKind::RootSectionItem => self.root_section_item_menu(item_id),
 
             _ => vec![],
@@ -1897,6 +1910,14 @@ impl Sidebar {
                     self.rebuild_tree_with_overrides(cx);
                 }
             }
+            ContextMenuAction::CopyColumnName => {
+                if let Some(
+                    SchemaNodeId::Column { name, .. } | SchemaNodeId::CollectionField { name, .. },
+                ) = parse_node_id(&item_id)
+                {
+                    cx.write_to_clipboard(ClipboardItem::new_string(name));
+                }
+            }
             ContextMenuAction::CopyItemId => {
                 if let Some(node_id) = parse_node_id(&item_id) {
                     let id_str = match &node_id {
@@ -2208,12 +2229,14 @@ mod menu_i18n_tests {
         assert_eq!(english, "Connect");
     }
 
-    const B3_KEYS: [&str; 5] = [
+    const B3_KEYS: [&str; 7] = [
         "sidebar.menu.new_dashboard",
         "sidebar.menu.rename_ellipsis",
         "sidebar.menu.delete",
         "sidebar.menu.copy_metric_id",
         "sidebar.menu.copy_inspector_id",
+        "sidebar.menu.copy_column_name",
+        "sidebar.menu.copy_field_name",
     ];
 
     #[test]
@@ -2320,7 +2343,7 @@ mod menu_availability_tests {
     ];
 
     /// Kinds whose rows open a context menu.
-    const KINDS_WITH_MENU: [SchemaNodeKind; 24] = [
+    const KINDS_WITH_MENU: [SchemaNodeKind; 26] = [
         SchemaNodeKind::ConnectionFolder,
         SchemaNodeKind::Profile,
         SchemaNodeKind::DatabasesFolder,
@@ -2345,6 +2368,8 @@ mod menu_availability_tests {
         SchemaNodeKind::InstanceInspectorLeaf,
         SchemaNodeKind::InstanceOverviewLeaf,
         SchemaNodeKind::RootSectionItem,
+        SchemaNodeKind::Column,
+        SchemaNodeKind::CollectionField,
     ];
 
     #[test]
@@ -2365,6 +2390,16 @@ mod menu_availability_tests {
             assert_eq!(
                 node_kind_has_context_menu(kind),
                 KINDS_WITH_MENU.contains(&kind),
+                "{kind:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn column_and_field_rows_offer_context_menus() {
+        for kind in [SchemaNodeKind::Column, SchemaNodeKind::CollectionField] {
+            assert!(
+                node_has_context_menu(kind, CodeGenCapabilities::empty()),
                 "{kind:?}"
             );
         }
@@ -2668,6 +2703,23 @@ mod menu_availability_tests {
         (state, profile_id)
     }
 
+    #[gpui::test]
+    async fn column_and_field_menus_have_copy_entries(cx: &mut TestAppContext) {
+        let (state, _) = connected_profile(cx);
+        let window = cx.add_window(|window, cx| Sidebar::new(state.clone(), window, cx));
+        window
+            .update(cx, |sidebar, _, cx| {
+                for (kind, label) in [
+                    (SchemaNodeKind::Column, "Copy column name"),
+                    (SchemaNodeKind::CollectionField, "Copy field name"),
+                ] {
+                    let items = sidebar.build_context_menu_items(kind, "unused", cx);
+                    assert_eq!(items.first().map(|item| item.label.as_str()), Some(label));
+                }
+            })
+            .expect("sidebar alive");
+    }
+
     /// Menus whose entries do not depend on driver capabilities are never
     /// empty for a kind the predicate allows, and a kind the predicate
     /// rejects never gets entries from the builder.
@@ -2702,6 +2754,16 @@ mod menu_availability_tests {
                 profile_id,
                 database: "main".into(),
                 name: "events".into(),
+            },
+            SchemaNodeId::Column {
+                profile_id,
+                table: "users".into(),
+                name: "email".into(),
+            },
+            SchemaNodeId::CollectionField {
+                profile_id,
+                collection: "events".into(),
+                name: "payload".into(),
             },
             SchemaNodeId::ScriptsFolder { path: None },
             SchemaNodeId::ScriptFile {
@@ -2748,6 +2810,46 @@ mod menu_availability_tests {
                 }
             })
             .expect("sidebar alive");
+    }
+
+    #[gpui::test]
+    async fn column_and_field_menus_copy_the_bare_name(cx: &mut TestAppContext) {
+        let (state, profile_id) = connected_profile(cx);
+        let window = cx.add_window(|window, cx| Sidebar::new(state.clone(), window, cx));
+        for (node_id, expected) in [
+            (
+                SchemaNodeId::Column {
+                    profile_id,
+                    table: "users".into(),
+                    name: "email".into(),
+                },
+                "email",
+            ),
+            (
+                SchemaNodeId::CollectionField {
+                    profile_id,
+                    collection: "events".into(),
+                    name: "payload".into(),
+                },
+                "payload",
+            ),
+        ] {
+            window
+                .update(cx, |sidebar, _, cx| {
+                    sidebar.open_menu_for_item(&node_id.to_string(), point(px(0.), px(0.)), cx);
+                    let menu = sidebar.context_menu_state().expect("menu opens");
+                    let index = menu
+                        .items
+                        .iter()
+                        .position(|item| matches!(item.action, ContextMenuAction::CopyColumnName))
+                        .expect("copy entry");
+                    sidebar.context_menu_execute_at(index, cx);
+                    assert!(!sidebar.has_context_menu_open());
+                })
+                .expect("sidebar alive");
+            let copied = cx.read_from_clipboard().and_then(|item| item.text());
+            assert_eq!(copied.as_deref(), Some(expected));
+        }
     }
 
     fn center(bounds: Bounds<Pixels>) -> gpui::Point<Pixels> {

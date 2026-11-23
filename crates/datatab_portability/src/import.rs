@@ -361,9 +361,11 @@ pub fn apply(
     let mut out_proxies: Vec<datatab_core::ProxyProfile> = Vec::new();
     let mut out_connections: Vec<datatab_core::ConnectionProfile> = Vec::new();
     let mut secret_writes: Vec<(String, SecretString)> = Vec::new();
+    let mut connection_field_secrets: Vec<(uuid::Uuid, String, SecretString)> = Vec::new();
     let mut kind_failures: Vec<(String, String)> = Vec::new();
     let mut unresolved_ref_connections: Vec<String> = Vec::new();
     let mut value_ref_failures: Vec<(String, Vec<String>)> = Vec::new();
+    let mut chosen_auth_profiles: Vec<(Uuid, Uuid)> = Vec::new();
 
     // Auth profiles.
     for auth_entry in &parsed.bundle.auth_profiles {
@@ -541,7 +543,17 @@ pub fn apply(
         }
 
         // Rewrite auth_profile_id to the new (or reused/mapped) destination id.
+        // A profile the user chose in the import panel fills the slot only when the
+        // bundle carried no auth binding (the plan hides the picker otherwise).
+        let chosen_auth_profile = chosen_auth_profile(conn_entry, choices);
         let auth_profile_id = resolve_auth_id(conn_entry, &id_map);
+        let auth_profile_id = match (auth_profile_id, chosen_auth_profile) {
+            (None, Some(chosen)) => {
+                chosen_auth_profiles.push((new_conn_id, chosen));
+                Some(chosen)
+            }
+            (bound, _) => bound,
+        };
 
         // Rewrite access_kind to point at the remapped ssh/proxy ids.
         // M3 / ADR-8: When the referenced local_id is absent from id_map (dangling ref),
@@ -596,18 +608,20 @@ pub fn apply(
             }
         }
 
-        // Collect user-supplied secrets for connection required_refs.
-        // C2 / ADR-2 apply guard: only Secret-kind refs write to the connection password
-        // slot. AuthProfileRef-kind refs are satisfied via auth_profile_choices, never the
-        // password slot.
+        // Collect user-supplied secrets for connection required_refs, with the
+        // field each one is for. The app layer, which knows the driver form,
+        // routes each to the connection password slot or to the field's own
+        // keyring entry.
+        // C2 / ADR-2 apply guard: only Secret-kind refs are collected.
+        // AuthProfileRef-kind refs are satisfied by the chosen auth profile
+        // (`chosen_auth_profile`), never a secret slot.
         for rref in &conn_entry.required_refs {
             if rref.kind != crate::bundle::RequiredRefKind::Secret {
                 continue;
             }
             let key = (conn_entry.local_id.clone(), rref.field.clone());
             if let Some(supplied) = choices.secret_values.get(&key) {
-                let new_ref = datatab_core::connection_secret_ref(&new_conn_id);
-                secret_writes.push((new_ref, supplied.clone()));
+                connection_field_secrets.push((new_conn_id, rref.field.clone(), supplied.clone()));
             }
         }
 
@@ -660,9 +674,11 @@ pub fn apply(
         ssh_tunnels: out_ssh_tunnels,
         proxies: out_proxies,
         secret_writes,
+        connection_field_secrets,
         kind_failures,
         unresolved_ref_connections,
         value_ref_failures,
+        chosen_auth_profiles,
     })
 }
 
@@ -898,6 +914,24 @@ fn build_proxy_auth(
 }
 
 /// Resolves a stored auth profile through its bundle-local id.
+/// The auth profile the user chose for this connection in the import panel.
+///
+/// The panel keys a choice by `(connection local_id, required-ref field)`.
+fn chosen_auth_profile(
+    conn: &crate::bundle::ConnectionEntry,
+    choices: &ResolutionChoices,
+) -> Option<Uuid> {
+    conn.required_refs
+        .iter()
+        .filter(|rref| rref.kind == crate::bundle::RequiredRefKind::AuthProfile)
+        .find_map(|rref| {
+            choices
+                .auth_profile_choices
+                .get(&(conn.local_id.clone(), rref.field.clone()))
+                .copied()
+        })
+}
+
 fn resolve_auth_id(
     conn: &crate::bundle::ConnectionEntry,
     id_map: &HashMap<String, Uuid>,
@@ -1107,6 +1141,47 @@ mod tests {
             kind: Some("Postgres".to_string()),
             uri_secret_fields: vec![],
         }
+    }
+
+    fn bundle_with_auth_ref_connection(local_id: &str) -> crate::ParsedBundle {
+        let mut entry = make_connection_entry(local_id);
+        entry.required_refs.push(crate::bundle::RequiredRef {
+            field: "profile".to_string(),
+            kind: crate::bundle::RequiredRefKind::AuthProfile,
+        });
+        let mut bundle = empty_bundle(EncryptionMode::None);
+        bundle.connections.push(entry);
+        crate::ParsedBundle {
+            bundle,
+            decrypted_secrets: None,
+        }
+    }
+
+    #[test]
+    fn apply_sets_the_auth_profile_chosen_for_a_required_ref() {
+        let parsed = bundle_with_auth_ref_connection("conn-auth-1");
+        let chosen = Uuid::new_v4();
+        let import_plan = plan(&parsed, &empty_dest());
+
+        let mut choices = ResolutionChoices::default();
+        choices
+            .auth_profile_choices
+            .insert(("conn-auth-1".to_string(), "profile".to_string()), chosen);
+
+        let actions = apply(&parsed, &import_plan, &choices).expect("apply");
+        let connection = actions.connections.first().expect("connection");
+        assert_eq!(connection.auth_profile_id, Some(chosen));
+        assert_eq!(actions.chosen_auth_profiles, vec![(connection.id, chosen)]);
+    }
+
+    #[test]
+    fn apply_without_an_auth_choice_leaves_the_connection_unbound() {
+        let parsed = bundle_with_auth_ref_connection("conn-auth-2");
+        let import_plan = plan(&parsed, &empty_dest());
+
+        let actions = apply(&parsed, &import_plan, &ResolutionChoices::default()).expect("apply");
+        assert_eq!(actions.connections[0].auth_profile_id, None);
+        assert!(actions.chosen_auth_profiles.is_empty());
     }
 
     fn make_dest_auth(provider_id: &str, name: &str) -> AuthProfile {
@@ -2079,6 +2154,7 @@ kind = "Postgres"
             (DbKind::Redshift, "Redshift", "redshift"),
             (DbKind::ClickHouse, "ClickHouse", "clickhouse"),
             (DbKind::Turso, "Turso", "turso"),
+            (DbKind::Cassandra, "Cassandra", "cassandra"),
         ];
 
         for (expected, kind_str, driver_id) in variants {

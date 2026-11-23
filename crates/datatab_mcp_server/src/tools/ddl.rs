@@ -413,7 +413,9 @@ fn schema_alter_kind_for_op(op: &AlterOperation) -> Option<datatab_policy::Schem
 
 /// Classify ALTER TABLE operations based on their risk level.
 ///
-/// Returns the highest (most restrictive) classification among all operations.
+/// Returns one classification for the whole operation list, never less
+/// restricted than any one of them: operations that are comparable on both
+/// ladders keep the more restricted one, and `AdminDestructive` wins outright.
 pub fn classify_alter_operations(
     operations: &[AlterOperation],
 ) -> datatab_policy::ExecutionClassification {
@@ -427,10 +429,10 @@ pub fn classify_alter_operations(
         })
         .collect();
 
-    // Return the highest classification, defaulting to AdminSafe if empty
+    // Return the most dangerous classification, defaulting to AdminSafe if empty
     classifications
         .into_iter()
-        .fold(ExecutionClassification::AdminSafe, |acc, c| acc.max(c))
+        .fold(ExecutionClassification::AdminSafe, |acc, c| acc.compose(c))
 }
 
 /// Check if ADD_COLUMN operation is safe (nullable or has default).
@@ -2328,6 +2330,36 @@ mod classification_tests {
 
         let classification = classify_alter_operations(&ops);
         assert_eq!(classification, ExecutionClassification::AdminDestructive);
+    }
+
+    /// A guard: a set of safe metadata operations stays `AdminSafe`. Composing
+    /// by the invariant never escalates a change that only adds or renames a
+    /// column, since no operand is `Destructive`.
+    #[test]
+    fn test_safe_metadata_operations_stay_admin_safe() {
+        let ops = vec![
+            AlterOperation {
+                action: "ADD_COLUMN".to_string(),
+                column: Some("note".to_string()),
+                definition: Some(serde_json::json!({
+                    "type": "TEXT",
+                    "nullable": true
+                })),
+            },
+            AlterOperation {
+                action: "RENAME_COLUMN".to_string(),
+                column: None,
+                definition: Some(serde_json::json!({
+                    "old_name": "old",
+                    "new_name": "new"
+                })),
+            },
+        ];
+
+        assert_eq!(
+            classify_alter_operations(&ops),
+            ExecutionClassification::AdminSafe
+        );
     }
 }
 

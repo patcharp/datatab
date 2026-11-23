@@ -1,5 +1,35 @@
 use super::*;
 
+#[test]
+fn clickhouse_tls_config_without_driver_row_keeps_legacy_verification() {
+    let runtime = StorageRuntime::in_memory().expect("storage");
+    let repo = runtime.connection_profiles();
+    let id = uuid::Uuid::new_v4();
+    let mut profile = ConnectionProfileDto::new(id, "legacy ClickHouse".into());
+    profile.kind = Some("ClickHouse".into());
+    repo.insert(&profile)
+        .expect("save profile without driver config");
+
+    let (profiles, errors) = load_profiles(&runtime).expect("load legacy profile");
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].id, id);
+    let datatab_core::DbConfig::ClickHouse { ssl_mode, .. } = &profiles[0].config else {
+        panic!("expected ClickHouse config");
+    };
+    assert_eq!(
+        ssl_mode, &None,
+        "missing config keeps legacy TLS verification"
+    );
+    assert!(
+        repo.driver_configs()
+            .get_for_profile(&id.to_string())
+            .expect("read driver config")
+            .is_none(),
+        "loading must not create a driver-config row"
+    );
+}
+
 /// One stored profile without a usable driver config must not stop the other
 /// profiles from loading (#311 ruling 1 item 3).
 #[test]

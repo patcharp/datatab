@@ -14,6 +14,7 @@ Microsoft SQL Server driver for DataTab, built on the
 
 ## Features
 
+- Bulk schema column reads use one catalog query per schema; no table-count batching is needed.
 - SQL Server / Azure SQL relational driver with SQL query execution and schema
   discovery.
 - Native console (`NATIVE_CONSOLE`): tables dock a console, and a database's sidebar menu opens one in its own tab, that runs one SQL statement line at a time through `Connection::execute` with the editor's validation, dangerous-query confirmation, audit rows and query history. The driver enforces `QueryRequest::limit` (`REQUEST_ROW_LIMIT`), so console commands carry the editor row limit.
@@ -94,7 +95,7 @@ Exposes a curated set of live server metrics sourced from `sys.dm_os_performance
 - `mssql.page_reads_per_sec` — buffer pool page reads per second
 - `mssql.page_writes_per_sec` — buffer pool page writes per second
 - `mssql.buffer_cache_hit_ratio` — buffer cache hit ratio (percent)
-- `mssql.server_memory_kb` — total server memory in KB
+- `mssql.server_memory_kb` — total server memory in bytes (the id keeps its old name; the counter is stored in KB and scaled)
 
 Each metric is returned as a single `(timestamp_ms, value)` row for live charting.
 
@@ -346,7 +347,7 @@ Requires the `VIEW SERVER STATE` permission.
   binding. Untyped `xml` columns generate faithfully.
 - Instance metrics and inspector features require the `VIEW SERVER STATE` server permission. Without it, both `list_metrics()` and `list_inspectors()` return empty lists rather than an error.
 
-- Instance metrics return a single data point per call (current value from `sys.dm_os_performance_counters`), not a historical time series. Rate counters (e.g. `mssql.batch_requests_per_sec`) represent the server-side running average as reported by the DMV, not a delta computed by the driver.
+- Instance metrics return a single data point per call (current value from `sys.dm_os_performance_counters`), not a historical time series. The `/sec` counters (e.g. `mssql.batch_requests_per_sec`) are cumulative totals in the DMV, so they are declared as counters and the chart shows the change per second between samples; the first sample has no point.
 
 - Minimum supported SQL Server: 2016 (13.0). The driver uses
   `DROP INDEX IF EXISTS … ON …` syntax that older servers reject with a
@@ -364,6 +365,19 @@ Requires the `VIEW SERVER STATE` permission.
   difference is that any session-local state (`SET` options, temp tables,
   open transactions) is reset by the cancel. The active database is
   restored automatically.
+- A cancel targets the session that was live when it was issued. Session
+  recovery first waits for every pending `KILL` (a `KILL` aimed at the old
+  session is finished, or abandoned at its deadline). Only then does it drop
+  the old client and connect the replacement. From that point until the
+  replacement is published or dropped, a new cancel sends no `KILL`; the
+  replacement is dropped and the cancelled call reports `Cancelled`. So a
+  `KILL` cannot reach a replacement that SQL Server gave the same SPID. The
+  wait never takes the connection lock, and a cancel never waits for recovery.
+  The whole `KILL` (connect, login, send, reply) has a 10 second deadline, and
+  its runtime is shut down without waiting for blocking work such as a DNS
+  lookup. Limit: an abandoned `KILL` that the server had already received can
+  still run after the replacement exists. The recovery wait itself is bounded
+  (12 seconds) and then goes on.
 - Cancellation latency depends on the SQL Server scheduler: typically a few
   milliseconds for CPU-bound queries, immediate for lock-waiters. Long
   rollbacks (e.g. cancelling a large `DELETE` mid-transaction) can keep the

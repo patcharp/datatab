@@ -5,9 +5,10 @@ impl Workspace {
     /// Opens (or focuses) the schema-diff & apply document for a connection or
     /// database node. Deduplicated by `(profile_id, database)`.
     ///
-    /// The relational gate lives in the sidebar (it only emits
-    /// `RequestSchemaDiff` for relational connections); this handler just
-    /// resolves an existing tab or creates a new one.
+    /// The gate lives in the sidebar, which only emits `RequestSchemaDiff` for
+    /// a connection whose metadata supports a SQL DDL diff
+    /// (`DriverMetadata::supports_schema_diff`); this handler just resolves an
+    /// existing tab or creates a new one.
     pub(in crate::ui::views::workspace) fn open_schema_diff(
         &mut self,
         profile_id: uuid::Uuid,

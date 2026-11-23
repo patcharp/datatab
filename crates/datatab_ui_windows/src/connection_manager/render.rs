@@ -268,6 +268,19 @@ impl ConnectionManagerWindow {
             .mx(IslandMetrics::GAP)
             .child(header)
             .child(tab_bar)
+            .when(self.delete_notice_visible, |form| {
+                let message = datatab_i18n::t!("connection_manager.banner.close_before_delete");
+                form.child(
+                    div()
+                        .id("connection-edit-delete-notice")
+                        .role(Role::Note)
+                        .aria_label(message.clone())
+                        .flex_shrink_0()
+                        .px(ConnectionFormMetrics::PADDING_X)
+                        .pt(ConnectionFormMetrics::BODY_PADDING_TOP)
+                        .child(BannerBlock::new(BannerVariant::Warning, message)),
+                )
+            })
             .child(
                 div()
                     .id("form-scroll-content")
@@ -364,12 +377,17 @@ impl ConnectionManagerWindow {
                     .child(
                         Button::new(
                             "save-connection",
-                            datatab_i18n::t!("connection_manager.action.save"),
+                            if self.saving {
+                                datatab_i18n::t!("form.action.saving")
+                            } else {
+                                datatab_i18n::t!("connection_manager.action.save")
+                            },
                         )
                         .primary()
                         .icon(AppIcon::Check)
                         .when_some(Self::shortcut(Command::SaveQuery), Button::kbd)
                         .focused(save_focused)
+                        .disabled(self.saving)
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.save_profile(window, cx);
                         })),

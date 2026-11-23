@@ -28,7 +28,11 @@ const PRIMARY_PASSWORD_SAVE_ERROR: &str =
 fn may_delete_unseen(stored: StoredPassword, what: &str, profile: &ConnectionProfile) -> bool {
     match stored {
         StoredPassword::Known => true,
-        StoredPassword::Loading | StoredPassword::Unreadable => {
+        StoredPassword::NotInKeyring => {
+            log::debug!("Keeping the saved {what}: it does not live in the keyring");
+            false
+        }
+        StoredPassword::Loading | StoredPassword::Unreadable | StoredPassword::Skipped => {
             log::warn!(
                 "Keeping the saved {what} for profile {}: the keyring had not been read when \
                  the form was saved, or could not be",
@@ -39,33 +43,406 @@ fn may_delete_unseen(stored: StoredPassword, what: &str, profile: &ConnectionPro
     }
 }
 
-fn delete_password_unless_unseen(
-    state: &mut datatab_ui_base::AppStateEntity,
-    profile: &ConnectionProfile,
-    stored_password: StoredPassword,
-) {
-    if may_delete_unseen(stored_password, "password", profile) {
-        state.delete_password(profile);
+struct ProfileSecretChanges {
+    password: Option<SecretString>,
+    delete_password: bool,
+    ssh_secret: Option<SecretString>,
+    delete_ssh_secret: bool,
+}
+
+struct SaveFailure {
+    messages: Vec<String>,
+    report: bool,
+    secret_fields_failed: bool,
+}
+
+impl SaveFailure {
+    fn primary() -> Self {
+        Self {
+            messages: vec![PRIMARY_PASSWORD_SAVE_ERROR.to_string()],
+            report: true,
+            secret_fields_failed: false,
+        }
+    }
+
+    fn with_rollback(
+        mut self,
+        rollback: Result<(), datatab_app::SecretFieldsMayHaveChanged>,
+    ) -> Self {
+        if let Err(changed) = rollback {
+            let message = datatab_i18n::t!(
+                "form.validation.secret_fields_may_have_changed",
+                fields = changed.quoted_labels()
+            );
+            if self.secret_fields_failed {
+                self.messages.push(message);
+            } else {
+                self.messages.insert(0, message);
+            }
+        }
+        self
     }
 }
 
-fn delete_ssh_password_unless_unseen(
-    state: &mut datatab_ui_base::AppStateEntity,
+/// Only plain data and the shared store cross onto the background executor.
+#[allow(clippy::result_large_err)]
+fn write_profile_secrets(
+    store: &std::sync::RwLock<Box<dyn datatab_core::SecretStore>>,
     profile: &ConnectionProfile,
-    stored_ssh_secret: StoredPassword,
-) {
-    if may_delete_unseen(stored_ssh_secret, "SSH secret", profile) {
-        state.delete_ssh_password(profile);
+    fields: datatab_app::app_state::SecretFieldWrite,
+    changes: ProfileSecretChanges,
+) -> Result<datatab_app::SecretFieldChanges, SaveFailure> {
+    let fields = fields.apply().map_err(|error| {
+        let failure = SaveFailure {
+            messages: vec![datatab_i18n::t!(
+                "form.validation.secret_field_keyring_failed",
+                field = error.label
+            )],
+            report: false,
+            secret_fields_failed: true,
+        };
+        match error.may_have_changed {
+            Some(changed) => failure.with_rollback(Err(changed)),
+            None => failure,
+        }
+    })?;
+    let secrets = datatab_core::secret_manager::ProfileSecrets::new(store);
+    if let Some(password) = changes.password {
+        if secrets.save_password(profile, &password).is_err() {
+            return Err(SaveFailure::primary().with_rollback(fields.restore(store)));
+        }
+    } else if changes.delete_password {
+        secrets.delete_password(profile);
     }
+    if let Some(secret) = changes.ssh_secret {
+        secrets.save_ssh_password(profile, &secret);
+    } else if changes.delete_ssh_secret {
+        secrets.delete_ssh_password(profile);
+    }
+    Ok(fields)
+}
+
+enum ProfileSaveCommit {
+    Saved,
+    Deleted,
 }
 
 #[allow(clippy::result_large_err)]
-fn finish_profile_save_after_primary_password(
-    password_save_result: Result<(), datatab_core::DbError>,
-    commit_profile: impl FnOnce() -> Result<(), datatab_core::DbError>,
-) -> Result<(), datatab_core::DbError> {
-    password_save_result?;
-    commit_profile()
+fn commit_saved_profile(
+    app_state: &Entity<datatab_ui_base::AppStateEntity>,
+    profile: ConnectionProfile,
+    guarded_password: &str,
+    is_edit: bool,
+    target_folder_id: Option<uuid::Uuid>,
+    cx: &mut App,
+) -> Result<ProfileSaveCommit, datatab_core::DbError> {
+    let saved_profile_id = profile.id;
+    app_state.update(cx, |state, cx| {
+        if is_edit {
+            if !state
+                .profiles()
+                .iter()
+                .any(|item| item.id == saved_profile_id)
+            {
+                return Ok(ProfileSaveCommit::Deleted);
+            }
+            state.update_profile_from_connection_manager(profile, guarded_password)?;
+
+            // If the edited profile is currently connected, surface a
+            // reconnect prompt — the sidebar consumes this flag on the
+            // next AppStateChanged and shows a toast with the choice.
+            // The profile change itself is already persisted; only the
+            // live session needs the explicit reconnect to pick it up.
+            if state.connections().contains_key(&saved_profile_id) {
+                state.pending_edit_reconnect_prompt = Some(saved_profile_id);
+            }
+        } else {
+            state.add_profile_in_folder(profile, target_folder_id);
+        }
+
+        save_profile_governance(state, saved_profile_id, cx);
+        cx.emit(datatab_ui_base::AppStateChanged);
+        Ok(ProfileSaveCommit::Saved)
+    })
+}
+
+fn delete_saved_profile_secrets(
+    store: &std::sync::RwLock<Box<dyn datatab_core::SecretStore>>,
+    profile: &ConnectionProfile,
+) -> SaveFailure {
+    let store = match store.read() {
+        Ok(store) => store,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let secret_refs = profile
+        .keyring_secret_fields
+        .iter()
+        .map(|field| datatab_core::connection_field_secret_ref(&profile.id, field))
+        .chain([profile.secret_ref(), profile.ssh_secret_ref()]);
+    let mut cleanup_failed = false;
+    for secret_ref in secret_refs {
+        if store.delete(&secret_ref).is_err() {
+            cleanup_failed = true;
+        }
+    }
+    let mut messages = vec![datatab_i18n::t!(
+        "form.validation.connection_deleted_while_saving"
+    )];
+    if cleanup_failed {
+        log::error!(
+            "Failed to remove secrets for deleted profile {}",
+            profile.id
+        );
+        messages.push(datatab_i18n::t!(
+            "form.validation.deleted_connection_secret_cleanup_failed"
+        ));
+    }
+    SaveFailure {
+        messages,
+        report: false,
+        secret_fields_failed: false,
+    }
+}
+
+fn save_profile_governance(
+    #[allow(unused_variables)] state: &mut datatab_ui_base::AppStateEntity,
+    #[allow(unused_variables)] saved_profile_id: uuid::Uuid,
+    #[allow(unused_variables)] cx: &mut Context<datatab_ui_base::AppStateEntity>,
+) {
+    #[cfg(feature = "mcp")]
+    {
+        if let Some(governance) = state
+            .profiles()
+            .iter()
+            .find(|item| item.id == saved_profile_id)
+            .and_then(|item| item.mcp_governance.clone())
+        {
+            let assignments = governance
+                .policy_bindings
+                .into_iter()
+                .map(|binding| datatab_policy::ConnectionPolicyAssignment {
+                    actor_id: binding.actor_id,
+                    scope: datatab_policy::PolicyBindingScope {
+                        connection_id: saved_profile_id.to_string(),
+                    },
+                    role_ids: binding.role_ids,
+                    policy_ids: binding.policy_ids,
+                })
+                .collect();
+
+            if let Err(e) = state.save_mcp_connection_policy_assignment(
+                datatab_mcp::ConnectionPolicyAssignmentDto {
+                    connection_id: saved_profile_id.to_string(),
+                    assignments,
+                },
+            ) {
+                report_error(
+                    UserFacingError::new(
+                        ErrorKind::Config,
+                        datatab_i18n::t!(
+                            "connection_manager.mcp_governance_error.save_policy",
+                            error = e
+                        ),
+                    ),
+                    cx,
+                );
+            }
+        } else if let Err(e) = state.save_mcp_connection_policy_assignment(
+            datatab_mcp::ConnectionPolicyAssignmentDto {
+                connection_id: saved_profile_id.to_string(),
+                assignments: Vec::new(),
+            },
+        ) {
+            report_error(
+                UserFacingError::new(
+                    ErrorKind::Config,
+                    datatab_i18n::t!(
+                        "connection_manager.mcp_governance_error.clear_policy",
+                        error = e
+                    ),
+                ),
+                cx,
+            );
+        }
+
+        cx.emit(datatab_ui_base::McpRuntimeEventRaised {
+            event: datatab_mcp::McpRuntimeEvent::ConnectionPolicyUpdated {
+                connection_id: saved_profile_id.to_string(),
+            },
+        });
+    }
+}
+
+struct PreparedProfileSave {
+    profile: ConnectionProfile,
+    guarded_password: String,
+    is_edit: bool,
+    target_folder_id: Option<uuid::Uuid>,
+}
+
+#[allow(clippy::result_large_err)]
+async fn persist_profile_after_secrets(
+    result: Result<datatab_app::SecretFieldChanges, SaveFailure>,
+    save: PreparedProfileSave,
+    app_state: Entity<datatab_ui_base::AppStateEntity>,
+    store: Arc<std::sync::RwLock<Box<dyn datatab_core::SecretStore>>>,
+    executor: BackgroundExecutor,
+    cx: &mut AsyncApp,
+) -> Option<SaveFailure> {
+    match result {
+        Err(failure) => Some(failure),
+        Ok(fields) => {
+            let saved_profile = save.profile.clone();
+            let result = cx.update(|cx| {
+                commit_saved_profile(
+                    &app_state,
+                    save.profile,
+                    &save.guarded_password,
+                    save.is_edit,
+                    save.target_folder_id,
+                    cx,
+                )
+            });
+            match result {
+                Ok(ProfileSaveCommit::Saved) => None,
+                Ok(ProfileSaveCommit::Deleted) => {
+                    // Restoring old values would recreate secrets the profile deletion removed.
+                    Some(
+                        executor
+                            .spawn(
+                                async move { delete_saved_profile_secrets(&store, &saved_profile) },
+                            )
+                            .await,
+                    )
+                }
+                Err(error) => {
+                    let failure = if matches!(error, datatab_core::DbError::InvalidProfile(_)) {
+                        SaveFailure {
+                            messages: vec![datatab_i18n::t!(
+                                "form.validation.broken_password_unresolved"
+                            )],
+                            report: false,
+                            secret_fields_failed: false,
+                        }
+                    } else {
+                        SaveFailure::primary()
+                    };
+                    let rollback = executor.spawn(async move { fields.restore(&store) }).await;
+                    Some(failure.with_rollback(rollback))
+                }
+            }
+        }
+    }
+}
+
+/// The SSL mode id and the certificate paths the shared Transport control holds.
+///
+/// Drivers hardcode a default and their form declares no TLS field, so the
+/// selection is written into the built config here: one source of truth for the
+/// control and the profile.
+fn apply_ssl_selection(
+    config: &mut DbConfig,
+    selected_mode: Option<&str>,
+    root_cert: Option<String>,
+    client_cert: Option<String>,
+    client_key: Option<String>,
+) {
+    if let Some(selected) = selected_mode {
+        match config {
+            DbConfig::Postgres { ssl_mode, .. }
+            | DbConfig::MySQL { ssl_mode, .. }
+            | DbConfig::MongoDB { ssl_mode, .. }
+            | DbConfig::Redis { ssl_mode, .. }
+            | DbConfig::Redshift { ssl_mode, .. }
+            | DbConfig::ClickHouse { ssl_mode, .. }
+            | DbConfig::Cassandra { ssl_mode, .. } => {
+                *ssl_mode = Some(selected.to_string());
+            }
+            DbConfig::SqlServer {
+                ssl_mode,
+                trust_server_certificate,
+                ..
+            } => {
+                *ssl_mode = Some(selected.to_string());
+                // `collect_form_values` does not carry the selected mode, so
+                // the driver's `build_config` fell back to its "on" default
+                // and set `trust_server_certificate: true`. Derive trust from
+                // the user's selection: the form clears it for `required`.
+                // The driver also enforces legacy `verify-*` modes even
+                // when this saved trust flag is true.
+                *trust_server_certificate = !matches!(selected, "required");
+            }
+            _ => {}
+        }
+    }
+
+    match config {
+        DbConfig::Postgres {
+            ssl_root_cert_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
+            ..
+        }
+        | DbConfig::MySQL {
+            ssl_root_cert_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
+            ..
+        }
+        | DbConfig::MongoDB {
+            ssl_root_cert_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
+            ..
+        }
+        | DbConfig::Redis {
+            ssl_root_cert_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
+            ..
+        }
+        | DbConfig::Redshift {
+            ssl_root_cert_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
+            ..
+        }
+        | DbConfig::ClickHouse {
+            ssl_root_cert_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
+            ..
+        }
+        | DbConfig::Cassandra {
+            ssl_root_cert_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
+            ..
+        } => {
+            *ssl_root_cert_path = root_cert;
+            *ssl_client_cert_path = client_cert;
+            *ssl_client_key_path = client_key;
+        }
+        DbConfig::SqlServer {
+            ssl_root_cert_path, ..
+        } => {
+            *ssl_root_cert_path = root_cert;
+        }
+        _ => {}
+    }
+}
+
+/// A text input's value as typed, or `None` when the user left it empty.
+///
+/// The value is not trimmed: a stored certificate path is kept exactly as it
+/// was entered, which is how the field behaved before this was a helper.
+fn text_input_value(input: &Entity<gpui_component::input::InputState>, cx: &App) -> Option<String> {
+    let value = input.read(cx).value().to_string();
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 impl ConnectionManagerWindow {
@@ -108,6 +485,17 @@ impl ConnectionManagerWindow {
             return false;
         };
 
+        if driver.metadata().ssl_modes.is_some_and(|modes| {
+            !modes
+                .iter()
+                .any(|mode| mode.id == self.form.selected_ssl_mode)
+        }) {
+            self.validation_errors.push(datatab_i18n::t!(
+                "form.validation.field_required",
+                field = datatab_i18n::t!("connection_manager.field.ssl_mode")
+            ));
+        }
+
         let form = driver.form_definition();
 
         for tab in form.tabs.iter().filter(|t| t.id != "ssh") {
@@ -132,6 +520,8 @@ impl ConnectionManagerWindow {
                     if field.required
                         && value.trim().is_empty()
                         && !self.has_dynamic_value_ref_for_field(&field.id, cx)
+                        && !self.saved_keyring_secret_fields(cx).contains(&field.id)
+                        && !self.kept_stored_value_refs(cx).contains_key(&field.id)
                     {
                         self.validation_errors.push(datatab_i18n::t!(
                             "form.validation.field_required",
@@ -277,92 +667,34 @@ impl ConnectionManagerWindow {
             }
         };
 
-        // Persist the SSL mode id string selected in the UI. Drivers hardcode a default; we
-        // overwrite here so the user's selection is saved without each driver reading form values.
-        if !self.form.selected_ssl_mode.is_empty() {
-            let selected = self.form.selected_ssl_mode.clone();
-            match &mut config {
-                DbConfig::Postgres { ssl_mode, .. }
-                | DbConfig::MySQL { ssl_mode, .. }
-                | DbConfig::MongoDB { ssl_mode, .. }
-                | DbConfig::Redis { ssl_mode, .. }
-                | DbConfig::Redshift { ssl_mode, .. } => {
-                    *ssl_mode = Some(selected);
-                }
-                DbConfig::SqlServer {
-                    ssl_mode,
-                    trust_server_certificate,
-                    ..
-                } => {
-                    *ssl_mode = Some(selected.clone());
-                    // `collect_form_values` does not carry the selected mode, so
-                    // the driver's `build_config` fell back to its "on" default
-                    // and set `trust_server_certificate: true`. Derive trust from
-                    // the user's selection: the form clears it for `required`.
-                    // The driver also enforces legacy `verify-*` modes even
-                    // when this saved trust flag is true.
-                    *trust_server_certificate = !matches!(selected.as_str(), "required");
-                }
-                _ => {}
-            }
-        }
-
-        // Apply SSL cert path inputs.
-        let ssl_root_cert = {
-            let v = self.form.ssl_ca_cert_input.read(cx).value().to_string();
-            if v.trim().is_empty() { None } else { Some(v) }
+        // Persist the shared Transport control's selection, which every driver
+        // with an `ssl_mode` field shares.
+        let selected_mode = if self.form.selected_ssl_mode.is_empty() {
+            None
+        } else {
+            Some(self.form.selected_ssl_mode.clone())
         };
-        let ssl_client_cert = {
-            let v = self.form.ssl_client_cert_input.read(cx).value().to_string();
-            if v.trim().is_empty() { None } else { Some(v) }
-        };
-        let ssl_client_key = {
-            let v = self.form.ssl_client_key_input.read(cx).value().to_string();
-            if v.trim().is_empty() { None } else { Some(v) }
-        };
-
-        match &mut config {
-            DbConfig::Postgres {
-                ssl_root_cert_path,
-                ssl_client_cert_path,
-                ssl_client_key_path,
-                ..
-            }
-            | DbConfig::MySQL {
-                ssl_root_cert_path,
-                ssl_client_cert_path,
-                ssl_client_key_path,
-                ..
-            }
-            | DbConfig::MongoDB {
-                ssl_root_cert_path,
-                ssl_client_cert_path,
-                ssl_client_key_path,
-                ..
-            }
-            | DbConfig::Redis {
-                ssl_root_cert_path,
-                ssl_client_cert_path,
-                ssl_client_key_path,
-                ..
-            }
-            | DbConfig::Redshift {
-                ssl_root_cert_path,
-                ssl_client_cert_path,
-                ssl_client_key_path,
-                ..
-            } => {
-                *ssl_root_cert_path = ssl_root_cert;
-                *ssl_client_cert_path = ssl_client_cert;
-                *ssl_client_key_path = ssl_client_key;
-            }
-            DbConfig::SqlServer {
-                ssl_root_cert_path, ..
-            } => {
-                *ssl_root_cert_path = ssl_root_cert;
-            }
-            _ => {}
-        }
+        let (root_visible, client_visible) = driver
+            .metadata()
+            .ssl_cert_fields
+            .map(|fields| fields.visible_for_mode(&self.form.selected_ssl_mode))
+            .unwrap_or((false, false));
+        let ssl_root_cert = root_visible
+            .then(|| text_input_value(&self.form.ssl_ca_cert_input, cx))
+            .flatten();
+        let ssl_client_cert = client_visible
+            .then(|| text_input_value(&self.form.ssl_client_cert_input, cx))
+            .flatten();
+        let ssl_client_key = client_visible
+            .then(|| text_input_value(&self.form.ssl_client_key_input, cx))
+            .flatten();
+        apply_ssl_selection(
+            &mut config,
+            selected_mode.as_deref(),
+            ssl_root_cert,
+            ssl_client_cert,
+            ssl_client_key,
+        );
 
         let ssh_tunnel_profile_id = self.access.selected_ssh_tunnel_id;
         let ssh_tunnel = if ssh_tunnel_profile_id.is_some() {
@@ -374,6 +706,57 @@ impl ConnectionManagerWindow {
         config.assign_ssh_tunnel(ssh_tunnel, ssh_tunnel_profile_id);
 
         Some(config)
+    }
+
+    fn with_stored_profile<R>(
+        &self,
+        cx: &App,
+        read: impl FnOnce(&ConnectionProfile) -> R,
+    ) -> Option<R> {
+        let profile_id = self.editing_profile_id?;
+        self.app_state
+            .read(cx)
+            .profiles()
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .map(read)
+    }
+
+    /// The secret fields whose value the keyring holds for the profile being
+    /// edited. An empty input for one of them keeps that value.
+    fn saved_keyring_secret_fields(&self, cx: &App) -> std::collections::BTreeSet<String> {
+        self.with_stored_profile(cx, |profile| profile.keyring_secret_fields.clone())
+            .unwrap_or_default()
+    }
+
+    /// The form has a value-source selector for host, database, user and
+    /// password only. A stored ref of any other field (for example an import's
+    /// `Env` source for an RPC driver's `api_token`) has no control to show or
+    /// change it, so an edit keeps it as stored. A field that has a control
+    /// and whose value the user changed since the form loaded is left out: the
+    /// typed value wins.
+    fn kept_stored_value_refs(
+        &self,
+        cx: &Context<Self>,
+    ) -> std::collections::HashMap<String, ValueRef> {
+        let current = self
+            .form
+            .selected_driver
+            .as_ref()
+            .map(|driver| self.collect_form_values(driver.form_definition(), cx))
+            .unwrap_or_default();
+        let mut kept = self
+            .with_stored_profile(cx, |stored| stored.value_refs.clone())
+            .unwrap_or_default();
+        kept.retain(|field, _| {
+            let loaded = self
+                .loaded_form_values
+                .get(field)
+                .map_or("", String::as_str);
+            let typed = current.get(field).is_some_and(|value| value != loaded);
+            !Self::VALUE_SOURCE_FIELDS.contains(&field.as_str()) && !typed
+        });
+        kept
     }
 
     pub(super) fn build_profile(&self, cx: &Context<Self>) -> Option<ConnectionProfile> {
@@ -391,6 +774,7 @@ impl ConnectionManagerWindow {
         };
 
         profile.save_password = self.form.form_save_password;
+        profile.keyring_secret_fields = self.saved_keyring_secret_fields(cx);
         profile.environment = self.form.environment;
         profile.navigator_view = self.form.navigator_view;
         profile.show_all_databases = self.form.show_all_databases;
@@ -398,6 +782,9 @@ impl ConnectionManagerWindow {
         profile.proxy_profile_id = self.access.selected_proxy_id;
         profile.auth_profile_id = self.auth_profile.selected_auth_profile_id;
         profile.value_refs = self.collect_value_refs(cx);
+        for (field, value_ref) in self.kept_stored_value_refs(cx) {
+            profile.value_refs.entry(field).or_insert(value_ref);
+        }
         profile.settings_overrides = self.collect_connection_overrides(cx);
         profile.connection_settings = self.collect_connection_settings(cx);
         profile.hook_bindings = self.collect_hook_bindings(cx);
@@ -449,7 +836,7 @@ impl ConnectionManagerWindow {
     }
 
     pub(super) fn save_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.defer_until_secrets_read(DeferredAction::Save) {
+        if self.saving || self.defer_until_secrets_read(DeferredAction::Save) {
             return;
         }
 
@@ -460,7 +847,7 @@ impl ConnectionManagerWindow {
             return;
         }
 
-        let Some(mut profile) = self.build_profile(cx) else {
+        let Some(profile) = self.build_profile(cx) else {
             return;
         };
 
@@ -473,203 +860,177 @@ impl ConnectionManagerWindow {
             return;
         }
 
-        let saved_profile_id = profile.id;
-
-        let mut password = self.form.input_password.read(cx).value().to_string();
+        let password = self.form.input_password.read(cx).value().to_string();
         let password_source_is_literal = self
             .form
             .password_value_source_selector
             .read(cx)
             .is_literal(cx);
-        if !self
+        let guarded_password = if password_source_is_literal {
+            password.clone()
+        } else {
+            String::new()
+        };
+        if let Err(error) = self
             .app_state
             .read(cx)
-            .connection_manager_password_is_resolved(
-                &profile,
-                if password_source_is_literal {
-                    &password
-                } else {
-                    ""
-                },
-            )
+            .check_connection_manager_save(&profile, &guarded_password)
         {
-            self.validation_errors.push(datatab_i18n::t!(
-                "form.validation.broken_password_unresolved"
-            ));
+            let message = match error {
+                datatab_app::app_state::ProfileSaveError::UnknownFormLiteral { .. } => {
+                    let message = datatab_i18n::t!("form.validation.unknown_form_literal_ref");
+                    report_error(UserFacingError::new(ErrorKind::Config, message.clone()), cx);
+                    message
+                }
+                datatab_app::app_state::ProfileSaveError::Storage(_) => {
+                    let message = datatab_i18n::t!("form.validation.profile_storage_read_failed");
+                    report_error(
+                        UserFacingError::new(ErrorKind::Storage, message.clone()),
+                        cx,
+                    );
+                    message
+                }
+                _ => datatab_i18n::t!("form.validation.broken_password_unresolved"),
+            };
+            self.validation_errors.push(message);
             cx.notify();
             return;
         }
 
-        let uri_password = profile.config.strip_uri_password();
+        self.start_profile_save(
+            profile,
+            (password, password_source_is_literal),
+            guarded_password,
+            window,
+            cx,
+        );
+    }
 
-        if password.is_empty()
-            && let Some(uri_password) = uri_password
+    fn start_profile_save(
+        &mut self,
+        mut profile: ConnectionProfile,
+        password_input: (String, bool),
+        guarded_password: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        info!("Saving profile: {}", profile.id);
+        let (mut password, password_source_is_literal) = password_input;
+        let fields = self
+            .app_state
+            .read(cx)
+            .prepare_external_secret_fields(&mut profile);
+        if let Some(uri_password) = profile.config.strip_uri_password()
+            && password.is_empty()
         {
             password = uri_password;
         }
-
-        let ssh_secret = self.get_ssh_secret(cx);
-        let is_edit = self.editing_profile_id.is_some();
-
-        let save_action = if is_edit {
-            datatab_i18n::t!("form.action.updating")
-        } else {
-            datatab_i18n::t!("form.action.saving")
+        let changes = ProfileSecretChanges {
+            password: (password_source_is_literal && profile.save_password && !password.is_empty())
+                .then(|| SecretString::from(password)),
+            delete_password: (!password_source_is_literal || !profile.save_password)
+                && may_delete_unseen(self.form.stored_password, "password", &profile),
+            ssh_secret: self
+                .form
+                .form_save_ssh_secret
+                .then(|| self.get_ssh_secret(cx))
+                .flatten()
+                .map(SecretString::from),
+            delete_ssh_secret: !self.form.form_save_ssh_secret
+                && may_delete_unseen(self.form.stored_ssh_secret, "SSH secret", &profile),
         };
-        info!(
-            "{} profile: {}, save_password={}, password_len={}, ssh_enabled={}, ssh_auth={:?}",
-            save_action,
-            profile.name,
-            profile.save_password,
-            password.len(),
-            self.access.ssh_enabled,
-            self.access.ssh_auth_method
-        );
+        for warning in self.save_warnings(&profile) {
+            Toast::warning(warning).meta_right(now_hms()).push(cx);
+        }
+        self.saving = true;
+        cx.notify();
+        let store = self.app_state.read(cx).secret_store();
+        let write = cx.background_executor().spawn({
+            let store = store.clone();
+            let profile = profile.clone();
+            async move { write_profile_secrets(&store, &profile, fields, changes) }
+        });
+        let app_state = self.app_state.clone();
+        let save = PreparedProfileSave {
+            profile,
+            guarded_password,
+            is_edit: self.editing_profile_id.is_some(),
+            target_folder_id: self.target_folder_id,
+        };
+        let window_handle = window.window_handle();
+        let executor = cx.background_executor().clone();
+        // The transaction outlives the window. Every failure is consumed here,
+        // after rollback, even if there is no form left to display it in.
+        cx.spawn(async move |this, cx| {
+            let result = write.await;
+            let failure =
+                persist_profile_after_secrets(result, save, app_state, store, executor, cx).await;
+            cx.update(|cx| {
+                let applied = window_handle
+                    .update(cx, |_, window, cx| {
+                        this.update(cx, |this, cx| {
+                            this.finish_profile_save(failure.as_ref(), window, cx)
+                        })
+                        .is_ok()
+                    })
+                    .unwrap_or(false);
+                if !applied && let Some(failure) = failure {
+                    report_error(
+                        UserFacingError::new(ErrorKind::Storage, failure.messages.join(" ")),
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
 
+    fn finish_profile_save(
+        &mut self,
+        failure: Option<&SaveFailure>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.saving = false;
+        if let Some(failure) = failure {
+            self.validation_errors.extend(
+                failure
+                    .messages
+                    .iter()
+                    .filter(|message| message.as_str() != PRIMARY_PASSWORD_SAVE_ERROR)
+                    .cloned(),
+            );
+            if failure.report {
+                report_error(
+                    UserFacingError::new(ErrorKind::Storage, PRIMARY_PASSWORD_SAVE_ERROR),
+                    cx,
+                );
+            }
+            cx.notify();
+        } else {
+            cx.emit(DismissEvent);
+            window.remove_window();
+        }
+    }
+
+    fn save_warnings(&self, profile: &ConnectionProfile) -> Vec<String> {
+        let mut warnings = Vec::new();
         if self.settings_tab.conn_override_refresh_interval
             && profile
                 .settings_overrides
                 .as_ref()
                 .is_none_or(|ov| ov.refresh_interval_secs.is_none())
         {
-            Toast::warning(datatab_i18n::t!("form.warning.refresh_interval_invalid"))
-                .meta_right(now_hms())
-                .push(cx);
+            warnings.push(datatab_i18n::t!("form.warning.refresh_interval_invalid"));
         }
 
         if let Some(ref conn_settings) = profile.connection_settings
             && let Some(driver) = &self.form.selected_driver
             && let Some(schema) = driver.settings_schema()
         {
-            let warnings = form_renderer::validate_values(&schema, conn_settings);
-            for warning in warnings {
-                Toast::warning(warning).meta_right(now_hms()).push(cx);
-            }
+            warnings.extend(form_renderer::validate_values(&schema, conn_settings));
         }
-
-        let stored_password = self.form.stored_password;
-        let stored_ssh_secret = self.form.stored_ssh_secret;
-
-        #[allow(clippy::result_large_err)]
-        let save_result: Result<(), datatab_core::DbError> =
-            self.app_state.update(cx, |state, cx| {
-                let wants_password_deleted = !password_source_is_literal || !profile.save_password;
-                let password_save_result = if password_source_is_literal
-                    && profile.save_password
-                    && !password.is_empty()
-                {
-                    info!("Saving password to keyring for profile {}", profile.id);
-                    state.save_password(&profile, &SecretString::from(password.clone()))
-                } else {
-                    if wants_password_deleted {
-                        delete_password_unless_unseen(state, &profile, stored_password);
-                    }
-                    Ok(())
-                };
-
-                finish_profile_save_after_primary_password(password_save_result, || {
-                    if self.form.form_save_ssh_secret {
-                        if let Some(ref secret) = ssh_secret {
-                            info!("Saving SSH secret to keyring for profile {}", profile.id);
-                            state.save_ssh_password(&profile, &SecretString::from(secret.clone()));
-                        }
-                    } else {
-                        delete_ssh_password_unless_unseen(state, &profile, stored_ssh_secret);
-                    }
-
-                    if is_edit {
-                        state.update_profile_from_connection_manager(profile, &password)?;
-
-                        // If the edited profile is currently connected, surface a
-                        // reconnect prompt — the sidebar consumes this flag on the
-                        // next AppStateChanged and shows a toast with the choice.
-                        // The profile change itself is already persisted; only the
-                        // live session needs the explicit reconnect to pick it up.
-                        if state.connections().contains_key(&saved_profile_id) {
-                            state.pending_edit_reconnect_prompt = Some(saved_profile_id);
-                        }
-                    } else {
-                        state.add_profile_in_folder(profile, self.target_folder_id);
-                    }
-
-                    #[cfg(feature = "mcp")]
-                    {
-                        if let Some(governance) = state
-                            .profiles()
-                            .iter()
-                            .find(|item| item.id == saved_profile_id)
-                            .and_then(|item| item.mcp_governance.clone())
-                        {
-                            let assignments = governance
-                                .policy_bindings
-                                .into_iter()
-                                .map(|binding| datatab_policy::ConnectionPolicyAssignment {
-                                    actor_id: binding.actor_id,
-                                    scope: datatab_policy::PolicyBindingScope {
-                                        connection_id: saved_profile_id.to_string(),
-                                    },
-                                    role_ids: binding.role_ids,
-                                    policy_ids: binding.policy_ids,
-                                })
-                                .collect();
-
-                            if let Err(e) = state.save_mcp_connection_policy_assignment(
-                                datatab_mcp::ConnectionPolicyAssignmentDto {
-                                    connection_id: saved_profile_id.to_string(),
-                                    assignments,
-                                },
-                            ) {
-                                report_error(
-                                    UserFacingError::new(
-                                        ErrorKind::Config,
-                                        datatab_i18n::t!(
-                                            "connection_manager.mcp_governance_error.save_policy",
-                                            error = e
-                                        ),
-                                    ),
-                                    cx,
-                                );
-                            }
-                        } else if let Err(e) = state.save_mcp_connection_policy_assignment(
-                            datatab_mcp::ConnectionPolicyAssignmentDto {
-                                connection_id: saved_profile_id.to_string(),
-                                assignments: Vec::new(),
-                            },
-                        ) {
-                            report_error(
-                                UserFacingError::new(
-                                    ErrorKind::Config,
-                                    datatab_i18n::t!(
-                                        "connection_manager.mcp_governance_error.clear_policy",
-                                        error = e
-                                    ),
-                                ),
-                                cx,
-                            );
-                        }
-
-                        cx.emit(datatab_ui_base::McpRuntimeEventRaised {
-                            event: datatab_mcp::McpRuntimeEvent::ConnectionPolicyUpdated {
-                                connection_id: saved_profile_id.to_string(),
-                            },
-                        });
-                    }
-
-                    cx.emit(datatab_ui_base::AppStateChanged);
-                    Ok(())
-                })
-            });
-
-        if save_result.is_err() {
-            report_error(
-                UserFacingError::new(ErrorKind::Storage, PRIMARY_PASSWORD_SAVE_ERROR),
-                cx,
-            );
-            return;
-        }
-
-        cx.emit(DismissEvent);
-        window.remove_window();
+        warnings
     }
 
     pub(super) fn test_connection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -748,6 +1109,7 @@ impl ConnectionManagerWindow {
         let password = self.form.input_password.read(cx).value().to_string();
         let password = (!password.is_empty()).then(|| SecretString::from(password));
         let ssh_secret = self.get_ssh_secret(cx).map(SecretString::from);
+        let secret_store = self.app_state.read(cx).secret_store();
 
         cx.spawn(async move |_this, cx| {
             let profile_id = profile.id;
@@ -786,6 +1148,7 @@ impl ConnectionManagerWindow {
                     let profile = profile.clone();
                     let password = password.clone();
                     let ssh_secret = ssh_secret.clone();
+                    let secret_store = secret_store.clone();
                     let background_executor = background_executor.clone();
 
                     Box::pin(async move {
@@ -810,6 +1173,15 @@ impl ConnectionManagerWindow {
                                         profile.config.redirect_to_tunnel(
                                             pipeline_output.access_handle.local_port(),
                                         );
+                                    }
+                                    if let Some(filled) =
+                                        datatab_core::profile_with_keyring_fields_from(
+                                            &profile,
+                                            driver.form_definition(),
+                                            &secret_store,
+                                        )?
+                                    {
+                                        profile = filled;
                                     }
 
                                     // The pipeline only yields a password when the
@@ -843,10 +1215,15 @@ impl ConnectionManagerWindow {
                         } else {
                             background_executor
                                 .spawn(async move {
+                                    let filled = datatab_core::profile_with_keyring_fields_from(
+                                        &profile,
+                                        driver.form_definition(),
+                                        &secret_store,
+                                    )?;
                                     let start = std::time::Instant::now();
                                     driver
                                         .test_connection_rich_with_secrets(
-                                            &profile,
+                                            filled.as_ref().unwrap_or(&profile),
                                             password.as_ref(),
                                             ssh_secret.as_ref(),
                                         )
@@ -1106,8 +1483,11 @@ fn format_detached_hook_cleanup_failure(
 
 #[cfg(test)]
 mod tests {
+    mod import_auth_choice;
     mod managed_access;
     mod refusal;
+    mod save_async;
+    mod secret_fields;
     mod tls;
     mod value_refs;
 
@@ -1155,6 +1535,8 @@ mod tests {
 
     const FORM_KEYS: &[&str] = &[
         "form.validation.connection_name_required",
+        "form.validation.connection_deleted_while_saving",
+        "form.validation.deleted_connection_secret_cleanup_failed",
         "form.validation.no_driver_selected",
         "form.validation.field_required",
         "form.validation.field_invalid_number",
@@ -1911,6 +2293,7 @@ mod tests {
                 shows_driver_build_error(manager)
             })
             .expect("save leaves the form window available");
+        cx.run_until_parked();
 
         assert!(
             shown,
@@ -1962,7 +2345,12 @@ mod tests {
         read_fails: Arc<AtomicBool>,
         /// A secret ref whose reads fail while every other read succeeds.
         failing_ref: Arc<Mutex<Option<String>>>,
+        /// A secret ref whose writes fail while every other write follows
+        /// `outcome`.
+        failing_write_ref: Arc<Mutex<Option<String>>>,
         values: Arc<Mutex<HashMap<String, SecretString>>>,
+        /// Every secret ref `get` was asked for.
+        reads: Arc<Mutex<Vec<String>>>,
     }
 
     impl SecretStoreFixture {
@@ -1971,8 +2359,19 @@ mod tests {
                 outcome: Arc::new(Mutex::new(outcome)),
                 read_fails: Arc::new(AtomicBool::new(false)),
                 failing_ref: Arc::new(Mutex::new(None)),
+                failing_write_ref: Arc::new(Mutex::new(None)),
                 values: Arc::new(Mutex::new(HashMap::new())),
+                reads: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        fn reads_of(&self, secret_ref: &str) -> usize {
+            self.reads
+                .lock()
+                .expect("test secret store reads lock poisoned")
+                .iter()
+                .filter(|read| read.as_str() == secret_ref)
+                .count()
         }
 
         fn seed(&self, profile: &ConnectionProfile, password: &str) {
@@ -2011,6 +2410,13 @@ mod tests {
                 .expect("test secret store failing ref lock poisoned") = Some(secret_ref);
         }
 
+        fn fail_writes_of(&self, secret_ref: String) {
+            *self
+                .failing_write_ref
+                .lock()
+                .expect("test secret store failing write ref lock poisoned") = Some(secret_ref);
+        }
+
         fn saved(&self, profile: &ConnectionProfile) -> Option<String> {
             self.values
                 .lock()
@@ -2032,6 +2438,10 @@ mod tests {
         }
 
         fn get(&self, secret_ref: &str) -> Result<Option<SecretString>, datatab_core::DbError> {
+            self.reads
+                .lock()
+                .expect("test secret store reads lock poisoned")
+                .push(secret_ref.to_string());
             let failing_ref = self
                 .failing_ref
                 .lock()
@@ -2053,6 +2463,17 @@ mod tests {
         }
 
         fn set(&self, secret_ref: &str, value: &SecretString) -> Result<(), datatab_core::DbError> {
+            if self
+                .failing_write_ref
+                .lock()
+                .expect("test secret store failing write ref lock poisoned")
+                .as_deref()
+                == Some(secret_ref)
+            {
+                return Err(datatab_core::DbError::IoError(std::io::Error::other(
+                    "test keyring write failure for one ref",
+                )));
+            }
             match *self
                 .outcome
                 .lock()
@@ -2203,6 +2624,7 @@ mod tests {
                 manager.save_profile(window, cx)
             })
             .expect("failed save leaves the real form window available");
+        cx.run_until_parked();
 
         assert!(window.root(&mut cx).is_ok(), "the form window remains open");
         assert!(
@@ -2244,6 +2666,7 @@ mod tests {
                 manager.save_profile(window, cx)
             })
             .expect("partial-write failure leaves the real form window available");
+        cx.run_until_parked();
 
         assert!(window.root(&mut cx).is_ok(), "the edit window remains open");
         let persisted = cx.update(|cx| app_state.read(cx).profiles().to_vec());
@@ -2349,9 +2772,10 @@ mod tests {
             .expect("edit window stays available");
         assert_eq!(
             stored_password,
-            StoredPassword::Unreadable,
+            StoredPassword::NotInKeyring,
             "saving still must not delete the entry the form never saw"
         );
+        assert_eq!(fixture.reads_of(&profile.secret_ref()), 0);
         assert_eq!(cx.update(|cx| host.read(cx).toast_count()), 0);
 
         window
@@ -2401,6 +2825,7 @@ mod tests {
                 manager.save_profile(window, cx)
             })
             .expect("save leaves the form window available");
+        cx.run_until_parked();
 
         assert_eq!(
             fixture.saved(&profile).as_deref(),
@@ -2449,6 +2874,7 @@ mod tests {
                 manager.save_profile(window, cx)
             })
             .expect("save leaves the form window available");
+        cx.run_until_parked();
 
         assert_eq!(
             fixture.saved(&profile).as_deref(),
@@ -2501,6 +2927,7 @@ mod tests {
                 manager.save_profile(window, cx)
             })
             .expect("save leaves the form window available");
+        cx.run_until_parked();
 
         assert_eq!(fixture.saved(&profile), None, "the entry is deleted");
         assert_eq!(cx.update(|cx| host.read(cx).toast_count()), 0);
@@ -2508,6 +2935,87 @@ mod tests {
         assert!(
             window.root(&mut cx).is_err(),
             "a successful save closes the window"
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn editing_reads_the_keyring_only_when_the_password_lives_there() {
+        let mut cx = TestAppContext::single();
+        init_form_test_runtime(&mut cx);
+
+        let mut env_profile = sqlite_profile("env password profile");
+        env_profile.value_refs.insert(
+            "password".to_string(),
+            datatab_core::ValueRef::env("PGPASSWORD"),
+        );
+        let mut unsaved_profile = sqlite_profile("unsaved password profile");
+        unsaved_profile.save_password = false;
+        let keyring_profile = sqlite_profile("keyring password profile");
+
+        for (profile, reads, expected) in [
+            (env_profile, 0, StoredPassword::NotInKeyring),
+            (unsaved_profile, 0, StoredPassword::NotInKeyring),
+            (keyring_profile, 1, StoredPassword::Known),
+        ] {
+            let fixture = SecretStoreFixture::new(PasswordSaveOutcome::Success);
+            let app_state = test_app_state(&mut cx, fixture.clone());
+            fixture.seed(&profile, "saved password");
+            app_state.update(&mut cx, |state, _| {
+                state.add_profile_in_folder(profile.clone(), None)
+            });
+
+            let window = open_untouched_edit_window(app_state, profile.clone(), &mut cx);
+            cx.run_until_parked();
+
+            let stored_password = window
+                .update(&mut cx, |manager, window, _| {
+                    let stored = manager.form.stored_password;
+                    window.remove_window();
+                    stored
+                })
+                .expect("edit window stays available");
+            assert_eq!(stored_password, expected, "{}", profile.name);
+            assert_eq!(
+                fixture.reads_of(&profile.secret_ref()),
+                reads,
+                "{}",
+                profile.name
+            );
+            assert_eq!(
+                fixture.saved(&profile).as_deref(),
+                Some("saved password"),
+                "the entry the form never read stays"
+            );
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn saving_a_form_with_the_password_not_in_the_keyring_keeps_the_saved_entry() {
+        let mut cx = TestAppContext::single();
+        init_form_test_runtime(&mut cx);
+        let fixture = SecretStoreFixture::new(PasswordSaveOutcome::Success);
+        let app_state = test_app_state(&mut cx, fixture.clone());
+        let mut profile = sqlite_profile("unsaved password profile");
+        profile.save_password = false;
+        fixture.seed(&profile, "stale password");
+        app_state.update(&mut cx, |state, _| {
+            state.add_profile_in_folder(profile.clone(), None)
+        });
+        let window = open_untouched_edit_window(app_state, profile.clone(), &mut cx);
+        cx.run_until_parked();
+
+        window
+            .update(&mut cx, |manager, window, cx| {
+                manager.form.form_save_password = false;
+                manager.save_profile(window, cx)
+            })
+            .expect("save leaves the form window available");
+        cx.run_until_parked();
+
+        assert_eq!(
+            fixture.saved(&profile).as_deref(),
+            Some("stale password"),
+            "an entry the form never saw is not deleted"
         );
     }
 
@@ -2660,6 +3168,7 @@ mod tests {
                 manager.save_profile(window, cx)
             })
             .expect("save leaves the form window available");
+        cx.run_until_parked();
 
         assert_eq!(
             fixture.saved_ssh(&profile).as_deref(),
@@ -2922,6 +3431,7 @@ mod tests {
                 manager.save_profile(window, cx)
             })
             .expect("edit window stays available");
+        cx.run_until_parked();
 
         let saved = cx.update(|cx| app_state.read(cx).profiles().to_vec());
         let value_ref = saved[0]
@@ -3943,6 +4453,7 @@ mod tests {
                 manager.save_profile(window, cx)
             })
             .expect("successful save runs");
+        cx.run_until_parked();
 
         assert!(
             window.root(&mut cx).is_err(),
@@ -4319,6 +4830,7 @@ mod tests {
                 manager.save_profile(window, cx)
             })
             .expect("save runs");
+        cx.run_until_parked();
 
         assert_eq!(
             cx.update(|cx| host.read(cx).toast_count()),

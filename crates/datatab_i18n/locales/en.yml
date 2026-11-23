@@ -309,6 +309,7 @@ connection_manager:
     connection_name: Connection name
     password: Password
     password_unreadable: "Saved password could not be read: the system keyring may be locked"
+    password_not_read: "Not read: this connection has a broken value source."
     password_needs_value: "This field needs a value or a source"
     key_passphrase_optional: Key passphrase (optional)
     ssh_password: SSH password
@@ -414,6 +415,7 @@ connection_manager:
     navigator: "Navigator"
     safety: "Safety"
   banner:
+    close_before_delete: This connection is open for editing. Close this window before deleting it.
     correct_following: Please correct the following
     broken_value_ref_save_first: Choose a value source for each broken field, then save first. This connection cannot connect until you save.
     testing_connection: "Testing connection…"
@@ -520,6 +522,8 @@ connection_manager:
       wrong_passphrase: Passphrase incorrect or bundle corrupted.
       decryption_error: "Decryption error: %{error}"
       import_failed: "Import failed: %{error}"
+      refused_secret_cleanup_failed: The import was refused, and a saved secret could not be removed from the system keyring.
+      password_keyring_failed: The connection password could not be saved to the system keyring, so the connection was not imported. Unlock the keyring and try again.
       secret_failures_toast:
         one: "%{count} secret could not be written to the keyring during import. The keyring may be locked or unavailable."
         many: "%{count} secrets could not be written to the keyring during import. The keyring may be locked or unavailable."
@@ -1174,6 +1178,7 @@ document:
       connection_not_found: Connection not found
       connection_error: "Connection error: %{error}"
       collection_source_unsupported: "Collection source not supported in ChartDocument; open via DataDocument"
+      reserved_language: "This connection's query language cannot be used for saved charts."
   code:
     gutter:
       run_statement: Run this statement
@@ -1194,10 +1199,10 @@ document:
       cancel: Cancel
       checking: "Checking…"
       run: Run
-      last_run: "last run %{seconds} s"
       read_only: Read-only
       saved: Saved
       save: Save
+      format_sql: Format SQL
       formatter_unavailable: Formatter unavailable
       query_history: Query history
       explain_query: Explain query
@@ -1294,6 +1299,9 @@ document:
         mongo_aggregate_write:
           title: "aggregate() writes to a collection"
           body: "aggregate() with $out or $merge will write its result into a collection"
+        cql_partial_key_delete:
+          title: DELETE without the full primary key
+          body: DELETE without the full primary key removes a whole partition or range
         redis_flush_all:
           title: FLUSHALL
           body: FLUSHALL will delete all keys in all databases
@@ -1518,6 +1526,7 @@ document:
       header: "%{column} · row %{row}"
       item:
         copy: Copy
+        copy_column_name: Copy column name
         view_document: View document
         add_document: Add document
         duplicate_document: Duplicate document
@@ -1655,6 +1664,9 @@ document:
         aggregated: Aggregated results cannot be edited
         no_primary_key: This table has no primary key - editing is disabled
         not_single_table: "Editing disabled: result is not bound to a single table."
+        free_form_read_only: "This result is not tied to one table and its primary key, so rows cannot be edited here."
+      sorting:
+        unavailable: The database cannot sort this view
       loading: Loading…
       empty: No data
       views:
@@ -3370,12 +3382,19 @@ dump_analysis:
 errors:
   action:
     view_in_audit: View in Audit
+    send_report: Send report…
   correlation:
     detail: "Correlation: %{id}"
     clipboard: "%{summary}\nCorrelation: %{id}"
 form:
   validation:
+    profile_storage_read_failed: "Connection profiles could not be read, so the connection was not saved. Try again."
+    unknown_form_literal_ref: "New literal value sources cannot be saved because the driver form is unavailable. Register the driver and try again."
+    connection_deleted_while_saving: "The connection was deleted while saving."
+    deleted_connection_secret_cleanup_failed: "Its secrets could not be removed from the system keyring. Unlock it and try again."
     broken_password_unresolved: "The broken password source needs a value or a source. You can also turn off Save password to enter it when connecting."
+    secret_field_keyring_failed: "The secret field \"%{field}\" could not be saved to the system keyring. Unlock the keyring and try again."
+    secret_fields_may_have_changed: "The saved value of these secret fields may have changed; check them before connecting: %{fields}"
     reserved_database_kind: "This driver declares a database kind that DataTab no longer supports, so the connection cannot be saved."
     connection_name_required: Connection name is required
     no_driver_selected: No driver selected
@@ -3628,6 +3647,51 @@ modals:
       many: "%{count} documents can't be saved from here — their changes are kept and the tabs stay open"
     dont_save: Don't save
     cancel: Cancel
+reports:
+  action:
+    dont_send: "Don't send"
+    save: "Save as file"
+    send: "Send"
+    close: "Close"
+  off:
+    setting: "Offer to send a report is off in Settings. Reports already written stay on disk until you delete them."
+    environment: "DATATAB_DISABLE_ERROR_REPORTS is set on this machine, so DataTab does not offer reports. Reports already written stay on disk until you delete them."
+    managed_file: "An error-reports-disabled file is on this machine, so DataTab does not offer reports. Reports already written stay on disk until you delete them."
+  send:
+    title: "Send this report?"
+    lead: "This is every byte the report holds, and the only thing that leaves this machine. Nothing is sent until you press Send."
+    decline_note: "Choosing Don't send keeps the file and stops DataTab from asking about this report again."
+    in_progress: "Sending the report…"
+    done: "Report sent. Our service keeps it for 90 days."
+    not_marked: "DataTab could not record the answer beside the file (%{error}), so the next start may offer it once more."
+    token_not_kept: "DataTab could not keep the delete token beside the file (%{error}), so this report cannot be deleted from the server later."
+    failed: "The report did not reach the service: %{error}. You can save it as a file and send it by email instead."
+  save:
+    dialog_title: "Save the report"
+    dialog_filter: "Report"
+    in_progress: "Saving the report…"
+    done: "Report saved to %{path}"
+    cancelled: "Nothing was saved."
+    failed: "The report could not be saved: %{error}"
+  notice:
+    title: "DataTab kept a crash report from a previous session"
+    body: "Nothing has been sent. You can read every byte before deciding."
+    review: "Review and send…"
+    dismiss: "Later"
+  about:
+    title: "Pending diagnostic reports"
+    row: "%{kind} report"
+    empty: "No reports are waiting."
+    decided: "Answered · not offered again"
+    decided_now: "DataTab will not ask about this report again. The file stays where it is."
+    decide_failed: "The answer could not be recorded: %{error}"
+    review_in_progress: "Opening the report…"
+    delete: "Delete from the server"
+    deleting: "Deleting the report from the server…"
+    deleted: "The report was deleted from the server, and its file was removed from this machine."
+    deleted_but_local: "The report was deleted from the server, but its file stayed: %{error}"
+    delete_failed: "The report was not deleted: %{error}. Everything stays on this machine."
+    no_token: "No delete token is kept for this report, so DataTab cannot delete it from the server. If it was sent before DataTab kept tokens, write to %{address} with its report id to remove it."
 palette:
   footer:
     navigate: "move"
@@ -3674,6 +3738,8 @@ palette:
       name: "Add external scripts folder…"
     toggle_comment:
       name: Toggle line comment
+    format_sql:
+      name: Format SQL
     open_history:
       name: Open query history
     cancel_query:
@@ -3958,6 +4024,9 @@ settings:
         "8s": "8 seconds"
         "15s": "15 seconds"
         never: "Keep until dismissed"
+    send_error_reports:
+      label: "Offer to send a report"
+      hint: "On, a panic or an error can offer to send a report you see and approve first. Off removes the Send report… action; reports already written stay on disk. An organization can also turn reports off with DATATAB_DISABLE_ERROR_REPORTS or an error-reports-disabled file."
     share_stable_db:
       label: Use the stable database
       error: Failed to update the shared-database setting
@@ -3974,6 +4043,7 @@ settings:
     title: About
     subtitle: Project information
     report_bug: Report a bug
+    view_source: View source
     copyright: "Copyright © 2026 %{author} and contributors."
     license: "Licensed under the %{license} licenses."
     derived_notice: "Derived from DBFlux. Not the official DBFlux."
@@ -4082,6 +4152,7 @@ settings:
       open_script_file: Open script file…
       add_external_scripts_folder: "Add external scripts folder…"
       toggle_comment: Toggle line comment
+      format_sql: Format SQL
       export_results: Export results
       clear_filter: Clear filter
       next_result_tab: Next result tab
@@ -4380,6 +4451,9 @@ settings:
       body_one: 'Are you sure you want to delete "%{name}"? 1 connection using this auth profile will be updated.'
       body_many: 'Are you sure you want to delete "%{name}"? %{count} connections using this auth profile will be updated.'
     login_hint: Log in to load options
+    options_failed_hint: Could not load options.
+    options_retry: Retry
+    options_retry_label: "Retry loading %{field}"
     inherited_from: "Inherited from %{trigger}."
     inherited_from_named: "Inherited from %{trigger} '%{name}'."
     error:
@@ -4910,6 +4984,8 @@ sidebar:
     schema_diff_unsupported: Schema diff is only available for relational connections.
     new_dashboard: New dashboard…
     rename_ellipsis: Rename…
+    copy_column_name: Copy column name
+    copy_field_name: Copy field name
     copy_metric_id: Copy metric ID
     copy_inspector_id: Copy inspector ID
     remove_external_folder: Remove from sidebar

@@ -19,20 +19,20 @@ use datatab_core::{
     DbKind, DbSchemaInfo, DdlCapabilities, DdlRejection, DefaultSpec, DeploymentClass,
     DescribeRequest, DocumentConnection, DriverCapabilities, DriverFormDef, DriverLimits,
     DriverMetadata, DropColumnRequest, DropForeignKeyRequest, DropIndexRequest, DropTypeRequest,
-    ErrorLocation, ExecutionSourceContext, ExplainRequest, FieldExportTransform, ForeignKeyBuilder,
-    ForeignKeyInfo, FormFieldKind, FormSection, FormTab, FormValues, FormattedError, Icon,
-    IndexData, IndexInfo, InstanceCatalog, IsolationLevel, KeyValueConnection,
-    MutationCapabilities, PaginationStyle, PlaceholderStyle, QueryCancelHandle, QueryCapabilities,
-    QueryErrorFormatter, QueryGenerator, QueryHandle, QueryLanguage, QueryRequest, QueryResult,
-    ReindexRequest, RelationalConnection, RelationalSchema, RoutineInfo, RoutineKind, Row,
-    RowDelete, RowInsert, RowPatch, SchemaColumnInfo, SchemaFeatures, SchemaForeignKeyBuilder,
-    SchemaForeignKeyInfo, SchemaIndexInfo, SchemaLoadingStrategy, SchemaSnapshot, SemanticPlan,
-    SemanticPlanKind, SemanticRequest, SortDirection, SqlDialect, SqlMutationGenerator,
-    SqlQueryBuilder, SshTunnelConfig, SyntaxInfo, TableInfo, TransactionCapabilities,
-    TransactionStateNote, TransferFamily, TypeDefinition, Value, ViewInfo, WhereOperator,
-    field_password, field_required, field_use_uri, generate_create_table, generate_delete_template,
-    generate_drop_table, generate_insert_template, generate_select_star, generate_truncate,
-    generate_update_template, render_semantic_filter_sql, sanitize_uri, ssh_tab,
+    ErrorLocation, ErrorPosition, ExecutionSourceContext, ExplainRequest, FieldExportTransform,
+    ForeignKeyBuilder, ForeignKeyInfo, FormFieldKind, FormSection, FormTab, FormValues,
+    FormattedError, Icon, IndexData, IndexInfo, InstanceCatalog, IsolationLevel,
+    KeyValueConnection, MutationCapabilities, PaginationStyle, PlaceholderStyle, QueryCancelHandle,
+    QueryCapabilities, QueryErrorFormatter, QueryGenerator, QueryHandle, QueryLanguage,
+    QueryRequest, QueryResult, ReindexRequest, RelationalConnection, RelationalSchema, RoutineInfo,
+    RoutineKind, Row, RowDelete, RowInsert, RowPatch, SchemaColumnInfo, SchemaFeatures,
+    SchemaForeignKeyBuilder, SchemaForeignKeyInfo, SchemaIndexInfo, SchemaLoadingStrategy,
+    SchemaSnapshot, SemanticPlan, SemanticPlanKind, SemanticRequest, SortDirection, SqlDialect,
+    SqlMutationGenerator, SqlQueryBuilder, SshTunnelConfig, SyntaxInfo, TableInfo,
+    TransactionCapabilities, TransactionStateNote, TransferFamily, TypeDefinition, Value, ViewInfo,
+    WhereOperator, field_password, field_required, field_use_uri, generate_create_table,
+    generate_delete_template, generate_drop_table, generate_insert_template, generate_select_star,
+    generate_truncate, generate_update_template, render_semantic_filter_sql, sanitize_uri, ssh_tab,
     strip_leading_comments, validate_ddl_fragment, when_checked, when_unchecked, with_default,
     with_help,
 };
@@ -5084,6 +5084,10 @@ impl PostgresErrorFormatter {
 
             formatted = formatted.with_code(db_err.code().code());
 
+            if let Some(position) = Self::statement_position(db_err.position()) {
+                formatted = formatted.with_position(position);
+            }
+
             let has_location = db_err.table().is_some()
                 || db_err.column().is_some()
                 || db_err.constraint().is_some()
@@ -5111,6 +5115,25 @@ impl PostgresErrorFormatter {
             formatted
         } else {
             FormattedError::new(Self::flatten_error(e))
+        }
+    }
+
+    /// The server's error position, when it points into the statement the user
+    /// submitted.
+    ///
+    /// PostgreSQL counts the first character of the statement as 1, and
+    /// `ErrorPosition::from_one_based_character` is the one place that removes
+    /// the leading one. A position of the `Internal` kind indexes a query the
+    /// server generated itself, which the editor never holds, so it is left out
+    /// rather than applied to the user's text.
+    fn statement_position(
+        position: Option<&postgres::error::ErrorPosition>,
+    ) -> Option<ErrorPosition> {
+        match position? {
+            postgres::error::ErrorPosition::Original(one_based) => {
+                Some(ErrorPosition::from_one_based_character(*one_based))
+            }
+            postgres::error::ErrorPosition::Internal { .. } => None,
         }
     }
 
@@ -6146,11 +6169,18 @@ fn simple_query_messages_to_results(
 /// Masks the secrets of a connection string, in URL or keyword form, for an
 /// error or a log line.
 fn sanitize_connection_string(input: &str) -> String {
-    if is_connection_url(input) {
-        return sanitize_uri(input);
+    // The userinfo password goes first, while its `@` still marks the end of
+    // it. The libpq pass then runs on the original text: nothing is skipped
+    // because it looks masked, and any key that is not public is masked.
+    let masked = datatab_core::redact_libpq_secret_values(
+        &datatab_core::redact_userinfo_passwords(input, "***"),
+        "***",
+    );
+    if is_connection_url(&masked) {
+        return sanitize_uri(&masked);
     }
     // A keyword string may still carry a URL with credentials.
-    sanitize_uri(&keyword::redacted(input))
+    sanitize_uri(&keyword::redacted(&masked))
 }
 
 fn format_pg_uri_error(e: &postgres::Error, uri: &str) -> DbError {
@@ -7701,6 +7731,35 @@ mod tests {
         let flattened = PostgresErrorFormatter::flatten_error(&error);
 
         assert_eq!(flattened, "timeout waiting for server");
+    }
+
+    /// The server counts the statement's first character as 1, so a `position`
+    /// of 8 must become offset 7 for the editor's cursor.
+    #[test]
+    fn a_server_position_becomes_a_zero_based_character_offset() {
+        let position = PostgresErrorFormatter::statement_position(Some(
+            &postgres::error::ErrorPosition::Original(8),
+        ))
+        .expect("an original position is the statement's own");
+
+        assert_eq!(position.character_offset, Some(7));
+        assert_eq!(position.resolve_character_offset("SELECT * FROMF"), Some(7));
+    }
+
+    /// A position of an internally generated query indexes text the editor
+    /// never holds, so it must not move the cursor in the user's statement.
+    #[test]
+    fn a_position_in_an_internal_query_is_left_out() {
+        let internal = postgres::error::ErrorPosition::Internal {
+            position: 3,
+            query: "SELECT internal()".to_string(),
+        };
+
+        assert_eq!(
+            PostgresErrorFormatter::statement_position(Some(&internal)),
+            None
+        );
+        assert_eq!(PostgresErrorFormatter::statement_position(None), None);
     }
 
     #[test]

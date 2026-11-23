@@ -21,6 +21,7 @@ pub mod notifications;
 pub mod object_tree;
 pub mod open_external;
 pub mod platform;
+pub mod report_offer;
 pub mod saved_chart_manager;
 pub mod saved_document_query_manager;
 pub mod saved_query_manager;
@@ -38,8 +39,9 @@ mod style_guardrails;
 #[cfg(feature = "mcp")]
 pub use app_state_entity::McpRuntimeEventRaised;
 pub use app_state_entity::{
-    AppStateChanged, AppStateEntity, AppStateGlobal, OpenAuditRequested, SaveTargetOutcome,
-    SaveTargetProvider, SaveTargetRequest, UserErrorReported, drain_hook_load_diagnostics,
+    AppStateChanged, AppStateEntity, AppStateGlobal, OpenAuditRequested, ReportWindowRequest,
+    ReportWindowRequested, SaveTargetOutcome, SaveTargetProvider, SaveTargetRequest,
+    UserErrorReported, drain_hook_load_diagnostics,
 };
 pub use async_ext::AsyncUpdateResultExt;
 pub use connection_session::ConnectionSession;
@@ -54,6 +56,7 @@ pub use object_tree::{
     ObjectTreeRequestKey, ObjectTreeRequestStatus, ObjectTreeSnapshot, database_display_label,
     project_object_tree, project_profile_tree,
 };
+pub use report_offer::{ReportOffSources, ReportOfferSeam, reports_offered};
 pub use saved_chart_manager::SavedChartManager;
 pub use saved_document_query_manager::SavedDocumentQueryManager;
 pub use saved_query_manager::{ConnectionTableProbe, SavedQueryManager, TableProbe};

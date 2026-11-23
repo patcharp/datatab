@@ -2,6 +2,76 @@
 
 All notable changes to DataTab will be documented in this file.
 
+## [0.1.4] - 2026-11-24
+
+### Added
+
+* **Crash and error reports** — When DataTab crashes or an operation fails, it can offer you a report. The window shows every byte it holds, **Don't send** is the default, and nothing leaves your machine until you press Send, one report at a time. A sent report can be deleted from Settings → About, and a setting, an environment variable or a managed file turns the offer off.
+* **Cassandra and ScyllaDB** — DataTab connects to Apache Cassandra and ScyllaDB, with a connection form that carries the TLS settings, and the driver ships in every build, the MCP server included.
+* **Cassandra and ScyllaDB schema** — The sidebar lists keyspaces, tables, materialized views, user types, indexes and CQL key roles.
+* **Cassandra and ScyllaDB** — CQL statements are classified by the driver, so a `SELECT` is a read, `GRANT` and `REVOKE` count as administration, `DROP`, `TRUNCATE` and `ALTER` ask for confirmation, and a `BEGIN BATCH … APPLY BATCH` block runs as one statement.
+* **Cassandra and ScyllaDB `DELETE`** — A `DELETE` is classified against the table's primary key, so one that does not name every key column with `=` asks for confirmation before it runs.
+* **Cassandra and ScyllaDB tables** — Browsing a table pages through the server's paging state, and a row can be edited, inserted and deleted through a lightweight transaction (`IF EXISTS` / `IF NOT EXISTS`). A table whose database cannot sort offers no header sort and says why.
+* **About** — The About page links to the public source repository.
+* **Column names** — Copy a column or field name from the schema tree, or the active column name from the grid header or the table menu.
+* **Schema diff** — Create and drop tables on DuckDB and ClickHouse, including a ClickHouse Cloud table's shared engine.
+* **ClickHouse TLS** — A custom CA, a client certificate for mutual TLS and a self-signed server, with a mode for each: the modes that do not check the certificate say so before you connect.
+* **Format SQL** — Format the whole buffer or the selection from a command, `Alt+Shift+F`, the command palette or the editor toolbar, on one undo step.
+* **Editor** — The split between the editor and its results is remembered per arrangement, so it comes back at the same place next time.
+* **Editor** — A failed query moves the cursor to the position the database named, where the driver reports one.
+* **Results** — A free-form result that cannot be edited says why, and points at the visual query builder.
+* **Thai data** — The grid, the editor and every surface that shows data fall back to a bundled Noto Sans Thai, so Thai text renders at the size of the text around it instead of a system font.
+* **Schema tree** — MySQL, SQL Server, SQLite and DuckDB load every column of a schema in one catalog read, so a large schema opens with far fewer round trips.
+* **macOS releases** — Signing runs in its own job on a fresh machine and the temporary keychain is removed as soon as the signature is verified.
+
+### Changed
+
+* **Editor** — The editor's context bar shows the last run time once.
+
+### Fixed
+
+* **Passwords** — A connection whose password comes from a value source, or whose Save password is off, no longer unlocks the system keyring. A broken value source says the saved password was not read instead of blaming a locked keyring, and a connection whose driver has no password field can still be saved.
+* **Editing a connection** — Editing a connection no longer drops the value sources of fields the form has no selector for, and a saved source for a field an external driver no longer declares is dropped when the connection loads.
+* **External drivers** — Connections made with an external (RPC) driver keep their settings after a restart.
+* **Auth profile form** — A dropdown that asks an RPC provider for its options sends one request at a time, does not ask a failing provider again on every repaint, and offers Retry on a field that failed.
+* **External auth providers** — An auth provider that runs as an RPC service and never answers its handshake no longer holds up app start, and several providers are probed at the same time instead of one after another.
+* **Settings** — The login dialog, with its Cancel button, opens however Settings was opened.
+* **Import** — Importing a bundle saves the auth profile you chose in the import panel, and a choice that names a deleted profile fails that connection with the reason. A second import cannot start while one runs, and a refused import is reported once and stays readable after the window closes.
+* **Connections** — Saving a connection and importing a bundle no longer freeze the window while secrets are written to the system keyring.
+* **Connection manager** — A connection has one edit window, and it cannot be deleted while that window is open.
+* **SQL Server** — Cancelling a query no longer interrupts or kills the session that recovery opened, a query cancelled before it was sent is not sent, and a cancel that stalls gives up after 10 seconds. The window no longer freezes while the connection recovers after a cancel.
+* **Instance metrics** — MongoDB resident memory and SQL Server total server memory show the right size, and InfluxDB BoltDB and HTTP request counts show a rate.
+* **Charts** — A chart saved in a query language DataTab no longer supports is refused at save with the reason, instead of disappearing at the next start.
+* **Redis Sentinel** — Connection and authentication errors name the Sentinel node that failed.
+* **SQL Server** — A foreign key's `ON DELETE` and `ON UPDATE` actions no longer show exchanged in table details; the actions now match the server's catalog.
+* **Linux** — The window's client inset matches the shadow it draws.
+
+### Security
+
+* **PostgreSQL and Redshift secrets** — Connect errors and logs mask every libpq secret key, a misspelled or unknown key, a key nested in quotes, keys with non-ASCII letters, and the escaped apostrophe of an unclosed value.
+* **External drivers** — The secret fields an external (RPC) driver declares besides the password are kept in the OS keyring instead of DataTab's database. Values that older versions stored are moved there at startup, and they never reach an export or a duplicate.
+* **Saved values** — A literal value reference on a secret field is no longer written to the database or to an export. It moves to the system keyring, or the export asks for it on import.
+* **Value sources** — When a driver's connection form cannot be loaded, a new literal value source on a secret field is refused, with the reason, instead of being stored.
+* **Redis Sentinel** — A Sentinel connection in TLS mode checks the certificate chain against your private CAs, presents your client certificate on discovery and master connections, and keeps doing so after a failover, with no plaintext fallback.
+* **MCP governance** — A batch that mixes a destructive statement with an administrative one is governed as the worse of the two, and a governance ceiling reads the data-risk ladder as well as the permission ladder, so a level that admits only administration no longer lets a statement that removes rows through.
+* **MCP governance** — A `DELETE` or `UPDATE` with no `WHERE` is destructive, so a policy that allows only `write` no longer runs a whole-table write without approval.
+* **MCP policies** — A policy may no longer allow an execution class while it decides a class below it more strictly. Saving such a policy is refused with an error that names the pair, and a stored one grants nothing.
+* **Query classification** — A `DELETE` or `UPDATE` with no `WHERE` is destructive, inside a stored procedure, a data-modifying `WITH` or an `EXPLAIN ANALYZE`, and the confirmation dialog names the pattern the policy acted on.
+* **MCP approvals** — An approval request carries the operation's own class, so a removal is never queued as an administrative change.
+
+### Upgrading
+
+* **Before you upgrade** — DataTab can now send a crash or error report, and only when you press **Send**. Nothing is sent automatically. **Settings → General → Offer to send a report** turns the offer off, and so does `DATATAB_DISABLE_ERROR_REPORTS` or a managed `error-reports-disabled` file for an organization.
+* **Windows** — Close DataTab, then run the new `datatab-windows-amd64-setup.exe`. It installs over 0.1.3 and keeps your data.
+* **Debian and Ubuntu** — Close DataTab, then run `sudo apt install ./datatab-linux-amd64.deb` with the new package.
+* **macOS** — Close DataTab, open the disk image for your Mac and drag `DataTab.app` to Applications, replacing the old one. Run `xattr -dr com.apple.quarantine /Applications/DataTab.app` before you start it. The app is signed with the PCPLab certificate, so macOS may ask once more for access to a saved password: choose **Always Allow**. Your data stays in its folder.
+
+### Rollback
+
+* **Windows** — Uninstall DataTab in Settings, Installed apps, then run the 0.1.3 installer. Your data folder stays.
+* **Debian and Ubuntu** — Run `sudo apt install --allow-downgrades ./datatab-linux-amd64.deb` with the 0.1.3 package.
+* **macOS** — Close DataTab, then replace `DataTab.app` with the 0.1.3 one, and run `xattr -dr com.apple.quarantine /Applications/DataTab.app` before you start it. Your data stays.
+
 ## [0.1.3] - 2026-11-16
 
 ### Added

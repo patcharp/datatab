@@ -194,6 +194,32 @@ fn test_editor_toggle_comment_binding() {
     );
 }
 
+/// Alt+Shift+F is the editor's Format chord, and holding Alt types no
+/// character, so it reaches the command instead of the text.
+#[test]
+fn test_editor_format_binding() {
+    let keymap = default_keymap();
+
+    let alt_shift_f = KeyChord::new(
+        "f",
+        Modifiers {
+            alt: true,
+            shift: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        keymap.resolve(ContextId::Editor, &alt_shift_f),
+        Some(Command::FormatSql)
+    );
+
+    // A bare `f` stays with the text input.
+    assert_eq!(
+        keymap.resolve(ContextId::Editor, &KeyChord::new("f", Modifiers::none())),
+        None
+    );
+}
+
 #[test]
 fn test_global_fallback_from_sidebar() {
     let keymap = default_keymap();

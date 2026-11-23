@@ -183,6 +183,31 @@ const TOASTS: SurfaceRegistry = SurfaceRegistry {
 
 /// The sidebar's inline confirmation of a driver-declared root section
 /// action: Enter confirms and Escape cancels in the Modal key context.
+/// The startup offer of a report a panic left: its three answers take focus
+/// and Tab reaches them from any part of the shell.
+const REPORT_NOTICE: SurfaceRegistry = SurfaceRegistry {
+    name: "report notice",
+    contexts: &[ContextId::Global],
+    entries: &[
+        ("report-notice-review", KeyboardPath::TabStop),
+        ("report-notice-decline", KeyboardPath::TabStop),
+        ("report-notice-dismiss", KeyboardPath::TabStop),
+    ],
+};
+
+/// The send window: a dialog, so Tab keeps the keyboard inside it and Enter
+/// runs the default action ("Don't send").
+const REPORT_SEND_WINDOW: SurfaceRegistry = SurfaceRegistry {
+    name: "report send window",
+    contexts: &[ContextId::Modal],
+    entries: &[
+        ("report-send-save", KeyboardPath::TabStop),
+        ("report-send-send", KeyboardPath::TabStop),
+        ("report-send-decline", KeyboardPath::TabStop),
+        ("report-send-close", KeyboardPath::TabStop),
+    ],
+};
+
 const ROOT_SECTION_ACTION_CONFIRM: SurfaceRegistry = SurfaceRegistry {
     name: "root section action confirmation",
     contexts: &[ContextId::Modal],
@@ -333,6 +358,8 @@ fn shell_coverage() -> Coverage {
         .with_surface(TASKS_PANEL)
         .with_surface(NOTIFICATIONS)
         .with_surface(TOASTS)
+        .with_surface(REPORT_NOTICE)
+        .with_surface(REPORT_SEND_WINDOW)
         .with_surface(PANE_ACTIONS_MENU)
         .delegate(
             "sql-doc-*",
@@ -655,5 +682,98 @@ fn window_controls_are_registered_as_chrome() {
             }),
             "missing window chrome entry for {id}"
         );
+    }
+}
+
+/// Points the workspace's pending-report reads at `dir` and refreshes the
+/// startup notice, as the app's own folder would.
+fn point_reports_at(
+    harness: &mut Harness<'_>,
+    dir: &std::path::Path,
+    reports: &[datatab_diagnostics::ErrorReport],
+) {
+    let app_state = harness
+        .window
+        .update(|_, cx| harness.workspace.read(cx).app_state.clone());
+
+    harness.window.update(|_, cx| {
+        app_state.update(cx, |state, _| {
+            state.set_reports_pending_dir(Some(dir.to_path_buf()));
+        });
+    });
+
+    for report in reports {
+        datatab_diagnostics::write_pending_report(dir, report).expect("pending report written");
+    }
+
+    let notice = harness
+        .window
+        .update(|_, cx| harness.workspace.read(cx).report_notice.clone());
+    harness
+        .window
+        .update(|_, cx| notice.update(cx, |notice, cx| notice.refresh(cx)));
+    harness.window.update(|window, _| window.refresh());
+    harness.window.run_until_parked();
+}
+
+fn panic_report() -> datatab_diagnostics::ErrorReport {
+    datatab_diagnostics::ErrorReport::new(
+        datatab_diagnostics::ReportKind::Panic,
+        "2026-11-23T05:00:00Z",
+    )
+}
+
+/// The next start's offer of a report: every answer is a tab stop, so the
+/// keyboard reaches it without the pointer.
+#[gpui::test]
+fn the_report_notice_is_covered(cx: &mut TestAppContext) {
+    let mut harness = open_workspace(cx);
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    point_reports_at(&mut harness, dir.path(), &[panic_report()]);
+
+    let frame = harness.capture.frame(harness.window);
+    let covered = shell_coverage().assert_covered(&frame);
+
+    for id in [
+        "report-notice-review",
+        "report-notice-decline",
+        "report-notice-dismiss",
+    ] {
+        assert!(covered.iter().any(|covered| covered == id), "{covered:?}");
+    }
+}
+
+/// The send window is a dialog: Tab keeps the keyboard in it, and the chrome
+/// answers Escape.
+#[gpui::test]
+fn the_report_send_window_is_covered(cx: &mut TestAppContext) {
+    let mut harness = open_workspace(cx);
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    point_reports_at(&mut harness, dir.path(), &[panic_report()]);
+
+    let path = datatab_diagnostics::pending::pending_reports(dir.path())
+        .into_iter()
+        .next()
+        .expect("the report is on disk");
+    let send = harness
+        .window
+        .update(|_, cx| harness.workspace.read(cx).report_send.clone());
+    harness
+        .window
+        .update(|_, cx| send.update(cx, |send, cx| send.open_pending(&path, cx)));
+    harness.window.update(|window, _| window.refresh());
+    harness.window.run_until_parked();
+
+    let frame = harness.capture.frame(harness.window);
+    let covered = shell_coverage()
+        .with_surface(datatab_ui_base::keyboard_coverage::MODAL_CHROME)
+        .assert_covered(&frame);
+
+    for id in [
+        "report-send-save",
+        "report-send-send",
+        "report-send-decline",
+    ] {
+        assert!(covered.iter().any(|covered| covered == id), "{covered:?}");
     }
 }

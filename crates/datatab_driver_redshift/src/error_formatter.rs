@@ -1,5 +1,6 @@
 use datatab_core::{
-    ConnectionErrorFormatter, DbError, ErrorLocation, FormattedError, QueryErrorFormatter,
+    ConnectionErrorFormatter, DbError, ErrorLocation, ErrorPosition, FormattedError,
+    QueryErrorFormatter,
 };
 
 /// Formats `postgres::Error` values raised by the Redshift wire client into
@@ -25,6 +26,10 @@ impl RedshiftErrorFormatter {
             }
 
             formatted = formatted.with_code(db_error.code().code());
+
+            if let Some(position) = Self::statement_position(db_error.position()) {
+                formatted = formatted.with_position(position);
+            }
 
             let has_location = db_error.table().is_some()
                 || db_error.column().is_some()
@@ -53,6 +58,25 @@ impl RedshiftErrorFormatter {
             formatted
         } else {
             FormattedError::new(Self::flatten_error(e))
+        }
+    }
+
+    /// The server's error position, when it points into the statement the user
+    /// submitted.
+    ///
+    /// Redshift reports it the way PostgreSQL does: the first character of the
+    /// statement is 1, and `ErrorPosition::from_one_based_character` is the one
+    /// place that removes the leading one. An `Internal` position indexes a
+    /// query the server generated, which the editor never holds, so it is left
+    /// out rather than applied to the user's text.
+    fn statement_position(
+        position: Option<&postgres::error::ErrorPosition>,
+    ) -> Option<ErrorPosition> {
+        match position? {
+            postgres::error::ErrorPosition::Original(one_based) => {
+                Some(ErrorPosition::from_one_based_character(*one_based))
+            }
+            postgres::error::ErrorPosition::Internal { .. } => None,
         }
     }
 
@@ -283,5 +307,34 @@ mod tests {
         let error = postgres::Error::__private_api_timeout();
         let db_error = format_redshift_connection_error(&error, "cluster.example.com", 5439);
         assert!(matches!(db_error, DbError::ConnectionFailed(_)));
+    }
+
+    /// Redshift counts the statement's first character as 1, like PostgreSQL,
+    /// so a `position` of 5 must become offset 4.
+    #[test]
+    fn a_cluster_position_becomes_a_zero_based_character_offset() {
+        let position = RedshiftErrorFormatter::statement_position(Some(
+            &postgres::error::ErrorPosition::Original(5),
+        ))
+        .expect("an original position is the statement's own");
+
+        assert_eq!(position.character_offset, Some(4));
+        assert_eq!(position.resolve_character_offset("SELEC * FROM t"), Some(4));
+    }
+
+    /// A position of an internally generated query indexes text the editor
+    /// never holds, so it must not move the cursor in the user's statement.
+    #[test]
+    fn a_position_in_an_internal_query_is_left_out() {
+        let internal = postgres::error::ErrorPosition::Internal {
+            position: 2,
+            query: "SELECT internal()".to_string(),
+        };
+
+        assert_eq!(
+            RedshiftErrorFormatter::statement_position(Some(&internal)),
+            None
+        );
+        assert_eq!(RedshiftErrorFormatter::statement_position(None), None);
     }
 }

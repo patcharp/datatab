@@ -243,7 +243,7 @@ jobs:
 
   macos:
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
-    name: macOS ${{ matrix.arch }} (.app)
+    name: Build macOS ${{ matrix.arch }} (.app)
     # Both apps build on the Apple Silicon runner; see the header.
     runs-on: macos-26
     timeout-minutes: 340
@@ -309,6 +309,49 @@ jobs:
           MACOS_SIGN_IDENTITY: ""
         run: sh scripts/build-macos.sh "$TARGET"
 
+      - name: Archive the unsigned app
+        # Preserve executable modes and symlinks across the artifact handoff.
+        run: tar -C target/macos-package -cf "$RUNNER_TEMP/datatab-macos-$ARCH.tar" DataTab.app
+
+      - name: Upload the unsigned app
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-macos-${{ matrix.arch }}
+          path: ${{ runner.temp }}/datatab-macos-${{ matrix.arch }}.tar
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
+  macos-sign:
+    name: Sign and package macOS ${{ matrix.arch }}
+    needs: macos
+    # A fresh hosted runner keeps build processes away from the signing keychain.
+    runs-on: macos-26
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, arm64]
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Download the unsigned app
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned-macos-${{ matrix.arch }}
+          path: ${{ runner.temp }}
+
+      - name: Unpack the unsigned app
+        run: |
+          mkdir -p target/macos-package
+          tar -C target/macos-package -xf "$RUNNER_TEMP/datatab-macos-$ARCH.tar"
+
       - name: Import the signing certificate
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         shell: bash
@@ -366,6 +409,27 @@ jobs:
           requirement='identifier "'"$bundle_id"'" and certificate leaf = H"83fab2cb8fc3a11aa870475c5022d0800ac605f6"'
           codesign --verify --strict -R="$requirement" "$app"
 
+      - name: Remove the signing keychain
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          keychain_path="$RUNNER_TEMP/datatab-signing.keychain-db"
+          search_list_path="$RUNNER_TEMP/datatab-signing-search-list.txt"
+          cleanup_status=0
+          if [ -f "$keychain_path" ]; then
+            security delete-keychain "$keychain_path" || cleanup_status=$?
+          fi
+          if [ -f "$search_list_path" ]; then
+            original_keychains=()
+            while IFS= read -r keychain; do
+              original_keychains+=("$keychain")
+            done < "$search_list_path"
+            security list-keychains -d user -s ${original_keychains[@]+"${original_keychains[@]}"} || cleanup_status=$?
+          fi
+          rm -f "$RUNNER_TEMP/datatab-signing.p12" "$search_list_path" "$search_list_path.pending"
+          exit "$cleanup_status"
+
       - name: Describe the unsigned test build
         if: github.event_name == 'workflow_dispatch'
         run: |
@@ -396,30 +460,9 @@ jobs:
           overwrite: true
           retention-days: 14
 
-      - name: Remove the signing keychain
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          keychain_path="$RUNNER_TEMP/datatab-signing.keychain-db"
-          search_list_path="$RUNNER_TEMP/datatab-signing-search-list.txt"
-          cleanup_status=0
-          if [ -f "$keychain_path" ]; then
-            security delete-keychain "$keychain_path" || cleanup_status=$?
-          fi
-          if [ -f "$search_list_path" ]; then
-            original_keychains=()
-            while IFS= read -r keychain; do
-              original_keychains+=("$keychain")
-            done < "$search_list_path"
-            security list-keychains -d user -s ${original_keychains[@]+"${original_keychains[@]}"} || cleanup_status=$?
-          fi
-          rm -f "$RUNNER_TEMP/datatab-signing.p12" "$search_list_path" "$search_list_path.pending"
-          exit "$cleanup_status"
-
   checksums:
     name: Collect and checksum
-    needs: [linux, windows, macos]
+    needs: [linux, windows, macos-sign]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:

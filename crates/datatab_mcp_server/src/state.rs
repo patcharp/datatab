@@ -469,13 +469,22 @@ fn apply_governance_settings(
     }
 
     for policy in &governance.policies {
+        let dto = ToolPolicyDto {
+            id: policy.id.clone(),
+            allowed_tools: policy.allowed_tools.clone(),
+            allowed_classes: policy.allowed_classes.clone(),
+            approval_classes: policy.approval_classes.clone(),
+        };
+
+        // Kept in the runtime so the GUI can show and repair it, but refused as
+        // a grant: the engine will not be built from a policy that decides a
+        // class below more strictly than a class above it (#490).
+        if let Err(error) = datatab_mcp::validate_policy_class_sets(&dto) {
+            log::warn!("A stored MCP policy grants nothing: {error}");
+        }
+
         runtime
-            .upsert_policy_mut(ToolPolicyDto {
-                id: policy.id.clone(),
-                allowed_tools: policy.allowed_tools.clone(),
-                allowed_classes: policy.allowed_classes.clone(),
-                approval_classes: policy.approval_classes.clone(),
-            })
+            .upsert_policy_mut(dto)
             .map_err(|e| format!("failed to load policy: {e}"))?;
     }
 
@@ -551,6 +560,20 @@ fn load_auth_profiles(runtime: &StorageRuntime) -> Result<Vec<datatab_core::Auth
             })
         })
         .collect()
+}
+
+/// The server registers no RPC driver, so it has no form that says which
+/// values of an external profile are secret. Rows written before such secrets
+/// were kept out of the database may still hold them, so none of the values
+/// is exposed: neither the config values nor a literal value reference.
+fn withhold_external_values(profile: &mut ConnectionProfile) {
+    let datatab_core::DbConfig::External { values, .. } = &mut profile.config else {
+        return;
+    };
+    values.clear();
+    profile
+        .value_refs
+        .retain(|_, value_ref| !matches!(value_ref, datatab_core::ValueRef::Literal { .. }));
 }
 
 /// Loads persisted profiles, refusing malformed value references before secret reads.
@@ -677,7 +700,9 @@ pub fn load_profiles(
             environment: None,
             navigator_view: datatab_core::NavigatorView::Advanced,
             show_all_databases: true,
+            keyring_secret_fields: std::collections::BTreeSet::new(),
         };
+        withhold_external_values(&mut profile);
 
         if hook_load_error.is_none()
             && let Some(bindings) = profile.hook_bindings.clone()
@@ -1272,6 +1297,7 @@ fn str_to_db_kind(value: &str) -> Option<datatab_core::DbKind> {
         "ClickHouse" => Some(datatab_core::DbKind::ClickHouse),
         "Turso" => Some(datatab_core::DbKind::Turso),
         "DuckDB" => Some(datatab_core::DbKind::DuckDB),
+        "Cassandra" => Some(datatab_core::DbKind::Cassandra),
         // The names of the removed AWS drivers ("DynamoDB", "CloudWatchLogs",
         // "S3", "AwsSecrets") are unknown like any other string.
         _ => None,
@@ -1295,6 +1321,7 @@ fn default_db_config_for_kind(kind: datatab_core::DbKind) -> Option<datatab_core
         DbKind::ClickHouse => DbConfig::default_clickhouse(),
         DbKind::Turso => DbConfig::default_turso(),
         DbKind::DuckDB => DbConfig::default_duckdb(),
+        DbKind::Cassandra => DbConfig::default_cassandra(),
         DbKind::ReservedDynamoDb
         | DbKind::ReservedCloudWatchLogs
         | DbKind::ReservedS3
@@ -1644,6 +1671,14 @@ fn build_driver_registry() -> HashMap<String, Arc<dyn DbDriver>> {
         );
     }
 
+    #[cfg(feature = "cassandra")]
+    {
+        registry.insert(
+            "cassandra".to_string(),
+            Arc::new(datatab_driver_cassandra::CassandraDriver::new()),
+        );
+    }
+
     registry
 }
 
@@ -1661,6 +1696,8 @@ fn load_external_auth_providers(
     registry: &mut HashMap<String, Arc<dyn DynAuthProvider>>,
     services: &[ServiceConfig],
 ) {
+    let mut candidates = Vec::new();
+    let mut inputs = Vec::new();
     for service in services {
         if !service.enabled {
             continue;
@@ -1697,7 +1734,15 @@ fn load_external_auth_providers(
             }
         };
 
-        let provider = match RpcAuthProvider::probe(&service.socket_id, launch) {
+        candidates.push(service);
+        inputs.push((service.socket_id.clone(), launch));
+    }
+
+    for (service, result) in candidates
+        .into_iter()
+        .zip(RpcAuthProvider::probe_many(&inputs))
+    {
+        let provider = match result {
             Ok(provider) => Arc::new(provider) as Arc<dyn DynAuthProvider>,
             Err(error) => {
                 log::warn!(
@@ -1823,6 +1868,8 @@ fn validate_secret_provider_contract(service: &ServiceConfig) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     mod driver_config;
+    mod external_values;
+    mod mcp_policies;
     mod value_refs;
 
     use super::*;
@@ -1837,6 +1884,21 @@ mod tests {
     use datatab_test_support::{
         FakeAuthProviderRpcConfig, FakeAuthProviderRpcServer, FakeAuthRpcResult,
     };
+
+    #[test]
+    #[cfg(feature = "cassandra")]
+    fn cassandra_is_available_to_mcp_when_feature_enabled() {
+        assert_eq!(
+            str_to_db_kind("Cassandra"),
+            Some(datatab_core::DbKind::Cassandra)
+        );
+
+        let registry = build_driver_registry();
+        let driver = registry
+            .get("cassandra")
+            .expect("cassandra driver must be registered");
+        assert_eq!(driver.driver_key(), "builtin:cassandra");
+    }
 
     #[test]
     #[cfg(feature = "clickhouse")]
@@ -2103,6 +2165,36 @@ mod tests {
             updated_at: String::new(),
         })
         .expect("insert service");
+    }
+
+    #[test]
+    fn auth_provider_registry_keeps_first_service_with_duplicate_provider_id() {
+        let (_temp_dir, runtime) = temp_runtime();
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let first_socket = format!("auth-first-{suffix}");
+        let second_socket = format!("auth-second-{suffix}");
+        insert_auth_provider_service(&runtime, &first_socket);
+        insert_auth_provider_service(&runtime, &second_socket);
+
+        let mut first = FakeAuthProviderRpcConfig::new(&first_socket, "duplicate-auth");
+        first.display_name = "First provider".into();
+        let mut second = FakeAuthProviderRpcConfig::new(&second_socket, "duplicate-auth");
+        second.display_name = "Second provider".into();
+        let first_server = FakeAuthProviderRpcServer::start(first).expect("first server");
+        let second_server = FakeAuthProviderRpcServer::start(second).expect("second server");
+
+        let mut services = datatab_storage::load_service_configs(&runtime);
+        services.sort_by_key(|service| service.socket_id != first_socket);
+        let registry = build_auth_provider_registry(&services);
+        assert_eq!(
+            registry
+                .get("duplicate-auth")
+                .expect("provider")
+                .display_name(),
+            "First provider"
+        );
+        first_server.wait().expect("first server join");
+        second_server.wait().expect("second server join");
     }
 
     #[tokio::test]

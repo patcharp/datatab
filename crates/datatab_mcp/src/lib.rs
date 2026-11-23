@@ -12,7 +12,7 @@ pub use built_ins::{
 pub use governance_service::{
     ApprovalOutcome, ConnectionPolicyAssignmentDto, GovernanceError, McpGovernanceService,
     PendingExecutionDetail, PendingExecutionSummary, PolicyRoleDto, ToolPolicyDto,
-    TrustedClientDto, execution_class_id, parse_execution_class_id,
+    TrustedClientDto, execution_class_id, parse_execution_class_id, validate_policy_class_sets,
 };
 pub use runtime::{APPROVAL_QUEUE_TOOLS, McpRuntime, McpRuntimeEvent};
 pub use tool_catalog::{

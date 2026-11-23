@@ -220,11 +220,16 @@ impl DataGridPanel {
             return;
         }
 
-        let order_by = Self::get_primary_key_columns(
+        let order_by = Self::browse_order(
             &self.app_state,
             profile_id,
-            database.as_deref(),
-            &table,
+            Self::get_primary_key_columns(
+                &self.app_state,
+                profile_id,
+                database.as_deref(),
+                &table,
+                cx,
+            ),
             cx,
         );
 

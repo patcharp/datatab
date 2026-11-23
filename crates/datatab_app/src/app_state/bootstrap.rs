@@ -55,6 +55,8 @@ use datatab_driver_mssql::MssqlDriver;
 #[cfg(feature = "redshift")]
 use datatab_driver_redshift::RedshiftDriver;
 
+#[cfg(feature = "cassandra")]
+use datatab_driver_cassandra::CassandraDriver;
 #[cfg(feature = "clickhouse")]
 use datatab_driver_clickhouse::ClickHouseDriver;
 #[cfg(feature = "duckdb")]
@@ -67,15 +69,14 @@ use crate::config_loader::{EditableGlobalHook, HookLoadDiagnostic, ProtectedHook
 use crate::rpc_services::external_audit::{ExternalAuditSink, NoOpContextProvider};
 use crate::rpc_services::{
     AuthProviderServiceAdaptation, DriverServiceAdaptation, ExternalDriverDiagnostic,
-    RpcServiceDiscovery, SecretProviderServiceAdaptation, adapt_auth_provider_service,
-    adapt_driver_service, adapt_secret_provider_service, discover_services,
+    RpcServiceDiscovery, SecretProviderServiceAdaptation, adapt_auth_provider_service_with,
+    adapt_driver_service, adapt_secret_provider_service, auth_provider_probe_input,
+    discover_services,
 };
 use crate::secret_provider_registry::SecretProviderRegistry;
 
 #[cfg(test)]
-use crate::rpc_services::{
-    DriverProbe, adapt_auth_provider_service_with, adapt_driver_service_with,
-};
+use crate::rpc_services::{DriverProbe, adapt_driver_service_with};
 
 #[cfg(test)]
 use datatab_driver_ipc::driver::IpcDriverLaunchConfig;
@@ -503,6 +504,7 @@ impl AppState {
         }
 
         state.hydrate_and_migrate_auth_secrets();
+        state.migrate_external_secret_values();
     }
 
     /// Re-hydrates secret-kind auth profile fields from the OS keyring and
@@ -640,13 +642,23 @@ impl AppState {
 
         let storage_policies = repo.get_tool_policies().map_err(|e| e.to_string())?;
         for policy in storage_policies {
+            let dto = ToolPolicyDto {
+                id: policy.policy_id,
+                allowed_tools: policy.allowed_tools,
+                allowed_classes: policy.allowed_classes,
+                approval_classes: policy.approval_classes,
+            };
+
+            // A stored policy whose class sets contradict the permission ladder
+            // is kept so Settings can show it and a person can repair it, and
+            // reported once here; its classes grant nothing, because the engine
+            // will not be built from it (#490).
+            if let Err(error) = datatab_mcp::validate_policy_class_sets(&dto) {
+                log::warn!("Stored MCP policy grants nothing: {}", error);
+            }
+
             self.mcp_runtime
-                .upsert_policy_mut(ToolPolicyDto {
-                    id: policy.policy_id,
-                    allowed_tools: policy.allowed_tools,
-                    allowed_classes: policy.allowed_classes,
-                    approval_classes: policy.approval_classes,
-                })
+                .upsert_policy_mut(dto)
                 .map_err(|e| format!("failed to upsert tool policy: {}", e))?;
         }
 
@@ -927,7 +939,60 @@ impl AppState {
         services: Vec<ServiceConfig>,
         audit_emitter: Option<Arc<dyn datatab_ipc::ExternalAuditEmitter>>,
     ) {
-        for discovery in discover_services(services) {
+        Self::launch_rpc_auth_providers_batch_with(registry, services, |inputs| {
+            datatab_ipc::RpcAuthProvider::probe_many(inputs)
+                .into_iter()
+                .map(|result| {
+                    result.map(|provider| {
+                        let provider = match &audit_emitter {
+                            Some(emitter) => provider.with_audit_emitter(emitter.clone()),
+                            None => provider,
+                        };
+                        Arc::new(provider) as Arc<dyn datatab_core::auth::DynAuthProvider>
+                    })
+                })
+                .collect()
+        });
+    }
+
+    pub(super) fn launch_rpc_auth_providers_batch_with<Probe>(
+        registry: &mut AuthProviderRegistry,
+        services: Vec<ServiceConfig>,
+        probe: Probe,
+    ) where
+        Probe: FnOnce(
+            &[(String, Option<datatab_ipc::IpcServiceLaunchConfig>)],
+        ) -> Vec<
+            Result<Arc<dyn datatab_core::auth::DynAuthProvider>, Box<datatab_core::DbError>>,
+        >,
+    {
+        let discoveries = discover_services(services);
+        let inputs: Vec<_> = discoveries
+            .iter()
+            .filter_map(|discovery| match discovery {
+                RpcServiceDiscovery::Descriptor(descriptor) => {
+                    auth_provider_probe_input(descriptor)
+                }
+                RpcServiceDiscovery::InvalidConfig { .. } => None,
+            })
+            .collect();
+        let mut results = probe(&inputs).into_iter();
+        let paired = discoveries.into_iter().map(|discovery| {
+            let result = match &discovery {
+                RpcServiceDiscovery::Descriptor(descriptor)
+                    if auth_provider_probe_input(descriptor).is_some() =>
+                {
+                    Some(results.next().unwrap_or_else(|| {
+                        Err(Box::new(datatab_core::DbError::connection_failed(
+                            "Missing auth-provider probe result",
+                        )))
+                    }))
+                }
+                _ => None,
+            };
+            (discovery, result)
+        });
+        for (discovery, result) in paired {
             let descriptor = match discovery {
                 RpcServiceDiscovery::Descriptor(descriptor) => descriptor,
                 RpcServiceDiscovery::InvalidConfig { diagnostic } => {
@@ -940,10 +1005,16 @@ impl AppState {
                 }
             };
 
-            match adapt_auth_provider_service(
+            match adapt_auth_provider_service_with(
                 descriptor,
                 |provider_id| registry.get(provider_id).is_some(),
-                audit_emitter.clone(),
+                |_, _| {
+                    result.unwrap_or_else(|| {
+                        Err(Box::new(datatab_core::DbError::connection_failed(
+                            "Missing auth-provider probe result",
+                        )))
+                    })
+                },
             ) {
                 AuthProviderServiceAdaptation::Registered {
                     provider_id,
@@ -1205,6 +1276,11 @@ impl AppState {
         #[cfg(feature = "duckdb")]
         {
             drivers.insert("duckdb".to_string(), Arc::new(DuckDbDriver::new()));
+        }
+
+        #[cfg(feature = "cassandra")]
+        {
+            drivers.insert("cassandra".to_string(), Arc::new(CassandraDriver::new()));
         }
 
         drivers

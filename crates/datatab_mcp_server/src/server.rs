@@ -1794,6 +1794,7 @@ impl DataTabServer {
     }
 
     /// Resolve secrets from a profile using keyring
+    #[allow(clippy::result_large_err)]
     fn resolve_profile_secrets(
         state: &ServerState,
         profile: &datatab_core::ConnectionProfile,
@@ -1803,7 +1804,7 @@ impl DataTabServer {
             let stored = datatab_core::keyring_password_for_connect(
                 profile,
                 driver_requires_password,
-                state.secret_manager.get_password(profile),
+                || state.secret_manager.get_password(profile),
             )
             .map_err(|error| format!("Profile '{}': {error}", profile.name))?;
             match stored {

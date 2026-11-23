@@ -348,6 +348,15 @@ pub struct ImportActions {
     /// must be surfaced as a user-facing error.
     pub secret_writes: Vec<(String, SecretString)>,
 
+    /// Secrets the user supplied for a connection's `Secret` required
+    /// references: `(new_connection_id, field_id, secret_value)`.
+    ///
+    /// `apply()` cannot tell which form field is the connection password, so
+    /// the app layer routes each: a secret field the driver keeps in its own
+    /// keyring entry goes there, any other to the connection password slot
+    /// (`connection_secret_ref`).
+    pub connection_field_secrets: Vec<(uuid::Uuid, String, SecretString)>,
+
     /// Connections skipped because their `kind` field was absent or unparseable.
     ///
     /// Each entry is `(connection_name, driver_id)`. The app layer records these
@@ -371,4 +380,12 @@ pub struct ImportActions {
     /// The app layer records these in `ImportOutcome::config_failures`. Only field
     /// names are carried, never the content of a reference.
     pub value_ref_failures: Vec<(String, Vec<String>)>,
+
+    /// `(new_connection_id, auth_profile_id)` for each connection that took its
+    /// auth profile from the user's choice in the import panel.
+    ///
+    /// `apply()` is pure and cannot tell whether the destination still holds the
+    /// profile. The app layer checks each one before it saves the connection and
+    /// fails that connection with a reason when the profile is gone.
+    pub chosen_auth_profiles: Vec<(uuid::Uuid, uuid::Uuid)>,
 }

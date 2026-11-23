@@ -10,7 +10,10 @@ use serde::{Deserialize, Serialize};
 use crate::DbError;
 use crate::driver::form::DriverFormDef;
 
-pub use refs::{AuthProfileLookup, expand_auth_profile_refs};
+pub use refs::{
+    AuthProfileLookup, auth_profile_form_values, auth_profile_ref_field_id_from_form,
+    expand_auth_profile_refs,
+};
 pub use types::*;
 
 /// Request to fetch the available options for a `DynamicSelect` field.

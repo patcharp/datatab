@@ -19,7 +19,7 @@ use datatab_core::chrono::{DateTime, Utc};
 use datatab_core::{TaskId, TaskKind, TaskSnapshot, TaskStatus};
 use uuid::Uuid;
 
-use crate::user_error::UserFacingError;
+use crate::user_error::{SendReportRequest, UserFacingError};
 
 /// Errors kept at most; the oldest is dropped first. The audit log keeps
 /// every one of them.
@@ -184,6 +184,9 @@ pub struct ErrorNotification {
     pub summary: String,
     pub cause: Option<String>,
     pub reported_at: DateTime<Utc>,
+    /// The closed fields a "Send report…" action needs. The summary and cause
+    /// above stay local: a report never carries them.
+    pub send_report: SendReportRequest,
 }
 
 impl ErrorNotification {
@@ -193,6 +196,7 @@ impl ErrorNotification {
             summary: error.summary.clone(),
             cause: error.cause.clone(),
             reported_at,
+            send_report: error.send_report_request(),
         }
     }
 
@@ -529,6 +533,13 @@ mod tests {
             summary: format!("failed {minutes_ago} min ago"),
             cause: None,
             reported_at: at(minutes_ago),
+            send_report: SendReportRequest {
+                correlation_id: Uuid::now_v7(),
+                error_kind: "driver",
+                severity: datatab_core::observability::EventSeverity::Error,
+                driver_id: None,
+                error_code: None,
+            },
         }
     }
 
@@ -850,6 +861,14 @@ mod tests {
             summary: "Export failed".into(),
             cause: None,
             reported_at: at(0),
+            send_report: SendReportRequest {
+                correlation_id: Uuid::parse_str("019f3c7a-0000-7000-8000-000000000000")
+                    .expect("valid uuid"),
+                error_kind: "storage",
+                severity: datatab_core::observability::EventSeverity::Error,
+                driver_id: None,
+                error_code: None,
+            },
         };
 
         assert_eq!(notification.short_correlation_id(), "019f3c7a");

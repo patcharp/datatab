@@ -11,8 +11,12 @@ fn broken_value_ref_blocks_test_until_connection_manager_save() {
         "password".into(),
         datatab_core::ValueRef::dotenv("unused-source", "PASSWORD"),
     );
-    datatab_app::config_loader::save_profiles(&runtime, std::slice::from_ref(&profile))
-        .expect("save profile");
+    datatab_app::config_loader::save_profiles(
+        &runtime,
+        std::slice::from_ref(&profile),
+        &std::collections::HashSet::new(),
+    )
+    .expect("save profile");
     runtime
         .open_datatab_db()
         .expect("database")
@@ -113,8 +117,12 @@ fn flagged_state_for_fields(
             datatab_core::ValueRef::dotenv("unused", "VALUE"),
         );
     }
-    datatab_app::config_loader::save_profiles(&runtime, std::slice::from_ref(&profile))
-        .expect("save");
+    datatab_app::config_loader::save_profiles(
+        &runtime,
+        std::slice::from_ref(&profile),
+        &std::collections::HashSet::new(),
+    )
+    .expect("save");
     runtime
         .open_datatab_db()
         .expect("db")
@@ -212,8 +220,12 @@ fn broken_value_ref_manager_save_removes_row_and_diagnostic_after_reload() {
         "password".into(),
         datatab_core::ValueRef::dotenv("unused", "PASSWORD"),
     );
-    datatab_app::config_loader::save_profiles(&runtime, std::slice::from_ref(&profile))
-        .expect("save");
+    datatab_app::config_loader::save_profiles(
+        &runtime,
+        std::slice::from_ref(&profile),
+        &std::collections::HashSet::new(),
+    )
+    .expect("save");
     runtime
         .open_datatab_db()
         .expect("db")
@@ -237,6 +249,7 @@ fn broken_value_ref_manager_save_removes_row_and_diagnostic_after_reload() {
             manager.save_profile(window, cx)
         })
         .expect("save repair");
+    cx.run_until_parked();
     assert!(window.root(&mut cx).is_err(), "save closes the window");
     state.read_with(&cx, |state, _| {
         assert!(state.value_ref_diagnostics(profile_id).is_empty());
@@ -496,6 +509,7 @@ fn save_broken_password_resolution(repair: PasswordRepair) {
             manager.save_profile(window, cx);
         })
         .expect("save repair");
+    cx.run_until_parked();
     assert!(window.root(&mut cx).is_err(), "repair closes form");
     assert_eq!(
         mutations.writes.load(Ordering::SeqCst),
@@ -569,6 +583,44 @@ fn broken_value_ref_password_placeholder_asks_for_value_or_source() {
             window.remove_window();
         })
         .expect("inspect placeholder");
+}
+
+#[::core::prelude::v1::test]
+fn broken_value_ref_literal_whitespace_password_save_is_refused_without_writes() {
+    let mut cx = TestAppContext::single();
+    let host = init_form_test_runtime(&mut cx);
+    let (_, window, _, mutations) = broken_password_form(&mut cx);
+    window
+        .update(&mut cx, |manager, window, cx| {
+            manager
+                .form
+                .input_password
+                .update(cx, |input, cx| input.set_value("   ", window, cx));
+            manager
+                .form
+                .input_name
+                .update(cx, |input, cx| input.set_value("refused edit", window, cx));
+            assert!(manager.form.form_save_password);
+            assert!(
+                manager
+                    .form
+                    .password_value_source_selector
+                    .read(cx)
+                    .is_literal(cx)
+            );
+            manager.save_profile(window, cx);
+            assert!(manager.validation_errors.contains(&datatab_i18n::t!(
+                "form.validation.broken_password_unresolved"
+            )));
+        })
+        .expect("refused form stays open");
+    assert!(window.root(&mut cx).is_ok());
+    assert_eq!(mutations.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(mutations.deletes.load(Ordering::SeqCst), 0);
+    assert_eq!(host.read_with(&cx, |host, _| host.toast_count()), 0);
+    window
+        .update(&mut cx, |_, window, _| window.remove_window())
+        .expect("close");
 }
 
 #[::core::prelude::v1::test]
@@ -649,7 +701,7 @@ fn broken_value_ref_password_placeholder_preserves_source_and_field_hints() {
                 let literal_placeholder = if field == "password" {
                     datatab_i18n::t!("connection_manager.placeholder.password_needs_value")
                 } else {
-                    datatab_i18n::t!("connection_manager.placeholder.password_unreadable")
+                    datatab_i18n::t!("connection_manager.placeholder.password_not_read")
                 };
                 assert_eq!(manager.password_placeholder(true, cx), literal_placeholder);
                 for (source, expected) in [
@@ -685,4 +737,77 @@ fn broken_value_ref_password_placeholder_preserves_source_and_field_hints() {
             })
             .expect("inspect source and field placeholders");
     }
+}
+
+#[::core::prelude::v1::test]
+fn edit_save_keeps_value_ref_of_field_without_selector_and_changes_selector_field() {
+    let mut cx = TestAppContext::single();
+    init_form_test_runtime(&mut cx);
+    let runtime = StorageRuntime::in_memory().expect("storage");
+    let mut profile = sqlite_profile("imported");
+    profile
+        .value_refs
+        .insert("api_token".into(), ValueRef::env("API_TOKEN"));
+    profile
+        .value_refs
+        .insert("password".into(), ValueRef::env("OLD_PASSWORD"));
+    datatab_app::config_loader::save_profiles(
+        &runtime,
+        std::slice::from_ref(&profile),
+        &std::collections::HashSet::new(),
+    )
+    .expect("save profile");
+    let profile_id = profile.id;
+    let state = cx.update(|cx| {
+        cx.new(|_| AppStateEntity::new_with_storage_runtime(runtime).expect("load state"))
+    });
+    state.update(&mut cx, |state, _| {
+        *state.secret_store().write().expect("secret store") =
+            Box::new(SecretStoreFixture::new(PasswordSaveOutcome::Success));
+    });
+    let profile = state.read_with(&cx, |state, _| state.profiles()[0].clone());
+    let window = open_edit_profile_window(state.clone(), profile, &mut cx);
+    cx.run_until_parked();
+    window
+        .update(&mut cx, |manager, window, cx| {
+            manager
+                .form
+                .input_name
+                .update(cx, |input, cx| input.set_value("renamed", window, cx));
+            manager
+                .form
+                .password_value_source_selector
+                .update(cx, |selector, cx| {
+                    selector.set_value_ref(Some(&ValueRef::env("NEW_PASSWORD")), window, cx);
+                });
+            manager
+                .form
+                .input_password
+                .update(cx, |input, cx| input.set_value("NEW_PASSWORD", window, cx));
+            manager.save_profile(window, cx);
+        })
+        .expect("save");
+    cx.run_until_parked();
+    assert!(window.root(&mut cx).is_err(), "save closes the window");
+    state.read_with(&cx, |state, _| {
+        let reloaded = AppStateEntity::new_with_storage_runtime(
+            StorageRuntime::for_path(state.storage_runtime().datatab_db_path().to_path_buf())
+                .expect("reopen"),
+        )
+        .expect("reload");
+        let saved = reloaded
+            .profiles()
+            .iter()
+            .find(|profile| profile.id == profile_id)
+            .expect("profile");
+        assert_eq!(saved.name, "renamed");
+        assert_eq!(
+            format!("{:?}", saved.value_refs.get("api_token")),
+            format!("{:?}", Some(&ValueRef::env("API_TOKEN")))
+        );
+        assert_eq!(
+            format!("{:?}", saved.value_refs.get("password")),
+            format!("{:?}", Some(&ValueRef::env("NEW_PASSWORD")))
+        );
+    });
 }

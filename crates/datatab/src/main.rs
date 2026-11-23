@@ -141,10 +141,79 @@ fn install_shutdown_signal_handlers() {
 #[cfg(not(unix))]
 fn install_shutdown_signal_handlers() {}
 
+/// The audit trail a panic report carries, read without waiting.
+///
+/// A busy audit database means an empty trail, never a blocked panic.
+fn panic_trail() -> Vec<datatab_audit::RecentEvent> {
+    let guard = AUDIT_SERVICE_FOR_PANIC
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    guard
+        .as_ref()
+        .map(|service| service.try_recent_events(datatab_diagnostics::MAX_TRAIL_EVENTS))
+        .unwrap_or_default()
+}
+
+/// Writes the pending report a panic leaves for the next start (ADR 0008).
+///
+/// Local only: nothing is sent, and the off switch does not stop the local
+/// file. Every failure is written to stderr because the hook runs while the
+/// process is already unwinding.
+fn write_pending_panic_report(panic_info: &std::panic::PanicHookInfo<'_>) {
+    let message = if let Some(text) = panic_info.payload().downcast_ref::<&str>() {
+        datatab_diagnostics::PanicMessage::Static(text)
+    } else if let Some(text) = panic_info.payload().downcast_ref::<String>() {
+        datatab_diagnostics::PanicMessage::Formatted(text)
+    } else {
+        datatab_diagnostics::PanicMessage::Unknown
+    };
+
+    let location =
+        panic_info
+            .location()
+            .map(|location| datatab_diagnostics::builder::SourceLocation {
+                file: location.file().to_string(),
+                line: location.line(),
+            });
+
+    let report = datatab_diagnostics::build_panic_report(datatab_diagnostics::PanicInput {
+        message,
+        location,
+        backtrace: datatab_diagnostics::builder::capture_backtrace(),
+        trail: panic_trail(),
+        now: datatab_core::chrono::Utc::now(),
+    });
+
+    let dir = match datatab_storage::paths::reports_pending_dir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            hook_note(&format!("pending report directory unavailable: {error}"));
+            return;
+        }
+    };
+
+    if let Err(error) = datatab_diagnostics::write_pending_report(&dir, &report) {
+        hook_note(&format!("pending report not written: {error}"));
+    }
+}
+
+/// Writes one note to stderr with the same shape the hook's own notes use.
+///
+/// `eprintln!` panics when the write fails, which inside an unwinding thread
+/// aborts the process; `write_all` returns the error, and a failed stderr write
+/// is where the note ends.
+fn hook_note(note: &str) {
+    let line = format!("[datatab] {note}\n");
+
+    let _ = std::io::stderr().write_all(line.as_bytes());
+}
+
 /// Installs a chained best-effort panic hook that:
 /// 1. Attempts to record the panic via AuditService::record_panic_report_best_effort
-/// 2. Falls back to stderr logging if the service is unavailable or fails
-/// 3. Always delegates to the previously installed panic hook
+/// 2. Writes the pending report the next start offers to send (ADR 0008)
+/// 3. Falls back to stderr logging if the service is unavailable or fails
+/// 4. Always delegates to the previously installed panic hook
 fn install_panic_hook() {
     let prev = std::panic::take_hook();
     *PREV_PANIC_HOOK
@@ -192,6 +261,8 @@ fn install_panic_hook() {
         }
 
         drop(audit_guard);
+
+        write_pending_panic_report(panic_info);
 
         let prev_guard = PREV_PANIC_HOOK
             .lock()
@@ -381,7 +452,7 @@ fn run_gui() {
     application.run(|cx: &mut App| {
         datatab_ui::theme::init(cx);
 
-        let app_state_inner = match AppStateEntity::new() {
+        let mut app_state_inner = match AppStateEntity::new() {
             Ok(state) => state,
             Err(e) => {
                 eprintln!(
@@ -392,6 +463,13 @@ fn run_gui() {
                 return;
             }
         };
+        // The two organization sources of the off switch are read once here,
+        // so no surface probes the environment or the data directory while it
+        // draws (ADR 0008, `docs/SETTINGS.md`). The setting itself stays live,
+        // and a send reads all three again.
+        app_state_inner
+            .set_report_off_sources(datatab_ui::ui::diagnostics::startup_report_off_sources());
+
         let app_state = cx.new(|_cx| app_state_inner);
 
         let keymap_overrides = datatab_app::keymap::load_keymap_overrides(

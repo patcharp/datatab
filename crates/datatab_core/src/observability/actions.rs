@@ -150,9 +150,69 @@ pub const SYSTEM_SHUTDOWN: AuditAction = AuditAction::new("system_shutdown");
 /// Panic or unrecoverable failure captured by the global handler.
 pub const SYSTEM_PANIC: AuditAction = AuditAction::new("system_panic");
 
+/// Every built-in action constant, for callers that must accept only these.
+///
+/// A new constant must be added here in the same change: the closed list is
+/// what a diagnostic report accepts as an `action`, and the test below keeps
+/// the two in step.
+pub const ALL: &[AuditAction] = &[
+    MCP_AUTHORIZE,
+    MCP_APPROVE_EXECUTION,
+    MCP_REJECT_EXECUTION,
+    MCP_TOOL_EXECUTE,
+    MCP_TOOL_EXECUTE_FAILED,
+    QUERY_EXECUTE,
+    QUERY_EXECUTE_FAILED,
+    QUERY_CANCEL,
+    DANGEROUS_QUERY_CONFIRMED,
+    KEY_BULK_DELETE,
+    KEY_BULK_DELETE_FAILED,
+    SCRIPT_EXECUTE,
+    SCRIPT_EXECUTE_FAILED,
+    CONNECTION_CONNECTING,
+    CONNECTION_CONNECT,
+    CONNECTION_DISCONNECT,
+    CONNECTION_CONNECT_FAILED,
+    HOOK_EXECUTE,
+    HOOK_EXECUTE_FAILED,
+    CONFIG_CHANGE,
+    CONFIG_CREATE,
+    CONFIG_UPDATE,
+    CONFIG_DELETE,
+    SCHEMA_VIZ_OPEN,
+    SCHEMA_VIZ_CANCEL,
+    SCHEMA_VIZ_ERROR,
+    SCHEMA_VIZ_LAYOUT_CHANGE,
+    SCHEMA_VIZ_EXPORT_DBML,
+    SCHEMA_VIZ_EXPORT_SQL,
+    SYSTEM_STARTUP,
+    SYSTEM_SHUTDOWN,
+    SYSTEM_PANIC,
+];
+
+/// Whether `action` is one of the built-in constants.
+pub fn is_known_action(action: &str) -> bool {
+    ALL.iter().any(|known| known.as_str() == action)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn known_action_accepts_every_constant_and_nothing_else() {
+        for action in ALL {
+            assert!(
+                is_known_action(action.as_str()),
+                "{} missing from ALL",
+                action.as_str()
+            );
+        }
+
+        assert!(!is_known_action("user_error"));
+        assert!(!is_known_action("query_execute; DROP TABLE t"));
+        assert!(!is_known_action(""));
+    }
 
     #[test]
     fn test_audit_action_as_str() {

@@ -10,6 +10,8 @@ use redis::cluster_routing::{RoutingInfo, SingleNodeRoutingInfo};
 use datatab_core::secrecy::{ExposeSecret, SecretString};
 
 use crate::language_service::RedisLanguageService;
+use crate::sentinel_resolver::TlsSentinelResolver;
+use datatab_core::access::AccessKind;
 use datatab_core::{
     CancelToken, ColumnKind, ColumnMeta, Connection, ConnectionErrorFormatter, ConnectionExt,
     ConnectionProfile, DatabaseCategory, DatabaseInfo, DbConfig, DbDriver, DbError, DbKind,
@@ -38,11 +40,11 @@ use datatab_ssh::{OpenedSshTunnel, SshTunnel};
 
 use crate::transport::{
     AclCommandAvailability, AclDryRunReply, ClusterScanCursor, ConfiguredTopology,
-    FallbackProbeOutcome, MasterRoleSanity, RedisTransport, RoleClassification, TopologyProbe,
-    classify_acl_command_error, classify_acl_dryrun_reply, classify_fallback_probe_error,
-    classify_role_reply, evaluate_master_role_sanity, is_connection_level_error,
-    parse_cluster_enabled, parse_cluster_slots_masters, parse_configured_topology, parse_node_list,
-    split_host_port, validate_cluster_database,
+    FallbackProbeOutcome, MasterRoleSanity, RedisTransport, RoleClassification, SentinelResolver,
+    TopologyProbe, classify_acl_command_error, classify_acl_dryrun_reply,
+    classify_fallback_probe_error, classify_role_reply, evaluate_master_role_sanity,
+    is_connection_level_error, parse_cluster_enabled, parse_cluster_slots_masters,
+    parse_configured_topology, parse_node_list, split_host_port, validate_cluster_database,
 };
 use redis::IntoConnectionInfo;
 use redis::sentinel::{SentinelClient, SentinelNodeConnectionInfo, SentinelServerType};
@@ -332,6 +334,11 @@ impl RedisDriver {
             params.ssl_client_key_path,
         )
         .map_err(DbError::InvalidProfile)?;
+
+        if params.topology == ConfiguredTopology::Sentinel && !matches!(tls, RedisTlsConfig::Plain)
+        {
+            return connect_tls_sentinel_master(params, tls);
+        }
 
         let uri = direct_connection_uri(&tls, params.host, params.port);
 
@@ -927,23 +934,30 @@ impl DbDriver for RedisDriver {
             return Ok(());
         }
 
-        // URI mode ignores the manual TLS settings. Manual mode must not read
-        // certificate files just to refuse a topology that cannot use them.
-        let uses_tls = if config.use_uri {
-            is_tls_uri(config.uri.as_deref().unwrap_or_default())
-        } else {
-            !matches!(
-                classify_redis_ssl_mode(config.ssl_mode.as_deref())
-                    .map_err(DbError::InvalidProfile)?,
-                RedisSslMode::Plain
-            )
-        };
-        if uses_tls {
+        // URI mode keeps its own TLS policy and ignores manual certificate paths.
+        if config.use_uri {
+            return if is_tls_uri(config.uri.as_deref().unwrap_or_default()) {
+                Err(DbError::InvalidProfile(
+                    "Redis Sentinel TLS requires manual mode; rediss:// URIs are not supported"
+                        .into(),
+                ))
+            } else {
+                Ok(())
+            };
+        }
+        let uses_tls = !matches!(
+            classify_redis_ssl_mode(config.ssl_mode.as_deref()).map_err(DbError::InvalidProfile)?,
+            RedisSslMode::Plain
+        );
+        let direct_access = profile
+            .access_kind
+            .as_ref()
+            .is_none_or(|kind| matches!(kind, AccessKind::Direct))
+            && matches!(profile.legacy_access_kind(), AccessKind::Direct)
+            && config.ssh_tunnel.is_none();
+        if uses_tls && !direct_access {
             return Err(DbError::InvalidProfile(
-                "Redis TLS is not available with the Sentinel topology, because DataTab \
-                 cannot reach the Sentinel master over TLS yet. To connect through \
-                 Sentinel without TLS, set the TLS mode to off or use a redis:// URI"
-                    .to_string(),
+                "Redis Sentinel TLS requires Direct access".into(),
             ));
         }
         Ok(())
@@ -2984,7 +2998,15 @@ impl RedisErrorFormatter {
     fn format_connection_message(source: &str, host: &str, port: u16) -> String {
         let lower = source.to_ascii_lowercase();
 
-        if lower.contains("connection refused") {
+        if lower.contains("redis sentinel did not return a master address") {
+            match source.split_once("Earlier Sentinel result: ") {
+                Some((message, earlier)) => format!(
+                    "{message}Earlier Sentinel result: {}",
+                    Self::format_connection_message(earlier, host, port)
+                ),
+                None => source.to_string(),
+            }
+        } else if lower.contains("connection refused") {
             format!("Connection refused. Is Redis running at {}:{}?", host, port)
         } else if lower.contains("timed out") {
             "Connection timed out".to_string()
@@ -3270,6 +3292,19 @@ fn format_redis_error(error: &redis::RedisError, host: &str, port: u16) -> DbErr
     formatted.into_connection_error()
 }
 
+fn format_tls_sentinel_error(error: &redis::RedisError, host: &str, port: u16) -> DbError {
+    let node_address = error.detail().and_then(|detail| {
+        let detail = detail
+            .strip_prefix("Earlier Sentinel result: ")
+            .unwrap_or(detail);
+        let address = detail.strip_prefix("Sentinel ")?.split_once(": ")?.0;
+        let (node_host, node_port) = address.rsplit_once(':')?;
+        Some((node_host, node_port.parse::<u16>().ok()?))
+    });
+    let (host, port) = node_address.unwrap_or((host, port));
+    format_redis_error(error, host, port)
+}
+
 fn format_redis_uri_error(error: &redis::RedisError, uri: &str) -> DbError {
     let sanitized = sanitize_uri(uri);
     let formatted = REDIS_ERROR_FORMATTER.format_uri_error(error, &sanitized);
@@ -3490,8 +3525,8 @@ fn build_cluster_connection(
 /// Builds the list of Sentinel node URIs: the primary node followed by any
 /// configured additional nodes, all as plain `redis://` addresses.
 ///
-/// `primary_uri` is used as typed by the caller, after `validate_profile`
-/// has refused TLS (see the driver README).
+/// Only the plain Sentinel path uses these URIs. TLS nodes are structured
+/// addresses built by `TlsSentinelResolver`.
 fn build_sentinel_node_uris(primary_uri: &str, additional_nodes: &[(String, u16)]) -> Vec<String> {
     let mut nodes = vec![primary_uri.to_string()];
     nodes.extend(
@@ -3514,6 +3549,73 @@ fn is_tls_uri(uri: &str) -> bool {
             ..
         })
     )
+}
+
+fn connect_tls_sentinel_master(
+    params: DirectConnectParams<'_>,
+    tls: RedisTlsConfig,
+) -> Result<Box<dyn Connection>, DbError> {
+    let master_name = params
+        .sentinel_master_name
+        .filter(|name| !name.trim().is_empty())
+        .ok_or_else(|| {
+            DbError::InvalidProfile(
+                "Redis Sentinel topology requires a configured master/service name".into(),
+            )
+        })?;
+    let (insecure, certificates) = match tls {
+        RedisTlsConfig::TlsInsecure => (
+            true,
+            redis::TlsCertificates {
+                client_tls: None,
+                root_cert: None,
+            },
+        ),
+        RedisTlsConfig::TlsVerify(certificates) => (
+            false,
+            redis::TlsCertificates {
+                client_tls: certificates.client_tls,
+                root_cert: certificates.root_cert,
+            },
+        ),
+        RedisTlsConfig::Plain => {
+            return Err(DbError::InvalidProfile(
+                "TLS Sentinel resolver requires TLS".into(),
+            ));
+        }
+    };
+    let mut resolver = TlsSentinelResolver::new(
+        (params.host, params.port),
+        params.additional_nodes,
+        master_name,
+        redis::RedisConnectionInfo {
+            db: params.database.map(i64::from).unwrap_or(0),
+            username: params
+                .user
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+            password: params.password.map(str::to_string),
+            ..Default::default()
+        },
+        insecure,
+        certificates,
+    )
+    .map_err(|error| format_redis_error(&error, params.host, params.port))?;
+    let (mut connection, (master_host, master_port)) = resolver
+        .get_connection()
+        .map_err(|error| format_tls_sentinel_error(&error, params.host, params.port))?;
+    set_client_name(&mut connection);
+    redis::cmd("PING")
+        .query::<String>(&mut connection)
+        .map_err(|error| format_redis_error(&error, &master_host, master_port))?;
+    Ok(Box::new(RedisConnection {
+        connection: Arc::new(Mutex::new(RedisTransport::SentinelMaster {
+            connection: Arc::new(Mutex::new(connection)),
+            resolver: Mutex::new(SentinelResolver::Tls(resolver)),
+        })),
+        active_database: Mutex::new(params.database),
+        _ssh_tunnel: params.ssh_tunnel,
+    }))
 }
 
 /// Resolves a Sentinel master, runs the standard post-connect sequence, and
@@ -3578,7 +3680,7 @@ fn connect_sentinel_master(
     Ok(Box::new(RedisConnection {
         connection: Arc::new(Mutex::new(RedisTransport::SentinelMaster {
             connection: Arc::new(Mutex::new(connection)),
-            resolver: Mutex::new(resolver),
+            resolver: Mutex::new(SentinelResolver::Plain(resolver)),
         })),
         active_database: Mutex::new(database),
         _ssh_tunnel: ssh_tunnel,
@@ -4538,6 +4640,57 @@ mod tests {
         SemanticPlanKind, SemanticRequest, TableBrowseRequest, TableRef, ValidationResult,
     };
 
+    #[test]
+    fn sentinel_refused_uses_connection_formatter() {
+        let error =
+            redis::RedisError::from((redis::ErrorKind::ResponseError, "connection refused"));
+        let result = format_tls_sentinel_error(&error, "localhost", 26379).to_string();
+        assert!(
+            result.contains("Connection refused. Is Redis running at localhost:26379?"),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn sentinel_refused_reports_failing_node() {
+        let error = redis::RedisError::from((
+            redis::ErrorKind::IoError,
+            "Redis Sentinel node connection failed",
+            "Sentinel other:26380: connection refused".to_string(),
+        ));
+        let result = format_tls_sentinel_error(&error, "primary", 26379).to_string();
+        assert!(result.contains("other:26380"), "{result}");
+    }
+
+    #[test]
+    fn sentinel_wrongpass_uses_connection_formatter() {
+        let error = redis::RedisError::from((redis::ErrorKind::ResponseError, "WRONGPASS"));
+        let result = format_tls_sentinel_error(&error, "localhost", 26379).to_string();
+        assert!(
+            result.contains("Authentication failed. Check credentials."),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn sentinel_missing_master_formats_earlier_auth_error() {
+        let error = redis::RedisError::from((
+            redis::ErrorKind::MasterNameNotFoundBySentinel,
+            "Redis Sentinel did not return a master address",
+            "Earlier Sentinel result: Sentinel other:26380: WRONGPASS secret-marker".to_string(),
+        ));
+        let result = format_tls_sentinel_error(&error, "localhost", 26379).to_string();
+        assert!(
+            result.contains("did not return a master address"),
+            "{result}"
+        );
+        assert!(
+            result.contains("Authentication failed. Check credentials."),
+            "{result}"
+        );
+        assert!(!result.contains("secret-marker"), "{result}");
+    }
+
     fn bulk(text: &str) -> redis::Value {
         redis::Value::BulkString(text.as_bytes().to_vec())
     }
@@ -5441,209 +5594,6 @@ mod tests {
                 additional_nodes: None,
             },
         )
-    }
-
-    fn is_sentinel_tls_refusal(result: &Result<Box<dyn Connection>, DbError>) -> bool {
-        matches!(
-            result,
-            Err(DbError::InvalidProfile(message))
-                if message.contains("cannot reach the Sentinel master over TLS yet")
-        )
-    }
-
-    #[test]
-    fn sentinel_refuses_tls_before_the_ssh_host() {
-        // Stands in for the SSH host. It counts each dial and closes the socket,
-        // so a dial ends in a failed handshake, with no SSH server needed.
-        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind listener");
-        let ssh_port = listener.local_addr().expect("listener address").port();
-        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        std::thread::spawn({
-            let dials = dials.clone();
-            move || {
-                for socket in listener.incoming() {
-                    dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                    drop(socket);
-                }
-            }
-        });
-        let dial_count = || dials.load(std::sync::atomic::Ordering::SeqCst);
-        let tunnel = || {
-            Some(SshTunnelConfig {
-                host: "127.0.0.1".to_string(),
-                port: ssh_port,
-                user: "not-a-real-user".to_string(),
-                auth_method: datatab_core::SshAuthMethod::Password,
-                ssh_config_host: None,
-            })
-        };
-        let connect = |profile: &ConnectionProfile| {
-            RedisDriver::new().connect_with_secrets(profile, None, None)
-        };
-
-        let not_refused: Vec<&str> = [
-            (
-                "mode on",
-                sentinel_profile("127.0.0.1", None, Some("on"), tunnel(), false),
-            ),
-            (
-                "mode on with a host that does not parse in a URI",
-                sentinel_profile("::1", None, Some("on"), tunnel(), false),
-            ),
-            (
-                "mode verify",
-                sentinel_profile("127.0.0.1", None, Some("verify"), tunnel(), false),
-            ),
-            (
-                "mode verify with a host that does not parse in a URI",
-                sentinel_profile("::1", None, Some("verify"), tunnel(), false),
-            ),
-        ]
-        .iter()
-        .filter(|(_, profile)| !is_sentinel_tls_refusal(&connect(profile)))
-        .map(|(case, _)| *case)
-        .collect();
-        assert!(
-            not_refused.is_empty(),
-            "not refused before the SSH host: {not_refused:?}"
-        );
-        assert_eq!(
-            dial_count(),
-            0,
-            "a TLS Sentinel profile dialed the SSH host"
-        );
-
-        for (case, uri) in [
-            ("a #insecure URI", "rediss://127.0.0.1:1/#insecure"),
-            ("a rediss URI", "rediss://127.0.0.1:1/"),
-        ] {
-            let profile = sentinel_profile("127.0.0.1", Some(uri), None, tunnel(), false);
-            assert!(
-                matches!(connect(&profile), Err(DbError::InvalidProfile(_))),
-                "{case} should be refused before the SSH host"
-            );
-        }
-        assert_eq!(
-            dial_count(),
-            0,
-            "a URI Sentinel profile dialed the SSH host"
-        );
-
-        let plain = sentinel_profile("127.0.0.1", None, Some("off"), tunnel(), false);
-        assert!(
-            !matches!(connect(&plain), Err(DbError::InvalidProfile(_))),
-            "plain Sentinel over a tunnel should not be refused"
-        );
-        assert!(
-            dial_count() > 0,
-            "plain Sentinel over a tunnel should reach the SSH host"
-        );
-    }
-
-    #[test]
-    fn sentinel_refuses_every_tls_form() {
-        // Without the refusal the connect reaches rustls, which needs a provider
-        // here, so a missing refusal fails on the assertions below.
-        rustls::crypto::aws_lc_rs::default_provider()
-            .install_default()
-            .expect("no provider is installed yet");
-
-        let connect = |profile: &ConnectionProfile| {
-            RedisDriver::new().connect_with_secrets(profile, None, None)
-        };
-
-        let not_refused: Vec<&str> = [
-            (
-                "mode on",
-                sentinel_profile("127.0.0.1", None, Some("on"), None, false),
-            ),
-            (
-                "mode verify",
-                sentinel_profile("127.0.0.1", None, Some("verify"), None, false),
-            ),
-            (
-                "a #insecure URI",
-                sentinel_profile(
-                    "127.0.0.1",
-                    Some("rediss://127.0.0.1:1/#insecure"),
-                    None,
-                    None,
-                    false,
-                ),
-            ),
-            (
-                "a #insecure URI with a trailing space",
-                sentinel_profile(
-                    "127.0.0.1",
-                    Some("rediss://127.0.0.1:1/#insecure "),
-                    None,
-                    None,
-                    false,
-                ),
-            ),
-            (
-                "a rediss URI",
-                sentinel_profile(
-                    "127.0.0.1",
-                    Some("rediss://127.0.0.1:1/"),
-                    None,
-                    None,
-                    false,
-                ),
-            ),
-            (
-                "a rediss URI with a trailing space",
-                sentinel_profile(
-                    "127.0.0.1",
-                    Some("rediss://127.0.0.1:1/ "),
-                    None,
-                    None,
-                    false,
-                ),
-            ),
-            (
-                "a rediss URI with an upper-case scheme",
-                sentinel_profile(
-                    "127.0.0.1",
-                    Some("REDISS://127.0.0.1:1/"),
-                    None,
-                    None,
-                    false,
-                ),
-            ),
-            (
-                "a rediss URI with mode off",
-                sentinel_profile(
-                    "127.0.0.1",
-                    Some("rediss://127.0.0.1:1/"),
-                    Some("off"),
-                    None,
-                    false,
-                ),
-            ),
-        ]
-        .iter()
-        .filter(|(_, profile)| !is_sentinel_tls_refusal(&connect(profile)))
-        .map(|(case, _)| *case)
-        .collect();
-        assert!(not_refused.is_empty(), "not refused: {not_refused:?}");
-
-        // Nothing listens on this port, so these fail to connect instead.
-        let refused: Vec<&str> = [
-            (
-                "mode off",
-                sentinel_profile("127.0.0.1", None, Some("off"), None, false),
-            ),
-            (
-                "a redis URI",
-                sentinel_profile("127.0.0.1", Some("redis://127.0.0.1:1/"), None, None, false),
-            ),
-        ]
-        .iter()
-        .filter(|(_, profile)| matches!(connect(profile), Err(DbError::InvalidProfile(_))))
-        .map(|(case, _)| *case)
-        .collect();
-        assert!(refused.is_empty(), "plain Sentinel refused: {refused:?}");
     }
 
     #[test]

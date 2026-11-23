@@ -25,6 +25,8 @@ datatab_ui_base.workspace = true
 datatab_ipc.workspace = true
 datatab_driver_ipc.workspace = true
 datatab_audit.workspace = true
+datatab_diagnostics.workspace = true
+datatab_storage.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
 log.workspace = true
 interprocess.workspace = true
@@ -57,7 +59,7 @@ workspace = true
 optional = true
 
 [features]
-default = ["sqlite", "postgres", "mysql", "mongodb", "redis", "influxdb", "mssql", "redshift", "clickhouse", "turso", "duckdb", "lua", "mcp"]
+default = ["sqlite", "postgres", "mysql", "mongodb", "redis", "influxdb", "mssql", "redshift", "clickhouse", "turso", "duckdb", "cassandra", "lua", "mcp"]
 # datatab_ui is driver-agnostic, so driver features only drive datatab_app (which
 # registers the drivers and relays to the MCP server). The binary does not need
 # to declare driver/runtime crates as direct optional deps — `datatab_app/<feat>`
@@ -73,6 +75,7 @@ redshift = ["datatab_app/redshift"]
 clickhouse = ["datatab_app/clickhouse"]
 turso = ["datatab_app/turso"]
 duckdb = ["datatab_app/duckdb"]
+cassandra = ["datatab_app/cassandra"]
 lua = ["datatab_app/lua", "datatab_ui/lua"]
 mcp = ["datatab_app/mcp", "datatab_ui/mcp"]
 # Development-only UI automation bridge (gpui-mcp). Never part of `default`.

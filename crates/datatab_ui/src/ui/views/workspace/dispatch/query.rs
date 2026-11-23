@@ -36,6 +36,12 @@ impl Workspace {
                 });
                 Some(true)
             }
+            Command::FormatSql => {
+                self.tab_manager.update(cx, |mgr, cx| {
+                    mgr.dispatch_active(Command::FormatSql, window, cx);
+                });
+                Some(true)
+            }
             Command::ExportResults => {
                 self.tab_manager.update(cx, |mgr, cx| {
                     mgr.dispatch_active(Command::ExportResults, window, cx);

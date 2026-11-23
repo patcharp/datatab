@@ -30,7 +30,7 @@ pub use release_channel::{ReleaseChannel, client_identity, client_identity_token
 pub use auth::{
     AuthFormDef, AuthProfile, AuthProfileSummary, AuthProvider, AuthSession, AuthSessionState,
     DynAuthProvider, FetchOptionsError, FetchOptionsRequest, FetchOptionsResponse,
-    ResolvedCredentials,
+    ResolvedCredentials, auth_profile_form_values, auth_profile_ref_field_id_from_form,
 };
 
 pub use config::{
@@ -94,15 +94,17 @@ pub use core::{
     BucketCreateOptions, BucketCreateOutcome, BucketDetails, BucketEncryption, BucketInfo,
     BucketSizeEstimate, CancelToken, CodeGenScope, CodeGeneratorInfo, Connection,
     ConnectionErrorFormatter, ConnectionExt, ConnectionOverrides, DbDriver, DbError,
-    DefaultErrorFormatter, DeletePrefixOutcome, DocumentConnection, ErrorLocation,
+    DefaultErrorFormatter, DeletePrefixOutcome, DocumentConnection, ErrorLocation, ErrorPosition,
     ExecutionSession, ExecutionSessionFactory, ExecutionSessionScope, FormattedError, KeyValueApi,
-    KeyValueConnection, LogErr, NoopCancelHandle, ObjectListingPage, ObjectMetadata,
-    ObjectStoreConnection, ObjectSummary, ObjectVersionSummary, PresignMethod, PublicAccessStatus,
-    QueryCancelHandle, QueryErrorFormatter, RelationalConnection, SchemaDropTarget, SchemaFeatures,
-    SchemaLoadingStrategy, SchemaObjectKind, SchemaSnapshotAuthority, ShutdownCoordinator,
-    ShutdownPhase, SourceContextSpec, SourceQueryMode, TaskId, TaskKind, TaskManager, TaskSlot,
-    TaskSnapshot, TaskStatus, TaskTarget, TransactionStateNote, Value, VersioningStatus,
-    redact_uri_credentials, sanitize_uri,
+    KeyValueConnection, LIBPQ_PUBLIC_KEYS, LIBPQ_SECRET_KEYS, LogErr, NoopCancelHandle,
+    ObjectListingPage, ObjectMetadata, ObjectStoreConnection, ObjectSummary, ObjectVersionSummary,
+    PresignMethod, PublicAccessStatus, QueryCancelHandle, QueryErrorFormatter,
+    RelationalConnection, SchemaDropTarget, SchemaFeatures, SchemaLoadingStrategy,
+    SchemaObjectKind, SchemaSnapshotAuthority, ShutdownCoordinator, ShutdownPhase,
+    SourceContextSpec, SourceQueryMode, TaskId, TaskKind, TaskManager, TaskSlot, TaskSnapshot,
+    TaskStatus, TaskTarget, TransactionStateNote, Value, VersioningStatus, is_libpq_public_key,
+    libpq_value_end, redact_libpq_secret_values, redact_uri_credentials, redact_userinfo_passwords,
+    sanitize_uri,
 };
 
 pub use data::{AggregatePipelineError, CollectionAggregateRequest, parse_aggregate_pipeline};
@@ -142,8 +144,8 @@ pub use data::{
 };
 
 pub use driver::{
-    DatabaseCategory, DdlCapabilities, DeploymentClass, DriverCapabilities, DriverFormDef,
-    DriverLimits, DriverMetadata, DriverMetadataBuilder, EditorLanguageProfile,
+    CQL_BATCH_HEADER_WORDS, DatabaseCategory, DdlCapabilities, DeploymentClass, DriverCapabilities,
+    DriverFormDef, DriverLimits, DriverMetadata, DriverMetadataBuilder, EditorLanguageProfile,
     ExecutionClassification, ExportFieldHint, FieldEquals, FieldExportTransform, FormFieldDef,
     FormFieldKind, FormSection, FormSectionIcon, FormTab, FormValues, Icon, IsolationLevel,
     MutationCapabilities, NativeConsoleProfile, OperationClassifier, OrderByMode, PaginationStyle,
@@ -181,8 +183,8 @@ pub use query::{
     VisualSortDirection, aggregate_writes_output, ceiling_permits, classify_query_for_governance,
     classify_query_for_language, classify_query_for_language_with_service, classify_sql_execution,
     classify_visual_mutation, contains_compound_block, contains_time_macros,
-    detect_dangerous_query, detect_dangerous_sql, infer_column_kind, inline_params,
-    is_safe_read_query, lower_keyset_predicate, parse_semantic_filter_json,
+    default_language_service, detect_dangerous_query, detect_dangerous_sql, infer_column_kind,
+    inline_params, is_safe_read_query, lower_keyset_predicate, parse_semantic_filter_json,
     project_aggregate_kinds, render_filter_node_sql, render_semantic_filter_sql,
     sql_statement_keywords, strip_leading_comments, substitute_time_macros,
 };
@@ -282,8 +284,9 @@ pub use secrecy;
 pub use storage::{
     HasSecretRef, HistoryEntry, KeyringSecretStore, NoopSecretStore, RecentFile, SavedQuery,
     SecretManager, SecretStore, SessionManifest, SessionStore, SessionTab, SessionTabKind, UiState,
-    UiStateStore, auth_field_secret_ref, connection_secret_ref, create_secret_store,
-    keyring_password_for_connect, password_lives_in_keyring, proxy_secret_ref,
+    UiStateStore, auth_field_secret_ref, connection_field_secret_ref, connection_secret_ref,
+    create_secret_store, keyring_password_for_connect, password_lives_in_keyring,
+    profile_with_keyring_fields, profile_with_keyring_fields_from, proxy_secret_ref,
     ssh_tunnel_secret_ref,
 };
 

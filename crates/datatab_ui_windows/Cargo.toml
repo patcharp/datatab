@@ -17,6 +17,9 @@ datatab_ui_base.workspace = true
 datatab_components.workspace = true
 datatab_core.workspace = true
 datatab_app.workspace = true
+# The report client: Settings > About and the workspace's send window act on
+# the same pending reports (ADR 0008).
+datatab_diagnostics.workspace = true
 datatab_storage.workspace = true
 datatab_portability.workspace = true
 datatab_ssh.workspace = true
@@ -31,8 +34,9 @@ dirs.workspace = true
 open = "5"
 
 [dev-dependencies]
-# The saved-profile regression edits a real Redshift profile.
-datatab_app = { workspace = true, features = ["redshift", "test-support"] }
+tempfile = "3"
+# TLS form regressions use the real Redshift and ClickHouse metadata.
+datatab_app = { workspace = true, features = ["redshift", "clickhouse", "test-support"] }
 gpui = { workspace = true, features = ["test-support"] }
 datatab_components = { workspace = true, features = ["test-support"] }
 datatab_ui_base = { workspace = true, features = ["test-support"] }

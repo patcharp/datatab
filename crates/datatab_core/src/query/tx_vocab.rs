@@ -128,6 +128,7 @@ impl TransactionVocab {
             | DbKind::InfluxDB
             | DbKind::Redshift
             | DbKind::ClickHouse
+            | DbKind::Cassandra
             | DbKind::ReservedDynamoDb
             | DbKind::ReservedCloudWatchLogs
             | DbKind::ReservedS3

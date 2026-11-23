@@ -46,11 +46,12 @@ use gpui_component::highlighter::{
     Diagnostic as InputDiagnostic, DiagnosticSeverity as InputDiagnosticSeverity,
 };
 use gpui_component::input::EditorState as GpuiEditorState;
-use gpui_component::resizable::{h_resizable, resizable_panel, v_resizable};
+use gpui_component::resizable::{ResizableState, h_resizable, resizable_panel, v_resizable};
 use lsp_types::{
     CompletionContext, CompletionItem, CompletionItemKind, CompletionResponse, CompletionTextEdit,
     InsertTextFormat, Position as LspPosition, Range as LspRange, TextEdit,
 };
+use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::cmp::min;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -73,6 +74,7 @@ mod execution_session;
 mod file_ops;
 mod file_persistence;
 mod focus;
+mod format;
 mod live_output;
 pub(crate) mod pane;
 mod render;
@@ -125,6 +127,29 @@ pub(crate) enum ResultsPosition {
 /// UI state key holding the position the last toggle chose, which new query
 /// tabs open with.
 const RESULTS_POSITION_KEY: &str = "query_results_position";
+
+/// UI state key holding the editor/results split the last drag left, as the
+/// share of the container the editor takes, per results position.
+const RESULTS_SPLIT_KEY: &str = "query_results_split_ratio";
+
+/// The share of the split a pane may open at, the least and the most.
+///
+/// A drag stops at the pixel ranges in `render.rs`, which need a measured
+/// container; a stored ratio has no container to measure against, so it is
+/// held inside these bounds instead, and the pixel ranges still clamp it when
+/// the split is laid out.
+const SPLIT_RATIO_MIN: f32 = 0.1;
+const SPLIT_RATIO_MAX: f32 = 0.9;
+
+/// The span a stored ratio turns into the two panes' opening sizes.
+///
+/// Only the panes' ratio to each other reaches the layout: the group draws
+/// them in proportion to their opening sizes and then adopts the measured
+/// pixels. The span is therefore arbitrary, and kept round.
+const SPLIT_RATIO_SPAN: Pixels = px(1000.0);
+
+/// The opening size of each pane when no split was ever dragged.
+const SPLIT_DEFAULT_PANE: Pixels = px(200.0);
 
 impl ResultsPosition {
     fn toggled(self) -> Self {
@@ -192,6 +217,150 @@ impl ResultsPosition {
         {
             log::error!("Could not save the results position: {error}");
         }
+    }
+}
+
+/// The editor/results split a document opens with, as the share of the
+/// container the editor takes, remembered for each results position: the two
+/// orientations split along different axes, and want their own split.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ResultsSplit {
+    bottom: Option<f32>,
+    right: Option<f32>,
+}
+
+/// What [`ResultsSplit`] looks like in the UI-state store.
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct StoredResultsSplit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bottom: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    right: Option<f32>,
+}
+
+/// A ratio the split can be laid out at, or `None` when it is no share of a
+/// container at all (`NaN`, an infinity).
+fn clamped_split_ratio(ratio: f32) -> Option<f32> {
+    ratio
+        .is_finite()
+        .then(|| ratio.clamp(SPLIT_RATIO_MIN, SPLIT_RATIO_MAX))
+}
+
+impl ResultsSplit {
+    fn load(app_state: &AppStateEntity) -> Self {
+        let stored = match app_state
+            .storage_runtime()
+            .ui_state()
+            .get(RESULTS_SPLIT_KEY)
+        {
+            Ok(Some(value)) => value,
+            Ok(None) => return Self::default(),
+            Err(error) => {
+                log::warn!("Could not read the saved editor split: {error}");
+                return Self::default();
+            }
+        };
+
+        let stored: StoredResultsSplit = match serde_json::from_str(&stored) {
+            Ok(stored) => stored,
+            Err(error) => {
+                log::warn!("Could not read the saved editor split: {error}");
+                return Self::default();
+            }
+        };
+
+        Self {
+            bottom: stored.bottom.and_then(clamped_split_ratio),
+            right: stored.right.and_then(clamped_split_ratio),
+        }
+    }
+
+    /// Records the share a finished drag left. The drag clamped both panes to
+    /// their pixel ranges already; the bounds here catch what a ratio cannot
+    /// say (a pane of no width at all).
+    fn set_ratio(&mut self, position: ResultsPosition, ratio: f32) {
+        let Some(ratio) = clamped_split_ratio(ratio) else {
+            return;
+        };
+        match position {
+            ResultsPosition::Bottom => self.bottom = Some(ratio),
+            ResultsPosition::Right => self.right = Some(ratio),
+        }
+    }
+
+    fn ratio(self, position: ResultsPosition) -> Option<f32> {
+        match position {
+            ResultsPosition::Bottom => self.bottom,
+            ResultsPosition::Right => self.right,
+        }
+    }
+
+    /// Writes one orientation back, leaving the other as the store holds it.
+    ///
+    /// The row is a whole-value upsert, and a document's copy of the split is
+    /// the one it was built with, so writing the snapshot whole would drop
+    /// what another tab dragged in the other orientation since. The current
+    /// value is therefore read back first and only `position` is replaced.
+    fn save(self, position: ResultsPosition, app_state: &AppStateEntity) {
+        let mut stored = Self::load(app_state);
+        match position {
+            ResultsPosition::Bottom => stored.bottom = self.bottom,
+            ResultsPosition::Right => stored.right = self.right,
+        }
+        let stored = StoredResultsSplit {
+            bottom: stored.bottom,
+            right: stored.right,
+        };
+        let value = match serde_json::to_string(&stored) {
+            Ok(value) => value,
+            Err(error) => {
+                log::error!("Could not encode the editor split: {error}");
+                return;
+            }
+        };
+        if let Err(error) = app_state
+            .storage_runtime()
+            .ui_state()
+            .set(RESULTS_SPLIT_KEY, &value)
+        {
+            log::error!("Could not save the editor split: {error}");
+        }
+    }
+
+    /// The opening size of each pane, editor first, for this position.
+    fn initial_sizes(self, position: ResultsPosition) -> (Pixels, Pixels) {
+        let Some(ratio) = self.ratio(position) else {
+            return (SPLIT_DEFAULT_PANE, SPLIT_DEFAULT_PANE);
+        };
+        (SPLIT_RATIO_SPAN * ratio, SPLIT_RATIO_SPAN * (1.0 - ratio))
+    }
+}
+
+impl CodeDocument {
+    /// The opening sizes of the editor and results panes: the split the user
+    /// last dragged in this orientation, or the fixed 200px both panes have
+    /// always opened at.
+    pub(crate) fn split_initial_sizes(&self) -> (Pixels, Pixels) {
+        self.results_split.initial_sizes(self.results_position)
+    }
+
+    /// Remembers the split a finished drag left behind.
+    ///
+    /// `editor` is the editor pane's size and `container` the extent the two
+    /// panes share; their ratio is what survives a window resize, where the
+    /// pixels would not.
+    pub(crate) fn save_results_split(
+        &mut self,
+        position: ResultsPosition,
+        editor: Pixels,
+        container: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        if container <= px(0.0) {
+            return;
+        }
+        self.results_split.set_ratio(position, editor / container);
+        self.results_split.save(position, self.app_state.read(cx));
     }
 }
 
@@ -415,9 +584,10 @@ pub(super) struct EditorState {
     pub(super) is_dirty: bool,
     /// Buffer length at the previous `Change` event, to detect deletions.
     pub(super) last_change_length: usize,
-    /// Set while `toggle_comment` rewrites the buffer, so the Change handler
-    /// skips the completion-menu plumbing meant for a user's deletion.
-    pub(super) toggling_comment: bool,
+    /// Set while a command rewrites the buffer on the user's behalf (a comment
+    /// toggle, a format), so the Change handler skips the completion-menu
+    /// plumbing meant for a user's deletion.
+    pub(super) programmatic_edit: bool,
     /// Shared with the completion provider, which bumps it on every query.
     /// A deletion that did NOT bump it was ignored by the menu plumbing
     /// (cursor deleted back past the menu's trigger start) and would leave a
@@ -595,6 +765,7 @@ pub struct CodeDocument {
     // Layout/focus
     layout: SqlQueryLayout,
     results_position: ResultsPosition,
+    results_split: ResultsSplit,
     focus_handle: FocusHandle,
     focus_mode: SqlQueryFocus,
     /// Keyboard focus for the multi-statement script confirmation.
@@ -834,10 +1005,10 @@ impl CodeDocument {
                     let current_length = input.read(cx).text().len();
                     let previous_length =
                         std::mem::replace(&mut this.editor.last_change_length, current_length);
-                    // Consumed here, not cleared by the toggle itself: GPUI
+                    // Consumed here, not cleared by the command itself: GPUI
                     // delivers `emit` after the outermost update finishes, so a
-                    // toggle's Change arrives long after it returned.
-                    let toggled = std::mem::take(&mut this.editor.toggling_comment);
+                    // programmatic edit's Change arrives long after it returned.
+                    let programmatic = std::mem::take(&mut this.editor.programmatic_edit);
 
                     let generation = this.editor.completion_query_generation.get();
                     let provider_queried = generation != this.editor.last_completion_generation;
@@ -853,7 +1024,7 @@ impl CodeDocument {
                         if current_length < previous_length
                             && !provider_queried
                             && this.editor.current_editor_mode == "sql"
-                            && !toggled
+                            && !programmatic
                         {
                             // The menu plumbing ignores deletions once the menu
                             // lost its trigger anchor, leaving a stale menu (or
@@ -1167,6 +1338,7 @@ impl CodeDocument {
 
         let vim = datatab_components::vim::VimBinding::new(input_state.clone(), window, cx);
         let results_position = ResultsPosition::load(app_state.read(cx));
+        let results_split = ResultsSplit::load(app_state.read(cx));
 
         let mut document = Self {
             id: doc_id,
@@ -1190,7 +1362,7 @@ impl CodeDocument {
                 path: None,
                 is_dirty: false,
                 last_change_length: 0,
-                toggling_comment: false,
+                programmatic_edit: false,
                 completion_query_generation,
                 last_completion_generation: 0,
                 cached_effective_language: query_language.clone(),
@@ -1246,6 +1418,7 @@ impl CodeDocument {
             },
             layout: SqlQueryLayout::EditorOnly,
             results_position,
+            results_split,
             focus_handle: cx.focus_handle(),
             focus_mode: SqlQueryFocus::Editor,
             script_confirm_focus: ModalFocus::new(cx),
@@ -1979,6 +2152,7 @@ impl CodeDocument {
                 true
             }
             Command::ToggleComment => self.toggle_comment(window, cx),
+            Command::FormatSql => self.format_sql(window, cx),
             Command::Cancel | Command::CancelQuery if self.runner.is_primary_active() => {
                 self.cancel_query(cx);
                 true
@@ -2313,8 +2487,9 @@ mod language_binding_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        CodeDocument, LanguageBinding, SqlQueryFocus, diff_stats_from_pair,
-        source_input_values_from_context,
+        CodeDocument, LanguageBinding, RESULTS_POSITION_KEY, RESULTS_SPLIT_KEY, ResultsPosition,
+        ResultsSplit, SPLIT_DEFAULT_PANE, SPLIT_RATIO_MAX, SPLIT_RATIO_MIN, SPLIT_RATIO_SPAN,
+        SqlQueryFocus, SqlQueryLayout, diff_stats_from_pair, source_input_values_from_context,
     };
     use crate::handle::DocumentEvent;
     use datatab_app::keymap::Command;
@@ -2323,7 +2498,7 @@ mod tests {
     use datatab_storage::bootstrap::StorageRuntime;
     use datatab_ui_base::toast::{ToastGlobal, ToastHost};
     use datatab_ui_base::{AppStateEntity, SaveTargetOutcome, SaveTargetProvider};
-    use gpui::{AppContext, Focusable, TestAppContext};
+    use gpui::{App, AppContext, Focusable, TestAppContext, px};
     use gpui_component::Root;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -2361,6 +2536,277 @@ mod tests {
         cx.update(|cx| {
             let host = cx.new(|_cx| ToastHost::new());
             cx.set_global(ToastGlobal { host });
+        });
+    }
+
+    /// Seeds the UI-state store, opens a query document over it, and runs
+    /// `run` with that document and the window it lives in still open.
+    fn with_window_document(
+        cx: &mut TestAppContext,
+        seed: &[(&str, &str)],
+        run: impl FnOnce(&gpui::Entity<CodeDocument>, &mut gpui::VisualTestContext),
+    ) {
+        init_test_runtime(cx);
+        let app_state = isolated_test_app_state(cx);
+        cx.update(|cx| {
+            for (key, value) in seed {
+                app_state
+                    .read(cx)
+                    .storage_runtime()
+                    .ui_state()
+                    .set(key, value)
+                    .expect("seed the ui state store");
+            }
+        });
+
+        let document = Rc::new(RefCell::new(None));
+        let slot = document.clone();
+        let (_, window) = cx.add_window_view(|window, cx| {
+            let doc = cx.new(|cx| {
+                CodeDocument::new_with_language(
+                    app_state.clone(),
+                    None,
+                    QueryLanguage::Sql,
+                    window,
+                    cx,
+                )
+            });
+            slot.replace(Some(doc.clone()));
+            Root::new(doc, window, cx)
+        });
+
+        let document = document
+            .borrow()
+            .clone()
+            .expect("the document was constructed");
+        run(&document, window);
+    }
+
+    /// [`with_window_document`] for a check that only reads the document.
+    fn with_query_document(
+        cx: &mut TestAppContext,
+        seed: &[(&str, &str)],
+        check: impl FnOnce(&gpui::Entity<CodeDocument>, &mut App),
+    ) {
+        with_window_document(cx, seed, |document, window| {
+            window.update(|_, cx| check(document, cx));
+        });
+    }
+
+    /// A split survives a restart: what one document wrote is what the next
+    /// one reads back, for both orientations.
+    #[gpui::test]
+    fn a_stored_split_ratio_round_trips_through_the_ui_state_store(cx: &mut TestAppContext) {
+        init_test_runtime(cx);
+        let app_state = isolated_test_app_state(cx);
+
+        cx.update(|cx| {
+            let mut split = ResultsSplit::default();
+            split.set_ratio(ResultsPosition::Bottom, 0.35);
+            split.save(ResultsPosition::Bottom, app_state.read(cx));
+            split.set_ratio(ResultsPosition::Right, 0.62);
+            split.save(ResultsPosition::Right, app_state.read(cx));
+
+            assert_eq!(ResultsSplit::load(app_state.read(cx)), split);
+            // Each orientation keeps its own share: the two split along
+            // different axes and would otherwise drag each other along.
+            assert_eq!(split.ratio(ResultsPosition::Bottom), Some(0.35));
+            assert_eq!(split.ratio(ResultsPosition::Right), Some(0.62));
+        });
+    }
+
+    /// Two documents open at once hold the split each was built with, and each
+    /// writes only the orientation the user dragged in it.
+    ///
+    /// This is the regression: a document wrote its whole snapshot, so the
+    /// row — one value for both orientations — took the second tab's stale
+    /// copy of the first tab's orientation with it. Drag the bottom split in
+    /// one tab, then the right split in another, and the bottom share was
+    /// gone.
+    #[gpui::test]
+    fn two_documents_saving_different_orientations_both_survive(cx: &mut TestAppContext) {
+        init_test_runtime(cx);
+        let app_state = isolated_test_app_state(cx);
+
+        cx.update(|cx| {
+            // Both tabs were built before either drag: neither has heard of
+            // the other's share.
+            let opened_with = ResultsSplit::default();
+
+            let mut tab_a = opened_with;
+            tab_a.set_ratio(ResultsPosition::Bottom, 0.4);
+            tab_a.save(ResultsPosition::Bottom, app_state.read(cx));
+
+            let mut tab_b = opened_with;
+            tab_b.set_ratio(ResultsPosition::Right, 0.7);
+            tab_b.save(ResultsPosition::Right, app_state.read(cx));
+
+            let stored = ResultsSplit::load(app_state.read(cx));
+            assert_eq!(
+                stored.ratio(ResultsPosition::Bottom),
+                Some(0.4),
+                "the second tab's write dropped the first tab's split"
+            );
+            assert_eq!(stored.ratio(ResultsPosition::Right), Some(0.7));
+        });
+    }
+
+    /// A drawn document splits its two panes at the stored share, in both
+    /// orientations: what the constructor restores reaches the layout.
+    ///
+    /// The panes carry debug selectors (`code-editor-pane`, `code-results-pane`)
+    /// so their laid-out bounds can be read the way `gpui-base` reads its own
+    /// panels.
+    #[gpui::test]
+    fn a_drawn_document_splits_its_panes_at_the_stored_share(cx: &mut TestAppContext) {
+        let cases = [
+            (ResultsPosition::Bottom, 0.25_f32, r#"{"bottom":0.25}"#),
+            (ResultsPosition::Right, 0.75_f32, r#"{"right":0.75}"#),
+        ];
+
+        for (position, ratio, stored) in cases {
+            with_window_document(
+                cx,
+                &[
+                    (RESULTS_POSITION_KEY, position.storage_value()),
+                    (RESULTS_SPLIT_KEY, stored),
+                ],
+                |document, window| {
+                    // A new document opens on the editor alone; the split is
+                    // what the user gets back after a query has run.
+                    window.update(|_, cx| {
+                        document.update(cx, |document, cx| {
+                            document.layout = SqlQueryLayout::Split;
+                            cx.notify();
+                        });
+                    });
+                    // The first frame measures the group, the second settles
+                    // the panes on it.
+                    window.update(|window, cx| {
+                        window.draw(cx).clear(cx);
+                        window.draw(cx).clear(cx);
+                    });
+
+                    let editor = window
+                        .debug_bounds("code-editor-pane")
+                        .expect("the editor pane is drawn");
+                    let results = window
+                        .debug_bounds("code-results-pane")
+                        .expect("the results pane is drawn");
+                    let extent = |bounds: gpui::Bounds<gpui::Pixels>| match position {
+                        ResultsPosition::Bottom => bounds.size.height,
+                        ResultsPosition::Right => bounds.size.width,
+                    };
+                    let share = extent(editor) / (extent(editor) + extent(results));
+
+                    assert!(
+                        (share - ratio).abs() < 0.01,
+                        "{position:?} split at {share}, expected {ratio}"
+                    );
+                },
+            );
+        }
+    }
+
+    /// A document built after a drag opens at the stored split, whichever
+    /// orientation the stored position names.
+    #[gpui::test]
+    fn a_document_opens_at_the_stored_split_in_both_orientations(cx: &mut TestAppContext) {
+        let cases = [
+            (ResultsPosition::Bottom, 0.25_f32, r#"{"bottom":0.25}"#),
+            (ResultsPosition::Right, 0.75_f32, r#"{"right":0.75}"#),
+        ];
+
+        for (position, ratio, stored) in cases {
+            with_query_document(
+                cx,
+                &[
+                    (RESULTS_POSITION_KEY, position.storage_value()),
+                    (RESULTS_SPLIT_KEY, stored),
+                ],
+                |document, cx| {
+                    let (editor, results) = document.read(cx).split_initial_sizes();
+                    let span = SPLIT_RATIO_SPAN.as_f32();
+                    assert_eq!(
+                        (editor.as_f32(), results.as_f32()),
+                        (span * ratio, span * (1.0 - ratio)),
+                        "{position:?} opens off the stored ratio"
+                    );
+                    assert_ne!(editor, results, "{position:?} opens off the default");
+                },
+            );
+        }
+    }
+
+    /// A stored value outside the band a pane may open at comes back from the
+    /// store clamped, so no window opens with a pane squeezed shut.
+    #[gpui::test]
+    fn an_out_of_range_split_ratio_is_clamped(cx: &mut TestAppContext) {
+        init_test_runtime(cx);
+        let app_state = isolated_test_app_state(cx);
+
+        cx.update(|cx| {
+            app_state
+                .read(cx)
+                .storage_runtime()
+                .ui_state()
+                .set(RESULTS_SPLIT_KEY, r#"{"bottom":-2.0,"right":4.0}"#)
+                .expect("seed the ui state store");
+
+            let split = ResultsSplit::load(app_state.read(cx));
+            assert_eq!(split.ratio(ResultsPosition::Bottom), Some(SPLIT_RATIO_MIN));
+            assert_eq!(split.ratio(ResultsPosition::Right), Some(SPLIT_RATIO_MAX));
+
+            // A drag goes through the same band, for a container narrower
+            // than the pane minimums.
+            let mut dragged = ResultsSplit::default();
+            dragged.set_ratio(ResultsPosition::Bottom, 3.5);
+            assert_eq!(
+                dragged.ratio(ResultsPosition::Bottom),
+                Some(SPLIT_RATIO_MAX)
+            );
+        });
+    }
+
+    /// No stored split, and one the store cannot read, keep the 200px both
+    /// panes have always opened at.
+    #[gpui::test]
+    fn a_missing_or_unreadable_split_keeps_the_default_pane_size(cx: &mut TestAppContext) {
+        let seeds: [&[(&str, &str)]; 3] = [
+            &[],
+            &[(RESULTS_SPLIT_KEY, "not json")],
+            &[(RESULTS_SPLIT_KEY, r#"{"bottom":"wide"}"#)],
+        ];
+
+        for seed in seeds {
+            with_query_document(cx, seed, |document, cx| {
+                assert_eq!(
+                    document.read(cx).split_initial_sizes(),
+                    (SPLIT_DEFAULT_PANE, SPLIT_DEFAULT_PANE),
+                    "seed {seed:?} keeps the default panes"
+                );
+            });
+        }
+    }
+
+    /// What the user leaves behind when the drag ends is the editor's share of
+    /// the container, so the split comes back at the same proportion in a
+    /// window of any size.
+    #[gpui::test]
+    fn a_finished_drag_is_remembered_as_a_ratio(cx: &mut TestAppContext) {
+        with_query_document(cx, &[], |document, cx| {
+            document.update(cx, |document, cx| {
+                document.save_results_split(ResultsPosition::Bottom, px(300.0), px(800.0), cx);
+            });
+
+            let app_state = document.read(cx).app_state.clone();
+            let stored = ResultsSplit::load(app_state.read(cx));
+            assert_eq!(stored.ratio(ResultsPosition::Bottom), Some(0.375));
+            assert_eq!(
+                stored.ratio(ResultsPosition::Right),
+                None,
+                "a drag in one orientation leaves the other alone"
+            );
         });
     }
 
@@ -2651,6 +3097,475 @@ mod tests {
                 text.len() - 3,
                 state.value().len(),
                 "the uncomment must shorten the buffer"
+            );
+        });
+    }
+
+    /// Opens a SQL document over `content` with no connection — the plain
+    /// script case, where the core's own SQL service formats it — and returns
+    /// the document with the window it lives in.
+    fn open_sql_doc_with<'a>(
+        cx: &'a mut TestAppContext,
+        content: &str,
+    ) -> (gpui::Entity<CodeDocument>, &'a mut gpui::VisualTestContext) {
+        init_test_runtime(cx);
+        let app_state = isolated_test_app_state(cx);
+        let content = content.to_string();
+        let doc_holder: Rc<RefCell<Option<gpui::Entity<CodeDocument>>>> =
+            Rc::new(RefCell::new(None));
+        let doc_ref = doc_holder.clone();
+
+        let (_, window) = cx.add_window_view(|window, cx| {
+            let doc = cx.new(|cx| {
+                let mut d = CodeDocument::new_with_language(
+                    app_state.clone(),
+                    None,
+                    QueryLanguage::Sql,
+                    window,
+                    cx,
+                );
+                d.set_content(&content, window, cx);
+                d
+            });
+            doc_ref.replace(Some(doc.clone()));
+            Root::new(doc, window, cx)
+        });
+        window.run_until_parked();
+
+        let doc = doc_holder.borrow().clone().expect("doc should be created");
+        (doc, window)
+    }
+
+    fn buffer_text(doc: &gpui::Entity<CodeDocument>, cx: &App) -> String {
+        doc.read(cx).editor.input_state.read(cx).value().to_string()
+    }
+
+    /// The Format command rewrites the whole buffer in one edit, so one undo —
+    /// sent as the keyboard sends it — restores exactly what the user had.
+    #[gpui::test]
+    fn format_sql_formats_the_buffer_and_one_undo_restores_it(cx: &mut TestAppContext) {
+        let original = "select id,name from   users";
+        let (doc, window) = open_sql_doc_with(cx, original);
+
+        window.update(|window, cx| {
+            doc.update(cx, |d, cx| {
+                assert!(
+                    d.dispatch_command(Command::FormatSql, window, cx),
+                    "an editable SQL document must handle FormatSql"
+                );
+            });
+        });
+
+        let formatted = window.update(|_, cx| buffer_text(&doc, cx));
+        assert_ne!(formatted, original, "a messy buffer must be rewritten");
+        assert!(
+            formatted.starts_with("SELECT"),
+            "keywords are upper-cased, got {formatted:?}"
+        );
+        assert!(
+            !formatted.contains("   "),
+            "runs of spaces are collapsed, got {formatted:?}"
+        );
+
+        window.update(|window, cx| {
+            doc.update(cx, |d, cx| {
+                d.editor
+                    .input_state
+                    .update(cx, |state, cx| state.focus(window, cx));
+            });
+            let _ = window.draw(cx).clear(cx);
+            window.dispatch_action(Box::new(gpui_component::input::Undo), cx);
+        });
+        window.run_until_parked();
+
+        assert_eq!(
+            window.update(|_, cx| buffer_text(&doc, cx)),
+            original,
+            "one undo restores the whole buffer"
+        );
+    }
+
+    /// A selection formats only the statements it touches, and the selection
+    /// still covers them afterwards, so the cursor stays where it was.
+    ///
+    /// The buffer holds a statement that needs no formatting between two that
+    /// do, with blank lines between all three: the middle statement and the
+    /// separators must come out byte for byte as they went in, and the
+    /// statement after the selection must not be touched at all.
+    #[gpui::test]
+    fn format_sql_formats_only_the_selected_statements_and_keeps_the_cursor(
+        cx: &mut TestAppContext,
+    ) {
+        let core = datatab_core::default_language_service(&QueryLanguage::Sql)
+            .expect("the core formats SQL");
+        let middle_source = "SELECT c FROM t2";
+        let middle_body = core
+            .format(middle_source, 0..middle_source.len())
+            .expect("the middle statement is not formatted yet")
+            .new_text;
+        assert!(
+            core.format(&middle_body, 0..middle_body.len()).is_none(),
+            "the middle statement is already formatted, so it needs no change"
+        );
+        // The `;` sits after the statement range, so it counts as separator.
+        let middle = format!("{middle_body};");
+
+        let first = "select a,b from   t1;";
+        let third = "select d from   t3;";
+        let separator = "\n\n";
+        let text = format!("{first}{separator}{middle}{separator}{third}");
+        let (doc, window) = open_sql_doc_with(cx, &text);
+
+        // The first two statements, ending at the middle statement's last byte.
+        let selection_end = first.len() + separator.len() + middle.len();
+        window.update(|window, cx| {
+            doc.update(cx, |d, cx| {
+                d.editor.input_state.update(cx, |state, cx| {
+                    state.set_selected_range(0..selection_end, cx)
+                });
+                assert!(d.dispatch_command(Command::FormatSql, window, cx));
+            });
+        });
+
+        let formatted = window.update(|_, cx| buffer_text(&doc, cx));
+        assert!(
+            formatted.contains(&format!("{separator}{middle}{separator}")),
+            "the already formatted statement and both separators are byte-for-byte unchanged, \
+             got {formatted:?}"
+        );
+        assert!(
+            formatted.ends_with(third),
+            "the statement after the selection is untouched, got {formatted:?}"
+        );
+        assert!(
+            !formatted.starts_with("select a,b"),
+            "the selected statement is rewritten, got {formatted:?}"
+        );
+
+        let selected =
+            window.update(|_, cx| doc.read(cx).editor.input_state.read(cx).selected_range());
+        let selected_text = &formatted[selected.clone()];
+        assert!(
+            selected_text.contains("t2"),
+            "the selection still covers the statements it formatted, got {selected_text:?}"
+        );
+        assert!(
+            !selected_text.contains("t3"),
+            "the selection stops before the untouched statement, got {selected_text:?}"
+        );
+    }
+
+    /// Without a selection the whole buffer formats, and the caret stays on
+    /// the statement it was in.
+    #[gpui::test]
+    fn format_sql_without_a_selection_keeps_the_caret_on_its_statement(cx: &mut TestAppContext) {
+        let text = "select 1;\nselect id,name from   users;\nselect 3;";
+        let (doc, window) = open_sql_doc_with(cx, text);
+
+        let caret = text.find("users").expect("the middle statement is there");
+        window.update(|window, cx| {
+            doc.update(cx, |d, cx| {
+                d.editor
+                    .input_state
+                    .update(cx, |state, cx| state.set_selected_range(caret..caret, cx));
+                assert!(d.dispatch_command(Command::FormatSql, window, cx));
+            });
+        });
+
+        let formatted = window.update(|_, cx| buffer_text(&doc, cx));
+        let statements = QueryLanguage::Sql
+            .statement_ranges(&formatted)
+            .expect("SQL splits into statements");
+        let caret =
+            window.update(|_, cx| doc.read(cx).editor.input_state.read(cx).selected_range());
+        assert_eq!(caret.start, caret.end, "the caret is not a selection");
+
+        let statement = statements
+            .iter()
+            .find(|range| caret.start >= range.start && caret.start <= range.end)
+            .unwrap_or_else(|| panic!("the caret stays on a statement: {caret:?}"));
+        assert!(
+            formatted[statement.clone()].contains("users"),
+            "the caret stays on its own statement, got {:?}",
+            &formatted[statement.clone()]
+        );
+    }
+
+    /// A buffer the formatter cannot change leaves the document and the undo
+    /// stack exactly as they were: no empty edit, so no undo step either.
+    #[gpui::test]
+    fn format_sql_leaves_no_undo_step_when_nothing_changes(cx: &mut TestAppContext) {
+        let (doc, window) = open_sql_doc_with(cx, "select id,name from   users");
+
+        window.update(|window, cx| {
+            doc.update(cx, |d, cx| {
+                assert!(d.dispatch_command(Command::FormatSql, window, cx));
+            });
+        });
+        let formatted = window.update(|_, cx| buffer_text(&doc, cx));
+
+        // Reload the formatted text, which clears the dirty flag.
+        window.update(|window, cx| {
+            doc.update(cx, |d, cx| d.set_content(&formatted, window, cx));
+        });
+
+        window.update(|window, cx| {
+            doc.update(cx, |d, cx| {
+                assert!(
+                    d.dispatch_command(Command::FormatSql, window, cx),
+                    "the command still answers when there is nothing to do"
+                );
+            });
+        });
+
+        window.update(|_, cx| {
+            let d = doc.read(cx);
+            assert_eq!(buffer_text(&doc, cx), formatted, "the buffer is untouched");
+            assert!(
+                !d.editor.is_dirty,
+                "no edit was made, so the document is not dirty"
+            );
+        });
+    }
+
+    /// A driver that replaces the shared SQL service to speak its own dialect
+    /// without carrying a formatter keeps the Format command: the document
+    /// falls back to the core's formatter for its language. A document
+    /// language still has none.
+    #[test]
+    fn a_driver_service_without_a_formatter_falls_back_to_the_language_formatter() {
+        use super::LanguageBinding;
+        use super::format::formatter_for;
+        use datatab_core::{DangerousQueryKind, LanguageService, ValidationResult};
+
+        struct DialectOnly;
+
+        impl LanguageService for DialectOnly {
+            fn validate(&self, _query: &str) -> ValidationResult {
+                ValidationResult::Valid
+            }
+
+            fn detect_dangerous(&self, _query: &str) -> Option<DangerousQueryKind> {
+                None
+            }
+        }
+
+        let sql = formatter_for(
+            LanguageBinding::FollowsConnection,
+            Some(&DialectOnly),
+            &QueryLanguage::Sql,
+        )
+        .expect("SQL keeps the shared formatter");
+        assert!(sql.can_format());
+
+        assert!(
+            formatter_for(
+                LanguageBinding::FollowsConnection,
+                Some(&DialectOnly),
+                &QueryLanguage::MongoQuery,
+            )
+            .is_none(),
+            "a document language has no formatter of its own"
+        );
+
+        let unconnected = formatter_for(
+            LanguageBinding::FollowsConnection,
+            None,
+            &QueryLanguage::Sql,
+        )
+        .expect("a script tab formats SQL");
+        assert!(unconnected.can_format());
+
+        // A pinned language came from the file, not the connection, so even a
+        // SQL connection's own formatter must not rewrite it.
+        let sql_connection = datatab_core::SqlLanguageService;
+        assert!(
+            formatter_for(
+                LanguageBinding::Pinned,
+                Some(&sql_connection),
+                &QueryLanguage::Cql,
+            )
+            .is_none(),
+            "a pinned CQL document on a SQL connection has no formatter"
+        );
+        assert!(
+            formatter_for(
+                LanguageBinding::Pinned,
+                Some(&sql_connection),
+                &QueryLanguage::Sql,
+            )
+            .is_some_and(|service| service.can_format()),
+            "a pinned SQL document still formats, through the core's service"
+        );
+        assert!(
+            formatter_for(
+                LanguageBinding::FollowsConnection,
+                Some(&sql_connection),
+                &QueryLanguage::Sql,
+            )
+            .is_some_and(|service| service.can_format()),
+            "a tab that follows its SQL connection formats too"
+        );
+    }
+
+    /// The caret remap works on the statements of the edit's span, and
+    /// `rewritten` is parallel to them: the buffer's earlier statements are in
+    /// neither list, so an index into one is an index into the other.
+    #[test]
+    fn remap_caret_indexes_the_statements_of_the_span() {
+        use super::format::remap_caret;
+
+        // Two statements of a buffer that holds one before the span.
+        let span = 50..90;
+        let in_span = vec![50..70, 72..90];
+        let rewritten = vec![50..60, 62..80];
+        let replacement = "0123456789xxAAAAAAAAAAAAAAAAAA";
+        assert_eq!(
+            replacement.len(),
+            30,
+            "the fixture matches the rewritten ranges"
+        );
+
+        assert_eq!(
+            remap_caret(75, &span, &in_span, &rewritten, replacement),
+            65,
+            "a caret inside a statement keeps its offset inside it"
+        );
+        assert_eq!(
+            remap_caret(95, &span, &in_span, &rewritten, replacement),
+            85,
+            "a caret after the span moves by the edit's growth"
+        );
+        assert_eq!(
+            remap_caret(10, &span, &in_span, &rewritten, replacement),
+            10,
+            "a caret before the span stays put"
+        );
+    }
+
+    /// A document whose language came from its file is not formatted by the
+    /// connection it happens to run on: `report.cql` opened on a SQL connection
+    /// keeps Format unavailable, instead of rewriting CQL with SQL rules.
+    #[gpui::test]
+    fn a_pinned_language_keeps_format_disabled_on_a_sql_connection(cx: &mut TestAppContext) {
+        use datatab_core::{ConnectionProfile, DbConfig, DbKind, WritePrivilege};
+        use datatab_test_support::fake_driver::FakeDriver;
+
+        init_test_runtime(cx);
+        let app_state = isolated_test_app_state(cx);
+
+        let profile = ConnectionProfile::new(
+            "test",
+            DbConfig::SQLite {
+                path: ":memory:".into(),
+                connection_id: None,
+            },
+        );
+        let connection = FakeDriver::new(DbKind::SQLite)
+            .connect_arc(&profile)
+            .expect("fake connection");
+        let profile_id = profile.id;
+        cx.update(|cx| {
+            app_state.update(cx, |app, _| {
+                app.apply_connect_profile(
+                    profile,
+                    connection,
+                    None,
+                    None,
+                    false,
+                    WritePrivilege::Unknown,
+                );
+            });
+        });
+
+        let doc_holder: Rc<RefCell<Option<gpui::Entity<CodeDocument>>>> =
+            Rc::new(RefCell::new(None));
+        let doc_ref = doc_holder.clone();
+        let (_, window) = cx.add_window_view(|window, cx| {
+            let doc = cx.new(|cx| {
+                let mut d = CodeDocument::new_with_language(
+                    app_state.clone(),
+                    Some(profile_id),
+                    QueryLanguage::Cql,
+                    window,
+                    cx,
+                )
+                .with_path(std::path::PathBuf::from("report.cql"));
+                d.set_content("SELECT a, b FROM t1", window, cx);
+                d
+            });
+            doc_ref.replace(Some(doc.clone()));
+            Root::new(doc, window, cx)
+        });
+        let doc = doc_holder.borrow().clone().expect("doc should be created");
+
+        window.update(|_, cx| {
+            assert!(
+                !doc.read(cx).can_format(cx),
+                "a CQL document has no formatter, whatever connection it runs on"
+            );
+        });
+
+        window.update(|window, cx| {
+            doc.update(cx, |d, cx| {
+                assert!(
+                    !d.dispatch_command(Command::FormatSql, window, cx),
+                    "the command declines instead of rewriting CQL as SQL"
+                );
+            });
+        });
+
+        window.update(|_, cx| {
+            assert_eq!(
+                buffer_text(&doc, cx),
+                "SELECT a, b FROM t1",
+                "the CQL buffer is untouched"
+            );
+        });
+    }
+
+    /// A language whose service ships no formatter keeps the command
+    /// unavailable, and says why instead of doing nothing silently.
+    #[gpui::test]
+    fn format_sql_reports_why_a_language_has_no_formatter(cx: &mut TestAppContext) {
+        init_test_runtime(cx);
+        let app_state = isolated_test_app_state(cx);
+        let doc_holder: Rc<RefCell<Option<gpui::Entity<CodeDocument>>>> =
+            Rc::new(RefCell::new(None));
+        let doc_ref = doc_holder.clone();
+
+        let (_, window) = cx.add_window_view(|window, cx| {
+            let doc = cx.new(|cx| {
+                let mut d = CodeDocument::new_with_language(
+                    app_state.clone(),
+                    None,
+                    QueryLanguage::Python,
+                    window,
+                    cx,
+                );
+                d.set_content("print(1)", window, cx);
+                d
+            });
+            doc_ref.replace(Some(doc.clone()));
+            Root::new(doc, window, cx)
+        });
+        let doc = doc_holder.borrow().clone().expect("doc should be created");
+
+        window.update(|window, cx| {
+            doc.update(cx, |d, cx| {
+                assert!(
+                    !d.dispatch_command(Command::FormatSql, window, cx),
+                    "a script document must decline FormatSql"
+                );
+            });
+        });
+
+        window.update(|_, cx| {
+            assert_eq!(buffer_text(&doc, cx), "print(1)", "the buffer is untouched");
+            assert_eq!(
+                cx.global::<ToastGlobal>().host.read(cx).last_toast_title(),
+                Some(datatab_i18n::t!("document.code.toolbar.formatter_unavailable").to_string()),
+                "the command says why it cannot format"
             );
         });
     }

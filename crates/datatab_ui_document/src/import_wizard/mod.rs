@@ -372,27 +372,47 @@ impl ImportWizard {
                 }
             };
 
-            let mut configs = Vec::with_capacity(manifest.tables.len());
-            for manifest_table in &manifest.tables {
-                let target_exists_and_columns = connection
-                    .table_details(
-                        &target_database,
-                        manifest_table.schema.as_deref(),
-                        &manifest_table.name,
-                    )
-                    .ok()
-                    .map(|info| {
-                        info.columns
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|c| datatab_core::TransferColumn {
-                                name: c.name,
-                                type_name: Some(c.type_name),
-                                nullable: c.nullable,
-                                is_primary_key: c.is_primary_key,
+            // `table_details` can block (a recovery reconnect), so the lookups
+            // run on the background executor; the configs are built here.
+            let table_names: Vec<(Option<String>, String)> = manifest
+                .tables
+                .iter()
+                .map(|table| (table.schema.clone(), table.name.clone()))
+                .collect();
+            let target_lookups = cx
+                .background_executor()
+                .spawn({
+                    let connection = connection.clone();
+                    let target_database = target_database.clone();
+                    async move {
+                        table_names
+                            .iter()
+                            .map(|(schema, name)| {
+                                connection
+                                    .table_details(&target_database, schema.as_deref(), name)
+                                    .ok()
+                                    .map(|info| {
+                                        info.columns
+                                            .unwrap_or_default()
+                                            .into_iter()
+                                            .map(|c| datatab_core::TransferColumn {
+                                                name: c.name,
+                                                type_name: Some(c.type_name),
+                                                nullable: c.nullable,
+                                                is_primary_key: c.is_primary_key,
+                                            })
+                                            .collect::<Vec<_>>()
+                                    })
                             })
                             .collect::<Vec<_>>()
-                    });
+                    }
+                })
+                .await;
+
+            let mut configs = Vec::with_capacity(manifest.tables.len());
+            for (manifest_table, target_exists_and_columns) in
+                manifest.tables.iter().zip(target_lookups)
+            {
                 let target_exists = target_exists_and_columns.is_some();
                 let target_columns = target_exists_and_columns.unwrap_or_default();
 

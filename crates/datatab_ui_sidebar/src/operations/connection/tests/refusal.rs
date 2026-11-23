@@ -54,7 +54,7 @@ fn flag_profile(fixture: &PasswordFixture, cx: &mut VisualTestContext) {
         profile.value_refs.insert("password".into(), datatab_core::ValueRef::dotenv("unused", "PASSWORD"));
         profile.value_refs.insert("host".into(), datatab_core::ValueRef::secret("unused", "unused", None));
         let runtime = datatab_storage::bootstrap::StorageRuntime::in_memory().expect("storage");
-        datatab_app::config_loader::save_profiles(&runtime, &[profile]).expect("save");
+        datatab_app::config_loader::save_profiles(&runtime, &[profile], &std::collections::HashSet::new()).expect("save");
         runtime.open_datatab_db().expect("db").execute(
             "UPDATE cfg_connection_profile_value_refs SET env_key = NULL, ref_provider = NULL WHERE profile_id = ?1",
             [fixture.profile_id.to_string()],

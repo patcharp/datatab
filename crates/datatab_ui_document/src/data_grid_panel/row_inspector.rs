@@ -33,7 +33,6 @@ use datatab_components::controls::Button;
 use datatab_components::icons::AppIcon;
 use datatab_components::primitives::{Chamfer, Icon, LoadingState, Text};
 use datatab_components::tokens::{ChamferCut, ChromeColors, InspectorMetrics, SyntaxColors};
-use datatab_components::typography::AppFonts;
 use datatab_core::Value;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -460,7 +459,7 @@ pub(crate) fn render_row_entry(
                     line.child(
                         div()
                             .flex_shrink_0()
-                            .font_family(datatab_components::fonts::editor_family(cx))
+                            .font(datatab_components::fonts::editor_font(cx))
                             .child(cell.type_label.clone()),
                     )
                 }),
@@ -476,7 +475,7 @@ pub(crate) fn render_row_entry(
                     div()
                         .min_w_0()
                         .truncate()
-                        .font_family(datatab_components::fonts::editor_family(cx))
+                        .font(datatab_components::fonts::editor_font(cx))
                         .text_size(InspectorMetrics::FIELD_VALUE_FONT)
                         .line_height(InspectorMetrics::FIELD_VALUE_LINE_HEIGHT)
                         .text_color(if is_null {
@@ -571,7 +570,7 @@ fn render_fk_reference_entry(
                 .flex_1()
                 .min_w_0()
                 .truncate()
-                .font_family(datatab_components::fonts::editor_family(cx))
+                .font(datatab_components::fonts::editor_font(cx))
                 .text_color(ChromeColors::strong(theme))
                 .child(reference.qualified_target()),
         )
@@ -833,7 +832,7 @@ impl RowInspectorContent {
                     .flex_1()
                     .min_w_0()
                     .truncate()
-                    .font_family(datatab_components::fonts::editor_family(cx))
+                    .font(datatab_components::fonts::editor_font(cx))
                     .text_size(InspectorMetrics::KEY_FONT)
                     .text_color(theme.muted_foreground)
                     .when_some(self.snapshot.row_key.clone(), |key, text| key.child(text)),

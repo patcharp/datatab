@@ -100,12 +100,27 @@ fn init_test_runtime(cx: &mut TestAppContext) {
 /// Connection stub for tests that only need a connected profile to hang
 /// cached metadata off; it answers no query.
 ///
-/// `dialect()` panics rather than returning a stand-in: the test-only
-/// dialects live in `datatab_core` behind `#[cfg(test)]`, so any path that
-/// reaches a dialect — `new_for_table` does, through `refresh` and
-/// `run_query` — panics instead of failing an assertion. Tests here drive the
-/// panel through `new_internal` and call the method under test directly.
-struct StubConnection;
+/// `execute` refuses every statement, so a path that reaches the connection
+/// (a sort request re-queries) fails visibly instead of answering with rows
+/// the test did not stage. Tests here drive the panel through `new_internal`
+/// and call the method under test directly.
+struct StubConnection {
+    /// Whether the stub declares `DriverCapabilities::SORTING`, which is what
+    /// the grid's sort rule reads.
+    sorting: bool,
+}
+
+impl StubConnection {
+    /// A driver with no `SORTING` capability, like the CQL driver.
+    fn new() -> Self {
+        Self { sorting: false }
+    }
+
+    /// A driver that sorts on the server, like every SQL driver.
+    fn sorting() -> Self {
+        Self { sorting: true }
+    }
+}
 
 impl datatab_core::Connection for StubConnection {
     /// Facets as a driver of the stub's category declares them.
@@ -123,6 +138,34 @@ impl datatab_core::Connection for StubConnection {
         };
 
         static META: std::sync::OnceLock<DriverMetadata> = std::sync::OnceLock::new();
+        static SORTING_META: std::sync::OnceLock<DriverMetadata> = std::sync::OnceLock::new();
+        if self.sorting {
+            return SORTING_META.get_or_init(|| DriverMetadata {
+                id: "stub-sorting".to_string(),
+                display_name: "Stub".to_string(),
+                description: "test".to_string(),
+                category: DatabaseCategory::Relational,
+                transfer_family: TransferFamily::Sql,
+                deployment_class: None,
+                query_language: QueryLanguage::Sql,
+                capabilities: DriverCapabilities::SORTING,
+                default_port: None,
+                uri_scheme: "stub".to_string(),
+                icon: CoreIcon::Database,
+                syntax: None,
+                query: None,
+                mutation: None,
+                ddl: None,
+                transactions: None,
+                limits: None,
+                ssl_modes: None,
+                ssl_cert_fields: None,
+                classification_override: None,
+                default_chunk_size: None,
+                supports_lock_timeout: false,
+                editor_profile: None,
+            });
+        }
         META.get_or_init(|| DriverMetadata {
             id: "stub".to_string(),
             display_name: "Stub".to_string(),
@@ -158,12 +201,11 @@ impl datatab_core::Connection for StubConnection {
         datatab_core::SchemaLoadingStrategy::SingleDatabase
     }
 
-    #[expect(
-        clippy::unimplemented,
-        reason = "test-only stub connection: no test path in this suite calls the dialect"
-    )]
+    /// The generic dialect: a path that reaches it (a sort request on a
+    /// sorting driver re-queries) builds SQL the stub then refuses at
+    /// `execute`, rather than panicking inside the test.
     fn dialect(&self) -> &dyn datatab_core::SqlDialect {
-        unimplemented!()
+        &datatab_core::DefaultSqlDialect
     }
 
     fn ping(&self) -> Result<(), datatab_core::DbError> {
@@ -687,12 +729,15 @@ mod builder_mutations;
 mod bulk_delete_outcome;
 mod close_completion;
 mod collection_views;
+mod column_header_menu;
 mod export_all;
 mod facets;
 mod fk_label_identity;
 mod fk_navigation;
+mod read_only_reason;
 mod reload_pending_edits;
 mod reload_state;
+mod sort_rule;
 mod sources_and_keys;
 mod statement_outcome;
 

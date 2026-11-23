@@ -3,6 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use datatab_core::DbError;
 
+use crate::sentinel_resolver::TlsSentinelResolver;
+
 /// The live connection backing a `RedisConnection`.
 ///
 /// `Standalone` and `SentinelMaster` both wrap a single `redis::Connection` in
@@ -12,7 +14,7 @@ use datatab_core::DbError;
 /// dispatch. `Cluster` has no single connection to hand out; `standalone()`
 /// returns `None` for it.
 ///
-/// `SentinelMaster` also carries the `SentinelClient` (`resolver`) used to
+/// `SentinelMaster` also carries the plain or TLS Sentinel `resolver` used to
 /// resolve the master, so `with_connection_like` can re-resolve and swap in a
 /// fresh connection after a failover instead of failing outright. Those
 /// instance-catalog/metric bypasses go through `standalone()` directly and do
@@ -22,8 +24,24 @@ pub(crate) enum RedisTransport {
     Cluster(Box<redis::cluster::ClusterConnection>),
     SentinelMaster {
         connection: Arc<Mutex<redis::Connection>>,
-        resolver: Mutex<redis::sentinel::SentinelClient>,
+        resolver: Mutex<SentinelResolver>,
     },
+}
+
+pub(crate) enum SentinelResolver {
+    Plain(redis::sentinel::SentinelClient),
+    Tls(TlsSentinelResolver),
+}
+
+impl SentinelResolver {
+    fn get_connection(&mut self) -> redis::RedisResult<redis::Connection> {
+        match self {
+            Self::Plain(resolver) => resolver.get_connection(),
+            Self::Tls(resolver) => resolver
+                .get_connection()
+                .map(|(connection, _address)| connection),
+        }
+    }
 }
 
 impl RedisTransport {
@@ -76,7 +94,7 @@ impl RedisTransport {
 /// one retry, not a generic retry loop.
 fn run_sentinel_master_command<T>(
     connection: &Arc<Mutex<redis::Connection>>,
-    resolver: &Mutex<redis::sentinel::SentinelClient>,
+    resolver: &Mutex<SentinelResolver>,
     f: impl Fn(&mut dyn redis::ConnectionLike) -> Result<T, DbError>,
 ) -> Result<T, DbError> {
     let first_error = {

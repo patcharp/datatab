@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 use testcontainers::core::{ContainerPort, WaitFor};
 use testcontainers::runners::SyncRunner;
-use testcontainers::{Container, GenericImage, ImageExt};
+use testcontainers::{GenericImage, ImageExt};
 
 /// Google's pull-through mirror of Docker Hub.
 ///
@@ -18,13 +18,24 @@ const MIRROR: &str = "mirror.gcr.io";
 /// Docker Hub: `postgres` is `library/postgres` here. A name that already
 /// carries an organisation keeps it.
 fn hub_image(image: &str, tag: &str) -> GenericImage {
-    let name = if image.contains('/') {
+    // The name and the tag stay apart: testcontainers joins them as
+    // `{name}:{tag}`, so a tag in the name would be written twice.
+    GenericImage::new(mirror_repository(image), tag.to_string())
+}
+
+/// The mirror's repository for a Docker Hub image, without a tag.
+fn mirror_repository(image: &str) -> String {
+    if image.contains('/') {
         format!("{MIRROR}/{image}")
     } else {
         format!("{MIRROR}/library/{image}")
-    };
+    }
+}
 
-    GenericImage::new(name, tag.to_string())
+/// The mirror's full image reference, for the helpers that shell out to
+/// `docker` instead of going through `testcontainers`.
+fn mirror_image_name(image: &str, tag: &str) -> String {
+    format!("{}:{tag}", mirror_repository(image))
 }
 
 #[expect(
@@ -178,60 +189,96 @@ where
     run(url)
 }
 
-#[expect(
-    clippy::expect_used,
-    clippy::unwrap_in_result,
-    reason = "container startup and host-port lookup are hard test-infrastructure failures that must abort the run, distinct from the callback's `Err` contract"
-)]
+struct RedisContainer(String);
+
+impl Drop for RedisContainer {
+    fn drop(&mut self) {
+        let result = std::process::Command::new("docker")
+            .args(["rm", "-f", "-v", &self.0])
+            .output();
+        if !matches!(&result, Ok(output) if output.status.success()) {
+            eprintln!("failed to remove redis container {}: {result:?}", self.0);
+            assert!(std::thread::panicking(), "redis container cleanup failed");
+        }
+    }
+}
+
 pub fn with_redis_url<T, E, F>(run: F) -> Result<T, E>
 where
     F: FnOnce(String) -> Result<T, E>,
 {
-    let image = hub_image("redis", "7")
-        .with_exposed_port(ContainerPort::Tcp(6379))
-        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"));
-
-    let container = image.start().expect("failed to start redis container");
-    let port = container
-        .get_host_port_ipv4(6379)
-        .expect("failed to get redis host port");
-    let url = format!("redis://127.0.0.1:{port}/0");
-
-    run(url)
+    with_redis_container(|url, _container| run(url))
 }
 
-/// Like [`with_redis_url`], but also hands `run` a reference to the running
-/// container so it can `exec` into it (e.g. to `cat` a file written inside
-/// the container's filesystem).
-///
-/// Prefer this over a host bind mount for reading files Redis writes (such
-/// as `dump.rdb`): the official `redis` image declares `/data` as an
-/// anonymous `VOLUME`, and a rootless container runtime maps that volume's
-/// ownership to a subordinate UID/GID range that the host user does not
-/// necessarily have configured, causing bind-mount and direct-volume access
-/// to fail with a "potentially insufficient UIDs or GIDs" error. `docker
-/// exec`/`podman exec` runs as a process inside the container's own user
-/// namespace and has no such requirement.
+/// Runs the callback with a Redis URL and container name for `docker exec`.
 #[expect(
     clippy::expect_used,
     clippy::unwrap_in_result,
-    reason = "container startup and host-port lookup are hard test-infrastructure failures that must abort the run, distinct from the callback's `Err` contract"
+    reason = "container startup and host-port lookup are hard test-infrastructure failures"
 )]
 pub fn with_redis_container<T, E, F>(run: F) -> Result<T, E>
 where
-    F: FnOnce(String, &Container<GenericImage>) -> Result<T, E>,
+    F: FnOnce(String, &str) -> Result<T, E>,
 {
-    let image = hub_image("redis", "7")
-        .with_exposed_port(ContainerPort::Tcp(6379))
-        .with_wait_for(WaitFor::message_on_stdout("Ready to accept connections"));
-
-    let container = image.start().expect("failed to start redis container");
-    let port = container
-        .get_host_port_ipv4(6379)
-        .expect("failed to get redis host port");
-    let url = format!("redis://127.0.0.1:{port}/0");
-
-    run(url, &container)
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_NAME: AtomicU64 = AtomicU64::new(0);
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock before Unix epoch")
+        .as_nanos();
+    let name = format!(
+        "datatab-main-redis-{}-{timestamp}-{}",
+        std::process::id(),
+        NEXT_NAME.fetch_add(1, Ordering::Relaxed)
+    );
+    let output = std::process::Command::new("docker")
+        .args([
+            "create",
+            "--name",
+            &name,
+            "--memory=256m",
+            "--tmpfs",
+            "/data",
+            "-p",
+            "127.0.0.1::6379",
+            "mirror.gcr.io/library/redis:7",
+        ])
+        .output()
+        .expect("create redis container");
+    assert!(
+        output.status.success(),
+        "create redis container: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let container = RedisContainer(name);
+    let output = std::process::Command::new("docker")
+        .args(["start", &container.0])
+        .output()
+        .expect("start redis container");
+    assert!(
+        output.status.success(),
+        "start redis container: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    retry_db_operation(Duration::from_secs(30), || {
+        let output = std::process::Command::new("docker")
+            .args(["logs", &container.0])
+            .output()?;
+        if String::from_utf8_lossy(&output.stdout).contains("Ready to accept connections") {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("redis not ready"))
+        }
+    })
+    .expect("redis readiness");
+    let output = std::process::Command::new("docker")
+        .args(["port", &container.0, "6379/tcp"])
+        .output()
+        .expect("redis port");
+    assert!(output.status.success(), "redis port lookup failed");
+    let address = String::from_utf8(output.stdout).expect("redis port UTF-8");
+    let port = address.trim().rsplit(':').next().expect("redis port");
+    run(format!("redis://127.0.0.1:{port}/0"), &container.0)
 }
 
 /// Host TCP ports of the six nodes (3 masters + 3 replicas) started by the
@@ -599,6 +646,281 @@ where
     run(InfluxV1Config { endpoint })
 }
 
+/// Where a test can reach a Cassandra or ScyllaDB container: loopback and the
+/// CQL port the node advertises.
+pub struct CassandraEndpoint {
+    pub host: String,
+    pub port: u16,
+}
+
+/// The CQL port every helper here maps onto the host 1:1.
+///
+/// A random host port does not work: after the control connection the driver
+/// opens its request pool against the node's own `native_transport_port` as
+/// advertised in cluster metadata, so the host port has to be the one the node
+/// names. Port 9042 must therefore be free on the host, which the one-container
+/// rule keeps true.
+const CQL_PORT: u16 = 9042;
+
+/// The role a container with `PasswordAuthenticator` creates for itself, and
+/// the password that ships with it. It is the image's own default, not a secret
+/// of ours: the container lives for one test and is removed afterwards.
+pub const CQL_TEST_USER: &str = "cassandra";
+pub const CQL_TEST_PASSWORD: &str = "cassandra";
+
+/// One Cassandra or ScyllaDB container at a time (ruling 2 on #64).
+///
+/// Both images publish the same 1:1 port, and one server alone can take a
+/// gigabyte and a half, so a second container would neither start nor fit. The
+/// lock is held for the container's whole life, which makes parallel test
+/// threads wait instead of colliding.
+///
+/// The lock is process-local and bounds nothing else: two test binaries, or two
+/// `cargo test` runs on the same machine, still collide on host port 9042. These
+/// suites therefore run one binary at a time, with `--test-threads=1`, so a
+/// container is never started beside another.
+static CQL_CONTAINER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The line each server logs once it accepts CQL clients, with or without TLS.
+const CQL_READY: &str = "Starting listening for CQL clients";
+
+/// How long a container is given to answer CQL. A first start initialises its
+/// system keyspaces, which on one core takes most of a minute; the budget is
+/// five minutes because ScyllaDB on one core, with TLS configured, starts slower
+/// than the Cassandra image this helper first served (240 s).
+const CQL_START_LIMIT: Duration = Duration::from_secs(300);
+
+/// A running CQL container, removed when it drops.
+struct CqlContainer {
+    name: String,
+    /// Held for the container's life: the next one waits for it.
+    _exclusive: std::sync::MutexGuard<'static, ()>,
+}
+
+#[expect(
+    clippy::expect_used,
+    reason = "container startup is a hard test-infrastructure failure that must abort the run, distinct from the callback's `Err` contract"
+)]
+impl CqlContainer {
+    /// Creates and starts one container. `args` follow `--name` and end with
+    /// the image and its command.
+    fn start(server: &str, args: &[String]) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_NAME: AtomicU64 = AtomicU64::new(0);
+        let exclusive = CQL_CONTAINER
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before Unix epoch")
+            .as_nanos();
+        let name = format!(
+            "datatab-main-{server}-{}-{timestamp}-{}",
+            std::process::id(),
+            NEXT_NAME.fetch_add(1, Ordering::Relaxed)
+        );
+        let output = std::process::Command::new("docker")
+            .args(["create", "--pull=never", "--name", &name])
+            .args(args)
+            .output()
+            .expect("create cql container");
+        assert!(
+            output.status.success(),
+            "create {server} container: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let container = Self {
+            name,
+            _exclusive: exclusive,
+        };
+        let output = std::process::Command::new("docker")
+            .args(["start", &container.name])
+            .output()
+            .expect("start cql container");
+        assert!(
+            output.status.success(),
+            "start {server} container: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        retry_db_operation::<(), std::io::Error, _>(CQL_START_LIMIT, || {
+            let output = std::process::Command::new("docker")
+                .args(["logs", &container.name])
+                .output()?;
+            // Cassandra logs to stdout and ScyllaDB to stderr, so both streams
+            // are read.
+            let logs = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            if logs.contains(CQL_READY) {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(format!("{server} not ready")))
+            }
+        })
+        .expect("cql readiness");
+        container
+    }
+}
+
+impl Drop for CqlContainer {
+    fn drop(&mut self) {
+        let result = std::process::Command::new("docker")
+            .args(["rm", "-f", "-v", &self.name])
+            .output();
+        if !matches!(&result, Ok(output) if output.status.success()) {
+            eprintln!("failed to remove cql container {}: {result:?}", self.name);
+            assert!(std::thread::panicking(), "cql container cleanup failed");
+        }
+    }
+}
+
+/// Runs one callback against a fresh container of `args`.
+fn run_cql_container<T, E, F>(server: &str, args: &[String], run: F) -> Result<T, E>
+where
+    F: FnOnce(CassandraEndpoint) -> Result<T, E>,
+{
+    let container = CqlContainer::start(server, args);
+    let outcome = run(CassandraEndpoint {
+        host: "127.0.0.1".to_string(),
+        port: CQL_PORT,
+    });
+    // Removed before the outcome is returned, so a passing run leaves nothing
+    // behind either.
+    drop(container);
+    outcome
+}
+
+/// The `docker create` arguments shared by every Cassandra container here.
+///
+/// A single node with its data directory on tmpfs: the suite only needs the
+/// answers it serves from memory, and the memory cap keeps one test run from
+/// competing with the rest of the machine. The heap is set explicitly because
+/// the image sizes it without seeing the container's memory cap, and the
+/// default heap is killed by the kernel inside it (design §7).
+fn cassandra_args(entrypoint_script: &str) -> Vec<String> {
+    vec![
+        "--memory=1536m".to_string(),
+        "--tmpfs".to_string(),
+        "/var/lib/cassandra".to_string(),
+        "-e".to_string(),
+        "MAX_HEAP_SIZE=768M".to_string(),
+        "-e".to_string(),
+        "HEAP_NEWSIZE=128M".to_string(),
+        "-p".to_string(),
+        format!("127.0.0.1:{CQL_PORT}:{CQL_PORT}"),
+        mirror_image_name("cassandra", "5.0"),
+        "bash".to_string(),
+        "-c".to_string(),
+        entrypoint_script.to_string(),
+    ]
+}
+
+/// The `docker create` arguments shared by every ScyllaDB container here.
+fn scylla_args(entrypoint_script: &str) -> Vec<String> {
+    vec![
+        "--memory=1024m".to_string(),
+        "--tmpfs".to_string(),
+        "/var/lib/scylla".to_string(),
+        "-p".to_string(),
+        format!("127.0.0.1:{CQL_PORT}:{CQL_PORT}"),
+        "--entrypoint".to_string(),
+        "/bin/sh".to_string(),
+        mirror_image_name("scylladb/scylla", "6.2"),
+        "-c".to_string(),
+        entrypoint_script.to_string(),
+    ]
+}
+
+/// The stock Cassandra image leaves materialized views off, so the suite that
+/// creates one turns the feature on and then hands over to the image's own
+/// start command. Nothing else in the image's configuration is changed.
+const CASSANDRA_START: &str = "sed -i 's/^materialized_views_enabled: false/materialized_views_enabled: true/' /etc/cassandra/cassandra.yaml && exec docker-entrypoint.sh cassandra -f";
+
+/// The same start, plus the role database: with `PasswordAuthenticator` the
+/// image creates its `cassandra` superuser on the first start, so a test proves
+/// the password path instead of connecting anonymously.
+const CASSANDRA_PASSWORD_START: &str = "sed -i -e 's/^materialized_views_enabled: false/materialized_views_enabled: true/' -e 's/^authenticator: AllowAllAuthenticator/authenticator: PasswordAuthenticator/' /etc/cassandra/cassandra.yaml && exec docker-entrypoint.sh cassandra -f";
+
+/// ScyllaDB's own start flags, with its role database turned on.
+///
+/// The authenticator is a server option, not a yaml edit: this image ships the
+/// `authenticator` line commented out, and the entry point hands an unknown
+/// option to the server, which then creates its `cassandra` superuser.
+///
+/// The node advertises `127.0.0.1` as the address clients use, which is where the
+/// helper publishes the port. Without it ScyllaDB names its bridge address, and a
+/// driver's request pool would have to reach that address directly; with it every
+/// connection goes through the published port, and a certificate for `127.0.0.1`
+/// is the one `verify-full` has to check.
+///
+/// The heap is 500M, not the 750M the first design assumed: seastar aborts with
+/// "needed 734003200 available 500000000" before the server binds a port, because
+/// inside this container it computes 500 MB as available, and it wants its request
+/// to sit 50 MiB under that. 500M is the largest heap that starts here, and it is
+/// ample for the suite's few dozen rows.
+const SCYLLA_PASSWORD_START: &str = "exec /docker-entrypoint.py --smp 1 --memory 500M --overprovisioned 1 --developer-mode 1 --authenticator PasswordAuthenticator --broadcast-rpc-address 127.0.0.1";
+
+/// ScyllaDB with its native transport encrypted, started with the certificates
+/// mounted read-only at `/tls`.
+///
+/// The certificate and key are copied where the server can read them, and the
+/// encryption block is appended to `scylla.yaml` before the image's entry point
+/// reads it. With encryption on, the native transport port accepts TLS only,
+/// which is what lets the test prove that a mode really changes the connection.
+const SCYLLA_TLS_START: &str = "mkdir -p /etc/scylla/tls && install -m 644 /tls/server.crt /etc/scylla/tls/server.crt && install -m 644 /tls/server.key /etc/scylla/tls/server.key && printf '%s\\n' 'client_encryption_options:' '  enabled: true' '  certificate: /etc/scylla/tls/server.crt' '  keyfile: /etc/scylla/tls/server.key' '  require_client_auth: false' >> /etc/scylla/scylla.yaml && exec /docker-entrypoint.py --smp 1 --memory 500M --overprovisioned 1 --developer-mode 1 --authenticator PasswordAuthenticator --broadcast-rpc-address 127.0.0.1";
+
+/// Spin up Cassandra and wait until it accepts CQL connections, anonymously.
+pub fn with_cassandra<T, E, F>(run: F) -> Result<T, E>
+where
+    F: FnOnce(CassandraEndpoint) -> Result<T, E>,
+{
+    run_cql_container("cassandra", &cassandra_args(CASSANDRA_START), run)
+}
+
+/// Spin up Cassandra whose CQL port requires the image's own `cassandra` role.
+pub fn with_authenticated_cassandra<T, E, F>(run: F) -> Result<T, E>
+where
+    F: FnOnce(CassandraEndpoint) -> Result<T, E>,
+{
+    run_cql_container("cassandra", &cassandra_args(CASSANDRA_PASSWORD_START), run)
+}
+
+/// Spin up ScyllaDB whose CQL port requires the image's own `cassandra` role.
+pub fn with_scylla<T, E, F>(run: F) -> Result<T, E>
+where
+    F: FnOnce(CassandraEndpoint) -> Result<T, E>,
+{
+    run_cql_container("scylla", &scylla_args(SCYLLA_PASSWORD_START), run)
+}
+
+/// Spin up ScyllaDB that accepts TLS only on its CQL port.
+///
+/// `certificates` holds `server.crt` and `server.key`, which the container reads
+/// from its `/tls` mount. ScyllaDB carries the TLS modes because the driver
+/// checks each node's IP against the certificate, which makes `verify-ca` the
+/// practical verifying mode (ruling 7).
+pub fn with_scylla_tls<T, E, F>(certificates: &std::path::Path, run: F) -> Result<T, E>
+where
+    F: FnOnce(CassandraEndpoint) -> Result<T, E>,
+{
+    let mut args = scylla_args(SCYLLA_TLS_START);
+    // The mount goes before the image name, the command after it.
+    let image_at = args
+        .iter()
+        .position(|arg| arg.contains("scylladb/scylla"))
+        .unwrap_or(args.len());
+    args.splice(
+        image_at..image_at,
+        [
+            "-v".to_string(),
+            format!("{}:/tls:ro", certificates.display()),
+        ],
+    );
+    run_cql_container("scylla", &args, run)
+}
+
 pub fn retry_db_operation<T, E, F>(timeout: Duration, mut operation: F) -> Result<T, E>
 where
     F: FnMut() -> Result<T, E>,
@@ -616,5 +938,34 @@ where
         }
 
         std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{hub_image, mirror_image_name};
+    use testcontainers::Image;
+
+    #[test]
+    fn the_image_name_carries_no_tag_because_testcontainers_adds_it() {
+        let image = hub_image("postgres", "16");
+        assert_eq!(image.name(), "mirror.gcr.io/library/postgres");
+        assert_eq!(image.tag(), "16");
+
+        let image = hub_image("pgvector/pgvector", "pg16");
+        assert_eq!(image.name(), "mirror.gcr.io/pgvector/pgvector");
+        assert_eq!(image.tag(), "pg16");
+    }
+
+    #[test]
+    fn a_shelled_out_reference_carries_its_tag_once() {
+        assert_eq!(
+            mirror_image_name("cassandra", "5.0"),
+            "mirror.gcr.io/library/cassandra:5.0"
+        );
+        assert_eq!(
+            mirror_image_name("pgvector/pgvector", "pg16"),
+            "mirror.gcr.io/pgvector/pgvector:pg16"
+        );
     }
 }

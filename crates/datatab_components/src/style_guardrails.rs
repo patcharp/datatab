@@ -60,7 +60,9 @@ mod style_guardrails {
 
     /// A bundled family constant ignores the families chosen in Settings;
     /// surfaces read the active family from `fonts` (`ui_family`,
-    /// `display_family`, `editor_family`, `grid_family`).
+    /// `display_family`, `editor_family`, `grid_family`), and the data
+    /// surfaces that set a family directly take `grid_font`/`editor_font` so
+    /// the bundled Thai fallback comes with it.
     const FORBIDDEN_FONT_FAMILY_PATTERNS: &[&str] = &[
         "font_family(AppFonts::",
         "font_family(crate::typography::AppFonts::",
@@ -71,6 +73,34 @@ mod style_guardrails {
     /// Files that define or resolve the bundled families. `bolt`'s
     /// `fonts.rs`/`typography.rs` match the same fragments.
     const FONT_FAMILY_EXEMPT: &[&str] = &["/fonts.rs", "/typography.rs"];
+
+    /// Files that draw user data — a key, a value, a record field, a column
+    /// figure, an audit cell, the console history, a chart tick. Paths are
+    /// relative to the crates directory, like `UI_CRATES`.
+    ///
+    /// #137 gave the grid body, both header roots, record mode and the code
+    /// editor the bundled Thai fallback. Every surface listed here draws the
+    /// data face too, and a bare family there leaves Thai to a platform font
+    /// at the wrong size (#532). The list is per file rather than per crate
+    /// because most interface text still sets a family for headers and
+    /// labels, where the interface face already carries Thai.
+    const DATA_SURFACE_FILES: &[&str] = &[
+        "datatab_ui_document/src/key_value/render_value.rs",
+        "datatab_ui_document/src/key_value/render_list.rs",
+        "datatab_ui_document/src/key_value/render.rs",
+        "datatab_ui_document/src/object_browser/preview.rs",
+        "datatab_ui_document/src/object_browser/render.rs",
+        "datatab_ui_document/src/data_grid_panel/row_inspector.rs",
+        "datatab_ui_document/src/audit/render.rs",
+        "datatab_ui_document/src/console/mod.rs",
+        "datatab_components/src/components/column_profile_view.rs",
+        "datatab_components/src/chart/engine.rs",
+    ];
+
+    /// Family accessors that hand out the Latin data face alone. A data
+    /// surface reads the resolved font instead: `grid_font` and `editor_font`
+    /// return the same family with the bundled Thai face under it.
+    const BARE_DATA_FAMILY_PATTERNS: &[&str] = &["fonts::editor_family(", "fonts::grid_family("];
 
     /// Fragments that, when found in a file's path, exempt it from ALL checks
     /// (both spacing and color). These are canonical token/semantic/theme
@@ -226,6 +256,45 @@ mod style_guardrails {
         assert!(
             violations.is_empty(),
             "Found bundled font family constants that ignore the font settings:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn data_surfaces_take_the_resolved_font_with_the_thai_fallback() {
+        let mut violations = Vec::new();
+
+        for relative in DATA_SURFACE_FILES {
+            let path = Path::new(CRATES_DIR).join(relative);
+            let content = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{} should exist: {error}", path.display()));
+
+            for (line_number, line) in content.lines().enumerate() {
+                if is_line_exempt(line) {
+                    continue;
+                }
+
+                for pattern in BARE_DATA_FAMILY_PATTERNS {
+                    if line.contains(pattern) {
+                        violations.push(format!(
+                            "{}:{}: {:?} sets the family alone, so Thai data falls \
+                             through to a platform font at the wrong size — read the \
+                             resolved font instead: `.font(fonts::editor_font(cx))`, or \
+                             `fonts::grid_font(cx)` where the surface sized itself for \
+                             the grid",
+                            path.display(),
+                            line_number + 1,
+                            pattern
+                        ));
+                        break;
+                    }
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "Data surfaces must draw Thai through the bundled fallback (#532):\n{}",
             violations.join("\n")
         );
     }

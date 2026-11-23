@@ -2,11 +2,12 @@ pub(crate) mod capabilities;
 pub(crate) mod form;
 
 pub use capabilities::{
-    DatabaseCategory, DdlCapabilities, DeploymentClass, DriverCapabilities, DriverLimits,
-    DriverMetadata, DriverMetadataBuilder, EditorLanguageProfile, ExecutionClassification, Icon,
-    IsolationLevel, MutationCapabilities, NativeConsoleProfile, OperationClassifier, OrderByMode,
-    PaginationStyle, QueryCapabilities, QueryLanguage, SslCertFields, SslModeOption, SyntaxInfo,
-    TransactionCapabilities, TransferFamily, WhereOperator, transfer_compatible,
+    CQL_BATCH_HEADER_WORDS, DatabaseCategory, DdlCapabilities, DeploymentClass, DriverCapabilities,
+    DriverLimits, DriverMetadata, DriverMetadataBuilder, EditorLanguageProfile,
+    ExecutionClassification, Icon, IsolationLevel, MutationCapabilities, NativeConsoleProfile,
+    OperationClassifier, OrderByMode, PaginationStyle, QueryCapabilities, QueryLanguage,
+    SslCertFields, SslModeOption, SyntaxInfo, TransactionCapabilities, TransferFamily,
+    WhereOperator, transfer_compatible,
 };
 pub use form::{
     DriverFormDef, ExportFieldHint, FieldEquals, FieldExportTransform, FormFieldDef, FormFieldKind,

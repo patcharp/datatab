@@ -10,10 +10,12 @@ use gpui::ElementId;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     Action, App, ClickEvent, Context, Entity, FontWeight, InteractiveElement, IntoElement,
-    Keystroke, ListSizingBehavior, MouseButton, MouseDownEvent, ParentElement, ScrollWheelEvent,
-    SharedString, StatefulInteractiveElement, Styled, Window, canvas, div, px, uniform_list,
+    Keystroke, ListSizingBehavior, MouseButton, MouseDownEvent, ParentElement, Role,
+    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, Window, canvas, div, px,
+    uniform_list,
 };
 use gpui_component::scroll::{Scrollbar, ScrollbarMode};
+use gpui_component::tooltip::Tooltip;
 use gpui_component::{ActiveTheme, Sizable};
 
 use super::document::DocumentPresentation;
@@ -561,7 +563,7 @@ impl gpui::Render for DataTable {
                 .relative()
                 .size_full()
                 .overflow_hidden()
-                .font_family(fonts::grid_family(cx))
+                .font(fonts::grid_font(cx))
                 .bg(theme.table)
                 // Navigation actions
                 .on_action(on_move_up)
@@ -722,6 +724,10 @@ impl DataTable {
     ) -> impl IntoElement {
         let model = state.model();
         let sort = state.sort();
+        // A header of a source that cannot sort offers no sort: cycling it
+        // would ask for an order the database cannot express, or move an arrow
+        // over rows that are not ordered.
+        let sort_blocked = state.sort_blocked().cloned();
         let font_size = fonts::grid_font_size(cx);
         let type_font_size = fonts::grid_type_font_size(cx);
         let column_widths = state.column_widths();
@@ -762,6 +768,8 @@ impl DataTable {
 
                 div()
                     .id(("header-col", col_ix))
+                    .role(Role::ColumnHeader)
+                    .aria_label(col_spec.title.clone())
                     .relative()
                     .flex()
                     .flex_shrink_0()
@@ -774,11 +782,21 @@ impl DataTable {
                     .border_r_1()
                     .border_color(theme.border)
                     .hover(|s| s.bg(theme.table_hover))
-                    .cursor_pointer()
-                    .on_click(move |_event: &ClickEvent, _window, cx| {
-                        state_for_click.update(cx, |state, cx| {
-                            state.cycle_sort(col_ix, cx);
-                        });
+                    .when(sort_blocked.is_none(), |cell| {
+                        cell.cursor_pointer()
+                            .on_click(move |_event: &ClickEvent, _window, cx| {
+                                state_for_click.update(cx, |state, cx| {
+                                    state.cycle_sort(col_ix, cx);
+                                });
+                            })
+                    })
+                    .when_some(sort_blocked.clone(), |cell, reason| {
+                        cell.aria_disabled(true)
+                            .aria_description(reason.clone())
+                            .cursor_not_allowed()
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(reason.clone()).build(window, cx)
+                            })
                     })
                     // Right-click opens the menu scoped to this column: its
                     // ordering and filtering in one flat list. Left click keeps
@@ -902,7 +920,7 @@ impl DataTable {
             .bg(theme.table_head)
             .border_b_1()
             .border_color(theme.input)
-            .font_family(fonts::grid_family(cx))
+            .font(fonts::grid_font(cx))
             .child(
                 div()
                     .flex()
@@ -929,6 +947,8 @@ impl DataTable {
         let column_widths = state.column_widths();
         let h_offset = state.horizontal_offset();
         let sort = state.sort();
+        // The row source may be unable to sort; the header then says so.
+        let sort_blocked = state.sort_blocked().cloned();
         let tint = ChromeColors::tint(theme);
         let resize_drag = self.resize_drag.clone();
         let strong = ChromeColors::strong(theme);
@@ -1079,6 +1099,8 @@ impl DataTable {
 
                 div()
                     .id(("header-col", col_ix))
+                    .role(Role::ColumnHeader)
+                    .aria_label(col_spec.title.clone())
                     .relative()
                     .flex()
                     .flex_col()
@@ -1095,9 +1117,20 @@ impl DataTable {
                         cell.bg(tint.opacity(CollectionMetrics::GROUP_CHILD_HEADER_ALPHA))
                     })
                     .hover(|cell| cell.bg(theme.table_hover))
-                    .cursor_pointer()
-                    .on_click(move |_event: &ClickEvent, _window, cx| {
-                        state_for_click.update(cx, |state, cx| state.cycle_sort(col_ix, cx));
+                    .when(sort_blocked.is_none(), |cell| {
+                        cell.cursor_pointer()
+                            .on_click(move |_event: &ClickEvent, _window, cx| {
+                                state_for_click
+                                    .update(cx, |state, cx| state.cycle_sort(col_ix, cx));
+                            })
+                    })
+                    .when_some(sort_blocked.clone(), |cell, reason| {
+                        cell.aria_disabled(true)
+                            .aria_description(reason.clone())
+                            .cursor_not_allowed()
+                            .tooltip(move |window, cx| {
+                                Tooltip::new(reason.clone()).build(window, cx)
+                            })
                     })
                     .on_mouse_down(
                         MouseButton::Right,
@@ -1133,7 +1166,7 @@ impl DataTable {
             .flex_shrink_0()
             .overflow_hidden()
             .bg(theme.table_head)
-            .font_family(fonts::grid_family(cx))
+            .font(fonts::grid_font(cx))
             .when_some(group_row, |header, row| header.child(row))
             .child(
                 div()

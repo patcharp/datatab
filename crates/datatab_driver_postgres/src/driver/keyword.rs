@@ -27,7 +27,7 @@ pub(super) fn parameters(mut input: &str) -> Result<Vec<Parameter<'_>>, DbError>
             return Err(invalid_keywords());
         }
         let rest = rest.trim_start();
-        let (raw_value, remaining) = rest.split_at(value_end(rest));
+        let (raw_value, remaining) = rest.split_at(datatab_core::libpq_value_end(rest));
         // Let the wire parser decode libpq quotes and backslash escapes. The
         // neutral key accepts all values, including the driver's verify modes.
         let decoded = format!("application_name={raw_value}")
@@ -44,21 +44,12 @@ pub(super) fn parameters(mut input: &str) -> Result<Vec<Parameter<'_>>, DbError>
     Ok(parameters)
 }
 
-/// libpq keys whose value is itself a secret. `passfile`, `sslkey` and
-/// `sslkeylogfile` hold paths, so they stay readable.
-const SECRET_KEYS: [&str; 5] = [
-    "password",
-    "sslpassword",
-    "oauth_client_secret",
-    "scram_client_key",
-    "scram_server_key",
-];
-
 const REDACTED_VALUE: &str = "***";
 const HIDDEN_STRING: &str = "[connection string hidden]";
 
-/// Renders a keyword string for an error or a log line, with every secret
-/// value replaced.
+/// Renders a keyword string for an error or a log line. Only the value of a
+/// public libpq key (`datatab_core::LIBPQ_PUBLIC_KEYS`) stays; every other
+/// key, a misspelled one included, shows as `key=***`.
 pub(super) fn redacted(input: &str) -> String {
     let Ok(parameters) = parameters(input) else {
         // Without parameter boundaries no part of the string is safe to show.
@@ -67,37 +58,14 @@ pub(super) fn redacted(input: &str) -> String {
     parameters
         .iter()
         .map(|parameter| {
-            if is_secret_key(parameter.key) {
-                format!("{}={REDACTED_VALUE}", parameter.key)
-            } else {
+            if datatab_core::is_libpq_public_key(parameter.key) {
                 parameter.raw.to_string()
+            } else {
+                format!("{}={REDACTED_VALUE}", parameter.key)
             }
         })
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn is_secret_key(key: &str) -> bool {
-    SECRET_KEYS
-        .iter()
-        .any(|secret_key| key.eq_ignore_ascii_case(secret_key))
-}
-
-fn value_end(input: &str) -> usize {
-    let quoted = input.starts_with('\'');
-    let mut escaped = false;
-    for (offset, character) in input.char_indices().skip(usize::from(quoted)) {
-        if escaped {
-            escaped = false;
-        } else if character == '\\' {
-            escaped = true;
-        } else if quoted && character == '\'' {
-            return offset + character.len_utf8();
-        } else if !quoted && character.is_whitespace() {
-            return offset;
-        }
-    }
-    input.len()
 }
 
 fn invalid_keywords() -> DbError {

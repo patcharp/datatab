@@ -27,6 +27,7 @@ members = [
     "crates/datatab_driver_clickhouse",
     "crates/datatab_driver_turso",
     "crates/datatab_driver_duckdb",
+    "crates/datatab_driver_cassandra",
     "crates/datatab_ssh",
     "crates/datatab_proxy",
     "crates/datatab_tunnel_core",
@@ -47,6 +48,7 @@ members = [
     "crates/datatab_driver_influxdb",
     "crates/datatab_portability",
     "crates/datatab_i18n",
+    "crates/datatab_diagnostics",
     # Upstream themixednuts/gpui-mcp crates for UI automation; see vendor/gpui-mcp/VENDOR.md.
     "vendor/gpui-mcp/crates/gpui-mcp",
     "vendor/gpui-mcp/crates/gpui-mcp-protocol",
@@ -59,7 +61,7 @@ resolver = "2"
 [workspace.package]
 edition = "2024"
 rust-version = "1.88"
-version = "0.1.3"
+version = "0.1.4"
 authors = ["PCPLab <me@pcplab.me>"]
 description = "A fast, keyboard-first database client"
 repository = "https://github.com/patcharp/datatab"
@@ -84,6 +86,7 @@ datatab_driver_redshift = { path = "crates/datatab_driver_redshift" }
 datatab_driver_clickhouse = { path = "crates/datatab_driver_clickhouse" }
 datatab_driver_turso = { path = "crates/datatab_driver_turso" }
 datatab_driver_duckdb = { path = "crates/datatab_driver_duckdb" }
+datatab_driver_cassandra = { path = "crates/datatab_driver_cassandra" }
 datatab_ssh = { path = "crates/datatab_ssh" }
 datatab_proxy = { path = "crates/datatab_proxy" }
 datatab_export = { path = "crates/datatab_export" }
@@ -113,6 +116,7 @@ datatab_ui_sidebar = { path = "crates/datatab_ui_sidebar" }
 datatab_ui = { path = "crates/datatab_ui" }
 datatab_transfer = { path = "crates/datatab_transfer" }
 datatab_i18n = { path = "crates/datatab_i18n" }
+datatab_diagnostics = { path = "crates/datatab_diagnostics" }
 mysql = "28"
 
 petgraph = "0.7"
@@ -279,4 +283,7 @@ debug = false
 # thin LTO already recovers most of the cross-unit optimization.
 [profile.release]
 lto = "thin"
-strip = "symbols"
+# Keep the symbol table: a pending crash report carries stack frames, and a
+# stripped binary has no names to put in them (ADR 0008, symbol plan). Debug
+# info stays off, so the growth is the symbol table alone, not DWARF.
+strip = "none"

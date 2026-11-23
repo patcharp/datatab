@@ -424,12 +424,11 @@ impl DataGridPanel {
                 });
             }
 
+            let mut needs_cleanup = false;
             cx.update(|cx| {
                 if cancel_token.is_cancelled() {
                     log::info!("Query was cancelled, discarding result");
-                    if let Err(e) = conn_for_cleanup.cleanup_after_cancel() {
-                        log::warn!("Cleanup after cancel failed: {}", e);
-                    }
+                    needs_cleanup = true;
                     return;
                 }
 
@@ -475,6 +474,14 @@ impl DataGridPanel {
                     }
                 }
             });
+            if needs_cleanup {
+                crate::cancel_cleanup::cleanup_after_cancel_in_background(
+                    conn_for_cleanup,
+                    "Query",
+                    cx,
+                )
+                .await;
+            }
         })
         .detach();
 
@@ -572,12 +579,11 @@ impl DataGridPanel {
                 });
             }
 
+            let mut needs_cleanup = false;
             cx.update(|cx| {
                 if cancel_token.is_cancelled() {
                     log::info!("Visual query was cancelled, discarding result");
-                    if let Err(e) = conn_for_cleanup.cleanup_after_cancel() {
-                        log::warn!("Cleanup after cancel failed: {}", e);
-                    }
+                    needs_cleanup = true;
                     return;
                 }
 
@@ -642,6 +648,14 @@ impl DataGridPanel {
                     }
                 }
             });
+            if needs_cleanup {
+                crate::cancel_cleanup::cleanup_after_cancel_in_background(
+                    conn_for_cleanup,
+                    "Query",
+                    cx,
+                )
+                .await;
+            }
         })
         .detach();
     }
@@ -828,12 +842,11 @@ impl DataGridPanel {
                 });
             }
 
+            let mut needs_cleanup = false;
             cx.update(|cx| {
                 if cancel_token.is_cancelled() {
                     log::info!("Query was cancelled, discarding result");
-                    if let Err(e) = conn_for_cleanup.cleanup_after_cancel() {
-                        log::warn!("Cleanup after cancel failed: {}", e);
-                    }
+                    needs_cleanup = true;
                     return;
                 }
 
@@ -880,6 +893,14 @@ impl DataGridPanel {
                     }
                 }
             });
+            if needs_cleanup {
+                crate::cancel_cleanup::cleanup_after_cancel_in_background(
+                    conn_for_cleanup,
+                    "Query",
+                    cx,
+                )
+                .await;
+            }
         })
         .detach();
 

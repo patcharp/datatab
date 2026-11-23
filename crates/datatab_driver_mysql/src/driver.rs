@@ -13,7 +13,7 @@ use datatab_core::{
     CreateIndexRequest, CrudResult, DatabaseCategory, DatabaseInfo, DbConfig, DbDriver, DbError,
     DbKind, DbSchemaInfo, DdlCapabilities, DdlRejection, DefaultSpec, DeploymentClass,
     DescribeRequest, DocumentConnection, DriverCapabilities, DriverFormDef, DriverLimits,
-    DriverMetadata, DropColumnRequest, DropForeignKeyRequest, DropIndexRequest,
+    DriverMetadata, DropColumnRequest, DropForeignKeyRequest, DropIndexRequest, ErrorPosition,
     ExecutionSourceContext, ExplainRequest, FieldExportTransform, ForeignKeyBuilder,
     ForeignKeyInfo, FormFieldKind, FormSection, FormTab, FormValues, FormattedError, Icon,
     IndexData, IndexInfo, InstanceCatalog, IsolationLevel, KeyValueConnection,
@@ -32,6 +32,16 @@ use datatab_core::{
 use datatab_ssh::{OpenedSshTunnel, SshTunnel};
 use mysql::prelude::*;
 use mysql::{ClientIdentity, Conn, Opts, OptsBuilder, SslOpts};
+
+type BulkColumnRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
+type BulkIndexRow = (String, String, Option<String>, Option<String>, i32);
 
 /// MySQL driver metadata.
 pub static MYSQL_METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverMetadata {
@@ -1615,7 +1625,14 @@ impl MysqlErrorFormatter {
     fn format_mysql_error(e: &mysql::Error) -> FormattedError {
         match e {
             mysql::Error::MySqlError(mysql_err) => {
-                FormattedError::new(&mysql_err.message).with_code(mysql_err.code.to_string())
+                let mut formatted =
+                    FormattedError::new(&mysql_err.message).with_code(mysql_err.code.to_string());
+
+                if let Some(line) = syntax_error_line(mysql_err.code, &mysql_err.message) {
+                    formatted = formatted.with_position(ErrorPosition::from_line(line));
+                }
+
+                formatted
             }
             _ => FormattedError::new(e.to_string()),
         }
@@ -1690,6 +1707,25 @@ impl ConnectionErrorFormatter for MysqlErrorFormatter {
 
         FormattedError::new(message)
     }
+}
+
+/// MySQL's error number for a syntax error; it is the only one whose message
+/// names a line of the submitted statement.
+const MYSQL_SYNTAX_ERROR_CODE: u16 = 1064;
+
+/// The line a MySQL syntax error names, when it names one.
+///
+/// Error 1064 ends its message with `near '<text>' at line <n>`, where `<n>` is
+/// a 1-based line of the submitted statement. Only the trailing ` at line ` is
+/// read, and only from that error number, so no other part of a message can be
+/// mistaken for a position.
+fn syntax_error_line(code: u16, message: &str) -> Option<u32> {
+    if code != MYSQL_SYNTAX_ERROR_CODE {
+        return None;
+    }
+
+    let (_, line) = message.rsplit_once(" at line ")?;
+    line.trim().parse().ok()
 }
 
 static MYSQL_ERROR_FORMATTER: MysqlErrorFormatter = MysqlErrorFormatter;
@@ -2597,6 +2633,23 @@ impl Connection for MysqlConnection {
             | SchemaFeatures::CHECK_CONSTRAINTS
             | SchemaFeatures::UNIQUE_CONSTRAINTS
             | SchemaFeatures::FUNCTIONS
+    }
+
+    fn schema_columns(
+        &self,
+        database: &str,
+        _schema: Option<&str>,
+    ) -> Result<Vec<datatab_core::SchemaColumnInfo>, DbError> {
+        let mut conn = self
+            .catalog_conn
+            .lock()
+            .map_err(|error| DbError::query_failed(format!("Lock error: {}", error)))?;
+        let rows: Vec<BulkColumnRow> = conn.exec(
+            "SELECT table_name, column_name, column_type, is_nullable, column_default, column_key \
+             FROM information_schema.columns WHERE table_schema = ? ORDER BY table_name, ordinal_position",
+            (database,),
+        ).map_err(|error| format_mysql_query_error(&error))?;
+        Ok(bulk_column_rows(rows))
     }
 
     fn schema_indexes(
@@ -4094,30 +4147,48 @@ fn fetch_columns(conn: &mut Conn, database: &str, table: &str) -> Result<Vec<Col
         table
     );
 
-    Ok(rows
-        .into_iter()
-        .map(|(name, type_name, nullable, default, key)| {
-            let is_pk = key.as_deref() == Some("PRI");
-            if is_pk {
-                log::info!(
-                    "[MYSQL] Column '{}' has Key='{:?}' -> is_primary_key={}",
-                    name,
-                    key,
-                    is_pk
-                );
-            }
-            let enum_values = parse_mysql_enum_or_set(&type_name);
+    Ok(rows.into_iter().map(mysql_column_from_row).collect())
+}
 
-            ColumnInfo {
-                name,
-                type_name,
-                nullable: nullable == "YES",
-                default_value: default,
-                is_primary_key: is_pk,
-                enum_values,
+fn mysql_column_from_row(
+    (name, type_name, nullable, default, key): (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    ),
+) -> ColumnInfo {
+    let is_pk = key.as_deref() == Some("PRI");
+    if is_pk {
+        log::info!(
+            "[MYSQL] Column '{}' has Key='{:?}' -> is_primary_key={}",
+            name,
+            key,
+            is_pk
+        );
+    }
+    let enum_values = parse_mysql_enum_or_set(&type_name);
+
+    ColumnInfo {
+        name,
+        type_name,
+        nullable: nullable == "YES",
+        default_value: default,
+        is_primary_key: is_pk,
+        enum_values,
+    }
+}
+
+fn bulk_column_rows(rows: Vec<BulkColumnRow>) -> Vec<datatab_core::SchemaColumnInfo> {
+    rows.into_iter()
+        .map(|(table_name, name, type_name, nullable, default, key)| {
+            datatab_core::SchemaColumnInfo {
+                table_name,
+                column: mysql_column_from_row((name, type_name, nullable, default, key)),
             }
         })
-        .collect())
+        .collect()
 }
 
 fn fetch_indexes(conn: &mut Conn, database: &str, table: &str) -> Result<Vec<IndexInfo>, DbError> {
@@ -4405,46 +4476,46 @@ fn fetch_constraints(
 }
 
 fn fetch_schema_indexes(conn: &mut Conn, database: &str) -> Result<Vec<SchemaIndexInfo>, DbError> {
-    let query = r"
-        SELECT
-            s.INDEX_NAME,
-            s.TABLE_NAME,
-            GROUP_CONCAT(s.COLUMN_NAME ORDER BY s.SEQ_IN_INDEX) as COLUMNS,
-            s.NON_UNIQUE
-        FROM information_schema.STATISTICS s
-        WHERE s.TABLE_SCHEMA = ?
-        GROUP BY s.INDEX_NAME, s.TABLE_NAME, s.NON_UNIQUE
-        ORDER BY s.TABLE_NAME, s.INDEX_NAME
-    ";
-
+    // SELECT * also works on MariaDB and older MySQL versions that do not expose EXPRESSION.
     let rows: Vec<mysql::Row> = conn
-        .exec(query, (database,))
-        .map_err(|e| format_mysql_query_error(&e))?;
+        .exec(
+            "SELECT * FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = ? \
+         ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX",
+            (database,),
+        )
+        .map_err(|error| format_mysql_query_error(&error))?;
+    Ok(bulk_index_rows(rows))
+}
 
-    Ok(rows
+fn bulk_index_rows(rows: Vec<mysql::Row>) -> Vec<SchemaIndexInfo> {
+    let rows = rows
         .into_iter()
         .filter_map(|row| {
-            let name: String = row.get("INDEX_NAME")?;
-            let table_name: String = row.get("TABLE_NAME")?;
-            let columns_str: Option<String> = row.get_opt("COLUMNS").and_then(|r| r.ok());
-            let non_unique: i32 = row.get("NON_UNIQUE").unwrap_or(1);
-
-            let columns: Vec<String> = columns_str?
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .collect();
-            let is_unique = non_unique == 0;
-            let is_primary = name == "PRIMARY";
-
-            Some(SchemaIndexInfo {
-                name,
-                table_name,
-                columns,
-                is_unique,
-                is_primary,
-            })
+            Some((
+                row.get("TABLE_NAME")?,
+                row.get("INDEX_NAME")?,
+                row.get("COLUMN_NAME").flatten(),
+                row.get("EXPRESSION").flatten(),
+                row.get("NON_UNIQUE").unwrap_or(1),
+            ))
         })
-        .collect())
+        .collect::<Vec<BulkIndexRow>>();
+    let mut indexes = std::collections::BTreeMap::new();
+    for (table_name, name, column, expression, non_unique) in rows {
+        let index = indexes
+            .entry((table_name.clone(), name.clone()))
+            .or_insert_with(|| SchemaIndexInfo {
+                is_unique: non_unique == 0,
+                is_primary: name == "PRIMARY",
+                table_name,
+                name,
+                columns: Vec::new(),
+            });
+        if let Some(key_part) = index_key_part_label(column, expression) {
+            index.columns.push(key_part);
+        }
+    }
+    indexes.into_values().collect()
 }
 
 fn fetch_schema_foreign_keys(
@@ -4499,7 +4570,7 @@ fn fetch_schema_foreign_keys(
         );
     }
 
-    Ok(builder.build())
+    Ok(builder.build_sorted())
 }
 
 /// Fetch all routines (stored procedures and user-defined functions) for `database`
@@ -4844,6 +4915,8 @@ fn resolve_write_privilege(
 
 #[cfg(test)]
 mod tests {
+    mod bulk;
+
     mod sslmode;
     mod tls_metadata;
 
@@ -4854,7 +4927,7 @@ mod tests {
         dependents_from_rows, index_key_part_label, initial_database_from_opts,
         inject_password_into_mysql_uri, may_open_transaction, mysql_routine_type_to_kind,
         mysql_text_literal, normalize_mysql_tcp_host, plan_mysql_semantic_request,
-        resolve_write_privilege,
+        resolve_write_privilege, syntax_error_line,
     };
     use datatab_core::{
         AddColumnRequest, AlterColumnRequest, CodeGenerator, DatabaseCategory, DbConfig, DbDriver,
@@ -5863,6 +5936,61 @@ mod tests {
         let grants = vec!["GRANT `app_role`@`%` TO `app`@`%`".to_string()];
         let result = resolve_write_privilege(false, Some(false), &grants);
         assert_eq!(result, WritePrivilege::Unknown);
+    }
+
+    /// Error 1064 names its line as ` at line <n>`. A syntax error on the
+    /// third line must carry line 3, so the editor can put the cursor on it.
+    #[test]
+    fn a_syntax_error_carries_the_line_mysql_names() {
+        use super::MysqlErrorFormatter;
+        use datatab_core::QueryErrorFormatter;
+
+        let server = mysql::error::MySqlError {
+            state: "42000".to_string(),
+            message: "You have an error in your SQL syntax; check the manual that corresponds \
+                      to your MySQL server version for the right syntax to use near 'FROM t' at \
+                      line 3"
+                .to_string(),
+            code: 1064,
+        };
+        let error = mysql::Error::MySqlError(server);
+
+        let formatted = MysqlErrorFormatter.format_query_error(&error);
+        let position = formatted.position.expect("a syntax error names its line");
+
+        assert_eq!(position.line, Some(3));
+        assert_eq!(position.character_offset, None, "MySQL names no offset");
+        assert_eq!(
+            position.resolve_character_offset("SELECT a,\nSELECT b,\nSELECT c FROM t"),
+            Some(20),
+            "the line resolves to its first character"
+        );
+    }
+
+    /// Only error 1064 states a line. Any other error that happens to contain
+    /// the words "at line" must not move a cursor.
+    #[test]
+    fn only_the_syntax_error_number_states_a_line() {
+        assert_eq!(
+            syntax_error_line(1064, "near 'x' at line 2"),
+            Some(2),
+            "the trailing suffix is read"
+        );
+        assert_eq!(
+            syntax_error_line(1146, "Table 'shop.orders' doesn't exist at line 2"),
+            None,
+            "another error number names no line"
+        );
+        assert_eq!(
+            syntax_error_line(1064, "near 'x'"),
+            None,
+            "a message without the suffix names no line"
+        );
+        assert_eq!(
+            syntax_error_line(1064, "near 'x' at line many"),
+            None,
+            "a suffix that is not a number names no line"
+        );
     }
 
     #[test]

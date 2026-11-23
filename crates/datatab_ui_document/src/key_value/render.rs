@@ -24,7 +24,6 @@ use datatab_components::primitives::{
     Badge, BadgeTone, Chamfer, Icon, Kbd, SegmentedControl, SegmentedItem, Text, vdivider,
 };
 use datatab_components::tokens::{ChamferCut, ChromeColors, FontSizes, KeyValueMetrics, Spacing};
-use datatab_components::typography::AppFonts;
 use datatab_core::{KeyType, KeyValueFeatures};
 use datatab_ui_base::keymap::RunCommand;
 use gpui::prelude::*;
@@ -117,7 +116,7 @@ pub(super) fn type_badge_element(key_type: Option<KeyType>, cx: &App) -> impl In
         )
         .child(
             div()
-                .font_family(datatab_components::fonts::editor_family(cx))
+                .font(datatab_components::fonts::editor_font(cx))
                 .text_size(KeyValueMetrics::TYPE_BADGE_FONT)
                 .font_weight(FontWeight::BOLD)
                 .text_color(color)
@@ -459,7 +458,7 @@ impl KeyValueDocument {
         let pattern_field = div()
             .flex_1()
             .min_w(KeyValueMetrics::PATTERN_MIN_WIDTH)
-            .font_family(datatab_components::fonts::editor_family(cx))
+            .font(datatab_components::fonts::editor_font(cx))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -691,7 +690,7 @@ impl KeyValueDocument {
                     .px(Spacing::MD)
                     .border_b_1()
                     .border_color(theme.table_row_border)
-                    .font_family(datatab_components::fonts::editor_family(cx))
+                    .font(datatab_components::fonts::editor_font(cx))
                     .text_size(KeyValueMetrics::LIST_ROW_FONT)
                     .child(type_badge_element(entry.key_type, cx))
                     .child(div().text_color(strong).child(entry.key.clone()))
@@ -732,7 +731,7 @@ impl KeyValueDocument {
                                 .gap(KeyValueMetrics::FOOTER_GAP)
                                 .h(KeyValueMetrics::BULK_ROW_HEIGHT)
                                 .px(Spacing::MD)
-                                .font_family(datatab_components::fonts::editor_family(cx))
+                                .font(datatab_components::fonts::editor_font(cx))
                                 .text_size(KeyValueMetrics::LIST_ROW_FONT)
                                 .text_color(muted)
                                 .child(div().w(KeyValueMetrics::TYPE_BADGE_WIDTH))
@@ -817,7 +816,7 @@ impl KeyValueDocument {
                     ))
                     .child(
                         div()
-                            .font_family(datatab_components::fonts::editor_family(cx))
+                            .font(datatab_components::fonts::editor_font(cx))
                             .text_color(strong)
                             .child(state.pattern.clone()),
                     )
@@ -828,7 +827,7 @@ impl KeyValueDocument {
             .when_some(state.confirm_input.clone(), |block, input| {
                 block.child(
                     div()
-                        .font_family(datatab_components::fonts::editor_family(cx))
+                        .font(datatab_components::fonts::editor_font(cx))
                         .child(input),
                 )
             });

@@ -78,7 +78,7 @@ fn reference_target_is_none_for_an_incoming_reference(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn reference_target_is_none_without_a_table_source(cx: &mut TestAppContext) {
-    let (app_state, profile_id) = register_stub_connection(cx, Arc::new(StubConnection));
+    let (app_state, profile_id) = register_stub_connection(cx, Arc::new(StubConnection::new()));
     let panel = build_panel_for_collection(cx, app_state, profile_id);
 
     cx.update(|app| {
@@ -300,7 +300,7 @@ fn focus_row_by_key_leaves_from_the_first_page_and_drops_the_cursor(cx: &mut Tes
 
 #[gpui::test]
 fn fk_target_for_cell_resolves_a_single_column_fk_cell(cx: &mut TestAppContext) {
-    let (app_state, profile_id) = register_stub_connection(cx, Arc::new(StubConnection));
+    let (app_state, profile_id) = register_stub_connection(cx, Arc::new(StubConnection::new()));
 
     cx.update(|cx| {
         app_state.update(cx, |app, _| {
@@ -382,7 +382,7 @@ fn fk_target_for_cell_resolves_a_single_column_fk_cell(cx: &mut TestAppContext) 
 fn fk_target_for_cell_resolves_through_the_visual_row_order(cx: &mut TestAppContext) {
     use datatab_components::components::data_table::model::CellValue;
 
-    let (app_state, profile_id) = register_stub_connection(cx, Arc::new(StubConnection));
+    let (app_state, profile_id) = register_stub_connection(cx, Arc::new(StubConnection::new()));
 
     cx.update(|cx| {
         app_state.update(cx, |app, _| {
@@ -504,7 +504,7 @@ fn panel_with_fk_cursor(
     Rc<RefCell<Vec<bool>>>,
     &mut gpui::VisualTestContext,
 ) {
-    let (app_state, profile_id) = register_stub_connection(cx, Arc::new(StubConnection));
+    let (app_state, profile_id) = register_stub_connection(cx, Arc::new(StubConnection::new()));
 
     cx.update(|cx| {
         app_state.update(cx, |app, _| {
@@ -783,7 +783,7 @@ fn the_fk_toolbar_action_opens_the_referenced_row(cx: &mut TestAppContext) {
 /// the click that opens the row they point at.
 #[gpui::test]
 fn an_incoming_reference_entry_is_not_clickable(cx: &mut TestAppContext) {
-    let (app_state, profile_id) = register_stub_connection(cx, Arc::new(StubConnection));
+    let (app_state, profile_id) = register_stub_connection(cx, Arc::new(StubConnection::new()));
 
     cx.update(|cx| {
         app_state.update(cx, |app, _| {

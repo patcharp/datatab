@@ -25,8 +25,12 @@ fn stored_managed_profile_stays_managed_after_untouched_save() {
         ]),
     });
     let expected = serde_json::to_value(&profile.access_kind).expect("serialize access kind");
-    datatab_app::config_loader::save_profiles(&runtime, std::slice::from_ref(&profile))
-        .expect("save profile");
+    datatab_app::config_loader::save_profiles(
+        &runtime,
+        std::slice::from_ref(&profile),
+        &std::collections::HashSet::new(),
+    )
+    .expect("save profile");
     let state = cx.update(|cx| {
         cx.new(|_| AppStateEntity::new_with_storage_runtime(runtime).expect("load state"))
     });

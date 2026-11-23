@@ -335,11 +335,10 @@ impl InspectorPanel {
         cx.spawn(async move |this, cx| {
             let result = task.await;
 
+            let mut needs_cleanup = false;
             cx.update(|cx| {
                 if cancel_token.is_cancelled() {
-                    if let Err(e) = conn_cleanup.cleanup_after_cancel() {
-                        log::warn!("[inspector] cleanup after cancel failed: {}", e);
-                    }
+                    needs_cleanup = true;
                     return;
                 }
 
@@ -349,6 +348,14 @@ impl InspectorPanel {
                     cx.notify();
                 });
             });
+            if needs_cleanup {
+                crate::cancel_cleanup::cleanup_after_cancel_in_background(
+                    conn_cleanup,
+                    "[inspector]",
+                    cx,
+                )
+                .await;
+            }
         })
         .detach();
     }

@@ -1680,6 +1680,7 @@ fn db_kind_variants_keep_their_postcard_indices() {
         (DbKind::Turso, 13),
         (DbKind::DuckDB, 14),
         (DbKind::ReservedAwsSecrets, 15),
+        (DbKind::Cassandra, 16),
     ];
 
     for (kind, expected_index) in cases {

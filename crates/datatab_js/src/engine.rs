@@ -24,8 +24,10 @@ use crate::scan::{self, StaticScanOutcome};
 pub struct ScriptRunConfig {
     pub source: String,
     /// The classification ceiling confirmed for this run (via the
-    /// pre-execution static scan). Any dispatched operation whose
-    /// classification exceeds this aborts the script at that statement.
+    /// pre-execution static scan). Any dispatched operation that is not within
+    /// this ceiling — on the permission ladder and on the data-risk ladder
+    /// alike, see `datatab_core::ceiling_permits` — aborts the script at that
+    /// statement.
     pub ceiling: ExecutionClassification,
     pub cancel_token: CancelToken,
 }
@@ -248,7 +250,7 @@ fn install_bindings<'js>(
         let operation = ScriptOperation::new(target.clone(), script_method, arguments);
         let classification = classify_operation(&operation);
 
-        if ceiling.max(classification) != ceiling {
+        if !datatab_core::ceiling_permits(ceiling, classification) {
             let message = format!(
                 ".{method}() is classified {classification:?}, which exceeds the confirmed {ceiling:?} ceiling for this run"
             );
@@ -552,6 +554,57 @@ mod tests {
         assert_eq!(outcome.ledger.len(), 1);
         assert_eq!(outcome.statements.len(), 0);
         assert!(outcome.failure.is_some());
+    }
+
+    /// #487: an `AdminSafe` ceiling authorises an object change, not a row
+    /// removal. It used to admit `deleteMany` because the ceiling was read on
+    /// the permission ladder alone, where `AdminSafe` outranks `Destructive`.
+    /// The unsafe old answer was to dispatch this statement.
+    #[test]
+    fn object_change_ceiling_refuses_a_row_removal_before_dispatch() {
+        let host = FakeHost::with_responses(vec![Ok(ScriptOperationOutcome::default())]);
+        let outcome = run(
+            config(
+                "db.users.deleteMany({});",
+                ExecutionClassification::AdminSafe,
+            ),
+            &host,
+        )
+        .expect("run should not error");
+
+        assert_eq!(
+            host.call_count(),
+            0,
+            "the row removal must never be dispatched"
+        );
+        assert_eq!(outcome.ledger.len(), 1);
+        assert_eq!(
+            outcome.ledger[0].classification,
+            Some(ExecutionClassification::Destructive)
+        );
+        assert!(outcome.failure.is_some());
+    }
+
+    /// The same ceiling still dispatches the object change it names, so the
+    /// rule only tightens the data-risk direction.
+    #[test]
+    fn object_change_ceiling_dispatches_the_object_change_it_names() {
+        let host = FakeHost::with_responses(vec![Ok(ScriptOperationOutcome::default())]);
+        let outcome = run(
+            config(
+                "db.users.createCollection('audit');",
+                ExecutionClassification::AdminSafe,
+            ),
+            &host,
+        )
+        .expect("run should not error");
+
+        assert!(outcome.failure.is_none(), "{:?}", outcome.failure);
+        assert_eq!(host.call_count(), 1);
+        assert_eq!(
+            outcome.ledger[0].classification,
+            Some(ExecutionClassification::AdminSafe)
+        );
     }
 
     #[test]

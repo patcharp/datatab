@@ -19,12 +19,41 @@ use datatab_ui_base::toast::{Toast, copy_action, now_hms};
 use gpui::KeyContext;
 use gpui_component::scroll::ScrollableElement;
 
+/// Writes the split back once a drag ends.
+///
+/// The panel group reports `on_resize` on the mouse-up that finishes a drag,
+/// and not on the frames in between, so a drag across the whole window costs
+/// one write and not one per frame. Its state carries the two panes' sizes and
+/// the container they share, which is all the ratio needs.
+fn split_resize_handler(
+    document: Entity<CodeDocument>,
+    position: ResultsPosition,
+) -> impl Fn(&Entity<ResizableState>, &mut Window, &mut App) + 'static {
+    move |state, _window, cx| {
+        let (editor, container) = {
+            let state = state.read(cx);
+            let Some(editor) = state.sizes().first().copied() else {
+                return;
+            };
+            (editor, state.container_size())
+        };
+        document.update(cx, |document, cx| {
+            document.save_results_split(position, editor, container, cx);
+        });
+    }
+}
+
 impl CodeDocument {
     /// The toolbar as pane actions (see [`crate::pane::PaneAction`]): the
     /// same buttons, under the same conditions, so the whole toolbar is
     /// reachable from the pane-actions menu. `entity` is this document, for
-    /// the entries that call back into it.
-    pub(crate) fn pane_actions(&self, entity: &Entity<Self>) -> Vec<crate::pane::PaneAction> {
+    /// the entries that call back into it, and `cx` answers whether the
+    /// language has a formatter, as the Format button does.
+    pub(crate) fn pane_actions(
+        &self,
+        entity: &Entity<Self>,
+        cx: &App,
+    ) -> Vec<crate::pane::PaneAction> {
         use crate::pane::PaneAction;
 
         if self.read_only {
@@ -81,15 +110,27 @@ impl CodeDocument {
             .icon(AppIcon::Save),
         );
 
-        actions.push(
-            PaneAction::callback(
-                "format",
-                datatab_i18n::t!("document.code.toolbar.formatter_unavailable"),
-                |_window, _cx| {},
-            )
-            .icon(AppIcon::Zap)
-            .enabled(false),
-        );
+        if self.can_format(cx) {
+            actions.push(
+                PaneAction::command(
+                    "format",
+                    datatab_i18n::t!("document.code.toolbar.format_sql"),
+                    Command::FormatSql,
+                    context,
+                )
+                .icon(AppIcon::Zap),
+            );
+        } else {
+            actions.push(
+                PaneAction::callback(
+                    "format",
+                    datatab_i18n::t!("document.code.toolbar.formatter_unavailable"),
+                    |_window, _cx| {},
+                )
+                .icon(AppIcon::Zap)
+                .enabled(false),
+            );
+        }
 
         actions.push(
             PaneAction::command(
@@ -268,6 +309,36 @@ impl CodeDocument {
         actions
     }
 
+    /// The Format button of the action strip: wired to
+    /// [`Command::FormatSql`] while the document's language has a formatter,
+    /// and otherwise disabled with the reason it has none as its label.
+    fn format_button(&self, cx: &mut Context<Self>) -> Button {
+        let can_format = self.can_format(cx);
+        let label = if can_format {
+            datatab_i18n::t!("document.code.toolbar.format_sql")
+        } else {
+            datatab_i18n::t!("document.code.toolbar.formatter_unavailable")
+        };
+
+        let button = Button::new("toolbar-format-btn", label)
+            .icon(AppIcon::Zap)
+            .icon_only()
+            .inline()
+            .ghost()
+            .disabled(!can_format);
+
+        if !can_format {
+            return button;
+        }
+
+        button.on_click(cx.listener(|this, _, window, cx| {
+            // The chord and the pane-actions entry both arrive as
+            // `Command::FormatSql` on the document, so the button runs that
+            // same entry point rather than the method behind it.
+            this.dispatch_command(Command::FormatSql, window, cx);
+        }))
+    }
+
     /// The editor action strip (IslEditor): a column of icon buttons on the
     /// editor's left edge, with Run first and set apart by a short line. The
     /// buttons keep the ids the toolbar row had. A read-only document has no
@@ -390,17 +461,7 @@ impl CodeDocument {
                     }
                 })),
             )
-            .child(
-                Button::new(
-                    "toolbar-format-btn",
-                    datatab_i18n::t!("document.code.toolbar.formatter_unavailable"),
-                )
-                .icon(AppIcon::Zap)
-                .icon_only()
-                .inline()
-                .ghost()
-                .disabled(true),
-            )
+            .child(self.format_button(cx))
             .child(
                 Button::new(
                     "toolbar-history-btn",
@@ -568,7 +629,7 @@ impl CodeDocument {
                     self.vim
                         .editor(self.read_only)
                         .appearance(false)
-                        .font_family(fonts::editor_family(cx))
+                        .font(fonts::editor_font(cx))
                         .text_size(fonts::editor_font_size(cx))
                         .line_height(fonts::editor_line_height(cx))
                         .w_full()
@@ -615,6 +676,7 @@ impl CodeDocument {
 
         // The results show focus through their own grid cursor and tabs.
         div()
+            .debug_selector(|| "code-results-pane".to_string())
             .size_full()
             .flex()
             .flex_col()
@@ -1235,6 +1297,7 @@ impl Render for CodeDocument {
             self.render_awaiting_connection(cx).into_any_element()
         } else {
             div()
+                .debug_selector(|| "code-editor-pane".to_string())
                 .size_full()
                 .flex()
                 .min_h_0()
@@ -1275,19 +1338,23 @@ impl Render for CodeDocument {
                         SqlQueryLayout::Split
                             if self.results_position == ResultsPosition::Right =>
                         {
+                            let (editor_size, results_size) = self.split_initial_sizes();
+                            let on_resize =
+                                split_resize_handler(cx.entity(), ResultsPosition::Right);
                             h_resizable(SharedString::from(format!(
                                 "sql-split-right-{}",
                                 self.id.0
                             )))
+                            .on_resize(on_resize)
                             .child(
                                 resizable_panel()
-                                    .size(px(200.0))
+                                    .size(editor_size)
                                     .size_range(px(200.0)..px(10_000.0))
                                     .child(editor_view),
                             )
                             .child(
                                 resizable_panel()
-                                    .size(px(200.0))
+                                    .size(results_size)
                                     .size_range(px(200.0)..px(10_000.0))
                                     .child(results_view),
                             )
@@ -1295,16 +1362,20 @@ impl Render for CodeDocument {
                         }
 
                         SqlQueryLayout::Split => {
+                            let (editor_size, results_size) = self.split_initial_sizes();
+                            let on_resize =
+                                split_resize_handler(cx.entity(), ResultsPosition::Bottom);
                             v_resizable(SharedString::from(format!("sql-split-{}", self.id.0)))
+                                .on_resize(on_resize)
                                 .child(
                                     resizable_panel()
-                                        .size(px(200.0))
+                                        .size(editor_size)
                                         .size_range(px(100.0)..px(1000.0))
                                         .child(editor_view),
                                 )
                                 .child(
                                     resizable_panel()
-                                        .size(px(200.0))
+                                        .size(results_size)
                                         .size_range(EditorMetrics::RESULTS_MIN_HEIGHT..px(1000.0))
                                         .child(results_view),
                                 )
@@ -1333,6 +1404,38 @@ impl Render for CodeDocument {
 
 #[cfg(test)]
 mod tests {
+    /// Both orientations hand the panel group's end-of-drag callback to the
+    /// code that writes the split.
+    ///
+    /// A drag needs simulated mouse events on the divider, which this does
+    /// not do: the callback's own work is covered by
+    /// `a_finished_drag_is_remembered_as_a_ratio`, and the laid-out split by
+    /// `a_drawn_document_splits_its_panes_at_the_stored_share`. What is left
+    /// is the one line that joins them, and nothing else would miss it.
+    #[test]
+    fn both_orientations_save_the_split_when_a_drag_ends() {
+        let source = include_str!("render.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("render.rs has production code before its tests");
+
+        for (name, anchor) in [
+            ("right", "ResultsPosition::Right =>"),
+            ("bottom", "SqlQueryLayout::Split =>"),
+        ] {
+            let start = production
+                .find(anchor)
+                .unwrap_or_else(|| panic!("the {name} split is drawn"));
+            let body = &production[start..(start + 1200).min(production.len())];
+
+            assert!(
+                body.contains(".on_resize(on_resize)"),
+                "the {name} split never saves the ratio"
+            );
+        }
+    }
+
     /// The editor and results panes draw no focus ring around themselves:
     /// focus inside a document shows through its own caret, grid cursor and
     /// controls.

@@ -1052,6 +1052,28 @@ pub enum QueryLanguage {
 }
 
 impl QueryLanguage {
+    /// Whether this language only holds a driver-wire slot of a removed
+    /// language. Such a language has no stored name: a saved chart carrying it
+    /// could not be loaded again, so it is refused at save.
+    pub fn is_reserved(&self) -> bool {
+        match self {
+            QueryLanguage::ReservedCloudWatchLogsInsightsQl
+            | QueryLanguage::ReservedOpenSearchPpl
+            | QueryLanguage::ReservedOpenSearchSql => true,
+            QueryLanguage::Sql
+            | QueryLanguage::MongoQuery
+            | QueryLanguage::RedisCommands
+            | QueryLanguage::Cypher
+            | QueryLanguage::InfluxQuery
+            | QueryLanguage::Flux
+            | QueryLanguage::Cql
+            | QueryLanguage::Lua
+            | QueryLanguage::Python
+            | QueryLanguage::Bash
+            | QueryLanguage::Custom(_) => false,
+        }
+    }
+
     /// Infer the query language from a file path's extension.
     ///
     /// Returns `None` for unrecognised extensions so the caller can fall back
@@ -1246,9 +1268,22 @@ impl QueryLanguage {
     /// comments (`/* */`, nestable), and PostgreSQL dollar-quoted bodies
     /// (`$tag$ ... $tag$`). Empty statements (only whitespace) are dropped.
     ///
+    /// `Cql` splits on `;` under CQL's own lexical rules, which differ from
+    /// SQL's in five ways: `//` to the end of the line is a comment; a
+    /// backslash escapes nothing inside a string, where a doubled quote does;
+    /// block comments do not nest; only `$$…$$` is a dollar-quoted string, so
+    /// `$tag$` is not one; and a backtick quotes no identifier. It also
+    /// keeps a `BEGIN BATCH … APPLY BATCH` block whole, because the server
+    /// rejects the statements of a batch run on their own; an unclosed batch
+    /// stays whole so the language service can report it.
+    ///
     /// For every other language the trimmed buffer is returned as a single
     /// statement, since they do not use `;`-delimited batches.
     pub fn split_statements(&self, text: &str) -> Vec<String> {
+        if matches!(self, QueryLanguage::Cql) {
+            return split_statements_in_ranges(text, cql_statement_ranges(text));
+        }
+
         if self.editor_mode() != "sql" {
             let trimmed = text.trim();
             return if trimmed.is_empty() {
@@ -1274,6 +1309,14 @@ impl QueryLanguage {
     /// [`QueryLanguage::split_statements`]; for non-SQL editor modes the whole
     /// buffer is a single statement.
     pub fn statement_bounds_at(&self, text: &str, offset: usize) -> std::ops::Range<usize> {
+        if matches!(self, QueryLanguage::Cql) {
+            let offset = offset.min(text.len());
+            return cql_statement_ranges(text)
+                .into_iter()
+                .find(|range| offset <= range.end)
+                .unwrap_or(0..text.len());
+        }
+
         if self.editor_mode() != "sql" {
             return 0..text.len();
         }
@@ -1293,23 +1336,15 @@ impl QueryLanguage {
     /// caller can tell a single statement apart from a language without a
     /// statement splitter.
     pub fn statement_ranges(&self, text: &str) -> Option<Vec<std::ops::Range<usize>>> {
+        if matches!(self, QueryLanguage::Cql) {
+            return Some(trimmed_statement_ranges(text, cql_statement_ranges(text)));
+        }
+
         if self.editor_mode() != "sql" {
             return None;
         }
 
-        Some(
-            sql_statement_ranges(text)
-                .into_iter()
-                .filter_map(|range| {
-                    let segment = text.get(range.clone())?;
-                    let leading = segment.len() - segment.trim_start().len();
-                    let trailing = segment.len() - segment.trim_end().len();
-                    let trimmed = (range.start + leading)..(range.end - trailing);
-
-                    (trimmed.start < trimmed.end).then_some(trimmed)
-                })
-                .collect(),
-        )
+        Some(trimmed_statement_ranges(text, sql_statement_ranges(text)))
     }
 }
 
@@ -1351,30 +1386,201 @@ impl EditorLanguageProfile {
 /// `;`-delimited SQL statement splitter that is aware of strings, identifiers,
 /// comments, and dollar-quoted bodies. See [`QueryLanguage::split_statements`].
 fn split_sql_statements(text: &str) -> Vec<String> {
-    sql_statement_ranges(text)
+    split_statements_in_ranges(text, sql_statement_ranges(text))
+}
+
+/// The statements located in `ranges`, trimmed, with the empty ones dropped.
+fn split_statements_in_ranges(text: &str, ranges: Vec<std::ops::Range<usize>>) -> Vec<String> {
+    ranges
         .into_iter()
         .filter_map(|range| {
-            let statement = text[range].trim();
+            let statement = text.get(range)?.trim();
             (!statement.is_empty()).then(|| statement.to_string())
         })
         .collect()
 }
 
+/// `ranges` trimmed of surrounding whitespace, with the empty ones dropped.
+/// See [`QueryLanguage::statement_ranges`].
+fn trimmed_statement_ranges(
+    text: &str,
+    ranges: Vec<std::ops::Range<usize>>,
+) -> Vec<std::ops::Range<usize>> {
+    ranges
+        .into_iter()
+        .filter_map(|range| {
+            let segment = text.get(range.clone())?;
+            let leading = segment.len() - segment.trim_start().len();
+            let trailing = segment.len() - segment.trim_end().len();
+            let trimmed = (range.start + leading)..(range.end - trailing);
+
+            (trimmed.start < trimmed.end).then_some(trimmed)
+        })
+        .collect()
+}
+
+/// How many leading words can spell a CQL batch header: `BEGIN BATCH`,
+/// `BEGIN UNLOGGED BATCH` or `BEGIN COUNTER BATCH`.
+///
+/// Shared by the statement splitter, which reads this many words to recognise
+/// a batch, and the Cassandra driver's language service, which reads the same
+/// header. The two recognise the close differently, and each says how.
+pub const CQL_BATCH_HEADER_WORDS: usize = 3;
+
+/// Byte ranges of the CQL statements in `text`: the `;`-delimited segments of
+/// the CQL scanner, with a `BEGIN BATCH … APPLY BATCH` block merged into the
+/// single statement it runs as.
+///
+/// An unclosed `BEGIN BATCH` merges every segment to the end of the buffer, so
+/// the whole unclosed batch stays one statement and the language service can
+/// report what is missing.
+///
+/// A segment closes the batch when it *begins* with `APPLY BATCH`. Every valid
+/// CQL batch has the `;` before `APPLY BATCH`, so this closes them all. The
+/// language service, which only validates, also accepts a statement that ends
+/// with the pair (`BEGIN BATCH APPLY BATCH;`), so a batch written without that
+/// `;` is one statement here and still validates there.
+fn cql_statement_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut merged: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut open_batch: Option<std::ops::Range<usize>> = None;
+
+    for segment in cql_lexed_statement_ranges(text) {
+        let words = leading_words(
+            text.get(segment.clone()).unwrap_or_default(),
+            CQL_BATCH_HEADER_WORDS,
+        );
+        let is_close = words.first().is_some_and(|word| word == "APPLY")
+            && words.get(1).is_some_and(|word| word == "BATCH");
+        let is_open = words.first().is_some_and(|word| word == "BEGIN")
+            && words.iter().any(|word| word == "BATCH");
+        match open_batch.take() {
+            Some(batch) => {
+                let batch = batch.start..segment.end;
+                if is_close {
+                    merged.push(batch);
+                } else {
+                    open_batch = Some(batch);
+                }
+            }
+            None if is_open => open_batch = Some(segment),
+            None => merged.push(segment),
+        }
+    }
+
+    if let Some(batch) = open_batch {
+        merged.push(batch);
+    }
+
+    merged
+}
+
+/// The first `count` unquoted words of `statement`, uppercased, ignoring
+/// leading whitespace and comments.
+fn leading_words(statement: &str, count: usize) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut rest = statement;
+
+    while words.len() < count {
+        rest = rest.trim_start();
+
+        if rest.starts_with("--") || rest.starts_with("//") {
+            rest = rest.split_once('\n').map_or("", |(_, after)| after);
+            continue;
+        }
+
+        if let Some(after_open) = rest.strip_prefix("/*") {
+            rest = after_open.split_once("*/").map_or("", |(_, after)| after);
+            continue;
+        }
+
+        let word_len = rest
+            .find(|character: char| !(character.is_alphanumeric() || character == '_'))
+            .unwrap_or(rest.len());
+
+        if word_len == 0 {
+            break;
+        }
+
+        if let Some(word) = rest.get(..word_len) {
+            words.push(word.to_ascii_uppercase());
+        }
+        rest = rest.get(word_len..).unwrap_or_default();
+    }
+
+    words
+}
+
+/// The lexical rules of one statement scanner.
+///
+/// [`StatementLexRules::CQL`] is the set the Cassandra driver's
+/// `CqlLanguageService` reads too, so the splitter and the service cut a buffer
+/// into the same lexical pieces: no quote, comment or dollar body can move a
+/// `;` for one reader and not for the other. Change one, change both. The batch
+/// merge on top of those pieces is the splitter's own; `cql_statement_ranges`
+/// says where its closing rule stops short of the service's.
+#[derive(Clone, Copy, Debug)]
+struct StatementLexRules {
+    /// A backslash inside a single-quoted string escapes the next character.
+    backslash_escapes: bool,
+    /// `//` to the end of the line is a comment.
+    slash_line_comments: bool,
+    /// A `/* … */` block comment nests, as PostgreSQL's does.
+    nested_block_comments: bool,
+    /// `$tag$ … $tag$` is a quoted body. When false only `$$ … $$` is.
+    tagged_dollar_quotes: bool,
+    /// A backtick quotes an identifier (MySQL). CQL has no such quote.
+    backtick_identifiers: bool,
+}
+
+impl StatementLexRules {
+    /// The rules every SQL dialect this scanner serves shares.
+    const SQL: Self = Self {
+        backslash_escapes: true,
+        slash_line_comments: false,
+        nested_block_comments: true,
+        tagged_dollar_quotes: true,
+        backtick_identifiers: true,
+    };
+
+    /// CQL's rules, as its language service reads them.
+    const CQL: Self = Self {
+        backslash_escapes: false,
+        slash_line_comments: true,
+        nested_block_comments: false,
+        tagged_dollar_quotes: false,
+        backtick_identifiers: false,
+    };
+}
+
 /// Byte ranges of the `;`-delimited segments in `text` (separators excluded,
 /// segments untrimmed, empty segments kept). Shared scanner behind
 /// [`split_sql_statements`] and [`QueryLanguage::statement_bounds_at`].
+pub(crate) fn sql_statement_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    statement_ranges_with(text, StatementLexRules::SQL)
+}
+
+/// Like [`sql_statement_ranges`], for a CQL buffer.
+///
+/// `//` is a comment and a backslash escapes nothing, so a `;` inside a `//`
+/// comment or after a trailing backslash in a string separates nothing.
+fn cql_lexed_statement_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    statement_ranges_with(text, StatementLexRules::CQL)
+}
+
+/// The `;`-delimited segments of `text` under `rules`.
 ///
 /// Bounds proof for the indexed accesses below: `chars` is built once from
 /// `char_indices`, so `len == chars.len()` and every `byte` offset is a char
 /// boundary of `text`. Each `chars[index]` sits under `while index < len`, and
 /// every lookahead `chars[index + 1]` is separately guarded by
-/// `index + 1 < len`, in all four state machines (line comment, block
-/// comment, quoted string/identifier, dollar quote).
+/// `index + 1 < len`, in all five state machines: the `--` line comment, the
+/// `//` line comment where the rules allow it, the block comment, the quoted
+/// string or identifier, and the dollar quote.
 #[expect(
     clippy::indexing_slicing,
     reason = "every chars[index] is under `while index < len` and every chars[index + 1] lookahead under a separate `index + 1 < len` guard; offsets come from char_indices so text[range] slices stay on char boundaries"
 )]
-pub(crate) fn sql_statement_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+fn statement_ranges_with(text: &str, rules: StatementLexRules) -> Vec<std::ops::Range<usize>> {
     let chars: Vec<(usize, char)> = text.char_indices().collect();
     let len = chars.len();
 
@@ -1393,13 +1599,25 @@ pub(crate) fn sql_statement_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
             continue;
         }
 
-        // Block comment: /* ... */ with PostgreSQL-style nesting.
+        // Line comment in a language that reads `//`: ... up to end of line.
+        if rules.slash_line_comments && ch == '/' && index + 1 < len && chars[index + 1].1 == '/' {
+            while index < len && chars[index].1 != '\n' {
+                index += 1;
+            }
+            continue;
+        }
+
+        // Block comment: /* ... */, nested when the language says so.
         if ch == '/' && index + 1 < len && chars[index + 1].1 == '*' {
             index += 2;
 
             let mut depth = 1;
             while index < len && depth > 0 {
-                if chars[index].1 == '/' && index + 1 < len && chars[index + 1].1 == '*' {
+                if rules.nested_block_comments
+                    && chars[index].1 == '/'
+                    && index + 1 < len
+                    && chars[index + 1].1 == '*'
+                {
                     depth += 1;
                     index += 2;
                 } else if chars[index].1 == '*' && index + 1 < len && chars[index + 1].1 == '/' {
@@ -1412,14 +1630,15 @@ pub(crate) fn sql_statement_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
             continue;
         }
 
-        // Single-quoted string literal ('' and backslash escapes).
+        // Single-quoted string literal ('' always, backslash when the language
+        // says so).
         if ch == '\'' {
             index += 1;
 
             while index < len {
                 let inner = chars[index].1;
 
-                if inner == '\\' && index + 1 < len {
+                if rules.backslash_escapes && inner == '\\' && index + 1 < len {
                     index += 2;
                     continue;
                 }
@@ -1439,8 +1658,8 @@ pub(crate) fn sql_statement_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
             continue;
         }
 
-        // Quoted identifier: "..." (standard SQL) or `...` (MySQL).
-        if ch == '"' || ch == '`' {
+        // Quoted identifier: "..." always, and `...` where the language has it.
+        if ch == '"' || (ch == '`' && rules.backtick_identifiers) {
             let quote = ch;
             index += 1;
 
@@ -1459,9 +1678,10 @@ pub(crate) fn sql_statement_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
             continue;
         }
 
-        // Dollar-quoted string: $tag$ ... $tag$ (PostgreSQL).
+        // Dollar-quoted string: $tag$ ... $tag$ (PostgreSQL), or `$$ ... $$`
+        // alone where the language has no tagged bodies.
         if ch == '$'
-            && let Some(tag_end) = dollar_tag_end(&chars, index)
+            && let Some(tag_end) = dollar_tag_end(&chars, index, rules.tagged_dollar_quotes)
         {
             let tag_start = index;
             let tag_len = tag_end + 1 - tag_start;
@@ -1494,16 +1714,20 @@ pub(crate) fn sql_statement_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
 }
 
 /// If `chars[start]` opens a dollar-quote tag, returns the index of the closing
-/// `$` of that opening tag. The tag identifier must be empty (`$$`) or a valid
+/// `$` of that opening tag.
+///
+/// With `tagged_allowed` the tag identifier must be empty (`$$`) or a valid
 /// identifier (letters, digits, underscore, not starting with a digit), which
-/// also prevents misreading parameter placeholders such as `$1`.
+/// also prevents misreading parameter placeholders such as `$1`. Without it,
+/// only the empty tag (`$$`) opens a body, for a language that has no tagged
+/// dollar quotes; `$tag$` and `$1` then open nothing.
 ///
 /// `chars[index]` is only read under `while index < chars.len()`.
 #[expect(
     clippy::indexing_slicing,
     reason = "chars[index] is read only under `while index < chars.len()`"
 )]
-fn dollar_tag_end(chars: &[(usize, char)], start: usize) -> Option<usize> {
+fn dollar_tag_end(chars: &[(usize, char)], start: usize, tagged_allowed: bool) -> Option<usize> {
     let mut index = start + 1;
 
     while index < chars.len() {
@@ -1511,6 +1735,10 @@ fn dollar_tag_end(chars: &[(usize, char)], start: usize) -> Option<usize> {
 
         if ch == '$' {
             return Some(index);
+        }
+
+        if !tagged_allowed {
+            return None;
         }
 
         let is_first = index == start + 1;
@@ -2256,6 +2484,16 @@ impl DriverMetadata {
         self.category == DatabaseCategory::Relational
     }
 
+    /// Whether the schema-diff workflow can compare against this connection.
+    ///
+    /// The workflow reads a schema snapshot and applies SQL DDL, so the
+    /// connection must be relational *and* speak SQL. A relational driver whose
+    /// language is CQL (Cassandra) would otherwise be offered a diff it can
+    /// neither build nor apply.
+    pub fn supports_schema_diff(&self) -> bool {
+        self.is_relational() && self.query_language == QueryLanguage::Sql
+    }
+
     /// Check if this is a document database.
     pub fn is_document(&self) -> bool {
         self.category == DatabaseCategory::Document
@@ -2569,6 +2807,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn schema_diff_needs_a_relational_driver_that_speaks_sql() {
+        let sql = DriverMetadataBuilder::new(
+            "postgres",
+            "PostgreSQL",
+            DatabaseCategory::Relational,
+            QueryLanguage::Sql,
+        )
+        .build();
+        let cql = DriverMetadataBuilder::new(
+            "cassandra",
+            "Cassandra / ScyllaDB",
+            DatabaseCategory::Relational,
+            QueryLanguage::Cql,
+        )
+        .build();
+        let document = DriverMetadataBuilder::new(
+            "mongodb",
+            "MongoDB",
+            DatabaseCategory::Document,
+            QueryLanguage::Sql,
+        )
+        .build();
+
+        assert!(sql.supports_schema_diff());
+        // The workflow builds and applies SQL DDL, so a relational driver with
+        // another query language is left out.
+        assert!(!cql.supports_schema_diff());
+        assert!(!document.supports_schema_diff());
+    }
+
+    #[test]
     fn split_statements_single_sql() {
         let stmts = QueryLanguage::Sql.split_statements("SELECT 1");
         assert_eq!(stmts, vec!["SELECT 1".to_string()]);
@@ -2685,6 +2954,182 @@ mod tests {
         assert_eq!(
             QueryLanguage::RedisCommands.statement_count("GET a\nGET b"),
             1
+        );
+    }
+
+    #[test]
+    fn split_statements_keeps_a_cql_batch_whole() {
+        let batch = "BEGIN BATCH
+                       INSERT INTO users (id, name) VALUES (1, 'a');
+                       UPDATE users SET name = 'b' WHERE id = 1;
+                     APPLY BATCH;";
+        let whole_batch = "BEGIN BATCH
+                       INSERT INTO users (id, name) VALUES (1, 'a');
+                       UPDATE users SET name = 'b' WHERE id = 1;
+                     APPLY BATCH";
+
+        // The trailing `;` is not part of a statement, here as in SQL.
+        assert_eq!(
+            QueryLanguage::Cql.split_statements(batch),
+            vec![whole_batch.to_string()]
+        );
+        assert_eq!(QueryLanguage::Cql.statement_count(batch), 1);
+    }
+
+    #[test]
+    fn split_statements_keeps_unlogged_and_counter_batches_whole() {
+        for batch in [
+            "BEGIN UNLOGGED BATCH INSERT INTO t (k) VALUES (1); APPLY BATCH;",
+            "BEGIN COUNTER BATCH UPDATE c SET n = n + 1 WHERE k = 1; APPLY BATCH;",
+        ] {
+            assert_eq!(QueryLanguage::Cql.statement_count(batch), 1, "{batch}");
+        }
+    }
+
+    #[test]
+    fn split_statements_keeps_an_unclosed_cql_batch_whole() {
+        let unclosed = "BEGIN BATCH INSERT INTO t (k) VALUES (1); DELETE FROM t WHERE k = 1;";
+
+        assert_eq!(QueryLanguage::Cql.statement_count(unclosed), 1);
+    }
+
+    #[test]
+    fn split_statements_splits_cql_statements_outside_a_batch() {
+        assert_eq!(
+            QueryLanguage::Cql.split_statements("SELECT * FROM t; SELECT * FROM u;"),
+            vec!["SELECT * FROM t".to_string(), "SELECT * FROM u".to_string()]
+        );
+    }
+
+    #[test]
+    fn split_statements_ends_a_cql_batch_at_apply_batch() {
+        let text = "BEGIN BATCH INSERT INTO t (k) VALUES (1); APPLY BATCH; SELECT * FROM t";
+
+        assert_eq!(
+            QueryLanguage::Cql.split_statements(text),
+            vec![
+                "BEGIN BATCH INSERT INTO t (k) VALUES (1); APPLY BATCH".to_string(),
+                "SELECT * FROM t".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn split_statements_finds_a_cql_batch_after_a_comment() {
+        let text = "-- load the users\nBEGIN BATCH INSERT INTO t (k) VALUES (1); APPLY BATCH;";
+
+        assert_eq!(QueryLanguage::Cql.statement_count(text), 1);
+    }
+
+    // Ruling 3 (issue #472): the CQL splitter follows CQL's own lexical rules,
+    // not SQL's. Each case below would split wrongly under the SQL rules.
+
+    #[test]
+    fn split_statements_ignores_a_semicolon_in_a_cql_string() {
+        assert_eq!(
+            QueryLanguage::Cql
+                .split_statements("SELECT * FROM t WHERE name = 'a;b'; SELECT * FROM u"),
+            vec![
+                "SELECT * FROM t WHERE name = 'a;b'".to_string(),
+                "SELECT * FROM u".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn split_statements_ignores_begin_batch_in_a_cql_comment() {
+        let text = "-- BEGIN BATCH INSERT INTO t (k) VALUES (1)\nSELECT * FROM t; SELECT * FROM u";
+
+        assert_eq!(QueryLanguage::Cql.statement_count(text), 2);
+    }
+
+    #[test]
+    fn split_statements_ignores_begin_batch_in_a_cql_string() {
+        let text = "INSERT INTO t (k) VALUES ('BEGIN BATCH'); SELECT * FROM u";
+
+        assert_eq!(QueryLanguage::Cql.statement_count(text), 2);
+    }
+
+    #[test]
+    fn split_statements_keeps_a_cql_batch_between_two_statements() {
+        let text = "SELECT 1; BEGIN BATCH INSERT INTO t (k) VALUES (1); APPLY BATCH; SELECT 2";
+
+        assert_eq!(
+            QueryLanguage::Cql.split_statements(text),
+            vec![
+                "SELECT 1".to_string(),
+                "BEGIN BATCH INSERT INTO t (k) VALUES (1); APPLY BATCH".to_string(),
+                "SELECT 2".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn split_statements_ignores_a_semicolon_in_a_cql_slash_comment() {
+        let text = "SELECT 1; // a; b\nSELECT 2";
+
+        assert_eq!(
+            QueryLanguage::Cql.split_statements(text),
+            vec!["SELECT 1".to_string(), "// a; b\nSELECT 2".to_string()]
+        );
+    }
+
+    #[test]
+    fn split_statements_applies_the_rest_of_cql_lexing() {
+        // CQL block comments do not nest, so this comment ends at the first
+        // `*/`; under SQL's rules the whole buffer would be one statement.
+        assert_eq!(
+            QueryLanguage::Cql.statement_count("/* a /* b */ SELECT 1; SELECT 2"),
+            2
+        );
+        // Only `$$…$$` is a quoted body in CQL, so `$tag$` quotes nothing.
+        assert_eq!(
+            QueryLanguage::Cql.statement_count("SELECT $tag$x;y$tag$; SELECT 2"),
+            3
+        );
+        // A backtick quotes nothing in CQL either.
+        assert_eq!(
+            QueryLanguage::Cql.statement_count("SELECT `a;b` FROM t; SELECT 2"),
+            3
+        );
+    }
+
+    #[test]
+    fn split_statements_reads_a_trailing_backslash_as_a_cql_literal() {
+        // CQL has no backslash escape, so the string ends at the quote and the
+        // `;` after it separates two statements. Under SQL's rules the quote
+        // would be escaped and the whole buffer would stay one statement.
+        let text = "SELECT * FROM t WHERE path = 'C:\\'; SELECT 2";
+
+        assert_eq!(QueryLanguage::Cql.statement_count(text), 2);
+    }
+
+    #[test]
+    fn statement_ranges_locate_a_cql_batch_and_the_statement_after_it() {
+        let text = "BEGIN BATCH INSERT INTO t (k) VALUES (1); APPLY BATCH; SELECT * FROM t";
+        let ranges = QueryLanguage::Cql
+            .statement_ranges(text)
+            .expect("CQL splits into statements");
+
+        let located: Vec<&str> = ranges.iter().map(|range| &text[range.clone()]).collect();
+
+        assert_eq!(
+            located,
+            vec![
+                "BEGIN BATCH INSERT INTO t (k) VALUES (1); APPLY BATCH",
+                "SELECT * FROM t"
+            ]
+        );
+    }
+
+    #[test]
+    fn statement_bounds_at_inside_a_cql_batch_selects_the_whole_batch() {
+        let text = "BEGIN BATCH INSERT INTO t (k) VALUES (1); APPLY BATCH; SELECT * FROM t";
+        let range = QueryLanguage::Cql.statement_bounds_at(text, 20);
+
+        assert_eq!(
+            text.get(range).unwrap_or_default(),
+            "BEGIN BATCH INSERT INTO t (k) VALUES (1); APPLY BATCH"
         );
     }
 

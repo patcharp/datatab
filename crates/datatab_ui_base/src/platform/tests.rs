@@ -1,6 +1,33 @@
 use gpui::{Context, IntoElement, Modifiers, Render, TestAppContext, Window, div, point, px};
 use gpui_component::ActiveTheme;
 
+#[test]
+fn client_decoration_preparation_does_not_set_the_inset() {
+    let source = include_str!("../platform.rs");
+    let body = source
+        .split_once("pub fn prepare_client_decorations(")
+        .expect("client decoration preparation exists")
+        .1
+        .split_once("\n}")
+        .expect("client decoration preparation ends")
+        .0;
+    assert!(
+        !body.contains("set_client_inset"),
+        "preparation must leave the inset to the window border"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[gpui::test]
+fn server_decoration_preparation_preserves_the_inset(cx: &mut TestAppContext) {
+    let (_, window) = cx.add_window_view(|_, _| SecondaryTitle);
+    window.update(|window, _| {
+        window.set_client_inset(px(20.0));
+        assert!(!super::prepare_client_decorations(window));
+        assert_eq!(window.client_inset(), Some(px(20.0)));
+    });
+}
+
 struct WindowControls;
 
 impl Render for WindowControls {

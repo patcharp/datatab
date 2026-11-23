@@ -156,6 +156,25 @@ pub fn set_nightly_shares_stable_db(enabled: bool) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Returns `<data dir>/reports/<channel>/pending/`, creating it owner-only.
+///
+/// This is where a panic leaves the report the next start offers to send
+/// (ADR 0008). The directory is inside the data directory so a full backup of
+/// the app's data includes it, and owner-only so no other user reads it. The
+/// channel's own folder keeps a Nightly build from offering a Stable build's
+/// reports and the other way round, the same way the two keep their databases
+/// apart.
+pub fn reports_pending_dir() -> Result<PathBuf, StorageError> {
+    let channel = datatab_core::ReleaseChannel::current().app_id();
+    let dir = reports_pending_dir_under(&data_dir()?, channel);
+    ensure_private_dir(&dir)?;
+    Ok(dir)
+}
+
+fn reports_pending_dir_under(data_dir: &Path, channel: &str) -> PathBuf {
+    data_dir.join("reports").join(channel).join("pending")
+}
+
 /// Returns the path for the unified database inside the data directory.
 ///
 /// The file name is channel-specific: nightly builds use `datatab-nightly.db`
@@ -178,6 +197,19 @@ mod tests {
 
     #[cfg(unix)]
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[test]
+    fn pending_reports_live_in_the_channel_folder() {
+        let base = std::path::Path::new("base");
+        let stable = super::reports_pending_dir_under(base, "datatab");
+        let nightly = super::reports_pending_dir_under(base, "datatab-nightly");
+
+        assert_eq!(stable, base.join("reports").join("datatab").join("pending"));
+        assert_ne!(
+            stable, nightly,
+            "a Nightly build must not offer a Stable build's reports"
+        );
+    }
 
     // Uses the join alone, because `data_dir()` would create the real folder.
     #[test]

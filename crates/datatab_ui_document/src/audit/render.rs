@@ -24,7 +24,6 @@ use datatab_components::primitives::{
 use datatab_components::tokens::{
     ChamferCut, ChromeColors, DocumentMetrics, Feedback, Spacing, SyntaxColors, ui,
 };
-use datatab_components::typography::AppFonts;
 use datatab_core::{EventCategory, EventOutcome};
 use datatab_storage::repositories::audit::AuditEventDto;
 use gpui::prelude::*;
@@ -821,7 +820,7 @@ impl AuditDocument {
                 .flex_shrink_0()
                 .pr(DocumentMetrics::GAP)
                 .truncate()
-                .font_family(datatab_components::fonts::editor_family(cx))
+                .font(datatab_components::fonts::editor_font(cx))
                 .text_size(DocumentMetrics::TABLE_META_FONT)
                 .text_color(muted)
                 .child(value)
@@ -835,7 +834,7 @@ impl AuditDocument {
                 .truncate()
                 .text_color(strong)
                 .when(mono, |cell| {
-                    cell.font_family(datatab_components::fonts::editor_family(cx))
+                    cell.font(datatab_components::fonts::editor_font(cx))
                 })
                 .child(if value.is_empty() {
                     SharedString::from("—")
@@ -1019,7 +1018,7 @@ impl AuditDocument {
             .mt(DocumentMetrics::DETAIL_BLOCK_MARGIN_TOP)
             .px(DocumentMetrics::DETAIL_BLOCK_PADDING_X)
             .py(DocumentMetrics::DETAIL_BLOCK_PADDING_Y)
-            .font_family(datatab_components::fonts::editor_family(cx))
+            .font(datatab_components::fonts::editor_font(cx))
             .text_size(DocumentMetrics::DETAIL_BLOCK_FONT)
             .line_height(relative(DocumentMetrics::DETAIL_BLOCK_LINE_HEIGHT))
             .text_color(theme.foreground)
@@ -1243,7 +1242,7 @@ impl AuditDocument {
                 detail.child(
                     div()
                         .mt(DocumentMetrics::DETAIL_BLOCK_MARGIN_TOP)
-                        .font_family(datatab_components::fonts::editor_family(cx))
+                        .font(datatab_components::fonts::editor_font(cx))
                         .text_size(DocumentMetrics::DETAIL_BLOCK_FONT)
                         .text_color(theme.danger)
                         .child(error),

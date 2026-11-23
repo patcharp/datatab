@@ -401,6 +401,14 @@ switches between them.
 - **One access method per connection.** Switching methods clears the others.
 - **Secrets live in your OS keyring**, never in the DataTab database. If the
   keyring is unavailable, "Save" checkboxes disappear and secrets aren't kept.
+- **Quitting during an import can leave saved secrets behind.** Import writes
+  secrets to the OS keyring before it commits the imported profiles. If DataTab
+  quits before that commit, those secrets may remain in the keyring without a
+  saved profile. DataTab does not clean them up at the next start.
+- **An external driver's other secret fields live in the keyring too.** A
+  `Password` or write-only field other than the password is saved to the OS
+  keyring, never to the database or an export; leave it empty when editing to
+  keep the saved value, and if the keyring cannot take it, the save is refused.
 - **An unsaved password is asked for when you connect.** If a connection's
   password is neither saved in the keyring nor taken from a value source,
   DataTab asks for it before connecting, and every database that connection

@@ -85,6 +85,7 @@ Notes:
 - Driver name/icon/category/form come from the service's `Hello` response (`driver_metadata`, `form_definition`), not from configuration
 - Services with `service_kind='driver'` that fail to complete the RPC handshake (`Hello`) during startup are not registered
 - Services with `service_kind='auth_provider'` are loaded into auth-provider registries when they pass compatibility checks and probe successfully
+- Auth providers that miss the `Hello` deadline are skipped.
 - Driver-path negotiation selects the highest mutually supported compatible minor version during `Hello`, then requires every later envelope to use that exact negotiated version
 - Auth-provider negotiation follows the same family/major/minor scheme under `auth_provider_rpc`; incompatible family or major versions are skipped before registration
 - Services with `service_kind='secret_provider'` negotiate under `secret_provider_rpc`, must announce a valid manifest in `Hello`, and are skipped when their `provider_id` is already registered

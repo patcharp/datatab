@@ -433,6 +433,18 @@ fn parse_query_language(s: &str) -> Result<QueryLanguage, StorageError> {
     }
 }
 
+/// A reserved language slot has no stored name, so a chart that carries one
+/// would be skipped at the next load. It is refused at save instead.
+fn has_reserved_language(source: &SavedChartSource) -> bool {
+    matches!(
+        source,
+        SavedChartSource::Collection {
+            time_window: Some(ResolvedWindow { language, .. }),
+            ..
+        } if language.is_reserved()
+    )
+}
+
 fn query_language_to_str(l: QueryLanguage) -> String {
     match l {
         QueryLanguage::Sql => "Sql".to_string(),
@@ -552,8 +564,15 @@ impl SavedChartManager {
     /// Returns `Ok(true)` when an existing record was replaced, `Ok(false)`
     /// when a new record was inserted. The cache is updated only when the
     /// repository write succeeds; on failure the error is propagated to the
-    /// caller so it can surface a toast and emit an audit event.
+    /// caller so it can surface a toast and emit an audit event. A chart whose
+    /// query language is a reserved slot is refused with an error and nothing
+    /// is written.
     pub fn upsert(&mut self, chart: SavedChart) -> Result<bool, StorageError> {
+        if has_reserved_language(&chart.source) {
+            return Err(StorageError::Data(datatab_i18n::t!(
+                "document.chart.error.reserved_language"
+            )));
+        }
         let series = chart_to_series_dtos(&chart);
         let binding_y = chart_to_binding_y_dtos(&chart);
         let dto = chart_to_dto(&chart, series, binding_y);
@@ -880,6 +899,52 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    /// A chart whose window language is a reserved slot is refused at save and
+    /// nothing is written; a chart in a normal language still saves.
+    #[test]
+    fn upsert_refuses_a_reserved_window_language() {
+        let runtime = temp_storage();
+        let connection = runtime.viz_connection().expect("open viz connection");
+        let repository = Arc::new(SavedChartsRepository::new(Arc::clone(&connection)));
+        let profile_id = Uuid::new_v4();
+        insert_test_profile(&connection, profile_id);
+        let mut manager = SavedChartManager::new(Arc::clone(&repository));
+
+        for reserved in [
+            QueryLanguage::ReservedCloudWatchLogsInsightsQl,
+            QueryLanguage::ReservedOpenSearchPpl,
+            QueryLanguage::ReservedOpenSearchSql,
+        ] {
+            let mut chart = sample_chart("reserved", profile_id);
+            chart.source = SavedChartSource::Collection {
+                collection_ref: CollectionRef::new("metrics", "cpu"),
+                time_window: Some(ResolvedWindow {
+                    start_ms: 1_000,
+                    end_ms: 2_000,
+                    language: reserved,
+                }),
+            };
+            assert!(manager.upsert(chart).is_err());
+        }
+        assert!(manager.all_charts().is_empty());
+        assert!(repository.list().expect("stored rows").is_empty());
+
+        let mut flux_chart = sample_chart("flux", profile_id);
+        flux_chart.source = SavedChartSource::Collection {
+            collection_ref: CollectionRef::new("metrics", "cpu"),
+            time_window: Some(ResolvedWindow {
+                start_ms: 1_000,
+                end_ms: 2_000,
+                language: QueryLanguage::Flux,
+            }),
+        };
+        manager.upsert(flux_chart).expect("normal language saves");
+        manager
+            .upsert(sample_chart("query", profile_id))
+            .expect("query chart saves");
+        assert_eq!(repository.list().expect("stored rows").len(), 2);
     }
 
     /// A collection chart stored with a time-window language of the removed

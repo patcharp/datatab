@@ -136,6 +136,51 @@ Toasts stack in the top-right corner of the document area. At most four are
 shown at once; older ones fold into an *N more* entry that expands them or
 dismisses them together.
 
+### Diagnostic reports
+
+DataTab can turn a panic or an error into a report you send by hand, once, from
+the window that shows every byte it holds. Nothing is sent automatically and
+there is no background check, so this section is only about turning the offer
+off.
+
+| Setting | What it does |
+|---------|--------------|
+| **Offer to send a report** | On by default. Off removes the *Send report…* action; a report already written stays in the data folder and the app never offers it. |
+
+Two more sources can turn reports off, for a user or for a whole machine. Any
+one of them is enough, and none can turn reports back on:
+
+| Source | Value |
+|--------|-------|
+| Environment variable | `DATATAB_DISABLE_ERROR_REPORTS`. Set to `1`, `true`, `yes` or any value other than `0`, `false`, `no` or `off`; an unset or empty value changes nothing. |
+| Managed file | A file named `error-reports-disabled` in one of: the DataTab data directory (`~/.local/share/datatab` on Linux, `~/Library/Application Support/datatab` on macOS, `%APPDATA%\datatab` on Windows), `/etc/datatab` (Linux), `/Library/Application Support/DataTab` (macOS) or `%ProgramData%\DataTab` (Windows). The file's contents do not matter. |
+
+When more than one source is set, the managed file wins over the environment
+variable, which wins over the setting. This is the order to rely on: an
+organization that forbids reports is obeyed even if a user turns the setting
+back on, and starting DataTab again is not needed — the switch is read each
+time a report would be sent.
+
+Panic reports are written under the data directory, in a folder for the release
+channel (`reports/datatab/pending` or `reports/datatab-nightly/pending`), at
+most five at a time, and they are written even while reports are off — a local
+file that is never sent. A Nightly build never offers a Stable build's reports.
+When a sixth report arrives the oldest goes, and its delete token goes with it,
+so that stored copy can no longer be deleted from the app; the service still
+deletes it after 90 days.
+
+A report that reaches the service comes back with a per-report delete token.
+DataTab keeps that token in a file beside the report, readable only by its
+owner (`<report>.json.sent`), and never in the database or in a saved copy.
+**Settings → About** lists such a report with **Delete from the server**: it
+removes the stored copy and then the local report, its decision marker and the
+token. A failure before the service confirms leaves everything in place and
+says why; a local file that cannot be removed after the service deleted the
+report is named in the line. Deleting works while reports are off, because it
+removes data and sends none. A report sent before DataTab kept tokens has none,
+so About says it cannot be deleted from there instead of offering the button;
+it can still be removed by writing to `me@pcplab.me` with its report id.
+
 ### Execution safety (dangerous-query confirmation)
 
 These three settings govern how DataTab treats risky queries across **all**

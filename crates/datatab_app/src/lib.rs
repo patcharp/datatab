@@ -18,7 +18,10 @@ pub mod secret_provider_registry;
 pub mod updates;
 
 pub use access_manager::AppAccessManager;
-pub use app_state::{AppState, ConnectionPasswordPrompt};
+pub use app_state::{
+    AppState, ConnectionPasswordPrompt, SecretFieldChanges, SecretFieldKeyringError,
+    SecretFieldsMayHaveChanged,
+};
 pub use auth_provider_registry::{AuthProviderRegistry, RegistryAuthProviderWrapper};
 pub use hook_executor::CompositeExecutor;
 pub use rpc_services::{ExternalDriverDiagnostic, ExternalDriverStage};

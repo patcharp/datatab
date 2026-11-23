@@ -56,6 +56,7 @@ fn duplicate_profile_in_state(
     cloned.id = Uuid::new_v4();
     cloned.name = format!("{} (Copy)", cloned.name);
     let new_id = cloned.id;
+    state.prepare_duplicate_external_values(&mut cloned);
 
     if let Some(password) = password.as_ref() {
         state

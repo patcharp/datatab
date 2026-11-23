@@ -14,8 +14,12 @@ fn stored_managed_and_postgres() -> (AppState, ConnectionProfile, ConnectionProf
         ]),
     });
     let postgres = ConnectionProfile::new("unaffected", DbConfig::default_postgres());
-    crate::config_loader::save_profiles(&runtime, &[managed.clone(), postgres.clone()])
-        .expect("save profiles");
+    crate::config_loader::save_profiles(
+        &runtime,
+        &[managed.clone(), postgres.clone()],
+        &std::collections::HashSet::new(),
+    )
+    .expect("save profiles");
     let state = AppState::new_with_storage_runtime(runtime).expect("load state");
     (state, managed, postgres)
 }

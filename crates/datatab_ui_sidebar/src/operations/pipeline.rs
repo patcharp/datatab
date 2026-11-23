@@ -211,6 +211,7 @@ impl Sidebar {
     /// Connect using the pipeline path (auth, value resolution, access, connect).
     /// `password` is the password typed into the connect prompt; it replaces
     /// the keyring lookup and serves the whole live session.
+    #[allow(clippy::result_large_err)]
     pub(super) fn connect_via_pipeline(
         &mut self,
         profile_id: Uuid,
@@ -248,7 +249,7 @@ impl Sidebar {
                         None => match datatab_core::keyring_password_for_connect(
                             &input.profile,
                             driver.requires_password(),
-                            state.get_password(&input.profile),
+                            || state.get_password(&input.profile),
                         ) {
                             Ok(password) => password,
                             Err(error) => {
@@ -340,6 +341,7 @@ impl Sidebar {
         self.refresh_tree(cx);
 
         let app_state = self.app_state.clone();
+        let secret_store = self.app_state.read(cx).secret_store();
         let sidebar = cx.entity().clone();
         let (state_tx, state_rx) = datatab_core::pipeline_state_channel();
         let task_state_rx = state_rx.clone();
@@ -653,8 +655,17 @@ impl Sidebar {
                             .redirect_to_tunnel(access_handle.local_port());
                     }
 
+                    let keyring_fields_profile =
+                        datatab_core::profile_with_keyring_fields_from(
+                            &profile,
+                            driver.form_definition(),
+                            &secret_store,
+                        )?;
                     let connection = driver
-                        .connect_with_overrides(&profile, &overrides)
+                        .connect_with_overrides(
+                            keyring_fields_profile.as_ref().unwrap_or(&profile),
+                            &overrides,
+                        )
                         .map_err(|e| e.to_string())?;
 
                     let _ = state_tx_for_connect.send(datatab_core::PipelineState::FetchingSchema);

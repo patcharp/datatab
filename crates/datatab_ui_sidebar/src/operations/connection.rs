@@ -1178,6 +1178,9 @@ impl Sidebar {
 
     pub(crate) fn delete_profile(&mut self, profile_id: Uuid, cx: &mut Context<Self>) {
         self.app_state.update(cx, |state, cx| {
+            if state.refuse_connection_delete(profile_id, cx) {
+                return;
+            }
             if let Some(idx) = state.profiles().iter().position(|p| p.id == profile_id)
                 && let Some(removed) = state.remove_profile(idx)
             {
@@ -1210,6 +1213,7 @@ impl Sidebar {
 
 #[cfg(test)]
 mod tests {
+    mod pipeline;
     mod refusal;
     use super::wait_for_connection_teardown;
     use datatab_core::CancelToken;

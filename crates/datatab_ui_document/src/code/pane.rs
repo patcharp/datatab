@@ -294,7 +294,7 @@ impl CodeDocument {
 
         handle.pane_actions = Some({
             let e = entity.clone();
-            Box::new(move |cx| e.read(cx).pane_actions(&e))
+            Box::new(move |cx| e.read(cx).pane_actions(&e, cx))
         });
 
         handle
@@ -306,13 +306,15 @@ mod tests {
     use crate::code::CodeDocument;
     use crate::pane::{PaneAction, PaneActionRun};
     use datatab_app::keymap::Command;
+    use datatab_components::accessibility::{accessibility_node, accessible_name};
     use datatab_components::theme;
     use datatab_core::QueryLanguage;
     use datatab_storage::bootstrap::StorageRuntime;
     use datatab_ui_base::AppStateEntity;
+    use datatab_ui_base::keyboard_coverage::FrameCapture;
     use datatab_ui_base::keymap::init_keymap;
     use datatab_ui_base::toast::{ToastGlobal, ToastHost};
-    use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext};
+    use gpui::{AppContext as _, Entity, Modifiers, TestAppContext, VisualTestContext};
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -360,7 +362,7 @@ mod tests {
 
     fn actions(document: &Entity<CodeDocument>, window: &mut VisualTestContext) -> Vec<PaneAction> {
         let document = document.clone();
-        window.update(|_, cx| document.read(cx).pane_actions(&document))
+        window.update(|_, cx| document.read(cx).pane_actions(&document, cx))
     }
 
     fn command_of(action: &PaneAction) -> Option<Command> {
@@ -420,8 +422,10 @@ mod tests {
 
     mod layout {
         use super::{open_document, open_sql_document};
+        use crate::code::ExecutionRecord;
         use datatab_components::tokens::EditorMetrics;
         use datatab_core::QueryLanguage;
+        use std::time::{Duration, Instant};
 
         /// The actions sit in a 32 px column on the editor's left edge, on
         /// the same row as the editor text and below the context bar, so the
@@ -499,6 +503,44 @@ mod tests {
                 "the count is inside the context bar: {summary:?} {context_bar:?}"
             );
         }
+
+        #[gpui::test]
+        fn a_finished_run_does_not_change_the_statement_count_in_the_context_bar(
+            cx: &mut gpui::TestAppContext,
+        ) {
+            let (document, window) = open_sql_document(cx);
+            window.update(|window, cx| {
+                document.update(cx, |document, cx| {
+                    document.set_content("SELECT 1;\nSELECT 2;", window, cx);
+                });
+            });
+            window.run_until_parked();
+            let before = window
+                .debug_bounds("context-run-summary")
+                .expect("statement count");
+
+            window.update(|_, cx| {
+                document.update(cx, |document, cx| {
+                    let started_at = Instant::now();
+                    document.execution.execution_history.push(ExecutionRecord {
+                        id: uuid::Uuid::new_v4(),
+                        started_at,
+                        finished_at: Some(started_at + Duration::from_secs(1)),
+                        result: None,
+                        error: None,
+                        rows_affected: None,
+                        is_script: false,
+                    });
+                    document.execution.active_execution_index = Some(0);
+                    cx.notify();
+                });
+            });
+            window.run_until_parked();
+            let after = window
+                .debug_bounds("context-run-summary")
+                .expect("statement count remains");
+            assert_eq!(after.size.width, before.size.width);
+        }
     }
 
     #[gpui::test]
@@ -529,12 +571,13 @@ mod tests {
         assert_eq!(command("run"), Some(Command::RunQuery));
         assert_eq!(command("run-in-new-tab"), Some(Command::RunQueryInNewTab));
         assert_eq!(command("save"), Some(Command::SaveQuery));
+        assert_eq!(command("format"), Some(Command::FormatSql));
         assert_eq!(command("history"), Some(Command::ToggleHistoryDropdown));
 
         let format = actions.iter().find(|action| action.id == "format");
         assert!(
-            format.is_some_and(|action| !action.enabled),
-            "the formatter is unavailable, as on the toolbar"
+            format.is_some_and(|action| action.enabled),
+            "SQL has a formatter, so the entry runs the command, as on the toolbar"
         );
 
         let run = actions.iter().find(|action| action.id == "run");
@@ -542,6 +585,84 @@ mod tests {
             run.is_some_and(|action| action.shortcut.is_some()),
             "an entry with a key binding shows its keys"
         );
+    }
+
+    /// The Format button runs the command: a click rewrites the buffer, the
+    /// same path the chord, the palette entry and the menu entry take.
+    #[gpui::test]
+    fn the_format_button_runs_the_format_command(cx: &mut TestAppContext) {
+        let (document, window) = open_sql_document(cx);
+        window.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.set_content("select id,name from   users", window, cx)
+            });
+        });
+
+        let capture = FrameCapture::observe(window);
+        let frame = capture.frame(window);
+
+        let node =
+            accessibility_node(&frame, "toolbar-format-btn").expect("the Format button is drawn");
+        assert!(!node.is_disabled(), "SQL has a formatter");
+        assert_eq!(
+            accessible_name(&frame, "toolbar-format-btn").as_deref(),
+            Some("Format SQL"),
+            "the button names what it does"
+        );
+
+        click(window, "toolbar-format-btn");
+
+        let value = window.update(|_, cx| {
+            document
+                .read(cx)
+                .editor
+                .input_state
+                .read(cx)
+                .value()
+                .to_string()
+        });
+        assert!(
+            value.starts_with("SELECT"),
+            "the button formats the buffer, got {value:?}"
+        );
+    }
+
+    /// A language whose service ships no formatter keeps the button disabled,
+    /// named after the reason, so the toolbar does not promise what it cannot
+    /// do.
+    #[gpui::test]
+    fn a_language_without_a_formatter_keeps_the_format_button_disabled(cx: &mut TestAppContext) {
+        let (_, window) = open_document(cx, QueryLanguage::Python);
+
+        let capture = FrameCapture::observe(window);
+        let frame = capture.frame(window);
+
+        let node =
+            accessibility_node(&frame, "toolbar-format-btn").expect("the Format button is drawn");
+        assert!(
+            node.is_disabled(),
+            "a language without a formatter keeps the button disabled"
+        );
+        assert_eq!(
+            accessible_name(&frame, "toolbar-format-btn").as_deref(),
+            Some("Formatter unavailable"),
+            "the button says why it is disabled"
+        );
+    }
+
+    /// Clicks the middle of the element drawn with `id`, as a mouse does.
+    fn click(window: &mut VisualTestContext, id: &str) {
+        let capture = FrameCapture::observe(window);
+        let frame = capture.frame(window);
+
+        let bounds = frame
+            .nodes()
+            .find(|(_, node)| node.id() == id)
+            .map(|(_, node)| node.bounds())
+            .unwrap_or_else(|| panic!("`{id}` is drawn"));
+
+        window.simulate_click(bounds.center(), Modifiers::default());
+        window.run_until_parked();
     }
 
     /// Enter on the target list of the context bar opens it with keyboard

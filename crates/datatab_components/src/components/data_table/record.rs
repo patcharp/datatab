@@ -323,6 +323,13 @@ fn render_fields(
                 render_editor_cell(state, theme)
             } else {
                 let display_text = display_value.display_text().to_string();
+                let value_color = if is_pending_delete || is_auto_generated || is_placeholder {
+                    theme.muted_foreground
+                } else if is_null {
+                    null_color
+                } else {
+                    theme.foreground
+                };
                 div()
                     .flex()
                     .flex_1()
@@ -348,23 +355,7 @@ fn render_fields(
                     .when(is_pending_delete, |d| d.line_through())
                     // Values read like the grid's cells: the data face, NULL
                     // in the null colour.
-                    .child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .font_family(fonts::grid_family(cx))
-                            .text_size(fonts::grid_font_size(cx))
-                            .text_color(
-                                if is_pending_delete || is_auto_generated || is_placeholder {
-                                    theme.muted_foreground
-                                } else if is_null {
-                                    null_color
-                                } else {
-                                    theme.foreground
-                                },
-                            )
-                            .child(display_text),
-                    )
+                    .child(value_text(display_text, value_color, cx))
                     .into_any_element()
             };
 
@@ -440,6 +431,22 @@ fn render_fields(
         .collect()
 }
 
+/// The text of one record field: the data face at the grid size, in the colour
+/// the field's state asks for.
+///
+/// It sets no font style and no family of its own. The field row italicises a
+/// NULL, generated or placeholder value and stretches a deleted one, and the
+/// grid root already supplies the data face with its Thai fallback; a `font`
+/// here would override both.
+fn value_text(text: String, color: gpui::Hsla, cx: &App) -> gpui::Div {
+    div()
+        .min_w_0()
+        .truncate()
+        .text_size(fonts::grid_font_size(cx))
+        .text_color(color)
+        .child(text)
+}
+
 /// The inline editor for the field being edited — the same enum dropdown or
 /// text input the grid mounts, so commit/cancel keep going through
 /// `DataTableState::stop_editing`.
@@ -471,4 +478,34 @@ fn render_input(input_state: &Entity<InputState>) -> impl IntoElement {
         .flex_1()
         .min_w_0()
         .child(Input::new(input_state).small())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::{TestAppContext, black};
+
+    /// A record field's value text must carry no font of its own.
+    ///
+    /// The field row italicises a NULL, generated or placeholder value with
+    /// `.italic()`, and the grid root supplies the data face together with the
+    /// bundled Thai fallback (`fonts::grid_font`). A font set on the value text
+    /// wins over both: the value draws upright, and Thai data goes back to the
+    /// platform fallback at the wrong size.
+    #[gpui::test]
+    fn the_value_text_leaves_the_rows_italic_to_the_row(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let mut cell = value_text("NULL".to_string(), black(), cx);
+            let text = &cell.style().text;
+
+            assert_eq!(
+                text.font_style, None,
+                "a font style on the value text draws a NULL upright"
+            );
+            assert_eq!(
+                text.font_family, None,
+                "a family on the value text drops the grid root's Thai fallback"
+            );
+        });
+    }
 }

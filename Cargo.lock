@@ -1340,7 +1340,7 @@ dependencies = [
 
 [[package]]
 name = "bolt"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bolt",
  "bolt_keys",
@@ -1359,11 +1359,12 @@ dependencies = [
  "tree-sitter-json",
  "tree-sitter-python",
  "tree-sitter-xml",
+ "ttf-parser",
 ]
 
 [[package]]
 name = "bolt_keys"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "log",
 ]
@@ -2352,6 +2353,16 @@ dependencies = [
 
 [[package]]
 name = "darling"
+version = "0.20.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc7f46116c46ff9ab3eb1597a45688b6715c6e628b5c133e288e709a29bcb4ee"
+dependencies = [
+ "darling_core 0.20.11",
+ "darling_macro 0.20.11",
+]
+
+[[package]]
+name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "25ae13da2f202d56bd7f91c25fba009e7717a1e4a1cc98a76d844b65ae912e9d"
@@ -2368,6 +2379,20 @@ checksum = "ed17f5901b6630b993ca003def43f2f8ef4014fc13b047b57aad617ff32bc2ec"
 dependencies = [
  "darling_core 0.24.1",
  "darling_macro 0.24.1",
+]
+
+[[package]]
+name = "darling_core"
+version = "0.20.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d00b9596d185e565c2207a0b01f8bd1a135483d02d9b7b0a54b11da8d53412e"
+dependencies = [
+ "fnv",
+ "ident_case",
+ "proc-macro2",
+ "quote",
+ "strsim",
+ "syn 2.0.117",
 ]
 
 [[package]]
@@ -2398,6 +2423,17 @@ dependencies = [
 
 [[package]]
 name = "darling_macro"
+version = "0.20.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fc34b93ccb385b40dc71c6fceac4b2ad23662c7eeb248cf10d529b7e055b6ead"
+dependencies = [
+ "darling_core 0.20.11",
+ "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "darling_macro"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac3984ec7bd6cfa798e62b4a642426a5be0e68f9401cfc2a01e3fa9ea2fcdb8d"
@@ -2419,6 +2455,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "6.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
+dependencies = [
+ "cfg-if",
+ "crossbeam-utils",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "data-encoding"
 version = "2.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2432,12 +2482,13 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
 name = "datatab"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "datatab_app",
  "datatab_audit",
  "datatab_cli",
  "datatab_core",
+ "datatab_diagnostics",
  "datatab_driver_ipc",
  "datatab_i18n",
  "datatab_ipc",
@@ -2462,7 +2513,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_app"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "bolt_keys",
@@ -2470,6 +2521,7 @@ dependencies = [
  "datatab_approval",
  "datatab_audit",
  "datatab_core",
+ "datatab_driver_cassandra",
  "datatab_driver_clickhouse",
  "datatab_driver_duckdb",
  "datatab_driver_influxdb",
@@ -2501,7 +2553,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_approval"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "datatab_policy",
  "serde",
@@ -2512,7 +2564,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_audit"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "datatab_core",
  "datatab_storage",
@@ -2527,11 +2579,11 @@ dependencies = [
 
 [[package]]
 name = "datatab_byte_source"
-version = "0.1.3"
+version = "0.1.4"
 
 [[package]]
 name = "datatab_cli"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "clap",
  "datatab_ipc",
@@ -2541,7 +2593,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_components"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "bolt",
  "chrono",
@@ -2568,7 +2620,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_core"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "bitflags 2.13.2",
@@ -2582,7 +2634,7 @@ dependencies = [
  "keyring",
  "libc",
  "log",
- "lz4_flex",
+ "lz4_flex 0.14.0",
  "rmp-serde",
  "rusqlite",
  "secrecy",
@@ -2608,7 +2660,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_delimited"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "chardetng",
  "datatab_byte_source",
@@ -2617,8 +2669,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "datatab_diagnostics"
+version = "0.1.4"
+dependencies = [
+ "backtrace",
+ "chrono",
+ "datatab_audit",
+ "datatab_core",
+ "regex",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "datatab_driver_cassandra"
+version = "0.1.4"
+dependencies = [
+ "chrono",
+ "datatab_core",
+ "datatab_test_support",
+ "log",
+ "rustls 0.23.46",
+ "rustls-native-certs 0.8.3",
+ "rustls-pemfile 2.2.0",
+ "scylla",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "datatab_driver_clickhouse"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2634,7 +2719,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_driver_duckdb"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "datatab_core",
@@ -2646,7 +2731,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_driver_host"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "datatab_core",
  "datatab_driver_mongodb",
@@ -2663,7 +2748,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_driver_influxdb"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2681,7 +2766,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_driver_ipc"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "datatab_core",
  "datatab_ipc",
@@ -2695,7 +2780,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_driver_mongodb"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2716,7 +2801,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_driver_mssql"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2738,7 +2823,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_driver_mysql"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2756,7 +2841,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_driver_postgres"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2777,7 +2862,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_driver_redis"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "datatab_core",
@@ -2795,7 +2880,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_driver_redshift"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "datatab_core",
@@ -2813,7 +2898,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_driver_sqlite"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "datatab_core",
  "datatab_test_support",
@@ -2826,7 +2911,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_driver_turso"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "datatab_core",
  "datatab_test_support",
@@ -2838,7 +2923,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_export"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "base64 0.22.1",
  "csv",
@@ -2850,7 +2935,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_i18n"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "serde_yaml",
  "sys-locale",
@@ -2858,7 +2943,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_ipc"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "async-trait",
  "datatab_core",
@@ -2876,7 +2961,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_js"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "datatab_core",
  "rquickjs",
@@ -2885,7 +2970,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_lua"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "datatab_core",
  "log",
@@ -2896,7 +2981,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_mcp"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "datatab_approval",
  "datatab_audit",
@@ -2911,7 +2996,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_mcp_server"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2919,6 +3004,7 @@ dependencies = [
  "datatab_approval",
  "datatab_audit",
  "datatab_core",
+ "datatab_driver_cassandra",
  "datatab_driver_clickhouse",
  "datatab_driver_duckdb",
  "datatab_driver_mongodb",
@@ -2947,7 +3033,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_parquet"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow-array 59.3.2",
  "arrow-schema 59.3.2",
@@ -2961,7 +3047,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_policy"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "serde",
  "serde_json",
@@ -2970,7 +3056,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_portability"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "aes",
  "age",
@@ -2990,7 +3076,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_proxy"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "datatab_core",
  "datatab_tunnel_core",
@@ -3005,7 +3091,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_schema_viz"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "datatab_core",
  "dbml-rs",
@@ -3015,7 +3101,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_spreadsheet"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "calamine",
  "chrono",
@@ -3028,7 +3114,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_ssh"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "base64 0.22.1",
  "datatab_core",
@@ -3044,7 +3130,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_storage"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "chrono",
  "datatab_approval",
@@ -3062,7 +3148,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_test_support"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "datatab_core",
  "datatab_driver_influxdb",
@@ -3081,7 +3167,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_transfer"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "csv",
  "datatab_core",
@@ -3095,7 +3181,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_tunnel_core"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "datatab_core",
  "log",
@@ -3103,7 +3189,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_ui"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "arrow-array 59.3.2",
  "arrow-schema 59.3.2",
@@ -3111,6 +3197,7 @@ dependencies = [
  "datatab_app",
  "datatab_components",
  "datatab_core",
+ "datatab_diagnostics",
  "datatab_i18n",
  "datatab_ipc",
  "datatab_ssh",
@@ -3129,12 +3216,13 @@ dependencies = [
  "parquet",
  "rfd",
  "serde_json",
+ "tempfile",
  "uuid",
 ]
 
 [[package]]
 name = "datatab_ui_base"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "bolt",
@@ -3142,6 +3230,7 @@ dependencies = [
  "datatab_app",
  "datatab_components",
  "datatab_core",
+ "datatab_diagnostics",
  "datatab_i18n",
  "datatab_mcp",
  "datatab_storage",
@@ -3159,7 +3248,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_ui_document"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "anyhow",
  "arrow-array 59.3.2",
@@ -3207,7 +3296,7 @@ dependencies = [
 
 [[package]]
 name = "datatab_ui_sidebar"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "datatab_app",
  "datatab_components",
@@ -3229,11 +3318,12 @@ dependencies = [
 
 [[package]]
 name = "datatab_ui_windows"
-version = "0.1.3"
+version = "0.1.4"
 dependencies = [
  "datatab_app",
  "datatab_components",
  "datatab_core",
+ "datatab_diagnostics",
  "datatab_i18n",
  "datatab_mcp",
  "datatab_policy",
@@ -3248,6 +3338,7 @@ dependencies = [
  "open",
  "rfd",
  "serde_json",
+ "tempfile",
  "uuid",
 ]
 
@@ -5639,6 +5730,8 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.1.5",
 ]
 
@@ -7097,6 +7190,15 @@ dependencies = [
  "float_next_after",
  "lyon_path",
  "num-traits",
+]
+
+[[package]]
+name = "lz4_flex"
+version = "0.11.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13591d77a9b6d941f7e6fcade7f9dfd9e801308752bde50c0a9bb5852778c22c"
+dependencies = [
+ "twox-hash",
 ]
 
 [[package]]
@@ -8627,7 +8729,7 @@ dependencies = [
  "flate2",
  "half",
  "hashbrown 0.17.1",
- "lz4_flex",
+ "lz4_flex 0.14.0",
  "num-bigint 0.5.1",
  "num-integer",
  "num-traits",
@@ -9471,7 +9573,7 @@ dependencies = [
  "getrandom 0.4.2",
  "lru-slab",
  "rand 0.10.1",
- "rand_pcg",
+ "rand_pcg 0.10.2",
  "ring",
  "rustc-hash 2.1.2",
  "rustls 0.23.46",
@@ -9599,6 +9701,15 @@ name = "rand_core"
 version = "0.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
+
+[[package]]
+name = "rand_pcg"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b48ac3f7ffaab7fac4d2376632268aa5f89abdb55f7ebf8f4d11fffccb2320f7"
+dependencies = [
+ "rand_core 0.9.5",
+]
 
 [[package]]
 name = "rand_pcg"
@@ -10687,6 +10798,81 @@ checksum = "da046153aa2352493d6cb7da4b6e5c0c057d8a1d0a9aa8560baffdd945acd414"
 dependencies = [
  "ring",
  "untrusted",
+]
+
+[[package]]
+name = "scylla"
+version = "1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4febc4a3c0b2b6a6ab0b25670a28015a7b87f6998b01ad324be19bb583237ad9"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "bytes",
+ "chrono",
+ "dashmap",
+ "futures",
+ "hashbrown 0.15.5",
+ "itertools 0.14.0",
+ "rand 0.9.5",
+ "rand_pcg 0.9.0",
+ "rustls 0.23.46",
+ "scylla-cql",
+ "scylla-cql-core",
+ "smallvec",
+ "socket2 0.5.10",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls 0.26.4",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "scylla-cql"
+version = "1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7898c851387b20e0996b33d6d98426c432cc0b45ed9af3cb4bd8b4d540ad7ade"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "chrono",
+ "itertools 0.14.0",
+ "lz4_flex 0.11.7",
+ "scylla-cql-core",
+ "snap",
+ "stable_deref_trait",
+ "thiserror 2.0.21",
+ "tokio",
+ "uuid",
+ "yoke",
+]
+
+[[package]]
+name = "scylla-cql-core"
+version = "1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2e609d59933b27489fb329e0e290469f0a027fd75a598f8d219b1479ed6213d0"
+dependencies = [
+ "byteorder",
+ "bytes",
+ "chrono",
+ "itertools 0.14.0",
+ "scylla-macros",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "scylla-macros"
+version = "1.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "275a0290cc00fc50a46b302ad09490ccce2eff1203d648addab1bd8ae833b96e"
+dependencies = [
+ "darling 0.20.11",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

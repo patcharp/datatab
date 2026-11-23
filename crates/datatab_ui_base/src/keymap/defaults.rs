@@ -475,6 +475,22 @@ fn editor_layer() -> KeymapLayer {
         Command::ToggleComment,
     );
 
+    // Format the buffer, or the statements the selection touches, with the
+    // connection's formatter. Alt+Shift+F is the editor convention for it, and
+    // holding Alt types no character, so the chord is free in every Vim mode
+    // and without Vim.
+    layer.bind(
+        KeyChord::new(
+            "f",
+            Modifiers {
+                alt: true,
+                shift: true,
+                ..Default::default()
+            },
+        ),
+        Command::FormatSql,
+    );
+
     // The toolbar menu from the text itself: Shift+F10 types nothing, so it
     // is free in every Vim mode and without Vim.
     layer.bind(

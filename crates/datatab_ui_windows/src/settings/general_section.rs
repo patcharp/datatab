@@ -61,6 +61,7 @@ pub(super) enum GeneralFormRow {
     ObjectPreviewLimit,
     KeyValueSizeLimit,
     ToastTimeout,
+    SendErrorReports,
     ShareStableDb,
     SaveButton,
 }
@@ -2174,6 +2175,10 @@ mod tests {
             (
                 "table-alias-as",
                 "settings.general.table_alias_use_as.label",
+            ),
+            (
+                "offer-error-reports",
+                "settings.general.send_error_reports.label",
             ),
             ("grid-fk-labels", "settings.general.grid_fk_labels.label"),
             ("restore-session", "settings.general.restore_session.label"),

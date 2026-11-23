@@ -42,6 +42,7 @@ use datatab_core::{
     GlobalOverrides, LogErr, SshAuthMethod, SshTunnelProfile, ValueRef,
 };
 use datatab_ui_base::AppStateEntity;
+use datatab_ui_base::app_state_entity::ConnectionEditAttentionRequested;
 use datatab_ui_base::user_error::{ErrorKind, UserFacingError, report_error};
 use gpui::*;
 use std::collections::{HashMap, HashSet};
@@ -49,6 +50,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 const AUTH_PROFILE_NONE_INDEX: usize = 0;
+const DELETE_NOTICE_DURATION: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Element id of a connection form input: `cm-field-<field id>`.
 ///
@@ -77,38 +79,81 @@ fn auth_profile_needs_login(
         )
 }
 
-/// Returns the `id` of the first `AuthProfileRef` field found in a form definition,
-/// or `None` if the form has no such field.
-fn auth_profile_ref_field_id_from_form(form: &DriverFormDef) -> Option<String> {
-    for tab in &form.tabs {
-        for section in &tab.sections {
-            for field in &section.fields {
-                if matches!(&field.kind, FormFieldKind::AuthProfileRef { .. }) {
-                    return Some(field.id.clone());
-                }
-            }
+/// The three certificate paths a saved config holds, for the shared Transport
+/// control's pickers. A driver without them restores empty boxes.
+fn ssl_cert_paths_from_config(config: &DbConfig) -> (String, String, String) {
+    match config {
+        DbConfig::Postgres {
+            ssl_root_cert_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
+            ..
         }
+        | DbConfig::MySQL {
+            ssl_root_cert_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
+            ..
+        }
+        | DbConfig::MongoDB {
+            ssl_root_cert_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
+            ..
+        }
+        | DbConfig::Redis {
+            ssl_root_cert_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
+            ..
+        }
+        | DbConfig::Redshift {
+            ssl_root_cert_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
+            ..
+        }
+        | DbConfig::ClickHouse {
+            ssl_root_cert_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
+            ..
+        }
+        | DbConfig::Cassandra {
+            ssl_root_cert_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
+            ..
+        } => (
+            ssl_root_cert_path.clone().unwrap_or_default(),
+            ssl_client_cert_path.clone().unwrap_or_default(),
+            ssl_client_key_path.clone().unwrap_or_default(),
+        ),
+        DbConfig::SqlServer {
+            ssl_root_cert_path, ..
+        } => (
+            ssl_root_cert_path.clone().unwrap_or_default(),
+            String::new(),
+            String::new(),
+        ),
+        _ => (String::new(), String::new(), String::new()),
     }
-    None
-}
-
-/// Returns the `id` of the first `AuthProfileRef` field found in the driver's form
-/// definition, or `None` if the driver is absent or has no such field.
-fn auth_profile_ref_field_id(driver: Option<&Arc<dyn DbDriver>>) -> Option<String> {
-    let driver = driver?;
-    auth_profile_ref_field_id_from_form(driver.form_definition())
 }
 
 /// Extracts the current SSL mode id string from a `DbConfig` for display in the UI segmented
 /// control. Returns `None` for configs that have no `ssl_mode` field.
 fn ssl_mode_from_config(config: &DbConfig) -> Option<String> {
     match config {
+        // A legacy profile keeps its system roots until saved. Editing it
+        // requires choosing one of the explicit modes before it can connect.
+        DbConfig::ClickHouse { ssl_mode, .. } => Some(ssl_mode.clone().unwrap_or_default()),
         DbConfig::Postgres { ssl_mode, .. }
         | DbConfig::Redshift { ssl_mode, .. }
         | DbConfig::MySQL { ssl_mode, .. }
         | DbConfig::MongoDB { ssl_mode, .. }
         | DbConfig::Redis { ssl_mode, .. }
-        | DbConfig::SqlServer { ssl_mode, .. } => ssl_mode.clone(),
+        | DbConfig::SqlServer { ssl_mode, .. }
+        | DbConfig::Cassandra { ssl_mode, .. } => ssl_mode.clone(),
         _ => None,
     }
 }
@@ -318,7 +363,9 @@ fn read_saved_secret(
 /// Everything the edit dialog reads from the keyring when it opens. Each read
 /// is independent, so one failure does not hide what the others returned.
 struct SavedSecrets {
-    password: SecretRead,
+    /// The profile's primary password; `None` when it does not live in the
+    /// keyring, so the keyring is not asked for it at all.
+    password: Option<SecretRead>,
     /// The profile's inline SSH secret; `None` when the profile has no inline tunnel.
     ssh: Option<SecretRead>,
     /// The bound tunnel profile's secret; `None` when no tunnel saves one.
@@ -332,7 +379,8 @@ fn read_saved_secrets(
     tunnel: Option<&SshTunnelProfile>,
 ) -> SavedSecrets {
     SavedSecrets {
-        password: read_saved_secret(secret_store, &profile.secret_ref()),
+        password: datatab_core::password_lives_in_keyring(profile)
+            .then(|| read_saved_secret(secret_store, &profile.secret_ref())),
         ssh: profile
             .config
             .ssh_tunnel()
@@ -375,6 +423,13 @@ enum StoredPassword {
     /// An empty field says nothing about the entry, and saving must not
     /// delete it.
     Unreadable,
+    /// The read was skipped on purpose because the profile has a broken value
+    /// source. Like `Unreadable`, the entry stays untouched on save.
+    Skipped,
+    /// The read was skipped on purpose because the profile's password does not
+    /// live in the keyring (a value source, or Save password off). The form
+    /// never saw any entry there, so saving leaves it untouched.
+    NotInKeyring,
 }
 
 /// Driver and credential input widgets for the connection form's main tab.
@@ -556,9 +611,12 @@ pub struct ConnectionManagerWindow {
     driver_grid_columns: usize,
     editing_profile_id: Option<uuid::Uuid>,
     value_ref_notice: Option<SharedString>,
+    delete_notice_visible: bool,
+    delete_notice_task: Option<Task<()>>,
     /// The pending keyring read of the edited profile's secrets; dropping it
     /// with the window cancels the apply step.
     secrets_read_task: Option<Task<()>>,
+    saving: bool,
     /// Save or Test Connection requested while the keyring read was pending.
     /// Both would otherwise evaluate a form that is still `Loading`; the
     /// request runs once the read has been applied.
@@ -567,6 +625,9 @@ pub struct ConnectionManagerWindow {
     /// cleared input looks untouched, so emptiness alone cannot tell "never
     /// typed" from "typed and deleted".
     inputs_edited_during_read: HashSet<EntityId>,
+    /// The driver form values an edit window opened with, to tell a field the
+    /// user typed in from one left as loaded.
+    loaded_form_values: datatab_core::FormValues,
 
     validation_errors: Vec<String>,
     test_status: TestStatus,
@@ -1037,9 +1098,13 @@ impl ConnectionManagerWindow {
             driver_grid_columns: render_driver_select::DEFAULT_GRID_COLUMNS,
             editing_profile_id: None,
             value_ref_notice: None,
+            delete_notice_visible: false,
+            delete_notice_task: None,
             secrets_read_task: None,
+            saving: false,
             deferred_after_secrets_read: None,
             inputs_edited_during_read: HashSet::new(),
+            loaded_form_values: datatab_core::FormValues::new(),
             validation_errors: Vec::new(),
             test_status: TestStatus::None,
             test_error: None,
@@ -1166,6 +1231,9 @@ impl ConnectionManagerWindow {
 
     /// Switch to the in-window import panel, resetting it to its first step.
     pub(super) fn open_import(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.import_panel.read(cx).is_busy() {
+            return;
+        }
         self.import_panel.update(cx, |panel, cx| {
             panel.reset(window, cx);
         });
@@ -1176,6 +1244,9 @@ impl ConnectionManagerWindow {
     /// Switch to the in-window import panel, pre-selecting an external-client
     /// source (DBeaver, Beekeeper Studio, ...) instead of the native bundle.
     pub(super) fn open_import_external(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.import_panel.read(cx).is_busy() {
+            return;
+        }
         self.import_panel.update(cx, |panel, cx| {
             panel.reset(window, cx);
             panel.preselect_external_source(cx);
@@ -1192,6 +1263,14 @@ impl ConnectionManagerWindow {
     ) -> Self {
         let mut instance = Self::new(app_state.clone(), window, cx);
         instance.editing_profile_id = Some(profile.id);
+        instance._subscriptions.push(cx.subscribe(
+            &app_state,
+            |this, _, event: &ConnectionEditAttentionRequested, cx| {
+                if this.editing_profile_id == Some(event.0) {
+                    this.show_delete_notice(cx);
+                }
+            },
+        ));
         instance.value_ref_notice =
             app_state
                 .read(cx)
@@ -1231,52 +1310,10 @@ impl ConnectionManagerWindow {
             instance.create_driver_inputs(form, window, cx);
             let values = driver.extract_values(&profile.config);
             instance.apply_form_values(&values, form, window, cx);
+            instance.loaded_form_values = instance.collect_form_values(form, cx);
 
             // Restore SSL cert paths from saved config.
-            let (root_cert, client_cert, client_key) = match &profile.config {
-                DbConfig::Postgres {
-                    ssl_root_cert_path,
-                    ssl_client_cert_path,
-                    ssl_client_key_path,
-                    ..
-                }
-                | DbConfig::MySQL {
-                    ssl_root_cert_path,
-                    ssl_client_cert_path,
-                    ssl_client_key_path,
-                    ..
-                }
-                | DbConfig::MongoDB {
-                    ssl_root_cert_path,
-                    ssl_client_cert_path,
-                    ssl_client_key_path,
-                    ..
-                }
-                | DbConfig::Redis {
-                    ssl_root_cert_path,
-                    ssl_client_cert_path,
-                    ssl_client_key_path,
-                    ..
-                }
-                | DbConfig::Redshift {
-                    ssl_root_cert_path,
-                    ssl_client_cert_path,
-                    ssl_client_key_path,
-                    ..
-                } => (
-                    ssl_root_cert_path.clone().unwrap_or_default(),
-                    ssl_client_cert_path.clone().unwrap_or_default(),
-                    ssl_client_key_path.clone().unwrap_or_default(),
-                ),
-                DbConfig::SqlServer {
-                    ssl_root_cert_path, ..
-                } => (
-                    ssl_root_cert_path.clone().unwrap_or_default(),
-                    String::new(),
-                    String::new(),
-                ),
-                _ => (String::new(), String::new(), String::new()),
-            };
+            let (root_cert, client_cert, client_key) = ssl_cert_paths_from_config(&profile.config);
 
             if !root_cert.is_empty() {
                 instance.form.ssl_ca_cert_input.update(cx, |state, cx| {
@@ -1417,6 +1454,20 @@ impl ConnectionManagerWindow {
         instance
     }
 
+    fn show_delete_notice(&mut self, cx: &mut Context<Self>) {
+        self.delete_notice_visible = true;
+        let timer = cx.background_executor().timer(DELETE_NOTICE_DURATION);
+        self.delete_notice_task = Some(cx.spawn(async move |this, cx| {
+            timer.await;
+            this.update(cx, |this, cx| {
+                this.delete_notice_visible = false;
+                cx.notify();
+            })
+            .log_err();
+        }));
+        cx.notify();
+    }
+
     fn select_driver(&mut self, driver_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let driver = self.app_state.read(cx).drivers().get(driver_id).cloned();
         self.select_driver_with(driver_id, driver, window, cx);
@@ -1454,15 +1505,23 @@ impl ConnectionManagerWindow {
         });
 
         if let Some(driver) = driver {
-            // Initialize SSL mode to the driver's first declared ssl mode option, if any.
-            self.form.selected_ssl_mode = driver
-                .metadata()
-                .ssl_modes
-                .and_then(|modes| modes.first())
-                .map(|m| m.id.to_string())
-                .unwrap_or_default();
-
             self.create_driver_inputs(driver.form_definition(), window, cx);
+            let values = self.collect_form_values(driver.form_definition(), cx);
+            let requires_ssl_choice = match driver.build_config(&values) {
+                Ok(config) => ssl_mode_from_config(&config).is_some_and(|mode| mode.is_empty()),
+                // Required fields may still be empty on a newly opened form.
+                Err(_) => false,
+            };
+            self.form.selected_ssl_mode = if requires_ssl_choice {
+                String::new()
+            } else {
+                driver
+                    .metadata()
+                    .ssl_modes
+                    .and_then(|modes| modes.first())
+                    .map(|mode| mode.id.to_string())
+                    .unwrap_or_default()
+            };
         }
 
         self.reset_value_source_selectors(window, cx);
@@ -1639,7 +1698,7 @@ impl ConnectionManagerWindow {
             .value_ref_diagnostics(profile.id)
             .is_empty()
         {
-            self.form.stored_password = StoredPassword::Unreadable;
+            self.form.stored_password = StoredPassword::Skipped;
             self.form.stored_ssh_secret = StoredPassword::Unreadable;
             return;
         }
@@ -1663,14 +1722,7 @@ impl ConnectionManagerWindow {
             let secrets = read.await;
 
             this.update_in(cx, |this, window, cx| {
-                this.apply_secrets_read(
-                    &profile,
-                    tunnel.as_ref(),
-                    secrets,
-                    read_auth_method,
-                    window,
-                    cx,
-                );
+                this.apply_secrets_read(tunnel.as_ref(), secrets, read_auth_method, window, cx);
             })
             .log_err();
         }));
@@ -1678,7 +1730,6 @@ impl ConnectionManagerWindow {
 
     fn apply_secrets_read(
         &mut self,
-        profile: &datatab_core::ConnectionProfile,
         tunnel: Option<&SshTunnelProfile>,
         secrets: SavedSecrets,
         read_auth_method: SshAuthSelection,
@@ -1690,7 +1741,8 @@ impl ConnectionManagerWindow {
         let mut failures: Vec<(&str, datatab_core::DbError)> = Vec::new();
 
         match secrets.password {
-            Ok(password) => {
+            None => self.form.stored_password = StoredPassword::NotInKeyring,
+            Some(Ok(password)) => {
                 self.form.stored_password = StoredPassword::Known;
 
                 // A password that lives behind another source (env, file, ...)
@@ -1718,20 +1770,10 @@ impl ConnectionManagerWindow {
                     self.sync_fields_to_uri(window, cx);
                 }
             }
-            Err(error) => {
-                // Unreadable either way, so saving cannot delete an entry the
-                // form never saw; only a profile whose password lives in the
-                // keyring has a failure worth reporting.
+            Some(Err(error)) => {
+                // Saving must not delete an entry the form never saw.
                 self.form.stored_password = StoredPassword::Unreadable;
-                if datatab_core::password_lives_in_keyring(profile) {
-                    failures.push(("password", error));
-                } else {
-                    log::warn!(
-                        "Keyring read failed for profile {}, whose password does not live in \
-                         the keyring: {error}",
-                        profile.id
-                    );
-                }
+                failures.push(("password", error));
             }
         }
 
@@ -1881,6 +1923,9 @@ impl ConnectionManagerWindow {
         {
             return datatab_i18n::t!("connection_manager.placeholder.password_needs_value");
         }
+        if password_source_is_literal && self.form.stored_password == StoredPassword::Skipped {
+            return datatab_i18n::t!("connection_manager.placeholder.password_not_read");
+        }
         if password_source_is_literal && self.form.stored_password == StoredPassword::Unreadable {
             return datatab_i18n::t!("connection_manager.placeholder.password_unreadable");
         }
@@ -2022,6 +2067,11 @@ impl ConnectionManagerWindow {
         }
         self.sync_fields_to_uri(window, cx);
     }
+
+    /// Fields with a value-source selector in the form. Every other field's
+    /// stored value ref is kept by an edit unless the user typed a value.
+    pub(super) const VALUE_SOURCE_FIELDS: [&'static str; 4] =
+        ["host", "database", "user", "password"];
 
     pub(super) fn collect_value_refs(&self, cx: &App) -> HashMap<String, ValueRef> {
         let mut refs = HashMap::new();
@@ -3719,11 +3769,9 @@ impl ConnectionManagerWindow {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let auth_profile_ref_field_id =
-            match auth_profile_ref_field_id(self.form.selected_driver.as_ref()) {
-                Some(id) => id,
-                None => return,
-            };
+        let Some(driver) = self.form.selected_driver.clone() else {
+            return;
+        };
 
         let Some(auth_profile_id) = self.auth_profile.selected_auth_profile_id else {
             return;
@@ -3740,29 +3788,13 @@ impl ConnectionManagerWindow {
             return;
         };
 
-        let profile_name = profile
-            .fields
-            .get("profile_name")
-            .cloned()
-            .unwrap_or_else(|| profile.name.clone());
-
-        if let Some(input) = self
-            .form
-            .driver_inputs
-            .get(auth_profile_ref_field_id.as_str())
-            .cloned()
-        {
-            input.update(cx, |state, cx| {
-                state.set_value(profile_name, window, cx);
-            });
-        }
-
-        if let Some(region) = profile.fields.get("region").cloned()
-            && let Some(input) = self.form.driver_inputs.get("region").cloned()
-        {
-            input.update(cx, |state, cx| {
-                state.set_value(region, window, cx);
-            });
+        let values = datatab_core::auth_profile_form_values(driver.form_definition(), &profile);
+        for (field_id, value) in values {
+            if let Some(input) = self.form.driver_inputs.get(field_id.as_str()).cloned() {
+                input.update(cx, |state, cx| {
+                    state.set_value(value, window, cx);
+                });
+            }
         }
     }
 
@@ -4361,10 +4393,12 @@ fn pick_file_into<T: 'static>(
 
 #[cfg(test)]
 mod tests {
+    mod attention;
+
     use super::ConnectionManagerWindow;
     use super::auth_profile_needs_login;
-    use super::auth_profile_ref_field_id_from_form;
     use datatab_core::AuthSessionState;
+    use datatab_core::auth_profile_ref_field_id_from_form;
     use std::collections::{HashMap, HashSet};
 
     // --- parse_hook_tokens ---
@@ -4621,6 +4655,7 @@ mod tests {
         "connection_manager.placeholder.connection_name",
         "connection_manager.placeholder.password",
         "connection_manager.placeholder.password_unreadable",
+        "connection_manager.placeholder.password_not_read",
         "connection_manager.placeholder.key_passphrase_optional",
         "connection_manager.placeholder.ssh_password",
         "connection_manager.placeholder.ca_cert_path",

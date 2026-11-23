@@ -416,6 +416,13 @@ pub struct GeneralSettings {
     #[serde(default)]
     pub grid_fk_labels: bool,
 
+    // -- Diagnostics --
+    /// Offer the "Send report…" action for an error or a panic, per ADR 0008.
+    /// On by default; an organization can also turn the reporting off outside
+    /// the app, so the switch that decides lives in `datatab_diagnostics`.
+    #[serde(default = "default_true")]
+    pub send_error_reports: bool,
+
     // -- Appearance --
     /// When scrollbars are shown in every window. While scrolling by default.
     #[serde(default)]
@@ -585,6 +592,7 @@ impl Default for GeneralSettings {
             table_alias_use_as: false,
             vim_leader: default_vim_leader(),
             grid_fk_labels: false,
+            send_error_reports: true,
             scrollbar_visibility: ScrollbarVisibility::WhileScrolling,
             ui_font_family: None,
             ui_font_size: Self::DEFAULT_UI_FONT_SIZE,

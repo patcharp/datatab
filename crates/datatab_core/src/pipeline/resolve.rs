@@ -15,6 +15,20 @@ pub async fn resolve_profile_values(
     resolver: &CompositeValueResolver,
     ctx: &ResolveContext<'_>,
 ) -> Result<(ConnectionProfile, Option<SecretString>), PipelineError> {
+    if matches!(profile.config, DbConfig::ClickHouse { .. })
+        && [
+            "ssl_mode",
+            "ssl_root_cert_path",
+            "ssl_client_cert_path",
+            "ssl_client_key_path",
+        ]
+        .iter()
+        .any(|field| profile.value_refs.contains_key(*field))
+    {
+        return Err(PipelineError::resolve(crate::DbError::InvalidProfile(
+            "ClickHouse TLS settings must be literal values, not value or secret references".into(),
+        )));
+    }
     if profile.value_refs.is_empty() {
         return Ok((profile.clone(), None));
     }
@@ -158,6 +172,7 @@ fn patch_config_field(config: &mut DbConfig, field: &str, value: &ResolvedValue)
             database,
             request_timeout_seconds,
             allow_insecure_http_password,
+            ..
         } => match field {
             "url" => *url = val.to_string(),
             "user" => *user = val.to_string(),
@@ -204,6 +219,34 @@ fn patch_config_field(config: &mut DbConfig, field: &str, value: &ResolvedValue)
             }
             "user" => *user = val.to_string(),
             "database" => *database = val.to_string(),
+            _ => {}
+        },
+
+        DbConfig::Cassandra {
+            contact_points,
+            port,
+            datacenter,
+            keyspace,
+            user,
+            ssl_mode,
+            ssl_root_cert_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
+            ..
+        } => match field {
+            "contact_points" => *contact_points = val.to_string(),
+            "port" => {
+                if let Ok(p) = val.parse() {
+                    *port = p;
+                }
+            }
+            "datacenter" => *datacenter = val.to_string(),
+            "keyspace" => *keyspace = val.to_string(),
+            "user" => *user = val.to_string(),
+            "ssl_mode" => *ssl_mode = Some(val.to_string()),
+            "ssl_root_cert_path" => *ssl_root_cert_path = Some(val.to_string()),
+            "ssl_client_cert_path" => *ssl_client_cert_path = Some(val.to_string()),
+            "ssl_client_key_path" => *ssl_client_key_path = Some(val.to_string()),
             _ => {}
         },
 
@@ -349,13 +392,37 @@ mod tests {
         );
 
         let mut profile = ConnectionProfile::new("clickhouse", DbConfig::default_clickhouse());
+        if let DbConfig::ClickHouse {
+            ssl_root_cert_path, ..
+        } = &mut profile.config
+        {
+            *ssl_root_cert_path = Some("/test-private-ca.pem".into());
+        }
         profile.value_refs = refs;
         let resolver = test_resolver();
         let ctx = ResolveContext::default();
-
         let (patched, password) = resolve_profile_values(&profile, &resolver, &ctx)
             .await
             .unwrap();
+        assert!(
+            matches!(&patched.config, DbConfig::ClickHouse { ssl_root_cert_path: Some(path), .. } if path == "/test-private-ca.pem")
+        );
+        for field in [
+            "ssl_mode",
+            "ssl_root_cert_path",
+            "ssl_client_cert_path",
+            "ssl_client_key_path",
+        ] {
+            let mut invalid = profile.clone();
+            invalid.value_refs.insert(
+                field.into(),
+                ValueRef::secret("stub", "must-not-resolve", None),
+            );
+            let error = resolve_profile_values(&invalid, &resolver, &ctx)
+                .await
+                .expect_err("TLS references are refused before resolving secrets");
+            assert!(error.to_string().contains("literal values"));
+        }
 
         let DbConfig::ClickHouse {
             url,
@@ -363,6 +430,7 @@ mod tests {
             database,
             request_timeout_seconds,
             allow_insecure_http_password,
+            ..
         } = patched.config
         else {
             panic!("expected ClickHouse");

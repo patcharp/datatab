@@ -141,3 +141,126 @@ fn import_refuses_a_connection_rebuilt_with_a_reserved_kind() {
         assert!(state.profiles().is_empty());
     });
 }
+
+#[::core::prelude::v1::test]
+fn unknown_form_literal_refusal_names_the_cause_before_secret_writes() {
+    let mut cx = TestAppContext::single();
+    let host = init_form_test_runtime(&mut cx);
+    let fixture = SecretStoreFixture::new(PasswordSaveOutcome::Success);
+    let state = test_app_state(&mut cx, fixture.clone());
+    let mut profile = sqlite_profile("unknown form");
+    profile
+        .value_refs
+        .insert("extra_field".into(), ValueRef::literal("literal-436"));
+    state.update(&mut cx, |state, _| {
+        state.add_profile_in_folder(profile.clone(), None);
+        // Model a newly supplied ref that has no value-source selector today.
+        state
+            .storage_runtime()
+            .connection_profiles()
+            .value_refs()
+            .delete_for_profile(&profile.id.to_string())
+            .expect("remove stored ref");
+    });
+    let window = open_new_profile_window(state.clone(), &mut cx);
+    window
+        .update(&mut cx, |manager, window, cx| {
+            manager.editing_profile_id = Some(profile.id);
+            let inner = manager
+                .form
+                .selected_driver
+                .clone()
+                .expect("selected driver");
+            manager.form.selected_driver = Some(Arc::new(RejectingDriver {
+                inner,
+                refuses_profile: false,
+                declared_kind: Some(datatab_core::DbKind::SQLite),
+            }));
+            manager.form.selected_driver_id = Some("unregistered".into());
+            let built = manager.build_profile(cx).expect("profile");
+            assert!(built.value_refs.contains_key("extra_field"));
+            manager.save_profile(window, cx);
+            assert!(
+                manager.validation_errors.contains(&datatab_i18n::t!(
+                    "form.validation.unknown_form_literal_ref"
+                )),
+                "show the unknown-form cause: {:?}",
+                manager.validation_errors
+            );
+            assert!(!manager.validation_errors.contains(&datatab_i18n::t!(
+                "form.validation.broken_password_unresolved"
+            )));
+            window.remove_window();
+        })
+        .expect("refused form");
+    assert_eq!(host.read_with(&cx, |host, _| host.toast_count()), 1);
+    assert_eq!(
+        state.read_with(&cx, |state, _| state.profiles()[0].name.clone()),
+        profile.name
+    );
+    assert!(fixture.values.lock().expect("keyring").is_empty());
+}
+
+#[::core::prelude::v1::test]
+fn unknown_form_storage_read_failure_reports_storage_once_before_secret_writes() {
+    let mut cx = TestAppContext::single();
+    let host = init_form_test_runtime(&mut cx);
+    let fixture = SecretStoreFixture::new(PasswordSaveOutcome::Success);
+    let state = test_app_state(&mut cx, fixture.clone());
+    let window = open_new_profile_window(state.clone(), &mut cx);
+    state.read_with(&cx, |state, _| {
+        state
+            .storage_runtime()
+            .open_datatab_db()
+            .expect("database")
+            .execute("DROP TABLE cfg_connection_profile_value_refs", [])
+            .expect("make the guard read fail");
+    });
+
+    window
+        .update(&mut cx, |manager, window, cx| {
+            let inner = manager
+                .form
+                .selected_driver
+                .clone()
+                .expect("selected driver");
+            manager.form.selected_driver = Some(Arc::new(RejectingDriver {
+                inner,
+                refuses_profile: false,
+                declared_kind: Some(datatab_core::DbKind::SQLite),
+            }));
+            manager.form.selected_driver_id = Some("unregistered".into());
+            let built = manager.build_profile(cx).expect("profile");
+            assert!(matches!(
+                state.read(cx).check_connection_manager_save(&built, ""),
+                Err(datatab_app::app_state::ProfileSaveError::Storage(_))
+            ));
+            manager.save_profile(window, cx);
+            assert_eq!(
+                manager.validation_errors,
+                vec![datatab_i18n::t!(
+                    "form.validation.profile_storage_read_failed"
+                )]
+            );
+            window.remove_window();
+        })
+        .expect("refused form");
+
+    assert_eq!(host.read_with(&cx, |host, _| host.toast_count()), 1);
+    assert_eq!(
+        host.read_with(&cx, |host, _| host.last_toast_occurrences()),
+        Some(1)
+    );
+    state.read_with(&cx, |state, _| {
+        assert!(state.profiles().is_empty());
+        assert!(
+            state
+                .storage_runtime()
+                .connection_profiles()
+                .all()
+                .expect("profiles")
+                .is_empty()
+        );
+    });
+    assert!(fixture.values.lock().expect("keyring").is_empty());
+}

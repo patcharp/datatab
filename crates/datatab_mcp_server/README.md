@@ -212,7 +212,7 @@ See [DDL Safety Guide](./docs/DDL_SAFETY.md) for detailed classification rules.
 |------|-------------|----------------|
 | `list_pending_executions` | List operations awaiting approval | Metadata |
 | `get_pending_execution` | Get pending execution details | Metadata |
-| `request_execution` | Queue an operation for approval by a person | Admin |
+| `request_execution` | Queue an operation for approval by a person | The requested tool's class, raised to at least Admin |
 | `approve_execution` | Always denied over MCP; a person approves in DataTab | — |
 | `reject_execution` | Always denied over MCP; a person rejects in DataTab | — |
 | `query_audit_logs` | Query audit log | Metadata |

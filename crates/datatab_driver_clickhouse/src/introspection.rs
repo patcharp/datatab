@@ -151,11 +151,14 @@ fn is_view_engine(engine: &str) -> bool {
     )
 }
 
+pub(crate) const ENGINE_HINT_LABEL: &str = "Engine";
+pub(crate) const SORTING_KEY_HINT_LABEL: &str = "Sorting Key";
+
 fn build_storage_hints(row: &[Value], column_rows: &[Vec<Value>]) -> Vec<TableStorageHint> {
     let mut hints = Vec::new();
-    push_detail_hint(&mut hints, "Engine", text_at(row, 0));
+    push_detail_hint(&mut hints, ENGINE_HINT_LABEL, text_at(row, 0));
     push_detail_hint(&mut hints, "Partition Key", text_at(row, 1));
-    push_detail_hint(&mut hints, "Sorting Key", text_at(row, 2));
+    push_detail_hint(&mut hints, SORTING_KEY_HINT_LABEL, text_at(row, 2));
     push_detail_hint(&mut hints, "Primary Key", text_at(row, 3));
     push_detail_hint(&mut hints, "Sampling Key", text_at(row, 4));
 

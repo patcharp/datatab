@@ -2,7 +2,7 @@
 //!
 //! This is the authoritative config-loading path for the app.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use datatab_core::{
     AccessKind, ConnectionHook, ConnectionHookBindings, ConnectionHooks, ConnectionMcpGovernance,
@@ -30,6 +30,59 @@ use datatab_storage::repositories::general_settings::{
 use datatab_storage::repositories::hook_definitions::{
     HookDefinitionDto, HookDefinitionReplacement,
 };
+
+/// A profile save refusal that callers can present without parsing error text.
+#[derive(Debug)]
+pub enum ProfileSaveError {
+    UnknownFormLiteral { profiles: usize },
+    Database(Box<datatab_core::DbError>),
+    Storage(datatab_storage::error::StorageError),
+}
+
+impl std::fmt::Display for ProfileSaveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownFormLiteral { profiles } => write!(
+                formatter,
+                "Save refused for {profiles} connection profile(s): newly supplied literal refs require a registered driver form"
+            ),
+            Self::Database(error) => error.fmt(formatter),
+            Self::Storage(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ProfileSaveError {}
+
+impl From<datatab_core::DbError> for ProfileSaveError {
+    fn from(error: datatab_core::DbError) -> Self {
+        Self::Database(Box::new(error))
+    }
+}
+
+impl From<datatab_storage::error::StorageError> for ProfileSaveError {
+    fn from(error: datatab_storage::error::StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl From<datatab_storage::error::RepositoryError> for ProfileSaveError {
+    fn from(error: datatab_storage::error::RepositoryError) -> Self {
+        Self::from(datatab_storage::error::StorageError::from(error))
+    }
+}
+
+impl From<ProfileSaveError> for datatab_core::DbError {
+    fn from(error: ProfileSaveError) -> Self {
+        match error {
+            ProfileSaveError::Database(error) => *error,
+            ProfileSaveError::Storage(error) => error.into(),
+            error @ ProfileSaveError::UnknownFormLiteral { .. } => {
+                Self::InvalidProfile(error.to_string())
+            }
+        }
+    }
+}
 
 pub type ProfileValueRefDiagnostics = HashMap<uuid::Uuid, Vec<ValueRefLoadDiagnostic>>;
 
@@ -144,6 +197,7 @@ fn save_general_settings_to(
         scrollbar_visibility: scrollbar_visibility_to_storage(settings.scrollbar_visibility)
             .to_string(),
         workspace_inspector_width_px: settings.workspace_inspector_width_px.map(f64::from),
+        send_error_reports: i32::from(settings.send_error_reports),
         updated_at: String::new(),
     };
     repo.upsert(&dto)?;
@@ -367,11 +421,36 @@ pub fn save_services(
     Ok(())
 }
 
+/// Stored literals may be retained on an unknown form, but no new literal
+/// can be classified safely. Legacy rows keep the value in `ref_value`.
+pub(crate) fn has_new_literal_value_refs(
+    runtime: &StorageRuntime,
+    profile: &ConnectionProfile,
+) -> Result<bool, datatab_storage::error::StorageError> {
+    use datatab_storage::repositories::connection_profile_value_refs::RefKind;
+
+    let stored = runtime
+        .connection_profiles()
+        .value_refs()
+        .get_for_profile(&profile.id.to_string())?;
+    Ok(profile.value_refs.iter().any(|(field, reference)| {
+        let ValueRef::Literal { value } = reference else {
+            return false;
+        };
+        !stored.iter().any(|row| {
+            row.ref_key == *field
+                && row.load_kind() == Ok(RefKind::Literal)
+                && row.literal_value.as_ref().unwrap_or(&row.ref_value) == value
+        })
+    }))
+}
+
 pub fn save_profiles(
     runtime: &StorageRuntime,
     profiles: &[ConnectionProfile],
-) -> Result<(), datatab_storage::error::StorageError> {
-    save_profiles_preserving_value_refs(runtime, profiles, &HashMap::new())
+    unknown_form_ids: &HashSet<uuid::Uuid>,
+) -> Result<(), ProfileSaveError> {
+    save_profiles_preserving_value_refs(runtime, profiles, &HashMap::new(), unknown_form_ids)
 }
 
 /// Why `profile` cannot be saved, when its kind or its config's kind is a
@@ -386,14 +465,60 @@ pub(crate) fn reserved_kind_refusal(profile: &ConnectionProfile) -> Option<Strin
     })
 }
 
+/// The stored form of `ConnectionProfile::keyring_secret_fields`: field ids
+/// only, `None` when there are none. A list that cannot be serialized fails
+/// the save rather than dropping the markers, which would lose track of the
+/// keyring entries.
+fn keyring_secret_fields_column(
+    profile: &ConnectionProfile,
+) -> Result<Option<String>, datatab_storage::error::StorageError> {
+    if profile.keyring_secret_fields.is_empty() {
+        return Ok(None);
+    }
+    serde_json::to_string(&profile.keyring_secret_fields)
+        .map(Some)
+        .map_err(|error| {
+            datatab_storage::error::StorageError::Data(format!(
+                "could not serialize the keyring secret fields of a profile: {error}"
+            ))
+        })
+}
+
+fn parse_keyring_secret_fields(column: Option<&str>) -> std::collections::BTreeSet<String> {
+    let Some(column) = column else {
+        return std::collections::BTreeSet::new();
+    };
+    serde_json::from_str(column).unwrap_or_else(|error| {
+        log::warn!("Ignoring an unreadable list of keyring secret fields: {error}");
+        std::collections::BTreeSet::new()
+    })
+}
+
 /// Saves `profiles`. A profile with a reserved kind is refused: no row is
 /// written for it, the other profiles are still saved, and the returned
-/// error names each refused profile and the reason.
+/// error names each refused profile and the reason. The caller classifies
+/// unknown forms explicitly, separately from broken-ref preservation. Refuse
+/// new literals on those forms before any profile is written.
 pub(crate) fn save_profiles_preserving_value_refs(
     runtime: &StorageRuntime,
     profiles: &[ConnectionProfile],
     diagnostics: &ProfileValueRefDiagnostics,
-) -> Result<(), datatab_storage::error::StorageError> {
+    unknown_form_ids: &HashSet<uuid::Uuid>,
+) -> Result<(), ProfileSaveError> {
+    let mut refused_literals = 0;
+    for profile in profiles {
+        if unknown_form_ids.contains(&profile.id)
+            && reserved_kind_refusal(profile).is_none()
+            && has_new_literal_value_refs(runtime, profile)?
+        {
+            refused_literals += 1;
+        }
+    }
+    if refused_literals > 0 {
+        return Err(ProfileSaveError::UnknownFormLiteral {
+            profiles: refused_literals,
+        });
+    }
     let repo = runtime.connection_profiles();
     let mut refused = Vec::new();
 
@@ -409,7 +534,14 @@ pub(crate) fn save_profiles_preserving_value_refs(
         let dto = ConnectionProfileDto {
             id: profile.id.to_string(),
             name: profile.name.clone(),
-            driver_id: Some(profile.driver_id()),
+            // An external profile keeps its stored id, even none: with
+            // `driver_id()` it would gain the built-in id its kind falls back
+            // to, and reload with that driver's form. A built-in profile keeps
+            // its built-in id, as before.
+            driver_id: match profile.config {
+                datatab_core::DbConfig::External { .. } => profile.driver_id.clone(),
+                _ => Some(profile.driver_id()),
+            },
             description: None,
             favorite: false,
             color: None,
@@ -429,6 +561,7 @@ pub(crate) fn save_profiles_preserving_value_refs(
             navigator_view: profile.navigator_view.as_str().to_string(),
             show_all_databases: profile.show_all_databases,
             read_only: profile.read_only_flag,
+            keyring_secret_fields: keyring_secret_fields_column(profile)?,
         };
 
         repo.upsert(&dto)?;
@@ -544,9 +677,7 @@ pub(crate) fn save_profiles_preserving_value_refs(
     }
 
     if !refused.is_empty() {
-        return Err(datatab_storage::error::StorageError::Data(
-            refused.join("; "),
-        ));
+        return Err(datatab_storage::error::StorageError::Data(refused.join("; ")).into());
     }
 
     Ok(())
@@ -566,6 +697,7 @@ fn db_kind_to_str(kind: DbKind) -> String {
         DbKind::ClickHouse => "ClickHouse",
         DbKind::Turso => "Turso",
         DbKind::DuckDB => "DuckDB",
+        DbKind::Cassandra => "Cassandra",
         // A reserved wire slot has no stored name. `str_to_db_kind` does not
         // parse this one, and `save_profiles` refuses such a profile.
         DbKind::ReservedDynamoDb
@@ -590,6 +722,7 @@ fn str_to_db_kind(s: &str) -> Option<DbKind> {
         "ClickHouse" => Some(DbKind::ClickHouse),
         "Turso" => Some(DbKind::Turso),
         "DuckDB" => Some(DbKind::DuckDB),
+        "Cassandra" => Some(DbKind::Cassandra),
         // The names of the removed AWS drivers ("DynamoDB", "CloudWatchLogs",
         // "S3", "AwsSecrets") are unknown like any other string.
         _ => None,
@@ -611,6 +744,7 @@ fn default_db_config_for_kind(kind: DbKind) -> Option<datatab_core::DbConfig> {
         DbKind::ClickHouse => datatab_core::DbConfig::default_clickhouse(),
         DbKind::Turso => datatab_core::DbConfig::default_turso(),
         DbKind::DuckDB => datatab_core::DbConfig::default_duckdb(),
+        DbKind::Cassandra => datatab_core::DbConfig::default_cassandra(),
         DbKind::ReservedDynamoDb
         | DbKind::ReservedCloudWatchLogs
         | DbKind::ReservedS3
@@ -1215,6 +1349,7 @@ fn load_general_settings(
             .unwrap_or(GeneralSettings::DEFAULT_TOAST_AUTO_DISMISS_SECS),
         grid_fk_labels: dto.grid_fk_labels != 0,
         scrollbar_visibility: scrollbar_visibility_from_storage(&dto.scrollbar_visibility),
+        send_error_reports: dto.send_error_reports != 0,
     }
 }
 
@@ -1714,7 +1849,7 @@ fn load_profiles(
                 })
             else {
                 log::warn!(
-                    "Dropping stored connection profile {profile_id}: its kind has no supported driver"
+                    "Dropping stored connection profile {profile_id}: it is missing a valid driver config"
                 );
                 return None;
             };
@@ -1901,6 +2036,9 @@ fn load_profiles(
                     .and_then(datatab_core::ConnectionEnvironment::from_id),
                 navigator_view: datatab_core::NavigatorView::from_storage_str(&dto.navigator_view),
                 show_all_databases: dto.show_all_databases,
+                keyring_secret_fields: parse_keyring_secret_fields(
+                    dto.keyring_secret_fields.as_deref(),
+                ),
             })
         })
         .collect();
@@ -2033,6 +2171,8 @@ fn load_ssh_tunnels(
 
 #[cfg(test)]
 mod tests {
+    mod unknown_form_guard;
+
     use super::{
         HookDefinitionSave, db_kind_to_str, default_db_config_for_kind,
         general_settings_theme_to_storage, load_config, save_hook_definitions, save_profiles,
@@ -2045,8 +2185,192 @@ mod tests {
         SshAuthMethod, SshTunnelConfig, SshTunnelProfile, ThemeSetting,
     };
     use datatab_storage::bootstrap::StorageRuntime;
+    use datatab_storage::repositories::connection_profiles::ConnectionProfileDto;
     use datatab_storage::repositories::general_settings::GeneralSettingsDto;
     use uuid::Uuid;
+
+    #[test]
+    fn preserving_value_refs_refuses_new_literals_before_any_write() {
+        for replace_stored in [false, true] {
+            let runtime = StorageRuntime::in_memory().expect("SQLite store");
+            let mut stored = ConnectionProfile::new(
+                "unknown form",
+                DbConfig::External {
+                    kind: DbKind::SQLite,
+                    values: Default::default(),
+                },
+            );
+            stored.value_refs.insert(
+                "password".into(),
+                datatab_core::ValueRef::literal("stored-literal"),
+            );
+            save_profiles(
+                &runtime,
+                std::slice::from_ref(&stored),
+                &std::collections::HashSet::new(),
+            )
+            .expect("seed stored profile");
+            let before = serde_json::to_value(
+                runtime
+                    .connection_profiles()
+                    .value_refs()
+                    .get_for_profile(&stored.id.to_string())
+                    .expect("stored refs"),
+            )
+            .expect("rows");
+            let mut edited = stored.clone();
+            edited.name = "refused edit".into();
+            edited.value_refs.insert(
+                if replace_stored {
+                    "password"
+                } else {
+                    "new_field"
+                }
+                .into(),
+                datatab_core::ValueRef::literal("new-literal-436"),
+            );
+            let other = ConnectionProfile::new("must not be written", DbConfig::default_postgres());
+            let preservation = [(stored.id, Vec::new())].into_iter().collect();
+
+            let result = super::save_profiles_preserving_value_refs(
+                &runtime,
+                &[other, edited],
+                &preservation,
+                &[stored.id].into_iter().collect(),
+            );
+
+            assert!(
+                result.is_err(),
+                "the write seam must refuse a new literal on a preserved profile"
+            );
+            let loaded = load_config(&runtime).expect("reload");
+            assert_eq!(loaded.profiles.len(), 1, "refuse before any profile write");
+            assert_eq!(loaded.profiles[0].name, stored.name);
+            assert_eq!(
+                serde_json::to_value(
+                    runtime
+                        .connection_profiles()
+                        .value_refs()
+                        .get_for_profile(&stored.id.to_string())
+                        .expect("stored refs")
+                )
+                .expect("rows"),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn preserving_value_refs_keeps_legacy_literals_and_accepts_nonliteral_edits() {
+        let runtime = StorageRuntime::in_memory().expect("SQLite store");
+        let mut stored = ConnectionProfile::new(
+            "unknown form",
+            DbConfig::External {
+                kind: DbKind::SQLite,
+                values: Default::default(),
+            },
+        );
+        stored.value_refs.insert(
+            "password".into(),
+            datatab_core::ValueRef::literal("stored-literal"),
+        );
+        save_profiles(
+            &runtime,
+            std::slice::from_ref(&stored),
+            &std::collections::HashSet::new(),
+        )
+        .expect("seed stored profile");
+        runtime
+            .open_datatab_db()
+            .expect("database")
+            .execute(
+                "UPDATE cfg_connection_profile_value_refs SET literal_value = NULL",
+                [],
+            )
+            .expect("legacy literal column");
+        let before = serde_json::to_value(
+            runtime
+                .connection_profiles()
+                .value_refs()
+                .get_for_profile(&stored.id.to_string())
+                .expect("stored refs"),
+        )
+        .expect("rows");
+        let preservation = [(stored.id, Vec::new())].into_iter().collect();
+        for keep_literal in [true, false] {
+            let mut edited = stored.clone();
+            edited.name = "renamed".into();
+            if !keep_literal {
+                edited.value_refs.clear();
+            }
+            edited
+                .value_refs
+                .insert("host".into(), datatab_core::ValueRef::env("UNUSED_HOST"));
+            super::save_profiles_preserving_value_refs(
+                &runtime,
+                &[edited],
+                &preservation,
+                &[stored.id].into_iter().collect(),
+            )
+            .expect("safe save");
+            assert_eq!(
+                load_config(&runtime).expect("reload").profiles[0].name,
+                "renamed"
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    runtime
+                        .connection_profiles()
+                        .value_refs()
+                        .get_for_profile(&stored.id.to_string())
+                        .expect("stored refs")
+                )
+                .expect("rows"),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn preserving_value_refs_keeps_reserved_kind_refusal_precedence() {
+        let runtime = StorageRuntime::in_memory().expect("SQLite store");
+        let mut profile = ConnectionProfile::new(
+            "reserved",
+            DbConfig::External {
+                kind: DbKind::ReservedDynamoDb,
+                values: Default::default(),
+            },
+        );
+        profile.value_refs.insert(
+            "password".into(),
+            datatab_core::ValueRef::literal("new-literal-436"),
+        );
+        let expected = save_profiles(
+            &runtime,
+            std::slice::from_ref(&profile),
+            &std::collections::HashSet::new(),
+        )
+        .expect_err("reserved kind")
+        .to_string();
+        let preservation = [(profile.id, Vec::new())].into_iter().collect();
+        let unknown_form_ids = [profile.id].into_iter().collect();
+        let actual = super::save_profiles_preserving_value_refs(
+            &runtime,
+            &[profile],
+            &preservation,
+            &unknown_form_ids,
+        )
+        .expect_err("reserved kind")
+        .to_string();
+        assert_eq!(actual, expected, "keep the existing reserved-kind refusal");
+        assert!(
+            runtime
+                .connection_profiles()
+                .all()
+                .expect("profiles")
+                .is_empty()
+        );
+    }
 
     fn command_hook(command: &str) -> ConnectionHook {
         ConnectionHook {
@@ -2213,7 +2537,12 @@ mod tests {
             pre_disconnect: Vec::new(),
             post_disconnect: Vec::new(),
         });
-        save_profiles(&runtime, &[profile.clone()]).expect("save profile hooks");
+        save_profiles(
+            &runtime,
+            &[profile.clone()],
+            &std::collections::HashSet::new(),
+        )
+        .expect("save profile hooks");
 
         let loaded = load_config(&runtime).expect("load configuration");
         assert_eq!(loaded.hook_definitions["empty-global"].hook, empty_hook);
@@ -2441,7 +2770,12 @@ mod tests {
             ],
         });
 
-        save_profiles(&runtime, &[profile.clone()]).expect("save profile hooks");
+        save_profiles(
+            &runtime,
+            &[profile.clone()],
+            &std::collections::HashSet::new(),
+        )
+        .expect("save profile hooks");
         let loaded = load_config(&runtime)
             .expect("load configuration")
             .profiles
@@ -2479,7 +2813,12 @@ mod tests {
             post_disconnect: Vec::new(),
         });
 
-        save_profiles(&runtime, &[profile.clone()]).expect("save profile with hook binding");
+        save_profiles(
+            &runtime,
+            &[profile.clone()],
+            &std::collections::HashSet::new(),
+        )
+        .expect("save profile with hook binding");
 
         let loaded = load_config(&runtime)
             .expect("load configuration")
@@ -2506,8 +2845,12 @@ mod tests {
         production.environment = Some(datatab_core::ConnectionEnvironment::Production);
         let unset = ConnectionProfile::new("unset", DbConfig::default_postgres());
 
-        save_profiles(&runtime, &[production.clone(), unset.clone()])
-            .expect("save profiles with environment");
+        save_profiles(
+            &runtime,
+            &[production.clone(), unset.clone()],
+            &std::collections::HashSet::new(),
+        )
+        .expect("save profiles with environment");
 
         let loaded = load_config(&runtime).expect("load configuration").profiles;
         let find = |id| {
@@ -2535,8 +2878,12 @@ mod tests {
         compact.navigator_view = datatab_core::NavigatorView::Compact;
         let unset = ConnectionProfile::new("unset", DbConfig::default_postgres());
 
-        save_profiles(&runtime, &[simple.clone(), compact.clone(), unset.clone()])
-            .expect("save profiles with navigator view");
+        save_profiles(
+            &runtime,
+            &[simple.clone(), compact.clone(), unset.clone()],
+            &std::collections::HashSet::new(),
+        )
+        .expect("save profiles with navigator view");
 
         let loaded = load_config(&runtime).expect("load configuration").profiles;
         let find = |id| {
@@ -2570,8 +2917,12 @@ mod tests {
         locked.read_only_flag = true;
         let writable = ConnectionProfile::new("writable", DbConfig::default_postgres());
 
-        save_profiles(&runtime, &[locked.clone(), writable.clone()])
-            .expect("save profiles with read-only flag");
+        save_profiles(
+            &runtime,
+            &[locked.clone(), writable.clone()],
+            &std::collections::HashSet::new(),
+        )
+        .expect("save profiles with read-only flag");
 
         let loaded = load_config(&runtime).expect("load configuration").profiles;
         let find = |id| {
@@ -2586,6 +2937,47 @@ mod tests {
     }
 
     #[test]
+    fn clickhouse_tls_config_round_trips_and_preserves_legacy_mode() {
+        let runtime = StorageRuntime::in_memory().expect("scratch storage");
+        for mode in [
+            None,
+            Some("disable"),
+            Some("require"),
+            Some("verify-ca"),
+            Some("verify-full"),
+            Some("unknown"),
+        ] {
+            let config = DbConfig::ClickHouse {
+                url: "https://localhost:8443".into(),
+                user: "default".into(),
+                database: "default".into(),
+                request_timeout_seconds: None,
+                allow_insecure_http_password: false,
+                ssl_mode: mode.map(str::to_string),
+                ssl_root_cert_path: Some("/test-ca.pem".into()),
+                ssl_client_cert_path: Some("/test-client.pem".into()),
+                ssl_client_key_path: Some("/test-key.pem".into()),
+            };
+            let profile = ConnectionProfile::new("TLS", config.clone());
+            save_profiles(
+                &runtime,
+                &[profile.clone()],
+                &std::collections::HashSet::new(),
+            )
+            .expect("save TLS paths");
+            let loaded = load_config(&runtime).expect("load TLS paths").profiles;
+            let restored = loaded
+                .iter()
+                .find(|candidate| candidate.id == profile.id)
+                .expect("profile");
+            assert_eq!(
+                serde_json::to_value(&restored.config).unwrap(),
+                serde_json::to_value(config).unwrap()
+            );
+        }
+    }
+
+    #[test]
     fn clickhouse_insecure_http_opt_in_round_trips_and_defaults_to_off() {
         let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
 
@@ -2595,12 +2987,20 @@ mod tests {
             database: "events".to_string(),
             request_timeout_seconds: None,
             allow_insecure_http_password,
+            ssl_mode: None,
+            ssl_root_cert_path: None,
+            ssl_client_cert_path: None,
+            ssl_client_key_path: None,
         };
         let opted_in = ConnectionProfile::new("opted-in", clickhouse(true));
         let default = ConnectionProfile::new("default", clickhouse(false));
 
-        save_profiles(&runtime, &[opted_in.clone(), default.clone()])
-            .expect("save clickhouse profiles");
+        save_profiles(
+            &runtime,
+            &[opted_in.clone(), default.clone()],
+            &std::collections::HashSet::new(),
+        )
+        .expect("save clickhouse profiles");
 
         let loaded = load_config(&runtime).expect("load configuration").profiles;
         let allows_insecure_http = |id| {
@@ -2634,7 +3034,12 @@ mod tests {
             .value_refs
             .insert("user".to_string(), datatab_core::ValueRef::env("DB_USER"));
 
-        save_profiles(&runtime, std::slice::from_ref(&profile)).expect("save sourced profile");
+        save_profiles(
+            &runtime,
+            std::slice::from_ref(&profile),
+            &std::collections::HashSet::new(),
+        )
+        .expect("save sourced profile");
 
         let loaded = load_config(&runtime).expect("load configuration").profiles;
         let reloaded = loaded
@@ -2667,7 +3072,12 @@ mod tests {
             datatab_core::ValueRef::file("~/.config/datatab/db.json", Some("user".to_string())),
         );
 
-        save_profiles(&runtime, std::slice::from_ref(&profile)).expect("save file profile");
+        save_profiles(
+            &runtime,
+            std::slice::from_ref(&profile),
+            &std::collections::HashSet::new(),
+        )
+        .expect("save file profile");
 
         let loaded = load_config(&runtime).expect("load configuration").profiles;
         let reloaded = loaded
@@ -2699,7 +3109,12 @@ mod tests {
         profile
             .value_refs
             .insert("user".to_string(), datatab_core::ValueRef::env("DB_USER"));
-        save_profiles(&runtime, std::slice::from_ref(&profile)).expect("save sourced profile");
+        save_profiles(
+            &runtime,
+            std::slice::from_ref(&profile),
+            &std::collections::HashSet::new(),
+        )
+        .expect("save sourced profile");
 
         let conn = runtime.open_datatab_db().expect("open runtime database");
         let updated = conn
@@ -2751,7 +3166,12 @@ mod tests {
             post_disconnect: Vec::new(),
         });
 
-        save_profiles(&runtime, &[profile.clone()]).expect("save profile hooks");
+        save_profiles(
+            &runtime,
+            &[profile.clone()],
+            &std::collections::HashSet::new(),
+        )
+        .expect("save profile hooks");
         let loaded = load_config(&runtime)
             .expect("load configuration")
             .profiles
@@ -2804,8 +3224,37 @@ mod tests {
                 ref database,
                 request_timeout_seconds: None,
                 allow_insecure_http_password: false,
+                ssl_mode: None,
+                ..
             }) if url == "http://localhost:8123" && user == "default" && database == "default"
         ));
+        let runtime = StorageRuntime::in_memory().expect("scratch storage");
+        let id = uuid::Uuid::new_v4();
+        let mut profile = ConnectionProfileDto::new(id, "legacy ClickHouse".into());
+        profile.kind = Some("ClickHouse".into());
+        runtime
+            .connection_profiles()
+            .insert(&profile)
+            .expect("save profile without driver config");
+        let loaded = load_config(&runtime).expect("load legacy profile");
+        assert_eq!(loaded.profiles.len(), 1);
+        assert_eq!(loaded.profiles[0].id, id);
+        let DbConfig::ClickHouse { ssl_mode, .. } = &loaded.profiles[0].config else {
+            panic!("expected ClickHouse config");
+        };
+        assert_eq!(
+            ssl_mode, &None,
+            "missing config keeps legacy TLS verification"
+        );
+        assert!(
+            runtime
+                .connection_profiles()
+                .driver_configs()
+                .get_for_profile(&id.to_string())
+                .expect("read driver config")
+                .is_none(),
+            "loading must not create a driver-config row"
+        );
     }
 
     #[test]
@@ -2871,6 +3320,7 @@ mod tests {
             grid_fk_labels: 0,
             scrollbar_visibility: "while_scrolling".to_string(),
             workspace_inspector_width_px: None,
+            send_error_reports: 1,
             updated_at: String::new(),
         };
 
@@ -2971,6 +3421,7 @@ mod tests {
             grid_fk_labels: 0,
             scrollbar_visibility: "while_scrolling".to_string(),
             workspace_inspector_width_px: None,
+            send_error_reports: 1,
             updated_at: String::new(),
         };
         runtime
@@ -3172,6 +3623,35 @@ mod tests {
             super::scrollbar_visibility_from_storage("unknown"),
             ScrollbarVisibility::WhileScrolling
         );
+    }
+
+    #[test]
+    fn send_error_reports_round_trips_through_save_and_load() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+
+        let default_config = load_config(&runtime).expect("load default configuration");
+        assert!(
+            default_config.general_settings.send_error_reports,
+            "the report offer is on until the user turns it off"
+        );
+
+        for enabled in [false, true] {
+            let settings = GeneralSettings {
+                send_error_reports: enabled,
+                ..Default::default()
+            };
+            super::save_general_settings(&runtime, &settings).expect("save the switch");
+
+            let dto = runtime
+                .general_settings()
+                .get()
+                .expect("load saved dto")
+                .expect("general settings row");
+            assert_eq!(dto.send_error_reports, i32::from(enabled));
+
+            let loaded = load_config(&runtime).expect("load configuration");
+            assert_eq!(loaded.general_settings.send_error_reports, enabled);
+        }
     }
 
     #[test]
@@ -3402,6 +3882,7 @@ mod tests {
             grid_fk_labels: 0,
             scrollbar_visibility: "while_scrolling".to_string(),
             workspace_inspector_width_px: None,
+            send_error_reports: 1,
             updated_at: String::new(),
         };
         runtime
@@ -3454,7 +3935,12 @@ mod tests {
             *ssh_tunnel_profile_id = Some(ssh_tunnel.id);
         }
 
-        save_profiles(&runtime, &[profile.clone()]).expect("save connection profile");
+        save_profiles(
+            &runtime,
+            &[profile.clone()],
+            &std::collections::HashSet::new(),
+        )
+        .expect("save connection profile");
 
         let loaded = load_config(&runtime).expect("load configuration");
         let reloaded = loaded
@@ -3666,5 +4152,46 @@ mod tests {
             default_db_config_for_kind(DbKind::Turso),
             Some(DbConfig::Turso { ref url }) if url.is_empty()
         ));
+    }
+    #[test]
+    fn external_rpc_profile_reloads_as_external_without_a_registered_driver() {
+        let runtime = StorageRuntime::in_memory().expect("in-memory storage runtime");
+
+        let mut values = datatab_core::FormValues::new();
+        values.insert("host".to_string(), "rpc.internal".to_string());
+        let mut profile = ConnectionProfile::new(
+            "rpc",
+            DbConfig::External {
+                kind: DbKind::Postgres,
+                values: values.clone(),
+            },
+        );
+        profile.set_driver_id("rpc:sock-1");
+
+        save_profiles(
+            &runtime,
+            std::slice::from_ref(&profile),
+            &std::collections::HashSet::new(),
+        )
+        .expect("save profile");
+
+        let loaded = load_config(&runtime)
+            .expect("load configuration")
+            .profiles
+            .into_iter()
+            .find(|candidate| candidate.id == profile.id)
+            .expect("reloaded profile");
+
+        assert_eq!(loaded.driver_id(), "rpc:sock-1");
+        match loaded.config {
+            DbConfig::External {
+                kind,
+                values: restored,
+            } => {
+                assert_eq!(kind, DbKind::Postgres);
+                assert_eq!(restored, values);
+            }
+            other => panic!("reloaded as {other:?}"),
+        }
     }
 }

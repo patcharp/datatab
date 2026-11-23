@@ -11,6 +11,8 @@ Popular open-source relational database.
 
 ## Features
 
+- Bulk schema column reads use one catalog query per database; schema-wide index reads retain functional index expressions.
+
 - MySQL and MariaDB relational driver implementations in one crate.
 - Native console (`NATIVE_CONSOLE`): tables dock a console, and a database's sidebar menu opens one in its own tab, that runs one SQL statement line at a time through `Connection::execute` with the editor's validation, dangerous-query confirmation, audit rows and query history. The driver enforces `QueryRequest::limit` (`REQUEST_ROW_LIMIT`), so console commands carry the editor row limit.
 - Supports SQL execution, schema discovery, indexes, foreign keys, check constraints, and unique constraints.
@@ -31,17 +33,17 @@ Popular open-source relational database.
 
 Exposes a curated set of live server metrics sourced from `SHOW GLOBAL STATUS`:
 
+- `mysql.queries_per_sec` — statements executed per second (counter)
+- `mysql.selects_per_sec` — `SELECT` statements per second (counter)
+- `mysql.inserts_per_sec` — `INSERT` statements per second (counter)
+- `mysql.updates_per_sec` — `UPDATE` statements per second (counter)
+- `mysql.deletes_per_sec` — `DELETE` statements per second (counter)
+- `mysql.buffer_pool_reads` — InnoDB buffer pool read requests per second (counter)
+- `mysql.buffer_pool_disk_reads` — InnoDB reads that missed the buffer pool, per second (counter)
 - `mysql.threads_connected` — current open connections
 - `mysql.threads_running` — currently executing queries
-- `mysql.queries_per_sec` — queries per second (cumulative counter)
-- `mysql.innodb_buffer_pool_hit_ratio` — InnoDB buffer pool read efficiency
-- `mysql.innodb_rows_read` — rows read from InnoDB storage engine
-- `mysql.innodb_rows_inserted` — rows inserted into InnoDB
-- `mysql.innodb_rows_updated` — rows updated in InnoDB
-- `mysql.innodb_rows_deleted` — rows deleted from InnoDB
-- `mysql.slow_queries` — cumulative slow query count
-- `mysql.table_locks_waited` — table-level lock contention counter
-- `mysql.bytes_sent` — network bytes sent per second
+- `mysql.bytes_received` — network bytes received per second (counter)
+- `mysql.bytes_sent` — network bytes sent per second (counter)
 
 Each metric is returned as a single `(timestamp_ms, value)` row for live charting.
 

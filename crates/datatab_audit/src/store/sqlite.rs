@@ -254,6 +254,12 @@ impl SqliteAuditStore {
         Ok(result)
     }
 
+    /// The newest `limit` store rows, or `Ok(None)` when the connection is
+    /// busy. Used for a report's audit trail, which must never wait.
+    pub fn try_recent(&self, limit: usize) -> Result<Option<Vec<AuditEventDto>>, AuditError> {
+        self.repo.try_recent(limit).map_err(to_audit_error)
+    }
+
     /// Records a panic event without blocking.
     ///
     /// This is the store-level implementation for panic-hook integration.

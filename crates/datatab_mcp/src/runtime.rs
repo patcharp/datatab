@@ -724,9 +724,14 @@ mod tests {
         EventCategory,
         actions::{MCP_APPROVE_EXECUTION, MCP_REJECT_EXECUTION},
     };
-    use datatab_policy::ConnectionPolicyAssignment;
+    use datatab_policy::{
+        ConnectionPolicyAssignment, ExecutionClassification, PolicyBindingScope, PolicyDecision,
+        PolicyDecisionReason, PolicyEngine, PolicyEvaluationRequest,
+    };
 
-    use crate::{ConnectionPolicyAssignmentDto, McpGovernanceService, TrustedClientDto};
+    use crate::{
+        ConnectionPolicyAssignmentDto, McpGovernanceService, ToolPolicyDto, TrustedClientDto,
+    };
 
     use datatab_approval::InMemoryPendingExecutionStore;
 
@@ -1129,5 +1134,62 @@ mod tests {
             .expect("list_pending should succeed");
         assert_eq!(still_pending.len(), 1);
         assert_eq!(still_pending[0].id.to_string(), pending.id);
+    }
+
+    /// A row in storage can still carry the incoherent shape that the save path
+    /// now refuses, so the engine refuses to build it: the classes it lists are
+    /// never granted, and a call that composes to an allowed class is denied
+    /// instead of running (#490).
+    #[test]
+    fn an_incoherent_stored_policy_grants_no_class() {
+        let mut runtime = runtime_for_tests("datatab-mcp-runtime-incoherent-policy.sqlite");
+        let ids = |classes: [&str; 5]| classes.iter().map(|id| id.to_string()).collect();
+
+        runtime
+            .upsert_policy_mut(ToolPolicyDto {
+                id: "custom".to_string(),
+                allowed_tools: vec!["drop_table".to_string()],
+                allowed_classes: ids([
+                    "metadata",
+                    "read",
+                    "write",
+                    "destructive",
+                    "admin_destructive",
+                ]),
+                approval_classes: vec!["admin_safe".to_string(), "admin".to_string()],
+            })
+            .expect("the stored row is kept so Settings can show it");
+
+        assert!(
+            runtime.policies_for_engine().is_empty(),
+            "the engine must not be built from an incoherent policy"
+        );
+
+        let engine = PolicyEngine::new(
+            vec![ConnectionPolicyAssignment {
+                actor_id: "agent-a".to_string(),
+                scope: PolicyBindingScope {
+                    connection_id: "conn-a".to_string(),
+                },
+                role_ids: Vec::new(),
+                policy_ids: vec!["custom".to_string()],
+            }],
+            Vec::new(),
+            runtime.policies_for_engine(),
+        );
+
+        let decision = engine
+            .evaluate(&PolicyEvaluationRequest {
+                actor_id: "agent-a".to_string(),
+                connection_id: "conn-a".to_string(),
+                tool_id: "drop_table".to_string(),
+                classification: ExecutionClassification::AdminDestructive,
+            })
+            .expect("evaluation should succeed");
+
+        assert_eq!(
+            decision,
+            PolicyDecision::Deny(PolicyDecisionReason::NoPolicy)
+        );
     }
 }

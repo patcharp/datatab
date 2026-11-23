@@ -3,6 +3,9 @@ pub mod purge;
 pub mod query;
 pub mod redaction;
 pub mod store;
+pub mod trail;
+
+pub use trail::RecentEvent;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -190,6 +193,40 @@ impl AuditService {
             .as_ref()
             .map(|c| c.load(Ordering::Relaxed))
             .unwrap_or(0)
+    }
+
+    /// The newest `limit` events as a report's trail, or an empty list.
+    ///
+    /// Never blocks: when the connection is busy, disabled or broken, the
+    /// caller gets an empty trail instead of a stalled panic hook.
+    pub fn try_recent_events(&self, limit: usize) -> Vec<RecentEvent> {
+        if !self.is_enabled() || limit == 0 {
+            return Vec::new();
+        }
+
+        match self.store.try_recent(limit) {
+            Ok(Some(rows)) => rows
+                .iter()
+                .filter_map(|row| {
+                    RecentEvent::from_stored(
+                        row.created_at_epoch_ms,
+                        row.category.as_deref(),
+                        row.action.as_deref(),
+                        row.outcome.as_deref(),
+                        row.driver_id.as_deref(),
+                    )
+                })
+                .collect(),
+            Ok(None) => Vec::new(),
+            Err(error) => {
+                // stderr, not the logger: this runs inside the panic hook and
+                // must not touch the logging pipeline. `write_all` rather than
+                // `eprintln!`, which panics if the write fails.
+                let note = format!("[datatab_audit] trail unavailable for a report: {error}\n");
+                let _ = std::io::Write::write_all(&mut std::io::stderr(), note.as_bytes());
+                Vec::new()
+            }
+        }
     }
 
     pub fn new_sqlite_default() -> Result<Self, AuditError> {

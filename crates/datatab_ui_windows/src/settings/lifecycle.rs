@@ -300,10 +300,15 @@ impl SettingsCoordinator {
                 });
                 (ActiveSettingsSection::Updates(section), vec![focus_sub])
             }
-            SettingsSectionId::About => (
-                ActiveSettingsSection::About(cx.new(AboutSection::new)),
-                vec![],
-            ),
+            SettingsSectionId::About => {
+                let section_app_state = app_state.clone();
+                (
+                    ActiveSettingsSection::About(
+                        cx.new(|cx| AboutSection::new(section_app_state, cx)),
+                    ),
+                    vec![],
+                )
+            }
         }
     }
 

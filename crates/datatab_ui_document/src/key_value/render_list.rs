@@ -11,7 +11,6 @@ use datatab_components::controls::{Button, Input};
 use datatab_components::icons::AppIcon;
 use datatab_components::primitives::{Icon, Text};
 use datatab_components::tokens::{Borders, ChromeColors, KeyValueMetrics, Spacing};
-use datatab_components::typography::AppFonts;
 use gpui::prelude::*;
 use gpui::*;
 use gpui_component::ActiveTheme;
@@ -209,7 +208,7 @@ impl KeyValueDocument {
             .pr(KeyValueMetrics::LIST_PADDING_RIGHT)
             .border_b_1()
             .border_color(theme.table_row_border)
-            .font_family(datatab_components::fonts::editor_family(cx))
+            .font(datatab_components::fonts::editor_font(cx))
             .text_size(KeyValueMetrics::FOLDER_ROW_FONT)
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -339,7 +338,7 @@ impl KeyValueDocument {
             .pr(KeyValueMetrics::LIST_PADDING_RIGHT)
             .border_b_1()
             .border_color(theme.table_row_border)
-            .font_family(datatab_components::fonts::editor_family(cx))
+            .font(datatab_components::fonts::editor_font(cx))
             .text_size(KeyValueMetrics::LIST_ROW_FONT)
             .cursor_pointer()
             .when(selected, |row| {

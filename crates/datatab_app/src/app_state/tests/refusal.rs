@@ -127,8 +127,12 @@ fn stored_aws_rows_are_dropped_and_postgres_profile_loads() {
 
     let runtime = datatab_storage::bootstrap::StorageRuntime::in_memory().expect("storage");
     let postgres = ConnectionProfile::new("unaffected", DbConfig::default_postgres());
-    crate::config_loader::save_profiles(&runtime, std::slice::from_ref(&postgres))
-        .expect("save the PostgreSQL profile");
+    crate::config_loader::save_profiles(
+        &runtime,
+        std::slice::from_ref(&postgres),
+        &std::collections::HashSet::new(),
+    )
+    .expect("save the PostgreSQL profile");
 
     let repo = runtime.connection_profiles();
     for (kind, driver_id) in [
@@ -196,6 +200,7 @@ fn saving_a_profile_with_a_reserved_kind_is_refused_and_writes_no_row() {
     let error = crate::config_loader::save_profiles(
         &runtime,
         &[reserved.clone(), postgres.clone(), reserved_config.clone()],
+        &std::collections::HashSet::new(),
     )
     .expect_err("a reserved kind must be refused")
     .to_string();

@@ -321,11 +321,22 @@ impl DataTabServer {
             .await
     }
 
+    /// The class an approval request for `tool_id` carries.
+    ///
+    /// A request is reviewed as at least admin work, because it asks a person to
+    /// authorise a call, and it is never less restricted than the call it names:
+    /// the two classes are composed, not `max`-ed. `Admin` outranks
+    /// `Destructive` on the permission ladder, so `Admin.max(Destructive)` gave
+    /// `Admin` and queued a row removal below its own data risk — a policy that
+    /// allowed `Admin` and asked on `Destructive` then let it through, and the
+    /// approval dialog named the wrong risk (#495). `compose` keeps the
+    /// operation's own class on both ladders, so a removal request carries
+    /// `AdminDestructive`.
     fn request_execution_classification(tool_id: &str) -> Result<ExecutionClassification, String> {
         let target_classification = Self::classify_tool(tool_id)
             .ok_or_else(|| format!("Unsupported tool for approval request: {}", tool_id))?;
 
-        Ok(ExecutionClassification::Admin.max(target_classification))
+        Ok(ExecutionClassification::Admin.compose(target_classification))
     }
 
     /// Classify a tool by its ID to determine its execution classification.
@@ -441,6 +452,288 @@ mod tests {
             DataTabServer::request_execution_classification("drop_table"),
             Ok(ExecutionClassification::AdminDestructive)
         );
+    }
+
+    /// #495: a request for a row removal is queued at the removal's own class,
+    /// never at `Admin`, which sits below `Destructive` on the permission
+    /// ladder.
+    #[test]
+    fn request_execution_carries_a_removals_own_data_risk() {
+        for tool_id in ["delete_records", "truncate_table"] {
+            let request = DataTabServer::request_execution_classification(tool_id)
+                .expect("a removal tool is a supported approval target");
+            let target = DataTabServer::classify_tool(tool_id)
+                .expect("a removal tool has its own classification");
+
+            assert_eq!(
+                request,
+                ExecutionClassification::AdminDestructive,
+                "{tool_id} must be queued at its own data risk"
+            );
+            assert_ne!(
+                request,
+                ExecutionClassification::Admin,
+                "{tool_id} must never be queued as Admin, below its own data risk"
+            );
+            assert!(
+                request.permits(target),
+                "{tool_id}: the request class must permit the class it names"
+            );
+        }
+    }
+
+    /// The whole table in one place: the class a request carries next to the
+    /// tool's own class, so a change to either side is visible here.
+    #[test]
+    fn request_execution_class_pins_the_class_it_carries_per_tool() {
+        use ExecutionClassification::*;
+
+        let cases = [
+            ("list_tables", Metadata, Admin),
+            ("select_data", Read, Admin),
+            ("insert_record", Write, Admin),
+            ("create_table", Admin, Admin),
+            ("delete_records", Destructive, AdminDestructive),
+            ("truncate_table", Destructive, AdminDestructive),
+            ("drop_table", AdminDestructive, AdminDestructive),
+        ];
+
+        for (tool_id, target, expected) in cases {
+            assert_eq!(
+                DataTabServer::classify_tool(tool_id),
+                Some(target),
+                "{tool_id} classifies as declared"
+            );
+            assert_eq!(
+                DataTabServer::request_execution_classification(tool_id),
+                Ok(expected),
+                "{tool_id} must be queued as {expected:?}"
+            );
+            assert_eq!(
+                expected.compose(target),
+                expected,
+                "{tool_id}: the request class is never raised further by the tool"
+            );
+        }
+    }
+
+    /// #495 from the policy's side: a policy that allows `Admin` and asks on
+    /// `Destructive` used to allow a removal request, because it was queued as
+    /// `Admin`. It now denies it, because the request carries
+    /// `AdminDestructive`, and a policy that asks on that class queues it.
+    #[test]
+    fn a_policy_that_allows_admin_and_asks_on_destructive_never_allows_a_removal_request() {
+        use datatab_policy::{
+            ConnectionPolicyAssignment, PolicyBindingScope, PolicyDecision, PolicyDecisionReason,
+            PolicyEngine, PolicyEvaluationRequest, ToolPolicy,
+        };
+
+        let engine = PolicyEngine::new(
+            vec![ConnectionPolicyAssignment {
+                actor_id: "actor".to_string(),
+                scope: PolicyBindingScope {
+                    connection_id: "conn".to_string(),
+                },
+                role_ids: vec![],
+                policy_ids: vec!["admin-allowed".to_string()],
+            }],
+            vec![],
+            vec![ToolPolicy {
+                id: "admin-allowed".to_string(),
+                allowed_tools: vec!["delete_records".to_string()],
+                allowed_classes: vec![ExecutionClassification::Admin],
+                approval_classes: vec![ExecutionClassification::Destructive],
+            }],
+        );
+
+        let evaluate = |classification: ExecutionClassification| {
+            engine
+                .evaluate(&PolicyEvaluationRequest {
+                    actor_id: "actor".to_string(),
+                    connection_id: "conn".to_string(),
+                    tool_id: "delete_records".to_string(),
+                    classification,
+                })
+                .expect("evaluation must not error")
+        };
+
+        // The class the site used to attach: the policy allows the removal.
+        assert_eq!(
+            evaluate(ExecutionClassification::Admin),
+            PolicyDecision::Allow,
+            "the old Admin class is what let the removal through"
+        );
+
+        assert_eq!(
+            evaluate(
+                DataTabServer::request_execution_classification("delete_records")
+                    .expect("delete_records is a supported approval target")
+            ),
+            PolicyDecision::Deny(PolicyDecisionReason::ClassificationDenied),
+            "a removal request must not be allowed by a policy that only allows Admin"
+        );
+    }
+
+    /// The same queue, read from the other side: a policy that asks on the
+    /// class the request now carries queues the removal instead of allowing it.
+    #[test]
+    fn a_policy_that_asks_on_the_carried_class_queues_the_removal_request() {
+        use datatab_policy::{
+            ConnectionPolicyAssignment, PolicyBindingScope, PolicyDecision, PolicyEngine,
+            PolicyEvaluationRequest, ToolPolicy,
+        };
+
+        let engine = PolicyEngine::new(
+            vec![ConnectionPolicyAssignment {
+                actor_id: "actor".to_string(),
+                scope: PolicyBindingScope {
+                    connection_id: "conn".to_string(),
+                },
+                role_ids: vec![],
+                policy_ids: vec!["removal-asks".to_string()],
+            }],
+            vec![],
+            vec![ToolPolicy {
+                id: "removal-asks".to_string(),
+                allowed_tools: vec!["delete_records".to_string()],
+                allowed_classes: vec![ExecutionClassification::Destructive],
+                approval_classes: vec![ExecutionClassification::AdminDestructive],
+            }],
+        );
+
+        let decision = engine
+            .evaluate(&PolicyEvaluationRequest {
+                actor_id: "actor".to_string(),
+                connection_id: "conn".to_string(),
+                tool_id: "delete_records".to_string(),
+                classification: DataTabServer::request_execution_classification("delete_records")
+                    .expect("delete_records is a supported approval target"),
+            })
+            .expect("evaluation must not error");
+
+        assert_eq!(decision, PolicyDecision::RequireApproval);
+    }
+
+    /// #495: the audit row a person reads is written from the class the
+    /// request carries, so a removal request's row says `AdminDestructive`.
+    #[test]
+    fn the_audit_row_names_the_class_the_request_carries() {
+        use datatab_core::observability::EventCategory;
+        use datatab_core::observability::actions::MCP_AUTHORIZE;
+        use datatab_mcp::server::authorization::{
+            AuthorizationRequest, authorize_request_with_approval,
+        };
+        use datatab_mcp::server::request_context::RequestIdentity;
+        use datatab_policy::TrustedClient;
+
+        let audit_service = test_audit_service("datatab-approval-class.sqlite");
+        let trusted_clients = datatab_policy::TrustedClientRegistry::new(vec![TrustedClient {
+            id: "agent-a".to_string(),
+            name: "Agent A".to_string(),
+            issuer: None,
+            active: true,
+        }]);
+        let policy_engine = datatab_policy::PolicyEngine::default();
+
+        let request = AuthorizationRequest {
+            identity: RequestIdentity {
+                client_id: "agent-a".to_string(),
+                issuer: None,
+            },
+            connection_id: "conn-a".to_string(),
+            tool_id: "request_execution".to_string(),
+            classification: DataTabServer::request_execution_classification("delete_records")
+                .expect("delete_records is a supported approval target"),
+            mcp_enabled_for_connection: true,
+            read_only_connection: false,
+            correlation_id: None,
+        };
+
+        let outcome = authorize_request_with_approval(
+            &trusted_clients,
+            &policy_engine,
+            &audit_service,
+            &request,
+            None,
+            1_000,
+        )
+        .expect("authorization must not error");
+        assert!(!outcome.allowed, "no policy assignment allows the request");
+
+        let rows = audit_service
+            .query_extended(&datatab_audit::query::AuditQueryFilter {
+                action: Some(MCP_AUTHORIZE.as_str().to_string()),
+                category: Some(EventCategory::Mcp.as_str().to_string()),
+                ..Default::default()
+            })
+            .expect("audit query should succeed");
+
+        assert_eq!(rows.len(), 1, "one authorization row is written");
+        assert!(
+            rows[0]
+                .summary
+                .as_deref()
+                .is_some_and(|summary| summary.contains("classification=AdminDestructive")),
+            "the audit row must name the class the request carries, got {:?}",
+            rows[0].summary
+        );
+        assert!(
+            rows[0]
+                .details_json
+                .as_deref()
+                .is_some_and(|details| details.contains("\"classification\":\"AdminDestructive\"")),
+            "the audit details must name the class the request carries, got {:?}",
+            rows[0].details_json
+        );
+    }
+
+    /// #495: the approval queue entry — what the dialog labels, the bell
+    /// shows and the MCP response reports — carries the composed class.
+    #[test]
+    fn the_queued_request_carries_the_class_the_dialog_labels() {
+        use datatab_mcp::{McpGovernanceService as _, McpRuntime};
+
+        let audit_service = test_audit_service("datatab-approval-queue-class.sqlite");
+        let mut runtime = McpRuntime::new(
+            audit_service,
+            Box::new(datatab_approval::InMemoryPendingExecutionStore::default()),
+        );
+
+        let queued = runtime
+            .request_execution_mut(ExecutionPlan {
+                connection_id: "conn-a".to_string(),
+                actor_id: "agent-a".to_string(),
+                tool_id: "delete_records".to_string(),
+                classification: DataTabServer::request_execution_classification("delete_records")
+                    .expect("delete_records is a supported approval target"),
+                payload: serde_json::json!({ "table": "items" }),
+            })
+            .expect("queuing a pending execution should succeed");
+
+        assert_eq!(
+            queued.classification,
+            ExecutionClassification::AdminDestructive
+        );
+
+        let pending = runtime
+            .list_pending_executions()
+            .expect("listing pending executions should succeed");
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].classification,
+            ExecutionClassification::AdminDestructive,
+            "the dialog and the MCP response read this class"
+        );
+    }
+
+    /// An audit service on a fresh temporary SQLite file, as the MCP
+    /// authorization tests use.
+    fn test_audit_service(file_name: &str) -> datatab_audit::AuditService {
+        use datatab_core::LogErr as _;
+
+        let path = datatab_audit::temp_sqlite_path(file_name);
+        std::fs::remove_file(&path).log_err();
+        datatab_audit::AuditService::new_sqlite(&path).expect("audit service should initialize")
     }
 
     #[test]

@@ -565,6 +565,8 @@ pub enum ContextMenuAction {
     RefreshInstanceCatalog,
     /// Copy the string ID of the selected node to the clipboard.
     CopyItemId,
+    /// Copy the bare name of a column or collection field.
+    CopyColumnName,
     /// Open the Export wizard for the selected table(s) (or the right-
     /// clicked table, when it is not part of a larger selection). Distinct
     /// from `Export` (connection-profile export) — gated on
@@ -717,7 +719,7 @@ impl ContextMenuAction {
             Self::DuplicateSavedChart => Some(AppIcon::Copy),
             // Instance catalog actions
             Self::RefreshInstanceCatalog => Some(AppIcon::RefreshCcw),
-            Self::CopyItemId => Some(AppIcon::Copy),
+            Self::CopyItemId | Self::CopyColumnName => Some(AppIcon::Copy),
             Self::ExportTables => Some(AppIcon::ArrowUp),
             Self::ImportTables => Some(AppIcon::Download),
             Self::MigrateTables => Some(AppIcon::ArrowUpDown),

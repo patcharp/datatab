@@ -27,7 +27,6 @@ use datatab_components::tokens::{
     ChromeColors, DocumentMetrics, Fields, Heights, IslandMetrics, ObjectStoreMetrics,
     PreviewRailMetrics, Spacing,
 };
-use datatab_components::typography::AppFonts;
 use datatab_core::{Encoding, ObjectVersionSummary};
 use gpui::prelude::*;
 use gpui::*;
@@ -349,7 +348,7 @@ impl ObjectBrowserDocument {
                 div()
                     .min_w_0()
                     .truncate()
-                    .font_family(datatab_components::fonts::editor_family(cx))
+                    .font(datatab_components::fonts::editor_font(cx))
                     .font_weight(FontWeight::BOLD)
                     .text_color(ChromeColors::strong(theme))
                     .child(name.to_string()),
@@ -698,7 +697,7 @@ impl ObjectBrowserDocument {
         let value = |text: String| {
             div()
                 .truncate()
-                .font_family(datatab_components::fonts::editor_family(cx))
+                .font(datatab_components::fonts::editor_font(cx))
                 .text_color(ChromeColors::strong(theme))
                 .child(text)
                 .into_any_element()

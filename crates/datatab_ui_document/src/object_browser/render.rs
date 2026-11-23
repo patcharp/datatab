@@ -24,7 +24,6 @@ use datatab_components::primitives::{
 use datatab_components::tokens::{
     ChamferCut, ChromeColors, DocumentMetrics, Fields, ObjectStoreMetrics, SyntaxColors, ui,
 };
-use datatab_components::typography::AppFonts;
 use datatab_core::chrono::{DateTime, Utc};
 use gpui::prelude::*;
 use gpui::*;
@@ -169,7 +168,7 @@ impl ObjectBrowserDocument {
             .px(Fields::PADDING_X)
             .overflow_hidden()
             .whitespace_nowrap()
-            .font_family(datatab_components::fonts::editor_family(cx))
+            .font(datatab_components::fonts::editor_font(cx))
             .text_size(Fields::TEXT)
             .text_color(muted)
             .child(
@@ -573,7 +572,7 @@ impl ObjectBrowserDocument {
                     .child(
                         div()
                             .truncate()
-                            .font_family(datatab_components::fonts::editor_family(cx))
+                            .font(datatab_components::fonts::editor_font(cx))
                             .text_size(ObjectStoreMetrics::OBJECT_NAME_FONT)
                             .text_color(strong)
                             .child(name_label),
@@ -583,7 +582,7 @@ impl ObjectBrowserDocument {
                 div()
                     .w(SIZE_WIDTH)
                     .flex_shrink_0()
-                    .font_family(datatab_components::fonts::editor_family(cx))
+                    .font(datatab_components::fonts::editor_font(cx))
                     .text_size(DocumentMetrics::TABLE_META_FONT)
                     .text_color(muted)
                     .child(size_label),

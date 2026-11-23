@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use datatab_app::portability::{
-    ConfirmSummary, ExternalPersistOutcome, ImportOutcome, ImportPersistence, OwnedDestSnapshot,
-    confirm_summary, default_candidate_includes, mapto_candidates, persist_external_candidate,
+    ConfirmSummary, ExternalPersistOutcome, ImportOutcome, OwnedDestSnapshot, confirm_summary,
+    default_candidate_includes, mapto_candidates, persist_external_candidate,
     toggle_candidate_include,
 };
 use datatab_components::controls::{Button, Checkbox, Input, InputEvent, InputState};
@@ -13,7 +13,7 @@ use datatab_components::primitives::{
 };
 use datatab_components::tokens::{FontSizes, Spacing};
 use datatab_core::secrecy::SecretString;
-use datatab_core::{AuthProfile, ConnectionProfile, LogErr, ProxyProfile, SshTunnelProfile};
+use datatab_core::{AuthProfile, LogErr};
 use datatab_portability::external::{
     ExternalImportCandidate, ExternalImportOutcome, ExternalImportSkip, ImportInput, ImportSource,
     importers,
@@ -77,96 +77,8 @@ enum Step {
     Outcome,
 }
 
-/// Bridges `AppState` to the portability `ImportPersistence` seam.
-///
-/// Identical wiring to the previous wizard's persistence adapter; the import
-/// backend itself is unchanged.
-pub(super) struct AppStatePersistence<'a> {
-    state: &'a mut datatab_app::AppState,
-    registered_drivers: std::collections::HashSet<String>,
-}
-
-impl<'a> AppStatePersistence<'a> {
-    pub(super) fn new(state: &'a mut datatab_app::AppState) -> Self {
-        let registered_drivers = state.drivers().keys().cloned().collect();
-        Self {
-            state,
-            registered_drivers,
-        }
-    }
-}
-
-impl ImportPersistence for AppStatePersistence<'_> {
-    fn add_auth_profile(&mut self, profile: AuthProfile) {
-        self.state.add_auth_profile(profile);
-    }
-
-    fn add_ssh_tunnel(&mut self, tunnel: SshTunnelProfile) {
-        self.state.add_ssh_tunnel(tunnel);
-    }
-
-    fn add_proxy(&mut self, proxy: ProxyProfile) {
-        self.state.add_proxy(proxy);
-    }
-
-    fn add_connection(
-        &mut self,
-        profile: ConnectionProfile,
-    ) -> datatab_app::portability::ConnectionInsertResult {
-        use datatab_app::portability::ConnectionInsertResult;
-
-        let driver_id = profile.driver_id().to_string();
-        if !self.registered_drivers.contains(&driver_id) {
-            return ConnectionInsertResult::NeedsDriver;
-        }
-
-        let Some(driver) = self.state.drivers().get(&driver_id).cloned() else {
-            return ConnectionInsertResult::NeedsDriver;
-        };
-
-        if let datatab_core::DbConfig::External { values, .. } = &profile.config {
-            match driver.build_config(values) {
-                Ok(config) => {
-                    let mut rebuilt = profile;
-                    rebuilt.config = config;
-                    // The registered driver may declare a reserved kind;
-                    // such a profile could not be loaded again.
-                    if let Err(error) = datatab_app::AppState::check_profile_can_be_saved(&rebuilt)
-                    {
-                        return ConnectionInsertResult::ConfigFailed(error.to_string());
-                    }
-                    self.state.add_profile_in_folder(rebuilt, None);
-                    ConnectionInsertResult::Ok
-                }
-                Err(e) => ConnectionInsertResult::ConfigFailed(e.to_string()),
-            }
-        } else {
-            self.state.add_profile_in_folder(profile, None);
-            ConnectionInsertResult::Ok
-        }
-    }
-
-    fn write_secret(&self, secret_ref: &str, secret: &SecretString) -> bool {
-        self.state.facade.secrets.set_by_ref(secret_ref, secret)
-    }
-
-    fn hydrate_auth_secret_fields(
-        &mut self,
-        auth_id: uuid::Uuid,
-        fields: HashMap<String, SecretString>,
-    ) {
-        if let Some(profile) = self
-            .state
-            .facade
-            .auth_profiles
-            .items
-            .iter_mut()
-            .find(|p| p.id == auth_id)
-        {
-            profile.secret_fields = fields;
-        }
-    }
-}
+#[cfg(test)]
+pub(super) use tests::AppStatePersistence;
 
 /// Result of a completed import run, rendered by reference (never `.take()`n)
 /// so failure details survive every frame.
@@ -175,6 +87,68 @@ enum ImportRunResult {
     Failed(String),
     /// Outcome of persisting a confirmed selection from an external-client import.
     External(ExternalPersistOutcome),
+}
+
+impl ImportRunResult {
+    fn secret_failure_count(&self) -> usize {
+        match self {
+            Self::Outcome(outcome) => outcome.secret_failures.len(),
+            Self::External(outcome) => outcome.secret_failures.len(),
+            Self::Failed(_) => 0,
+        }
+    }
+
+    fn reject_connections(&mut self, failures: Vec<(uuid::Uuid, String, String)>) {
+        for (connection_id, name, reason) in failures {
+            let (succeeded, config_failures) = match self {
+                Self::Outcome(outcome) => {
+                    let password_ref = datatab_core::connection_secret_ref(&connection_id);
+                    outcome.secret_failures.retain(|(_, secret_ref)| {
+                        secret_ref != &password_ref
+                            && !secret_ref.starts_with(&format!("{password_ref}:"))
+                    });
+                    (&mut outcome.succeeded, &mut outcome.config_failures)
+                }
+                Self::External(outcome) => (&mut outcome.succeeded, &mut outcome.config_failures),
+                Self::Failed(_) => return,
+            };
+            if let Some(index) = succeeded.iter().rposition(|succeeded| succeeded == &name) {
+                succeeded.remove(index);
+            }
+            config_failures.push((name, reason));
+        }
+    }
+
+    fn failure_message(&self) -> Option<String> {
+        let (config_failures, needs_driver, unresolved_refs) = match self {
+            Self::Failed(message) => return Some(message.clone()),
+            Self::Outcome(outcome) => (
+                &outcome.config_failures,
+                outcome.needs_driver.len(),
+                outcome.unresolved_refs.len(),
+            ),
+            Self::External(outcome) => (&outcome.config_failures, outcome.needs_driver.len(), 0),
+        };
+        let mut reasons: Vec<String> = config_failures
+            .iter()
+            .map(|(_, reason)| reason.clone())
+            .collect();
+        if needs_driver > 0 {
+            reasons.push(crate::labels::import_outcome_needs_driver(needs_driver));
+        }
+        if unresolved_refs > 0 {
+            reasons.push(crate::labels::import_outcome_unresolved_refs(
+                unresolved_refs,
+            ));
+        }
+        let secret_failures = self.secret_failure_count();
+        if secret_failures > 0 {
+            reasons.push(crate::labels::import_error_secret_failures_toast(
+                secret_failures,
+            ));
+        }
+        (!reasons.is_empty()).then(|| reasons.join("\n"))
+    }
 }
 
 /// In-window connection import panel.
@@ -325,6 +299,9 @@ impl ImportConnectionsPanel {
     /// Reset the panel to its first step and focus it. Called by the connection
     /// manager when switching into the import view.
     pub fn reset(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            return;
+        }
         self.step = Step::SelectFile;
         self.source_selection = ImportSourceSelection::Bundle;
         self.external_primary_path = None;
@@ -366,7 +343,7 @@ impl ImportConnectionsPanel {
 
     /// Whether a load or an import is running. The panel cannot be dismissed
     /// until it finishes.
-    fn is_busy(&self) -> bool {
+    pub(super) fn is_busy(&self) -> bool {
         self.is_parsing || self.is_parsing_external || self.is_applying || self.is_applying_external
     }
 
@@ -605,64 +582,27 @@ impl ImportConnectionsPanel {
         .detach();
     }
 
-    /// Persist the user-confirmed selection of external-import candidates
-    /// through the same `AppStatePersistence` seam bundle import uses, then
-    /// move to the outcome step.
+    /// Run the confirmed external candidates through the background secret phase.
     fn do_apply_external(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            return;
+        }
         let includes = std::mem::take(&mut self.external_includes);
         let selected: Vec<ExternalImportCandidate> = std::mem::take(&mut self.external_candidates)
             .into_iter()
             .zip(includes)
             .filter_map(|(candidate, include)| include.then_some(candidate))
             .collect();
-
-        let app_state_entity = self.app_state.clone();
-        let this = cx.entity().clone();
-
+        let mut session = self.import_session(cx);
         self.is_applying_external = true;
-        window.focus(self.focus.handle(), cx);
-        cx.notify();
-
-        cx.spawn(async move |_this, cx| {
-            cx.update(|cx| {
-                let outcome = app_state_entity.update(cx, |state, cx| {
-                    let mut deps = AppStatePersistence::new(state);
-                    let mut outcome = ExternalPersistOutcome::default();
-                    for candidate in selected {
-                        persist_external_candidate(candidate, &mut deps, &mut outcome);
-                    }
-                    cx.emit(datatab_ui_base::AppStateChanged);
-                    cx.notify();
-                    outcome
-                });
-
-                if !outcome.secret_failures.is_empty() {
-                    let count = outcome.secret_failures.len();
-                    let msg = crate::labels::import_error_secret_failures_toast(count);
-                    report_error(UserFacingError::new(ErrorKind::Storage, msg), cx);
-                }
-
-                this.update(cx, |this, cx| {
-                    this.is_applying_external = false;
-                    let succeeded = outcome.succeeded.len();
-                    let has_failures = !outcome.secret_failures.is_empty()
-                        || !outcome.needs_driver.is_empty()
-                        || !outcome.config_failures.is_empty();
-
-                    if !has_failures && succeeded > 0 {
-                        datatab_ui_base::toast::Toast::success(
-                            crate::labels::import_status_imported_toast(succeeded),
-                        )
-                        .push(cx);
-                    }
-
-                    this.run_result = Some(ImportRunResult::External(outcome));
-                    this.step = Step::Outcome;
-                    cx.notify();
-                });
-            });
-        })
-        .detach();
+        let task = cx.background_executor().spawn(async move {
+            let mut outcome = ExternalPersistOutcome::default();
+            for candidate in selected {
+                persist_external_candidate(candidate, &mut session, &mut outcome);
+            }
+            (session, ImportRunResult::External(outcome))
+        });
+        self.finish_import_task(task, window, cx);
     }
 
     fn browse_input_path(&mut self, cx: &mut Context<Self>) {
@@ -942,9 +882,11 @@ impl ImportConnectionsPanel {
         }
     }
 
-    /// Run `apply()` on the background executor, persist through `AppState`, and
-    /// move to the outcome step.
+    /// Prepare and write secrets in the background before committing accepted rows.
     fn do_apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.is_busy() {
+            return;
+        }
         let Some(parsed) = self.parsed_bundle.take() else {
             return;
         };
@@ -952,71 +894,109 @@ impl ImportConnectionsPanel {
             return;
         };
         let choices = self.build_resolution_choices();
-        let app_state_entity = self.app_state.clone();
-        let this = cx.entity().clone();
-
+        let mut session = self.import_session(cx);
         self.is_applying = true;
+        let task = cx.background_executor().spawn(async move {
+            let result = match datatab_app::portability::apply_import(
+                &parsed,
+                &plan,
+                &choices,
+                &mut session,
+            ) {
+                Ok(outcome) => ImportRunResult::Outcome(outcome),
+                Err(error) => ImportRunResult::Failed(crate::labels::import_error_import_failed(
+                    &error.to_string(),
+                )),
+            };
+            (session, result)
+        });
+        self.finish_import_task(task, window, cx);
+    }
+
+    fn import_session(&self, cx: &App) -> datatab_app::portability::ImportSession {
+        datatab_app::portability::ImportSession::new(
+            self.app_state.read(cx),
+            datatab_i18n::t!("connection_manager.import.error.password_keyring_failed"),
+        )
+    }
+
+    fn finish_import_task(
+        &mut self,
+        task: Task<(datatab_app::portability::ImportSession, ImportRunResult)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         window.focus(self.focus.handle(), cx);
         cx.notify();
-
-        cx.spawn(async move |_this, cx| {
-            let apply_result = cx
-                .background_executor()
-                .spawn(async move { datatab_portability::import::apply(&parsed, &plan, &choices) })
-                .await;
-
-            cx.update(|cx| match apply_result {
-                Err(e) => {
-                    this.update(cx, |this, cx| {
-                        this.is_applying = false;
-                        this.run_result = Some(ImportRunResult::Failed(
-                            crate::labels::import_error_import_failed(&e.to_string()),
-                        ));
-                        this.step = Step::Outcome;
-                        cx.notify();
-                    });
-                }
-                Ok(actions) => {
-                    let outcome = app_state_entity.update(cx, |state, cx| {
-                        let result = {
-                            let mut deps = AppStatePersistence::new(state);
-                            datatab_app::portability::persist_import_actions(actions, &mut deps)
-                        };
+        let app_state = self.app_state.clone();
+        let window_handle = window.window_handle();
+        // The detached transaction owns the session, so closing the window cannot
+        // cancel a write or strand its rollback and completion report.
+        cx.spawn(async move |this, cx| {
+            let (mut session, mut result) = task.await;
+            cx.update(|cx| {
+                if !matches!(result, ImportRunResult::Failed(_)) {
+                    app_state.update(cx, |state, cx| {
+                        session.commit(state);
                         cx.emit(datatab_ui_base::AppStateChanged);
-                        cx.notify();
-                        result
-                    });
-
-                    // Only the first catch site reports through the user-error seam.
-                    if !outcome.secret_failures.is_empty() {
-                        let count = outcome.secret_failures.len();
-                        let msg = crate::labels::import_error_secret_failures_toast(count);
-                        report_error(UserFacingError::new(ErrorKind::Storage, msg), cx);
-                    }
-
-                    this.update(cx, |this, cx| {
-                        this.is_applying = false;
-                        let succeeded = outcome.succeeded.len();
-                        let has_failures = !outcome.secret_failures.is_empty()
-                            || !outcome.needs_driver.is_empty()
-                            || !outcome.config_failures.is_empty()
-                            || !outcome.unresolved_refs.is_empty();
-
-                        if !has_failures {
-                            datatab_ui_base::toast::Toast::success(
-                                crate::labels::import_status_imported_toast(succeeded),
-                            )
-                            .push(cx);
-                        }
-
-                        this.run_result = Some(ImportRunResult::Outcome(outcome));
-                        this.step = Step::Outcome;
                         cx.notify();
                     });
                 }
             });
+            let cleanup_failed =
+                datatab_i18n::t!("connection_manager.import.error.refused_secret_cleanup_failed");
+            let failures = cx
+                .background_executor()
+                .spawn(async move { session.rollback_rejected(&cleanup_failed) })
+                .await;
+            result.reject_connections(failures);
+            cx.update(|cx| {
+                let secret_failures = result.secret_failure_count();
+                let failure = result.failure_message();
+                let applied = window_handle
+                    .update(cx, |_, _, cx| {
+                        this.update(cx, |this, cx| this.finish_import(result, cx))
+                            .is_ok()
+                    })
+                    .unwrap_or(false);
+                let message = if !applied {
+                    failure
+                } else if secret_failures > 0 {
+                    Some(crate::labels::import_error_secret_failures_toast(
+                        secret_failures,
+                    ))
+                } else {
+                    None
+                };
+                if let Some(message) = message {
+                    report_error(UserFacingError::new(ErrorKind::Storage, message), cx);
+                }
+            });
         })
         .detach();
+    }
+
+    fn finish_import(&mut self, result: ImportRunResult, cx: &mut Context<Self>) {
+        self.is_applying = false;
+        self.is_applying_external = false;
+        let succeeded = match &result {
+            ImportRunResult::Outcome(outcome) => Some(outcome.succeeded.len()),
+            ImportRunResult::External(outcome) if !outcome.succeeded.is_empty() => {
+                Some(outcome.succeeded.len())
+            }
+            _ => None,
+        };
+        if result.failure_message().is_none()
+            && let Some(succeeded) = succeeded
+        {
+            datatab_ui_base::toast::Toast::success(crate::labels::import_status_imported_toast(
+                succeeded,
+            ))
+            .push(cx);
+        }
+        self.run_result = Some(result);
+        self.step = Step::Outcome;
+        cx.notify();
     }
 }
 
@@ -2124,6 +2104,12 @@ fn parse_auth_choice(id: &str) -> Option<Uuid> {
 
 #[cfg(test)]
 mod tests {
+    use datatab_app::portability::ImportPersistence;
+    use datatab_core::secrecy::SecretString;
+    use datatab_core::{AuthProfile, ConnectionProfile, ProxyProfile, SshTunnelProfile};
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
     /// Every `connection_manager.import.*` key this panel resolves directly via
     /// `datatab_i18n::t!`, including the plural `.one`/`.many` variants. Keys backed
     /// by `crate::labels` helpers are exercised separately by `labels.rs`'s own
@@ -2144,6 +2130,7 @@ mod tests {
         "connection_manager.import.error.wrong_passphrase",
         "connection_manager.import.error.decryption_error",
         "connection_manager.import.error.import_failed",
+        "connection_manager.import.error.refused_secret_cleanup_failed",
         "connection_manager.import.error.secret_failures_toast.one",
         "connection_manager.import.error.secret_failures_toast.many",
         "connection_manager.import.field.bundle_file",
@@ -2255,6 +2242,82 @@ mod tests {
             assert!(!label.is_empty(), "{kind:?} resolved an empty label");
         }
     }
+
+    pub(crate) struct AppStatePersistence<'a> {
+        state: &'a mut datatab_app::AppState,
+        session: datatab_app::portability::ImportSession,
+    }
+
+    impl<'a> AppStatePersistence<'a> {
+        pub(crate) fn new(state: &'a mut datatab_app::AppState) -> Self {
+            let session = datatab_app::portability::ImportSession::new(
+                state,
+                datatab_i18n::t!("connection_manager.import.error.password_keyring_failed"),
+            );
+            Self { state, session }
+        }
+    }
+
+    impl ImportPersistence for AppStatePersistence<'_> {
+        fn add_auth_profile(&mut self, profile: AuthProfile) {
+            self.session.add_auth_profile(profile);
+            self.session.commit(self.state);
+        }
+        fn add_ssh_tunnel(&mut self, tunnel: SshTunnelProfile) {
+            self.session.add_ssh_tunnel(tunnel);
+            self.session.commit(self.state);
+        }
+        fn add_proxy(&mut self, proxy: ProxyProfile) {
+            self.session.add_proxy(proxy);
+            self.session.commit(self.state);
+        }
+        fn add_connection(
+            &mut self,
+            profile: ConnectionProfile,
+        ) -> datatab_app::portability::ConnectionInsertResult {
+            self.add_connection_with_password(profile, None).0
+        }
+        fn add_connection_with_password(
+            &mut self,
+            profile: ConnectionProfile,
+            password: Option<SecretString>,
+        ) -> (
+            datatab_app::portability::ConnectionInsertResult,
+            Option<SecretString>,
+        ) {
+            let result = self.session.add_connection_with_password(profile, password);
+            self.session.commit(self.state);
+            result
+        }
+        fn write_secret(&self, secret_ref: &str, secret: &SecretString) -> bool {
+            self.session.write_secret(secret_ref, secret)
+        }
+        fn keyring_secret_field_ids(&self, profile: &ConnectionProfile) -> Vec<String> {
+            self.session.keyring_secret_field_ids(profile)
+        }
+        fn secret_field_ids(&self, profile: &ConnectionProfile) -> Vec<String> {
+            self.session.secret_field_ids(profile)
+        }
+        fn chosen_auth_profile_values(
+            &mut self,
+            connection_id: Uuid,
+            driver_id: &str,
+            auth_id: Uuid,
+        ) -> Option<datatab_core::FormValues> {
+            self.session
+                .chosen_auth_profile_values(connection_id, driver_id, auth_id)
+        }
+        fn hydrate_auth_secret_fields(
+            &mut self,
+            auth_id: Uuid,
+            fields: HashMap<String, SecretString>,
+        ) {
+            self.session.hydrate_auth_secret_fields(auth_id, fields);
+            self.session.commit(self.state);
+        }
+    }
+
+    mod secret_fields;
 }
 
 #[cfg(test)]

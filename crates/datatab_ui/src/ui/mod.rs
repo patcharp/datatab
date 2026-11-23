@@ -1,4 +1,5 @@
 pub mod components;
+pub mod diagnostics;
 pub mod dock;
 pub mod document;
 pub mod icons;

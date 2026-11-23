@@ -14,7 +14,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use datatab_core::{CancelToken, Connection, TaskId, TaskKind, TaskTarget};
+use datatab_core::{CancelToken, Connection, LogErr, TaskId, TaskKind, TaskTarget};
 use datatab_transfer::TableTransferStatus;
 use datatab_transfer::export::{
     ExportOptions, ExportOutcome, ExportTable, ExportedTable, run_export,
@@ -321,42 +321,53 @@ impl ExportWizard {
         cx.notify();
 
         cx.spawn(async move |this, cx| {
-            let export_tables =
-                match build_export_tables(&connection, database.as_deref(), &table_specs) {
-                    Ok(tables) => tables,
-                    Err(err) => {
-                        cx.update(|cx| {
-                            app_state.update(cx, |state, cx| {
-                                state.fail_task(task_id, err.clone());
-                                cx.emit(AppStateChanged);
-                            });
-                            report_error(
-                                UserFacingError::new(
-                                    ErrorKind::Driver,
-                                    datatab_i18n::t!(
-                                        "document.export_wizard.toast.schema_fetch_failed",
-                                        error = err
-                                    ),
-                                ),
-                                cx,
-                            );
+            // `table_details` can block (a recovery reconnect), so it runs on
+            // the background executor and the results are applied here.
+            let build_result =
+                cx.background_executor()
+                    .spawn({
+                        let connection = connection.clone();
+                        let database = database.clone();
+                        async move {
+                            build_export_tables(&connection, database.as_deref(), &table_specs)
+                        }
+                    })
+                    .await;
+            let export_tables = match build_result {
+                Ok(tables) => tables,
+                Err(err) => {
+                    cx.update(|cx| {
+                        app_state.update(cx, |state, cx| {
+                            state.fail_task(task_id, err.clone());
+                            cx.emit(AppStateChanged);
                         });
+                        report_error(
+                            UserFacingError::new(
+                                ErrorKind::Driver,
+                                datatab_i18n::t!(
+                                    "document.export_wizard.toast.schema_fetch_failed",
+                                    error = err
+                                ),
+                            ),
+                            cx,
+                        );
+                    });
 
-                        this.update(cx, |this, cx| {
-                            this.run_state = RunState::Done;
-                            this.cancel_token = None;
-                            this.result_summary = Some(datatab_i18n::t!(
-                                "document.export_wizard.toast.failed",
-                                error = err
-                            ));
-                            cx.notify();
-                        })
-                        .ok();
-                        return;
-                    }
-                };
+                    this.update(cx, |this, cx| {
+                        this.run_state = RunState::Done;
+                        this.cancel_token = None;
+                        this.result_summary = Some(datatab_i18n::t!(
+                            "document.export_wizard.toast.failed",
+                            error = err
+                        ));
+                        cx.notify();
+                    })
+                    .log_err();
+                    return;
+                }
+            };
 
-            this.update(cx, |this, cx| {
+            let started = this.update(cx, |this, cx| {
                 this.spawn_progress_ticker(task_id, cx);
                 this.spawn_run(
                     ExportRunContext {
@@ -372,8 +383,18 @@ impl ExportWizard {
                     task_id,
                     cx,
                 );
-            })
-            .ok();
+            });
+            if let Err(error) = started {
+                // The wizard was dropped while the metadata loaded: the export
+                // never starts, so its registered task must end here.
+                log::warn!("Export wizard closed before the export started: {error}");
+                cx.update(|cx| {
+                    app_state.update(cx, |state, cx| {
+                        state.tasks_mut().cancel(task_id);
+                        cx.emit(AppStateChanged);
+                    });
+                });
+            }
         })
         .detach();
     }

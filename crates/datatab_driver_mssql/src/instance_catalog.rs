@@ -106,7 +106,7 @@ pub const PERFORMANCE_COUNTERS: &[(
         "Total Server Memory (KB)",
         "",
         "mssql.server_memory_kb",
-        "Total server memory (KB)",
+        "Total server memory",
         "Memory",
         InstanceMetricUnit::Bytes,
         InstanceMetricKind::Gauge,
@@ -562,6 +562,17 @@ fn escape_mssql_literal(s: &str) -> String {
     s.replace('\'', "''")
 }
 
+const BYTES_PER_KILOBYTE: f64 = 1024.0;
+
+/// Factor that turns a raw `cntr_value` into the unit the catalog declares.
+/// `Total Server Memory (KB)` is stored in kilobytes, but is declared in bytes.
+fn counter_scale(counter_name: &str) -> f64 {
+    match counter_name {
+        "Total Server Memory (KB)" => BYTES_PER_KILOBYTE,
+        _ => 1.0,
+    }
+}
+
 fn fetch_performance_counter(
     inner: &mut MssqlConnectionInner,
     counter_name: &str,
@@ -600,9 +611,16 @@ fn fetch_performance_counter(
         })?
     };
 
+    Ok(counter_result(counter_name, display_name, value))
+}
+
+/// Builds the one-row metric result from a raw `cntr_value`, in the unit the
+/// catalog declares.
+fn counter_result(counter_name: &str, display_name: &str, raw_value: f64) -> QueryResult {
+    let value = raw_value * counter_scale(counter_name);
     let row: Row = vec![Value::Int(now_epoch_ms()), Value::Float(value)];
 
-    Ok(QueryResult {
+    QueryResult {
         shape: QueryResultShape::Table,
         columns: vec![timestamp_col("timestamp_ms"), float_col(display_name)],
         rows: vec![row],
@@ -614,7 +632,7 @@ fn fetch_performance_counter(
         resolved_window: None,
         metadata_extra: None,
         additional_results: Vec::new(),
-    })
+    }
 }
 
 /// Fetches a ratio-type performance counter as a percentage.
@@ -845,6 +863,43 @@ mod tests {
                 "mssql.lock_waits_per_sec",
                 "mssql.page_reads_per_sec",
                 "mssql.page_writes_per_sec"
+            ]
+        );
+    }
+
+    /// A counter that SQL Server stores in kilobytes is declared in bytes, so
+    /// the fetch must scale it and the label must not name kilobytes.
+    #[test]
+    fn server_memory_is_declared_and_scaled_as_bytes() {
+        let metric = MssqlInstanceCatalog::static_metrics()
+            .into_iter()
+            .find(|metric| metric.id == "mssql.server_memory_kb")
+            .expect("mssql.server_memory_kb must be declared");
+        assert_eq!(metric.unit, InstanceMetricUnit::Bytes);
+        assert!(!metric.display_name.contains("KB"));
+
+        let result = counter_result("Total Server Memory (KB)", &metric.display_name, 2048.0);
+        assert_eq!(result.rows[0][1], Value::Float(2_097_152.0));
+
+        let result = counter_result("Batch Requests/sec", "Batch requests / sec", 2048.0);
+        assert_eq!(result.rows[0][1], Value::Float(2048.0));
+    }
+
+    /// Cumulative counters are charted per second; a gauge here would show the
+    /// running total. Only point-in-time readings stay gauges.
+    #[test]
+    fn only_point_in_time_counters_are_gauges() {
+        let gauges: Vec<_> = MssqlInstanceCatalog::static_metrics()
+            .into_iter()
+            .filter(|metric| metric.kind == datatab_core::InstanceMetricKind::Gauge)
+            .map(|metric| metric.id)
+            .collect();
+        assert_eq!(
+            gauges,
+            vec![
+                "mssql.user_connections",
+                "mssql.buffer_cache_hit_ratio",
+                "mssql.server_memory_kb"
             ]
         );
     }

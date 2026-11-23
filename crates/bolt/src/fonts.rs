@@ -8,7 +8,9 @@
 
 use std::sync::{Arc, LazyLock, OnceLock};
 
-use gpui::{AbsoluteLength, App, Global, Pixels, Rems, SharedString, px};
+use gpui::{
+    AbsoluteLength, App, Font, FontFallbacks, Global, Pixels, Rems, SharedString, font, px,
+};
 
 use crate::tokens::{BASE_REM, EditorMetrics, GridMetrics};
 use crate::typography::{AppFonts, BUNDLED_FONT_ASSETS};
@@ -215,6 +217,17 @@ pub fn editor_family(cx: &App) -> SharedString {
     active(cx).editor_family.clone()
 }
 
+/// The data face's font for the code editor: its family with the mono role's
+/// fallback under it.
+///
+/// The editor sets its family itself instead of going through a text role, so
+/// it does not inherit [`TextVariant::Code`](crate::primitives::TextVariant)'s
+/// fallbacks. Thai text in an editor line finds its glyphs in the bundled Thai
+/// face this way.
+pub fn editor_font(cx: &App) -> Font {
+    mono_font(active(cx).editor_family.clone())
+}
+
 /// Scales an editor-surface measurement drawn for the default editor size,
 /// such as the console's monospace text, by the chosen editor size.
 pub fn editor_scaled(cx: &App, value: Pixels) -> Pixels {
@@ -237,6 +250,18 @@ pub fn editor_line_height(cx: &App) -> Pixels {
 
 pub fn grid_family(cx: &App) -> SharedString {
     active(cx).grid_family.clone()
+}
+
+/// The data face's font for the data grid: its family with the mono role's
+/// fallback under it.
+///
+/// The grid sets its family on a container instead of going through a text
+/// role, so it does not inherit
+/// [`TextVariant::Code`](crate::primitives::TextVariant)'s fallbacks. Cell
+/// values, column names and record fields take the fallback from here, so Thai
+/// data renders in a bundled face at the grid's own size.
+pub fn grid_font(cx: &App) -> Font {
+    mono_font(active(cx).grid_family.clone())
 }
 
 /// Grid cell text and column name size.
@@ -286,6 +311,18 @@ pub fn grid_char_advance(cx: &App) -> f32 {
 /// Advance of one column type character, in pixels.
 pub fn grid_type_char_advance(cx: &App) -> f32 {
     f32::from(grid_type_font_size(cx)) * MONO_ADVANCE_EM
+}
+
+/// `family` with the mono role's fallback under it.
+///
+/// This mirrors [`TextVariant::Code`](crate::primitives::TextVariant)'s font
+/// for the surfaces that set a mono family directly.
+fn mono_font(family: SharedString) -> Font {
+    let mut text_font = font(family);
+    text_font.fallbacks = Some(FontFallbacks::from_fonts(vec![
+        AppFonts::MONO_FALLBACK.to_owned(),
+    ]));
+    text_font
 }
 
 fn active(cx: &App) -> &FontSettings {
@@ -554,6 +591,39 @@ mod tests {
                 SharedString::from("Fira Code")
             );
             assert_eq!(family_for(cx, "Other"), SharedString::from("Other"));
+        });
+    }
+
+    #[gpui::test]
+    fn grid_and_editor_fonts_carry_the_bundled_thai_fallback(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            let thai = Some(FontFallbacks::from_fonts(vec![
+                AppFonts::MONO_FALLBACK.to_owned(),
+            ]));
+
+            let grid = grid_font(cx);
+            assert_eq!(grid.family.as_ref(), AppFonts::MONO);
+            assert_eq!(grid.fallbacks, thai, "grid cells lose Thai glyphs");
+
+            let editor = editor_font(cx);
+            assert_eq!(editor.family.as_ref(), AppFonts::MONO);
+            assert_eq!(editor.fallbacks, thai, "editor lines lose Thai glyphs");
+
+            // A chosen family replaces the Latin face only: the Thai face
+            // below it is the bundled one either way.
+            init(
+                cx,
+                FontSettings {
+                    editor_family: "Fira Code".into(),
+                    grid_family: "Fira Code".into(),
+                    ..FontSettings::default()
+                },
+            );
+
+            assert_eq!(grid_font(cx).family.as_ref(), "Fira Code");
+            assert_eq!(grid_font(cx).fallbacks, thai);
+            assert_eq!(editor_font(cx).family.as_ref(), "Fira Code");
+            assert_eq!(editor_font(cx).fallbacks, thai);
         });
     }
 

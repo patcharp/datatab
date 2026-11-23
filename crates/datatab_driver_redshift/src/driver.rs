@@ -524,11 +524,18 @@ fn is_connection_url(input: &str) -> bool {
 /// Masks the secrets of a connection string, in URL or keyword form, for an
 /// error or a log line.
 pub(crate) fn sanitize_connection_string(input: &str) -> String {
-    if is_connection_url(input) {
-        return datatab_core::sanitize_uri(input);
+    // The userinfo password goes first, while its `@` still marks the end of
+    // it. The libpq pass then runs on the original text: nothing is skipped
+    // because it looks masked, and any key that is not public is masked.
+    let masked = datatab_core::redact_libpq_secret_values(
+        &datatab_core::redact_userinfo_passwords(input, "***"),
+        "***",
+    );
+    if is_connection_url(&masked) {
+        return datatab_core::sanitize_uri(&masked);
     }
     // A keyword string may still carry a URL with credentials.
-    datatab_core::sanitize_uri(&keyword::redacted(input))
+    datatab_core::sanitize_uri(&keyword::redacted(&masked))
 }
 
 fn redshift_uri_sslmode(uri: &str) -> Result<RedshiftSslMode, DbError> {

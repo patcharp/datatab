@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, Utc};
@@ -1258,12 +1258,13 @@ impl MssqlDriver {
             cancelled: Arc::new(AtomicBool::new(false)),
             cancel_generation: Arc::new(AtomicU64::new(0)),
             cancel_lock: Arc::new(Mutex::new(())),
+            identity: Arc::new(SessionIdentity::default()),
             spid: Arc::new(AtomicI32::new(spid)),
             reconnect_config: Arc::new(reconnect_config),
             poisoned: Arc::new(AtomicBool::new(false)),
             recovery: Mutex::new(()),
             #[cfg(test)]
-            test_hooks: Mutex::new(MssqlTestHooks::default()),
+            test_hooks: Arc::new(Mutex::new(MssqlTestHooks::default())),
         }))
     }
 
@@ -1438,12 +1439,13 @@ fn build_mssql_connection(
         cancelled: Arc::new(AtomicBool::new(false)),
         cancel_generation: Arc::new(AtomicU64::new(0)),
         cancel_lock: Arc::new(Mutex::new(())),
+        identity: Arc::new(SessionIdentity::default()),
         spid: Arc::new(AtomicI32::new(session.spid)),
         reconnect_config: Arc::new(session.reconnect_config),
         poisoned: Arc::new(AtomicBool::new(false)),
         recovery: Mutex::new(()),
         #[cfg(test)]
-        test_hooks: Mutex::new(MssqlTestHooks::default()),
+        test_hooks: Arc::new(Mutex::new(MssqlTestHooks::default())),
     }
 }
 
@@ -1458,6 +1460,13 @@ struct MssqlTestHooks {
     after_set_active_database_recover: Option<MssqlTestHook>,
     before_metadata_retry_recovery: Option<MssqlTestHook>,
     before_metadata_retry_attempt: Option<MssqlTestHook>,
+    after_cancel_flags_set: Option<MssqlTestHook>,
+    before_gated_dispatch: Option<MssqlTestHook>,
+    after_execute_cancel_generation: Option<MssqlTestHook>,
+    before_kill_wait: Option<MssqlTestHook>,
+    after_kill_drain: Option<MssqlTestHook>,
+    drain_blocked: Option<MssqlTestHook>,
+    kill_runtime_blocking_work: Option<MssqlTestHook>,
 }
 
 // =============================================================================
@@ -1477,6 +1486,7 @@ pub struct MssqlConnection {
     cancelled: Arc<AtomicBool>,
     cancel_generation: Arc<AtomicU64>,
     cancel_lock: Arc<Mutex<()>>,
+    identity: Arc<SessionIdentity>,
 
     // Cancellation state. `spid` is the server-side session id captured at
     // connect time (and refreshed after each reconnect). `reconnect_config`
@@ -1491,29 +1501,40 @@ pub struct MssqlConnection {
     // Serializes session recovery and database selection (`set_active_database`)
     // so two callers cannot interleave reconnect/restore with a database switch
     // or each reconnect and drop the session the other just restored.
-    // Lock order: `recovery`, then `current_database`, then `inner`, then `cancel_lock`.
+    // Lock order: `recovery`, then `current_database`, then `inner`, then `cancel_lock`,
+    // then `identity.pending_kills` state (taken last, and alone while waiting).
     recovery: Mutex<()>,
 
     #[cfg(test)]
-    test_hooks: Mutex<MssqlTestHooks>,
+    test_hooks: Arc<Mutex<MssqlTestHooks>>,
 }
 
 struct MssqlCancelHandle {
     cancelled: Arc<AtomicBool>,
     cancel_generation: Arc<AtomicU64>,
     cancel_lock: Arc<Mutex<()>>,
+    identity: Arc<SessionIdentity>,
     spid: Arc<AtomicI32>,
     reconnect_config: Arc<tiberius::Config>,
     poisoned: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_hooks: Arc<Mutex<MssqlTestHooks>>,
 }
 
 impl QueryCancelHandle for MssqlCancelHandle {
     fn cancel(&self) -> Result<(), DbError> {
-        // Mark cancellation requested, arm `poisoned`, and advance
-        // `cancel_generation` atomically under `cancel_lock` so recovery and
-        // metadata retries observe the cancel immediately and cannot erase
-        // `cancelled` or overwrite `poisoned` after a concurrent recovery.
-        {
+        // In one critical section under `cancel_lock`: mark the cancel, arm
+        // `poisoned`, advance `cancel_generation`, capture the target (SPID,
+        // incarnation) and register the KILL as pending. Recovery waits for
+        // every pending KILL before it drops the old client and connects a
+        // replacement, so a KILL registered here is finished, or abandoned at
+        // its deadline, before a replacement exists. A cancel that arrives
+        // once recovery has begun its replacement phase registers nothing and
+        // sends no KILL: no statement of the user runs on the replacement
+        // yet. It keeps its flags and generation, so recovery drops the
+        // replacement and the cancelled call reports `Cancelled`. The
+        // incarnation check before the send stays as a second guard.
+        let (spid, incarnation, pending_kill) = {
             let _guard = self
                 .cancel_lock
                 .lock()
@@ -1521,12 +1542,31 @@ impl QueryCancelHandle for MssqlCancelHandle {
             self.cancelled.store(true, Ordering::SeqCst);
             self.poisoned.store(true, Ordering::SeqCst);
             self.cancel_generation.fetch_add(1, Ordering::SeqCst);
-        }
+            let spid = self.spid.load(Ordering::SeqCst);
+            let pending_kill = if spid == 0 {
+                None
+            } else {
+                self.identity.pending_kills.register()
+            };
+            (
+                spid,
+                self.identity.incarnation.load(Ordering::SeqCst),
+                pending_kill,
+            )
+        };
 
-        let spid = self.spid.load(Ordering::SeqCst);
-        if spid == 0 {
+        #[cfg(test)]
+        self.run_test_hook(|hooks| hooks.after_cancel_flags_set.as_ref());
+
+        let Some(pending_kill) = pending_kill else {
+            if spid != 0 {
+                log::info!(
+                    "[CANCEL] session {} is being replaced; no KILL sent, the replacement is dropped",
+                    spid
+                );
+            }
             return Ok(());
-        }
+        };
 
         // Use a fresh single-threaded runtime for the kill round-trip. We
         // must never share the runtime that's currently driving the
@@ -1536,25 +1576,71 @@ impl QueryCancelHandle for MssqlCancelHandle {
             .build()
             .map_err(|e| DbError::query_failed(format!("Failed to start KILL runtime: {}", e)))?;
 
+        #[cfg(test)]
+        if let Some(work) = self
+            .test_hooks
+            .lock()
+            .ok()
+            .and_then(|hooks| hooks.kill_runtime_blocking_work.clone())
+        {
+            rt.spawn_blocking(move || work());
+        }
+
         let config = (*self.reconnect_config).clone();
-        let result: Result<(), tiberius::error::Error> = rt.block_on(async move {
-            let tcp = TcpStream::connect_named(&config).await?;
-            tcp.set_nodelay(true)?;
-            let mut killer = Client::connect(config, tcp.compat_write()).await?;
-            killer
-                .simple_query(format!("KILL {}", spid))
-                .await?
-                .into_results()
-                .await?;
-            Ok(())
+        // One deadline covers connect, login, send and the read of the reply.
+        // A KILL that passes it is abandoned (its socket is dropped) and
+        // treated like a transport failure: recovery is already armed.
+        let deadline = self.identity.pending_kills.kill_deadline();
+        let result: Result<bool, KillFailure> = rt.block_on(async move {
+            tokio::time::timeout(deadline, async move {
+                let tcp = TcpStream::connect_named(&config).await?;
+                tcp.set_nodelay(true)?;
+                let mut killer = Client::connect(config, tcp.compat_write()).await?;
+                if !self.session_is_current(incarnation) {
+                    return Ok(false);
+                }
+                killer
+                    .simple_query(format!("KILL {}", spid))
+                    .await?
+                    .into_results()
+                    .await?;
+                Ok::<_, tiberius::error::Error>(true)
+            })
+            .await
+            .map_err(|_elapsed| KillFailure::DeadlineExceeded)?
+            .map_err(KillFailure::Transport)
         });
 
+        // The KILL is over: release the marker first, then tear the runtime
+        // down without waiting for blocking work (a DNS lookup can outlive
+        // the deadline), so neither holds up recovery or this cancel.
+        drop(pending_kill);
+        rt.shutdown_background();
+
         match result {
-            Ok(()) => {
+            Ok(true) => {
                 log::info!("[CANCEL] KILL {} sent successfully", spid);
                 Ok(())
             }
-            Err(err) => {
+            Ok(false) => {
+                // The session this cancel was issued for has been replaced.
+                // The replacement is untouched; the cancelled call reports
+                // `Cancelled` on its own and no error is shown for the cancel.
+                log::info!(
+                    "[CANCEL] session {} was replaced before KILL; not applicable to the new session",
+                    spid
+                );
+                Ok(())
+            }
+            Err(KillFailure::DeadlineExceeded) => {
+                log::error!(
+                    "[CANCEL] KILL {} did not finish within {:?}; abandoned (recovery armed)",
+                    spid,
+                    deadline
+                );
+                Ok(())
+            }
+            Err(KillFailure::Transport(err)) => {
                 // `poisoned == true` is already armed above, so the next
                 // `execute()` will run `cleanup_after_cancel` and reconnect.
                 // Surfacing this transport failure to the caller would show
@@ -1572,6 +1658,239 @@ impl QueryCancelHandle for MssqlCancelHandle {
 
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
+    }
+}
+
+enum KillFailure {
+    DeadlineExceeded,
+    Transport(tiberius::error::Error),
+}
+
+impl MssqlCancelHandle {
+    fn session_is_current(&self, incarnation: u64) -> bool {
+        let _guard = self
+            .cancel_lock
+            .lock()
+            .unwrap_or_else(|poison_err| poison_err.into_inner());
+        self.identity.incarnation.load(Ordering::SeqCst) == incarnation
+    }
+
+    #[cfg(test)]
+    fn run_test_hook(&self, select: impl FnOnce(&MssqlTestHooks) -> Option<&MssqlTestHook>) {
+        let hook = self
+            .test_hooks
+            .lock()
+            .ok()
+            .and_then(|hooks| select(&hooks).cloned());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+}
+
+/// Identity of the live session, shared by recovery and cancel handles.
+///
+/// `incarnation` is bumped, under `cancel_lock`, by every recovery that
+/// publishes a replacement session. SQL Server may hand the replacement the
+/// same SPID, so a cancel compares the incarnation, never only the SPID.
+#[derive(Default)]
+struct SessionIdentity {
+    incarnation: AtomicU64,
+    pending_kills: Arc<PendingKills>,
+}
+
+/// Longest a cancel's whole `KILL` operation (connect, login, send and read of
+/// the reply, and the runtime teardown that follows) may run. It runs on a side
+/// channel, so a stalled server or network must not hold a cancel, or the
+/// recovery waiting on it, forever.
+const KILL_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Extra time recovery grants beyond [`KILL_DEADLINE`] while it waits for a
+/// pending `KILL`, so the `KILL` always gives up first.
+const KILL_WAIT_GRACE: Duration = Duration::from_secs(2);
+
+/// The `KILL` bookkeeping that coordinates a cancel with session recovery.
+///
+/// Guarantee: a `KILL` aimed at the old session is finished, or abandoned at
+/// its deadline, before recovery drops the old client and connects a
+/// replacement; and a cancel that arrives after that point sends no `KILL` at
+/// all. So a `KILL` cannot reach a replacement that SQL Server gave the same
+/// SPID. Limit: an abandoned `KILL` the server had already received can still
+/// run afterwards.
+///
+/// The state is one mutex, so "no `KILL` pending" and "the replacement phase
+/// has begun" change together. A cancel takes `cancel_lock`, then this mutex;
+/// recovery waits on this mutex alone, holding neither `cancel_lock` nor
+/// `inner`.
+struct PendingKills {
+    state: Mutex<PendingKillsState>,
+    finished: Condvar,
+    deadline: Mutex<Duration>,
+    #[cfg(test)]
+    wait_limit: Mutex<Option<Duration>>,
+}
+
+#[derive(Default)]
+struct PendingKillsState {
+    pending: usize,
+    /// True from the end of the drain until the replacement is published or
+    /// dropped. Set and cleared by recovery only.
+    replacing: bool,
+}
+
+impl Default for PendingKills {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(PendingKillsState::default()),
+            finished: Condvar::new(),
+            deadline: Mutex::new(KILL_DEADLINE),
+            #[cfg(test)]
+            wait_limit: Mutex::new(None),
+        }
+    }
+}
+
+impl PendingKills {
+    fn state(&self) -> std::sync::MutexGuard<'_, PendingKillsState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poison_err| poison_err.into_inner())
+    }
+
+    /// The deadline of one `KILL`. The only place it is read.
+    fn kill_deadline(&self) -> Duration {
+        *self
+            .deadline
+            .lock()
+            .unwrap_or_else(|poison_err| poison_err.into_inner())
+    }
+
+    #[cfg(test)]
+    fn set_kill_deadline(&self, deadline: Duration) {
+        *self
+            .deadline
+            .lock()
+            .unwrap_or_else(|poison_err| poison_err.into_inner()) = deadline;
+    }
+
+    #[cfg(test)]
+    fn set_wait_limit(&self, limit: Duration) {
+        *self
+            .wait_limit
+            .lock()
+            .unwrap_or_else(|poison_err| poison_err.into_inner()) = Some(limit);
+    }
+
+    /// How long recovery waits for pending `KILL`s: past their own deadline.
+    fn wait_limit(&self) -> Duration {
+        #[cfg(test)]
+        if let Some(limit) = *self
+            .wait_limit
+            .lock()
+            .unwrap_or_else(|poison_err| poison_err.into_inner())
+        {
+            return limit;
+        }
+        self.kill_deadline().saturating_add(KILL_WAIT_GRACE)
+    }
+
+    /// Register a `KILL`. `None` once the replacement phase has begun: that
+    /// cancel must send no `KILL`.
+    fn register(self: &Arc<Self>) -> Option<PendingKillGuard> {
+        let mut state = self.state();
+        if state.replacing {
+            return None;
+        }
+        state.pending += 1;
+        Some(PendingKillGuard {
+            owner: Arc::clone(self),
+        })
+    }
+
+    /// Wait until no `KILL` is pending, or `limit` has passed, then begin the
+    /// replacement phase in the same critical section. Returns `false` when
+    /// the wait gave up.
+    fn drain_and_begin_replacement(&self, limit: Duration, on_block: impl Fn()) -> bool {
+        let state = self.state();
+        let (mut state, result) = self
+            .finished
+            .wait_timeout_while(state, limit, |state| {
+                let must_wait = state.pending > 0;
+                if must_wait {
+                    on_block();
+                }
+                must_wait
+            })
+            .unwrap_or_else(|poison_err| poison_err.into_inner());
+        state.replacing = true;
+        !result.timed_out()
+    }
+
+    fn end_replacement(&self) {
+        self.state().replacing = false;
+    }
+
+    #[cfg(test)]
+    fn is_replacing(&self) -> bool {
+        self.state().replacing
+    }
+
+    #[cfg(test)]
+    fn pending(&self) -> usize {
+        self.state().pending
+    }
+}
+
+/// Marks one cancel's `KILL` as pending until it is dropped, on every path.
+struct PendingKillGuard {
+    owner: Arc<PendingKills>,
+}
+
+impl Drop for PendingKillGuard {
+    fn drop(&mut self) {
+        let mut state = self.owner.state();
+        state.pending = state.pending.saturating_sub(1);
+        if state.pending == 0 {
+            self.owner.finished.notify_all();
+        }
+    }
+}
+
+/// Ends the replacement phase when recovery leaves it, on every path.
+struct ReplacementPhase<'a> {
+    pending_kills: &'a PendingKills,
+}
+
+impl Drop for ReplacementPhase<'_> {
+    fn drop(&mut self) {
+        self.pending_kills.end_replacement();
+    }
+}
+
+thread_local! {
+    /// Cancel generation every dispatch on this thread must still match when
+    /// it takes the `inner` lock. Armed for the scope of a metadata retry and
+    /// for the send of one `execute()` batch.
+    static RETRY_DISPATCH_GATE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Arms [`RETRY_DISPATCH_GATE`] for one scope and restores the previous value
+/// on drop, even when the scope never reaches `with_client_checked`, so
+/// nested scopes are safe.
+struct RetryDispatchGate {
+    previous: Option<u64>,
+}
+
+impl RetryDispatchGate {
+    fn arm(cancel_gen: u64) -> Self {
+        let previous = RETRY_DISPATCH_GATE.with(|gate| gate.replace(Some(cancel_gen)));
+        Self { previous }
+    }
+}
+
+impl Drop for RetryDispatchGate {
+    fn drop(&mut self) {
+        RETRY_DISPATCH_GATE.with(|gate| gate.set(self.previous));
     }
 }
 
@@ -1626,6 +1945,13 @@ impl MssqlConnection {
             });
         };
 
+        // While a gate is armed (a metadata retry, or the send of one
+        // `execute()` batch), the dispatch decides here, under `inner`: a
+        // cancel that landed earlier stops it, and one that lands later is an
+        // in-flight cancel whose KILL interrupts the call. `cancel()` never
+        // takes `inner`, so the KILL is not blocked by this call.
+        self.check_dispatch_gate().map_err(ClientCallError::from)?;
+
         match f(&inner.runtime, client) {
             Ok(value) => Ok(value),
             Err(ClientError::Db(error)) => Err(ClientCallError::from(error)),
@@ -1651,6 +1977,20 @@ impl MssqlConnection {
     fn recover_session(&self) -> Result<(), DbError> {
         if self.poisoned.load(Ordering::SeqCst) {
             self.cleanup_after_cancel()?;
+        }
+        Ok(())
+    }
+
+    /// Refuse a dispatch when the armed gate's cancel generation has moved.
+    /// The caller holds `inner`.
+    fn check_dispatch_gate(&self) -> Result<(), DbError> {
+        let Some(gate_generation) = RETRY_DISPATCH_GATE.with(|gate| gate.get()) else {
+            return Ok(());
+        };
+        #[cfg(test)]
+        self.run_test_hook(|hooks| hooks.before_gated_dispatch.as_ref());
+        if self.is_cancelled_for_generation(Some(gate_generation)) {
+            return Err(DbError::Cancelled);
         }
         Ok(())
     }
@@ -1710,6 +2050,31 @@ impl MssqlConnection {
         })
     }
 
+    /// Drain the pending KILLs and begin the replacement phase. The phase ends
+    /// when the returned guard drops (a published or dropped replacement).
+    fn begin_replacement(&self) -> ReplacementPhase<'_> {
+        #[cfg(test)]
+        self.run_test_hook(|hooks| hooks.before_kill_wait.as_ref());
+
+        let pending_kills = &*self.identity.pending_kills;
+        let limit = pending_kills.wait_limit();
+        let on_block = || {
+            #[cfg(test)]
+            self.run_test_hook(|hooks| hooks.drain_blocked.as_ref());
+        };
+        if !pending_kills.drain_and_begin_replacement(limit, on_block) {
+            log::warn!(
+                "[CLEANUP] A pending KILL did not finish within {limit:?}; reconnecting anyway"
+            );
+        }
+        let phase = ReplacementPhase { pending_kills };
+
+        #[cfg(test)]
+        self.run_test_hook(|hooks| hooks.after_kill_drain.as_ref());
+
+        phase
+    }
+
     fn cleanup_after_cancel_locked(
         &self,
         expected_cancel_gen: Option<u64>,
@@ -1754,6 +2119,13 @@ impl MssqlConnection {
         #[cfg(test)]
         self.run_test_hook(|hooks| hooks.before_cleanup_inner_lock.as_ref());
 
+        // A KILL aimed at the old session must be finished, or abandoned at
+        // its deadline, before the old client is dropped and a replacement
+        // exists; from here until the replacement is published or dropped, a
+        // new cancel sends no KILL. This holds `recovery` only: a cancel never
+        // takes it, nor `inner`.
+        let _replacement_phase = self.begin_replacement();
+
         let new_session: Result<Option<(i32, Option<String>)>, DbError> = {
             let mut guard = match self.inner.lock() {
                 Ok(g) => g,
@@ -1769,6 +2141,9 @@ impl MssqlConnection {
                         .cancel_lock
                         .lock()
                         .unwrap_or_else(|poison_err| poison_err.into_inner());
+                    // The decision and the end of the phase are one step under
+                    // `cancel_lock`, so no cancel falls between them.
+                    self.identity.pending_kills.end_replacement();
                     let gen_now = self.cancel_generation.load(Ordering::SeqCst);
                     let cancelled_now = self.cancelled.load(Ordering::SeqCst);
                     let new_cancel_arrived = gen_now != cancel_gen_at_start
@@ -1779,12 +2154,31 @@ impl MssqlConnection {
                     }
                     guard.client = Some(client);
                     self.spid.store(spid, Ordering::SeqCst);
+                    self.identity.incarnation.fetch_add(1, Ordering::SeqCst);
                     self.poisoned.store(false, Ordering::SeqCst);
                     self.cancelled.store(false, Ordering::SeqCst);
                     Some((spid, database))
                 },
             )
         };
+
+        // A failed reconnect, capture or database restore after a cancel
+        // advanced the generation is that cancel's doing: report `Cancelled`,
+        // not a connection error.
+        if new_session.is_err() {
+            let _cancel_guard = self
+                .cancel_lock
+                .lock()
+                .unwrap_or_else(|poison_err| poison_err.into_inner());
+            let gen_now = self.cancel_generation.load(Ordering::SeqCst);
+            let cancelled_now = self.cancelled.load(Ordering::SeqCst);
+            if gen_now != cancel_gen_at_start
+                || expected_cancel_gen
+                    .is_some_and(|gen_before| cancelled_now || gen_now != gen_before)
+            {
+                return Ok(RecoveryOutcome::Cancelled);
+            }
+        }
 
         let Some((new_spid, new_database)) = new_session? else {
             return Ok(RecoveryOutcome::Cancelled);
@@ -1850,7 +2244,10 @@ impl MssqlConnection {
                     "[SCHEMA] Retrying metadata read on a new session after: {}",
                     failure.error
                 );
-                let retry_result = read().map_err(|retry_failure| retry_failure.error);
+                let retry_result = {
+                    let _gate = RetryDispatchGate::arm(cancel_gen_before);
+                    read().map_err(|retry_failure| retry_failure.error)
+                };
                 if self.is_cancelled_for_generation(Some(cancel_gen_before)) {
                     return Err(DbError::Cancelled);
                 }
@@ -2386,6 +2783,13 @@ impl Connection for MssqlConnection {
             }
         }
 
+        // A cancel that lands after this point and before the batch is sent
+        // must stop the send even if another call's recovery clears
+        // `cancelled` in between, so remember the generation now.
+        let cancel_gen_at_start = self.cancel_generation.load(Ordering::SeqCst);
+        #[cfg(test)]
+        self.run_test_hook(|hooks| hooks.after_execute_cancel_generation.as_ref());
+
         // Do not blanket-reset `cancelled` here — that would race with a
         // `cancel()` that fires between two executions and silently drop the
         // signal. Instead, recover the connection if a previous cancel or lost
@@ -2407,12 +2811,16 @@ impl Connection for MssqlConnection {
                     let mut inner = self.inner.lock().map_err(|_| {
                         DbError::QueryFailed("mssql inner mutex poisoned".to_string().into())
                     })?;
+                    let _gate = RetryDispatchGate::arm(cancel_gen_at_start);
+                    self.check_dispatch_gate()?;
                     return crate::instance_catalog::dispatch_metric_series(&mut inner, metric_id);
                 }
                 ExecutionSourceContext::InstanceInspectorQuery { metric_id } => {
                     let mut inner = self.inner.lock().map_err(|_| {
                         DbError::QueryFailed("mssql inner mutex poisoned".to_string().into())
                     })?;
+                    let _gate = RetryDispatchGate::arm(cancel_gen_at_start);
+                    self.check_dispatch_gate()?;
                     return crate::instance_catalog::dispatch_inspector_snapshot(
                         &mut inner, metric_id,
                     );
@@ -2432,21 +2840,28 @@ impl Connection for MssqlConnection {
 
         let transaction_count_before = self.transaction_count_before_batch(&req.sql);
 
-        match self.execute_simple_bounded(&req.sql, req.limit) {
+        let batch_result = {
+            let _gate = RetryDispatchGate::arm(cancel_gen_at_start);
+            self.execute_simple_bounded(&req.sql, req.limit)
+        };
+        match batch_result {
             Ok(result) => {
-                if self.cancelled.load(Ordering::SeqCst) {
+                if self.is_cancelled_for_generation(Some(cancel_gen_at_start)) {
                     Err(DbError::Cancelled)
                 } else {
                     Ok(result)
                 }
             }
+            Err(DbError::Cancelled) => Err(DbError::Cancelled),
             Err(err) => {
                 // After KILL, the server raises a session-terminated error
                 // (596 / 233 / 6005) on the next read from the killed
                 // connection. Map any such error to `Cancelled` when the user
                 // actually requested cancellation, so the UI surfaces the
                 // expected outcome instead of a confusing protocol error.
-                if self.cancelled.load(Ordering::SeqCst) || is_kill_error(&err) {
+                if self.is_cancelled_for_generation(Some(cancel_gen_at_start))
+                    || is_kill_error(&err)
+                {
                     Err(DbError::Cancelled)
                 } else {
                     Err(self.resolve_failed_batch_transaction(err, transaction_count_before))
@@ -2468,9 +2883,12 @@ impl Connection for MssqlConnection {
             cancelled: self.cancelled.clone(),
             cancel_generation: self.cancel_generation.clone(),
             cancel_lock: self.cancel_lock.clone(),
+            identity: self.identity.clone(),
             spid: self.spid.clone(),
             reconnect_config: self.reconnect_config.clone(),
             poisoned: self.poisoned.clone(),
+            #[cfg(test)]
+            test_hooks: self.test_hooks.clone(),
         })
     }
 
@@ -3082,6 +3500,15 @@ impl Connection for MssqlConnection {
         self.read_metadata(|| self.fetch_schema_indexes(database, schema_name))
     }
 
+    fn schema_columns(
+        &self,
+        database: &str,
+        schema: Option<&str>,
+    ) -> Result<Vec<datatab_core::SchemaColumnInfo>, DbError> {
+        let schema_name = schema.unwrap_or("dbo");
+        self.read_metadata(|| self.fetch_schema_columns(database, schema_name))
+    }
+
     fn schema_foreign_keys(
         &self,
         database: &str,
@@ -3592,53 +4019,46 @@ impl MssqlConnection {
         );
 
         let result = self.execute_simple_checked(&sql)?;
-        let mut columns = Vec::new();
+        Ok(decode_table_columns(result.rows))
+    }
 
-        for row in result.rows {
-            let mut iter = row.into_iter();
+    fn fetch_schema_columns(
+        &self,
+        database: &str,
+        schema: &str,
+    ) -> Result<Vec<datatab_core::SchemaColumnInfo>, ClientCallError> {
+        let escaped_db = database.replace(']', "]]");
+        let qualified_db = format!("[{}]", escaped_db);
+        let escaped_schema = schema.replace('\'', "''");
 
-            let name = match iter.next() {
-                Some(Value::Text(s)) => s,
-                _ => continue,
-            };
-            let type_name = match iter.next() {
-                Some(Value::Text(s)) => s,
-                _ => String::new(),
-            };
-            let nullable = value_is_truthy(iter.next());
-            let default_value = match iter.next() {
-                Some(Value::Text(s)) => Some(s),
-                _ => None,
-            };
-            let is_primary_key = value_is_truthy(iter.next());
-            let max_length = match iter.next() {
-                Some(Value::Int(n)) => n as i32,
-                _ => 0,
-            };
-            let precision = match iter.next() {
-                Some(Value::Int(n)) => n.clamp(0, u8::MAX as i64) as u8,
-                _ => 0,
-            };
-            let scale = match iter.next() {
-                Some(Value::Int(n)) => n.clamp(0, u8::MAX as i64) as u8,
-                _ => 0,
-            };
+        let sql = format!(
+            "SELECT \
+                tbl.name AS table_name, \
+                c.name AS column_name, \
+                t.name AS type_name, \
+                c.is_nullable AS nullable, \
+                CAST(dc.definition AS NVARCHAR(MAX)) AS column_default, \
+                CASE WHEN ic.column_id IS NOT NULL THEN 1 ELSE 0 END AS is_pk, \
+                c.max_length, c.precision, c.scale \
+             FROM {qualified_db}.sys.columns c \
+             JOIN {qualified_db}.sys.tables tbl ON tbl.object_id = c.object_id \
+             JOIN {qualified_db}.sys.schemas s ON s.schema_id = tbl.schema_id \
+             JOIN {qualified_db}.sys.types t ON t.user_type_id = c.user_type_id \
+             LEFT JOIN {qualified_db}.sys.default_constraints dc \
+               ON dc.parent_object_id = c.object_id AND dc.parent_column_id = c.column_id \
+             LEFT JOIN {qualified_db}.sys.indexes pk \
+               ON pk.object_id = c.object_id AND pk.is_primary_key = 1 \
+             LEFT JOIN {qualified_db}.sys.index_columns ic \
+               ON ic.object_id = pk.object_id AND ic.index_id = pk.index_id \
+               AND ic.column_id = c.column_id \
+             WHERE s.name = '{escaped_schema}' \
+             ORDER BY tbl.name, c.column_id",
+            qualified_db = qualified_db,
+            escaped_schema = escaped_schema
+        );
 
-            columns.push(ColumnInfo {
-                name,
-                // Full dimensions (lengths incl. MAX, precision/scale,
-                // temporal scale) are baked in here; identity deliberately
-                // stays out of the type name — it travels in
-                // `table_creation_metadata`.
-                type_name: mssql_column_type_name(&type_name, max_length, precision, scale),
-                nullable,
-                default_value,
-                is_primary_key,
-                enum_values: None,
-            });
-        }
-
-        Ok(columns)
+        let result = self.execute_simple_checked(&sql)?;
+        Ok(decode_schema_columns(result.rows))
     }
 
     fn fetch_indexes(
@@ -3744,52 +4164,7 @@ impl MssqlConnection {
 
         let result = self.execute_simple_checked(&sql)?;
 
-        let mut builder = ForeignKeyBuilder::new();
-
-        for row in result.rows {
-            let mut iter = row.into_iter();
-
-            let name = match iter.next() {
-                Some(Value::Text(s)) => s,
-                _ => continue,
-            };
-            let column = match iter.next() {
-                Some(Value::Text(s)) => s,
-                _ => continue,
-            };
-            let referenced_schema = match iter.next() {
-                Some(Value::Text(s)) => Some(s),
-                _ => None,
-            };
-            let referenced_table = match iter.next() {
-                Some(Value::Text(s)) => s,
-                _ => continue,
-            };
-            let referenced_column = match iter.next() {
-                Some(Value::Text(s)) => s,
-                _ => continue,
-            };
-            let on_delete = match iter.next() {
-                Some(Value::Text(s)) if s != "NO_ACTION" => Some(normalize_fk_action(&s)),
-                _ => None,
-            };
-            let on_update = match iter.next() {
-                Some(Value::Text(s)) if s != "NO_ACTION" => Some(normalize_fk_action(&s)),
-                _ => None,
-            };
-
-            builder.add_column(
-                name,
-                column,
-                referenced_schema,
-                referenced_table,
-                referenced_column,
-                on_delete,
-                on_update,
-            );
-        }
-
-        Ok(builder.build_sorted())
+        Ok(decode_table_foreign_keys(result.rows))
     }
 
     fn fetch_constraints(
@@ -4079,57 +4454,172 @@ impl MssqlConnection {
         );
 
         let rows = self.execute_simple_checked(&sql)?;
-        let mut builder = SchemaForeignKeyBuilder::new();
-
-        for row in rows.rows {
-            let mut iter = row.into_iter();
-            let table_name = match iter.next() {
-                Some(Value::Text(s)) => s,
-                _ => continue,
-            };
-            let name = match iter.next() {
-                Some(Value::Text(s)) => s,
-                _ => continue,
-            };
-            let column = match iter.next() {
-                Some(Value::Text(s)) => s,
-                _ => continue,
-            };
-            let referenced_schema = match iter.next() {
-                Some(Value::Text(s)) => Some(s),
-                _ => None,
-            };
-            let referenced_table = match iter.next() {
-                Some(Value::Text(s)) => s,
-                _ => continue,
-            };
-            let referenced_column = match iter.next() {
-                Some(Value::Text(s)) => s,
-                _ => continue,
-            };
-            let on_delete = match iter.next() {
-                Some(Value::Text(s)) if s != "NO_ACTION" => Some(normalize_fk_action(&s)),
-                _ => None,
-            };
-            let on_update = match iter.next() {
-                Some(Value::Text(s)) if s != "NO_ACTION" => Some(normalize_fk_action(&s)),
-                _ => None,
-            };
-
-            builder.add_column(
-                table_name,
-                name,
-                column,
-                referenced_schema,
-                referenced_table,
-                referenced_column,
-                on_update,
-                on_delete,
-            );
-        }
-
-        Ok(builder.build_sorted())
+        Ok(decode_schema_foreign_keys(rows.rows))
     }
+}
+
+fn decode_table_columns(rows: Vec<Row>) -> Vec<ColumnInfo> {
+    rows.into_iter().filter_map(decode_column).collect()
+}
+
+fn decode_column(row: Row) -> Option<ColumnInfo> {
+    let mut iter = row.into_iter();
+
+    let name = match iter.next() {
+        Some(Value::Text(s)) => s,
+        _ => return None,
+    };
+    let type_name = match iter.next() {
+        Some(Value::Text(s)) => s,
+        _ => String::new(),
+    };
+    let nullable = value_is_truthy(iter.next());
+    let default_value = match iter.next() {
+        Some(Value::Text(s)) => Some(s),
+        _ => None,
+    };
+    let is_primary_key = value_is_truthy(iter.next());
+    let max_length = match iter.next() {
+        Some(Value::Int(n)) => n as i32,
+        _ => 0,
+    };
+    let precision = match iter.next() {
+        Some(Value::Int(n)) => n.clamp(0, u8::MAX as i64) as u8,
+        _ => 0,
+    };
+    let scale = match iter.next() {
+        Some(Value::Int(n)) => n.clamp(0, u8::MAX as i64) as u8,
+        _ => 0,
+    };
+
+    Some(ColumnInfo {
+        name,
+        // Full dimensions (lengths incl. MAX, precision/scale,
+        // temporal scale) are baked in here; identity deliberately
+        // stays out of the type name — it travels in
+        // `table_creation_metadata`.
+        type_name: mssql_column_type_name(&type_name, max_length, precision, scale),
+        nullable,
+        default_value,
+        is_primary_key,
+        enum_values: None,
+    })
+}
+
+fn decode_schema_columns(rows: Vec<Row>) -> Vec<datatab_core::SchemaColumnInfo> {
+    rows.into_iter()
+        .filter_map(|row| {
+            let mut values = row.into_iter();
+            let table_name = match values.next() {
+                Some(Value::Text(name)) => name,
+                _ => return None,
+            };
+            let column = decode_column(values.collect())?;
+            Some(datatab_core::SchemaColumnInfo { table_name, column })
+        })
+        .collect()
+}
+
+fn decode_table_foreign_keys(rows: Vec<Vec<Value>>) -> Vec<ForeignKeyInfo> {
+    let mut builder = ForeignKeyBuilder::new();
+
+    for row in rows {
+        let mut iter = row.into_iter();
+
+        let name = match iter.next() {
+            Some(Value::Text(s)) => s,
+            _ => continue,
+        };
+        let column = match iter.next() {
+            Some(Value::Text(s)) => s,
+            _ => continue,
+        };
+        let referenced_schema = match iter.next() {
+            Some(Value::Text(s)) => Some(s),
+            _ => None,
+        };
+        let referenced_table = match iter.next() {
+            Some(Value::Text(s)) => s,
+            _ => continue,
+        };
+        let referenced_column = match iter.next() {
+            Some(Value::Text(s)) => s,
+            _ => continue,
+        };
+        let on_delete = match iter.next() {
+            Some(Value::Text(s)) if s != "NO_ACTION" => Some(normalize_fk_action(&s)),
+            _ => None,
+        };
+        let on_update = match iter.next() {
+            Some(Value::Text(s)) if s != "NO_ACTION" => Some(normalize_fk_action(&s)),
+            _ => None,
+        };
+
+        builder.add_column(
+            name,
+            column,
+            referenced_schema,
+            referenced_table,
+            referenced_column,
+            on_update,
+            on_delete,
+        );
+    }
+
+    builder.build_sorted()
+}
+
+fn decode_schema_foreign_keys(rows: Vec<Vec<Value>>) -> Vec<SchemaForeignKeyInfo> {
+    let mut builder = SchemaForeignKeyBuilder::new();
+
+    for row in rows {
+        let mut iter = row.into_iter();
+        let table_name = match iter.next() {
+            Some(Value::Text(s)) => s,
+            _ => continue,
+        };
+        let name = match iter.next() {
+            Some(Value::Text(s)) => s,
+            _ => continue,
+        };
+        let column = match iter.next() {
+            Some(Value::Text(s)) => s,
+            _ => continue,
+        };
+        let referenced_schema = match iter.next() {
+            Some(Value::Text(s)) => Some(s),
+            _ => None,
+        };
+        let referenced_table = match iter.next() {
+            Some(Value::Text(s)) => s,
+            _ => continue,
+        };
+        let referenced_column = match iter.next() {
+            Some(Value::Text(s)) => s,
+            _ => continue,
+        };
+        let on_delete = match iter.next() {
+            Some(Value::Text(s)) if s != "NO_ACTION" => Some(normalize_fk_action(&s)),
+            _ => None,
+        };
+        let on_update = match iter.next() {
+            Some(Value::Text(s)) if s != "NO_ACTION" => Some(normalize_fk_action(&s)),
+            _ => None,
+        };
+
+        builder.add_column(
+            table_name,
+            name,
+            column,
+            referenced_schema,
+            referenced_table,
+            referenced_column,
+            on_update,
+            on_delete,
+        );
+    }
+
+    builder.build_sorted()
 }
 
 // Local indexmap usage so we don't depend on datatab_core's indexmap re-export.
@@ -5670,6 +6160,7 @@ fn dependents_from_rows(rows: Vec<(String, String, String)>) -> Vec<datatab_core
 
 #[cfg(test)]
 mod tests {
+    mod referential_actions;
     mod sslmode;
     mod tls_metadata;
 
@@ -7784,12 +8275,13 @@ mod query_safety_tests {
             cancelled: Arc::new(AtomicBool::new(false)),
             cancel_generation: Arc::new(AtomicU64::new(0)),
             cancel_lock: Arc::new(Mutex::new(())),
+            identity: Arc::new(super::SessionIdentity::default()),
             spid: Arc::new(AtomicI32::new(0)),
             reconnect_config: Arc::new(tiberius::Config::new()),
             poisoned: Arc::new(AtomicBool::new(false)),
             recovery: Mutex::new(()),
             #[cfg(test)]
-            test_hooks: Mutex::new(MssqlTestHooks::default()),
+            test_hooks: Arc::new(Mutex::new(MssqlTestHooks::default())),
         }
     }
 
@@ -8364,12 +8856,13 @@ mod query_safety_tests {
                 cancelled: Arc::new(AtomicBool::new(false)),
                 cancel_generation: Arc::new(AtomicU64::new(0)),
                 cancel_lock: Arc::new(Mutex::new(())),
+                identity: Arc::new(super::SessionIdentity::default()),
                 spid: Arc::new(AtomicI32::new(0)),
                 reconnect_config: Arc::new(reconnect_config),
                 poisoned: Arc::new(AtomicBool::new(false)),
                 recovery: Mutex::new(()),
                 #[cfg(test)]
-                test_hooks: Mutex::new(MssqlTestHooks::default()),
+                test_hooks: Arc::new(Mutex::new(MssqlTestHooks::default())),
             }
         }
     }
@@ -8819,10 +9312,10 @@ mod query_safety_tests {
                         database: Some("master".to_string()),
                     }
                 }
-                // conn 2: KILL 42 from cancel()
-                (2, 0) => TdsBatchAction::ReplyDone,
-                // conn 3: post-cancel cleanup recovery
-                (3, 0) => TdsBatchAction::ReplySessionInfo {
+                // The cancel arrives during the replacement phase and sends no
+                // KILL, so there is no side-channel connection.
+                // conn 2: post-cancel cleanup recovery
+                (2, 0) => TdsBatchAction::ReplySessionInfo {
                     spid: 44,
                     database: Some("master".to_string()),
                 },
@@ -8962,6 +9455,683 @@ mod query_safety_tests {
             assert!(connection.cancelled.load(Ordering::SeqCst));
             assert!(connection.poisoned.load(Ordering::SeqCst));
         }
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum RecoveryEvent {
+        DrainBlocked,
+        Drained,
+        ReplacementEstablished,
+    }
+
+    /// Model of SQL Server's `KILL`: a KILL that arrives after a replacement
+    /// session was handed the same SPID kills that replacement.
+    #[test]
+    fn mssql_recovery_waits_for_a_pending_kill_before_a_replacement_reuses_the_spid() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let kill_seen = Arc::new(AtomicBool::new(false));
+        let replacement_established = Arc::new(AtomicBool::new(false));
+        let replacement_killed = Arc::new(AtomicBool::new(false));
+        let kill_seen_at_drain_end = Arc::new(AtomicBool::new(false));
+        let kill_gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+
+        let (events_tx, events_rx) = std::sync::mpsc::channel::<RecoveryEvent>();
+        let events = Arc::new(Mutex::new(events_tx));
+
+        let server = FakeTdsServer::start_with_handler({
+            let events = events.clone();
+            let kill_seen = kill_seen.clone();
+            let replacement_established = replacement_established.clone();
+            let replacement_killed = replacement_killed.clone();
+            let kill_gate = kill_gate.clone();
+            move |req| {
+                let sql = req.sql.clone().unwrap_or_default();
+                if sql.starts_with("KILL") {
+                    if replacement_established.load(Ordering::SeqCst) {
+                        replacement_killed.store(true, Ordering::SeqCst);
+                    }
+                    kill_seen.store(true, Ordering::SeqCst);
+                    let (lock, cvar) = &*kill_gate;
+                    *lock.lock().expect("kill gate lock") = true;
+                    cvar.notify_all();
+                    TdsBatchAction::ReplyDone
+                } else if sql.contains("@@SPID") {
+                    // The recovery connection: the server reuses SPID 42.
+                    replacement_established.store(true, Ordering::SeqCst);
+                    events
+                        .lock()
+                        .expect("events lock")
+                        .send(RecoveryEvent::ReplacementEstablished)
+                        .expect("signal replacement established");
+                    let (lock, cvar) = &*kill_gate;
+                    let guard = lock.lock().expect("kill gate lock");
+                    let _ = cvar
+                        .wait_timeout_while(guard, Duration::from_secs(5), |seen| !*seen)
+                        .expect("kill gate wait");
+                    TdsBatchAction::ReplySessionInfo {
+                        spid: 42,
+                        database: Some("master".to_string()),
+                    }
+                } else {
+                    TdsBatchAction::ReplyDone
+                }
+            }
+        });
+        let connection = server.connect();
+        connection.spid.store(42, Ordering::SeqCst);
+        let cancel_handle = connection.cancel_handle();
+
+        let (parked_tx, parked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        let (at_wait_tx, at_wait_rx) = std::sync::mpsc::channel();
+        {
+            let mut hooks = connection.test_hooks.lock().expect("test_hooks lock");
+            hooks.after_cancel_flags_set = Some(Arc::new(move || {
+                parked_tx.send(()).expect("signal cancel parked");
+                release_rx
+                    .lock()
+                    .expect("release rx lock")
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("cancel must be released");
+            }));
+            hooks.before_kill_wait = Some(Arc::new(move || {
+                at_wait_tx.send(()).expect("signal recovery at wait");
+            }));
+            let kill_seen = kill_seen.clone();
+            let kill_seen_at_drain_end = kill_seen_at_drain_end.clone();
+            let drained_events = events.clone();
+            hooks.after_kill_drain = Some(Arc::new(move || {
+                kill_seen_at_drain_end.store(kill_seen.load(Ordering::SeqCst), Ordering::SeqCst);
+                drained_events
+                    .lock()
+                    .expect("events lock")
+                    .send(RecoveryEvent::Drained)
+                    .expect("signal drain ended");
+            }));
+            let blocked_events = events.clone();
+            hooks.drain_blocked = Some(Arc::new(move || {
+                // Sent from inside the drain's wait predicate: it is about to
+                // block on the pending KILL.
+                if let Err(error) = blocked_events
+                    .lock()
+                    .expect("events lock")
+                    .send(RecoveryEvent::DrainBlocked)
+                {
+                    // The predicate can run again after the test stopped
+                    // listening; that later signal has no reader.
+                    log::trace!("drain_blocked signal not delivered: {error}");
+                }
+            }));
+        }
+
+        std::thread::scope(|scope| {
+            let cancel_thread = scope.spawn(|| cancel_handle.cancel());
+            parked_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("cancel must register its KILL and park");
+            let recovery_thread = scope.spawn(|| connection.cleanup_after_cancel());
+            at_wait_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("recovery must reach the pending-KILL wait");
+            // Force the unsafe order. The cancel is released only once
+            // recovery either blocks on the pending KILL (correct code) or got
+            // past the drain (no drain). In the second case the cancel is held
+            // further until the replacement exists, so its KILL is certain to
+            // arrive after it.
+            loop {
+                match events_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("recovery must block on the KILL or pass the drain")
+                {
+                    RecoveryEvent::DrainBlocked => break,
+                    RecoveryEvent::Drained => {
+                        while events_rx
+                            .recv_timeout(Duration::from_secs(5))
+                            .expect("the replacement must connect")
+                            != RecoveryEvent::ReplacementEstablished
+                        {}
+                        break;
+                    }
+                    RecoveryEvent::ReplacementEstablished => {}
+                }
+            }
+            release_tx.send(()).expect("release the cancel");
+            cancel_thread
+                .join()
+                .expect("cancel thread must not panic")
+                .expect("cancel must succeed");
+            recovery_thread
+                .join()
+                .expect("recovery thread must not panic")
+                .expect("recovery must succeed");
+        });
+
+        assert!(
+            kill_seen.load(Ordering::SeqCst),
+            "the pending KILL must reach the old session"
+        );
+        assert!(
+            kill_seen_at_drain_end.load(Ordering::SeqCst),
+            "the drain must end only after the pending KILL was served"
+        );
+        assert!(
+            !replacement_killed.load(Ordering::SeqCst),
+            "a replacement that reuses the SPID must not be killed"
+        );
+        assert_eq!(connection.spid.load(Ordering::SeqCst), 42);
+        assert_eq!(connection.identity.incarnation.load(Ordering::SeqCst), 1);
+        assert!(!connection.poisoned.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn mssql_kill_that_stalls_is_abandoned_at_its_deadline() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let handler_gave_up = Arc::new(AtomicBool::new(false));
+        let stall_gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let server = FakeTdsServer::start_with_handler({
+            let handler_gave_up = handler_gave_up.clone();
+            let stall_gate = stall_gate.clone();
+            move |req| {
+                if req
+                    .sql
+                    .as_deref()
+                    .is_some_and(|sql| sql.starts_with("KILL"))
+                {
+                    // The side channel never answers until the test lets it.
+                    let (lock, cvar) = &*stall_gate;
+                    let guard = lock.lock().expect("stall gate lock");
+                    let (_guard, wait) = cvar
+                        .wait_timeout_while(guard, Duration::from_secs(5), |open| !*open)
+                        .expect("stall gate wait");
+                    if wait.timed_out() {
+                        handler_gave_up.store(true, Ordering::SeqCst);
+                    }
+                }
+                TdsBatchAction::ReplyDone
+            }
+        });
+        let connection = server.connect();
+        connection.spid.store(42, Ordering::SeqCst);
+        connection
+            .identity
+            .pending_kills
+            .set_kill_deadline(Duration::from_millis(100));
+
+        connection
+            .cancel_handle()
+            .cancel()
+            .expect("a stalled KILL is abandoned without failing the cancel");
+
+        assert!(
+            !handler_gave_up.load(Ordering::SeqCst),
+            "the cancel must return at its deadline while the server is still silent"
+        );
+        assert_eq!(
+            connection.identity.pending_kills.pending(),
+            0,
+            "an abandoned KILL must not stay pending"
+        );
+        assert!(connection.poisoned.load(Ordering::SeqCst));
+
+        let (lock, cvar) = &*stall_gate;
+        *lock.lock().expect("stall gate lock") = true;
+        cvar.notify_all();
+    }
+
+    #[test]
+    fn mssql_pending_kill_drain_is_bounded_and_ends_when_the_kill_finishes() {
+        let pending = Arc::new(super::PendingKills::default());
+
+        let guard = pending
+            .register()
+            .expect("a KILL registers before recovery");
+        assert!(
+            !pending.drain_and_begin_replacement(Duration::ZERO, || {}),
+            "a stuck KILL must not hold the drain past its limit"
+        );
+        assert!(pending.is_replacing());
+        assert!(
+            pending.register().is_none(),
+            "no KILL registers once the replacement phase began"
+        );
+        drop(guard);
+        pending.end_replacement();
+        assert!(pending.register().is_some());
+        assert!(pending.drain_and_begin_replacement(Duration::ZERO, || {}));
+    }
+
+    #[test]
+    fn mssql_recovery_goes_on_when_a_pending_kill_never_finishes() {
+        use std::sync::atomic::Ordering;
+
+        let server = FakeTdsServer::start_with_handler(|req| {
+            if req.sql.as_deref().is_some_and(|sql| sql.contains("@@SPID")) {
+                TdsBatchAction::ReplySessionInfo {
+                    spid: 43,
+                    database: Some("master".to_string()),
+                }
+            } else {
+                TdsBatchAction::ReplyDone
+            }
+        });
+        let connection = server.connect();
+        connection.spid.store(42, Ordering::SeqCst);
+        connection.poisoned.store(true, Ordering::SeqCst);
+        let stuck = connection
+            .identity
+            .pending_kills
+            .register()
+            .expect("a KILL registers before recovery");
+        connection
+            .identity
+            .pending_kills
+            .set_wait_limit(Duration::from_millis(20));
+
+        connection
+            .cleanup_after_cancel()
+            .expect("recovery must go on after the wait limit");
+
+        assert_eq!(connection.spid.load(Ordering::SeqCst), 43);
+        assert_eq!(connection.identity.incarnation.load(Ordering::SeqCst), 1);
+        assert!(!connection.identity.pending_kills.is_replacing());
+        drop(stuck);
+    }
+
+    #[test]
+    fn mssql_cancel_after_the_drain_sends_no_kill_and_drops_the_replacement() {
+        use std::sync::atomic::Ordering;
+
+        let server = FakeTdsServer::start_with_handler(|req| {
+            if req.sql.as_deref().is_some_and(|sql| sql.contains("@@SPID")) {
+                // The replacement reuses SPID 42.
+                TdsBatchAction::ReplySessionInfo {
+                    spid: 42,
+                    database: Some("master".to_string()),
+                }
+            } else {
+                TdsBatchAction::ReplyDone
+            }
+        });
+        let connection = server.connect();
+        connection.spid.store(42, Ordering::SeqCst);
+        connection.poisoned.store(true, Ordering::SeqCst);
+        let cancel_handle = connection.cancel_handle();
+
+        let (drained_tx, drained_rx) = std::sync::mpsc::channel();
+        let (go_on_tx, go_on_rx) = std::sync::mpsc::channel::<()>();
+        let go_on_rx = Mutex::new(go_on_rx);
+        connection
+            .test_hooks
+            .lock()
+            .expect("test_hooks lock")
+            .after_kill_drain = Some(Arc::new(move || {
+            drained_tx.send(()).expect("signal drain ended");
+            go_on_rx
+                .lock()
+                .expect("go on rx lock")
+                .recv_timeout(Duration::from_secs(5))
+                .expect("recovery must be released");
+        }));
+
+        let outcome = std::thread::scope(|scope| {
+            let recovery_thread = scope.spawn(|| connection.cleanup_after_cancel());
+            drained_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("recovery must reach the end of the drain");
+            // The cancel registers AFTER the drain returned.
+            cancel_handle
+                .cancel()
+                .expect("a cancel during the replacement phase succeeds");
+            go_on_tx.send(()).expect("release recovery");
+            recovery_thread
+                .join()
+                .expect("recovery thread must not panic")
+        });
+
+        assert!(
+            matches!(outcome, Err(DbError::Cancelled)),
+            "the cancelled recovery must report Cancelled, got: {outcome:?}"
+        );
+        let kills: Vec<String> = server
+            .recorded_batches
+            .lock()
+            .expect("recorded batches")
+            .iter()
+            .filter_map(|req| req.sql.clone())
+            .filter(|sql| sql.starts_with("KILL"))
+            .collect();
+        assert!(kills.is_empty(), "no KILL may be sent, got: {kills:?}");
+        assert_eq!(
+            connection.identity.incarnation.load(Ordering::SeqCst),
+            0,
+            "the replacement must not be published"
+        );
+        assert!(connection.poisoned.load(Ordering::SeqCst));
+        assert!(!connection.identity.pending_kills.is_replacing());
+    }
+
+    #[test]
+    fn mssql_failed_reconnect_after_a_cancel_reports_cancelled() {
+        use std::sync::atomic::Ordering;
+
+        // The recovery connection's session capture is refused.
+        let server = FakeTdsServer::start_with_handler(|req| {
+            if req.sql.as_deref().is_some_and(|sql| sql.contains("@@SPID")) {
+                TdsBatchAction::ReplyError {
+                    code: 4060,
+                    message: "Cannot open database requested by the login.".to_string(),
+                }
+            } else {
+                TdsBatchAction::ReplyDone
+            }
+        });
+        let connection = server.connect();
+        connection.spid.store(42, Ordering::SeqCst);
+        connection.poisoned.store(true, Ordering::SeqCst);
+        let cancel_handle = connection.cancel_handle();
+
+        connection
+            .test_hooks
+            .lock()
+            .expect("test_hooks lock")
+            .after_kill_drain = Some(Arc::new(move || {
+            // The cancel lands during the replacement phase.
+            cancel_handle.cancel().expect("cancel must succeed");
+        }));
+
+        let outcome = connection.cleanup_after_cancel();
+        assert!(
+            matches!(outcome, Err(DbError::Cancelled)),
+            "a failed reconnect after a cancel must report Cancelled, got: {outcome:?}"
+        );
+
+        // Without a cancel the same failure is still a connection error.
+        let connection = server.connect();
+        connection.spid.store(42, Ordering::SeqCst);
+        connection.poisoned.store(true, Ordering::SeqCst);
+        let outcome = connection.cleanup_after_cancel();
+        assert!(
+            !matches!(outcome, Err(DbError::Cancelled)) && outcome.is_err(),
+            "an uncancelled failed reconnect keeps its error, got: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn mssql_kill_runtime_teardown_does_not_wait_for_blocking_work() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let server = FakeTdsServer::start(false);
+        let connection = server.connect();
+        connection.spid.store(42, Ordering::SeqCst);
+
+        let work_timed_out = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let release_rx = Mutex::new(release_rx);
+        connection
+            .test_hooks
+            .lock()
+            .expect("test_hooks lock")
+            .kill_runtime_blocking_work = Some(Arc::new({
+            let work_timed_out = work_timed_out.clone();
+            move || {
+                // Stands in for a DNS lookup that never returns in time.
+                let released = release_rx
+                    .lock()
+                    .expect("release rx lock")
+                    .recv_timeout(Duration::from_secs(5));
+                if released.is_err() {
+                    work_timed_out.store(true, Ordering::SeqCst);
+                }
+            }
+        }));
+
+        connection
+            .cancel_handle()
+            .cancel()
+            .expect("cancel must succeed");
+
+        assert!(
+            !work_timed_out.load(Ordering::SeqCst),
+            "the cancel must return while blocking work still runs"
+        );
+        assert_eq!(connection.identity.pending_kills.pending(), 0);
+        release_tx.send(()).expect("release the blocking work");
+    }
+
+    #[test]
+    fn mssql_metadata_retry_is_not_dispatched_when_cancelled_just_before_the_read() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let server =
+            FakeTdsServer::start_with_handler(|req| match (req.conn_index, req.conn_batch_index) {
+                (0, 0) => TdsBatchAction::DropConnection,
+                (1, 0) => TdsBatchAction::ReplySessionInfo {
+                    spid: 44,
+                    database: Some("master".to_string()),
+                },
+                _ => TdsBatchAction::ReplyDone,
+            });
+        let connection = server.connect();
+        let cancel_handle = connection.cancel_handle();
+        let attempts = AtomicUsize::new(0);
+
+        // Fires after the last pre-dispatch check, at the moment the retry
+        // takes the session to send its read.
+        connection
+            .test_hooks
+            .lock()
+            .expect("test_hooks lock")
+            .before_gated_dispatch = Some(Arc::new(move || {
+            cancel_handle.cancel().expect("cancel must succeed");
+        }));
+
+        let result = connection.read_metadata(|| {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            connection.execute_simple_checked("SELECT 1")
+        });
+
+        assert!(
+            matches!(result, Err(DbError::Cancelled)),
+            "a cancel before the retry read must surface DbError::Cancelled, got: {result:?}"
+        );
+        let retried = server
+            .recorded_batches
+            .lock()
+            .expect("recorded batches")
+            .iter()
+            .any(|req| req.conn_index == 1 && req.sql.as_deref() == Some("SELECT 1"));
+        assert!(
+            !retried,
+            "the retry read must not reach the server after a cancel"
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            2,
+            "the first read plus the retry closure, which is stopped before it sends"
+        );
+    }
+
+    #[test]
+    fn mssql_compound_metadata_retry_stops_before_its_second_query_after_a_cancel() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let server =
+            FakeTdsServer::start_with_handler(|req| match (req.conn_index, req.conn_batch_index) {
+                (0, 0) => TdsBatchAction::DropConnection,
+                (1, 0) => TdsBatchAction::ReplySessionInfo {
+                    spid: 44,
+                    database: Some("master".to_string()),
+                },
+                _ => TdsBatchAction::ReplyDone,
+            });
+        let connection = server.connect();
+        let cancel_handle = connection.cancel_handle();
+        let dispatches = Arc::new(AtomicUsize::new(0));
+
+        // Cancel as the retry takes the session for its second query.
+        connection
+            .test_hooks
+            .lock()
+            .expect("test_hooks lock")
+            .before_gated_dispatch = Some(Arc::new({
+            let dispatches = Arc::clone(&dispatches);
+            move || {
+                if dispatches.fetch_add(1, Ordering::SeqCst) == 1 {
+                    cancel_handle.cancel().expect("cancel must succeed");
+                }
+            }
+        }));
+
+        let result = connection.read_metadata(|| {
+            connection.execute_simple_checked("SELECT 1")?;
+            connection.execute_simple_checked("SELECT 2")
+        });
+
+        assert!(matches!(result, Err(DbError::Cancelled)), "got: {result:?}");
+        let sent: Vec<String> = server
+            .recorded_batches
+            .lock()
+            .expect("recorded batches")
+            .iter()
+            .filter(|req| req.conn_index == 1)
+            .filter_map(|req| req.sql.clone())
+            .collect();
+        assert!(sent.iter().any(|sql| sql == "SELECT 1"));
+        assert!(
+            !sent.iter().any(|sql| sql == "SELECT 2"),
+            "the second query of the retry must not be sent after a cancel, got: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn mssql_execute_is_not_sent_when_a_cancel_is_cleared_by_another_recovery() {
+        let server =
+            FakeTdsServer::start_with_handler(|req| match (req.conn_index, req.conn_batch_index) {
+                (1, 0) => TdsBatchAction::ReplySessionInfo {
+                    spid: 44,
+                    database: Some("master".to_string()),
+                },
+                _ => TdsBatchAction::ReplyDone,
+            });
+        let connection = server.connect();
+        let cancel_handle = connection.cancel_handle();
+
+        // The user cancels after `execute()` started. The recovery that
+        // `execute()` runs next publishes a replacement session and clears
+        // `cancelled`, exactly as another call's recovery would.
+        connection
+            .test_hooks
+            .lock()
+            .expect("test_hooks lock")
+            .after_execute_cancel_generation = Some(Arc::new(move || {
+            cancel_handle.cancel().expect("cancel must succeed");
+        }));
+
+        let result = connection.execute(&QueryRequest::new("SELECT 77"));
+
+        assert!(matches!(result, Err(DbError::Cancelled)), "got: {result:?}");
+        let sent: Vec<String> = server
+            .recorded_batches
+            .lock()
+            .expect("recorded batches")
+            .iter()
+            .filter_map(|req| req.sql.clone())
+            .collect();
+        assert!(
+            !sent.iter().any(|sql| sql == "SELECT 77"),
+            "a batch cancelled before it was sent must not be sent, got: {sent:?}"
+        );
+    }
+
+    fn instance_request(source: ExecutionSourceContext) -> QueryRequest {
+        let mut request = QueryRequest::new("SELECT 1");
+        request.execution_context = Some(ExecutionContext {
+            source: Some(source),
+            ..Default::default()
+        });
+        request
+    }
+
+    #[test]
+    fn mssql_instance_dispatch_is_not_sent_when_cancelled_before_it_starts() {
+        for source in [
+            ExecutionSourceContext::InstanceMetricQuery {
+                metric_id: "mssql.batch_requests_per_sec".to_string(),
+                start_ms: 0,
+                end_ms: 1,
+            },
+            ExecutionSourceContext::InstanceInspectorQuery {
+                metric_id: "mssql.active_sessions".to_string(),
+            },
+        ] {
+            let server = FakeTdsServer::start_with_handler(|req| {
+                match (req.conn_index, req.conn_batch_index) {
+                    (1, 0) => TdsBatchAction::ReplySessionInfo {
+                        spid: 44,
+                        database: Some("master".to_string()),
+                    },
+                    _ => TdsBatchAction::ReplyDone,
+                }
+            });
+            let connection = server.connect();
+            let cancel_handle = connection.cancel_handle();
+            connection
+                .test_hooks
+                .lock()
+                .expect("test_hooks lock")
+                .after_execute_cancel_generation = Some(Arc::new(move || {
+                cancel_handle.cancel().expect("cancel must succeed");
+            }));
+            let batches_before = server.recorded_batches.lock().expect("batches").len();
+
+            let result = connection.execute(&instance_request(source));
+
+            assert!(matches!(result, Err(DbError::Cancelled)), "got: {result:?}");
+            let sent: Vec<String> = server
+                .recorded_batches
+                .lock()
+                .expect("batches")
+                .iter()
+                .skip(batches_before)
+                .filter_map(|req| req.sql.clone())
+                .filter(|sql| sql != "SELECT @@SPID, DB_NAME()")
+                .collect();
+            assert!(
+                sent.is_empty(),
+                "no instance query may be sent, got: {sent:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mssql_cancel_before_execute_starts_does_not_cancel_it() {
+        let server =
+            FakeTdsServer::start_with_handler(|req| match (req.conn_index, req.conn_batch_index) {
+                (1, 0) => TdsBatchAction::ReplySessionInfo {
+                    spid: 44,
+                    database: Some("master".to_string()),
+                },
+                _ => TdsBatchAction::ReplyDone,
+            });
+        let connection = server.connect();
+        connection
+            .cancel_handle()
+            .cancel()
+            .expect("cancel must succeed");
+
+        let result = connection.execute(&QueryRequest::new("SELECT 88"));
+
+        assert!(result.is_ok(), "got: {result:?}");
+        let sent = server
+            .recorded_batches
+            .lock()
+            .expect("batches")
+            .iter()
+            .any(|req| req.sql.as_deref() == Some("SELECT 88"));
+        assert!(sent, "the batch must be sent");
     }
 
     #[test]

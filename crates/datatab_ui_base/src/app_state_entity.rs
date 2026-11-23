@@ -3,6 +3,7 @@
 //! This module provides `AppStateEntity`, which wraps the pure `AppState` from `datatab_app`
 //! and adds GPUI-specific state (like the settings window handle) and event types.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -24,7 +25,7 @@ use crate::saved_chart_manager::SavedChartManager;
 use crate::saved_document_query_manager::SavedDocumentQueryManager;
 use crate::saved_query_manager::SavedQueryManager;
 use crate::schema_snapshot_manager::SchemaSnapshotManager;
-use crate::user_error::{ErrorKind, UserFacingError};
+use crate::user_error::{ErrorKind, SendReportRequest, UserFacingError};
 
 /// Publishes the Vim settings now and after every app-state change, so every
 /// editor follows Settings > General live: Vim mode to
@@ -162,6 +163,9 @@ pub fn drain_scripts_directory_diagnostics(
 /// Emitted when the app state changes in ways that require UI updates.
 pub struct AppStateChanged;
 
+/// A delete was refused because this profile's edit window is still open.
+pub struct ConnectionEditAttentionRequested(pub Uuid);
+
 /// Emitted each time `report_error` fires for a new user-facing failure.
 ///
 /// Subscribers (e.g., `StatusBar`) use this to update the unread-error badge
@@ -181,6 +185,28 @@ pub struct UserErrorReported {
 /// path uniform — the workspace subscribes once.
 #[derive(Clone, Copy)]
 pub struct OpenAuditRequested(pub Option<Uuid>);
+
+/// Which report the send window opens on.
+///
+/// Neither variant carries free text: an error report travels as the closed
+/// fields a report may hold, never the toast summary or cause.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ReportWindowRequest {
+    /// An error reported in this session. The report is built when the window
+    /// opens, so what the user sees is what would be posted.
+    Error(SendReportRequest),
+    /// A report a panic left on disk.
+    Pending(PathBuf),
+}
+
+/// Asks the workspace to open the send window for one report.
+///
+/// Emitted by the "Send report…" action on an error toast and by the Send
+/// action of a pending report in Settings > About. The request waits in
+/// [`AppStateEntity::pending_report_window`] until the first workspace capable
+/// of showing the window takes it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReportWindowRequested(pub ReportWindowRequest);
 
 /// Emitted when an MCP runtime event occurs.
 #[cfg(feature = "mcp")]
@@ -245,6 +271,10 @@ pub struct AppStateEntity {
     /// Used to focus/reuse an existing settings window rather than opening multiple.
     pub settings_window: Option<WindowHandle<Root>>,
 
+    /// One edit window per profile, shared by every workspace and delete path.
+    pub connection_edit_windows: HashMap<Uuid, WindowHandle<Root>>,
+    connection_edit_window_closed_subscription: Option<gpui::Subscription>,
+
     /// Saved-chart manager — loaded from SQLite on startup; mutated via `upsert`/`remove`.
     pub saved_charts: SavedChartManager,
 
@@ -304,9 +334,80 @@ pub struct AppStateEntity {
     /// Pending MCP execution the approvals document should select the next
     /// time it refreshes, set when a notification's "Review" opens it.
     pub pending_approval_focus: Option<String>,
+
+    /// The folder that holds this channel's pending reports: what a panic left
+    /// for the next start to offer (ADR 0008).
+    ///
+    /// `None` in tests and embeds, which name their own folder through
+    /// [`Self::set_reports_pending_dir`]. A finished app start sets it to
+    /// `datatab_storage::paths::reports_pending_dir()`.
+    reports_pending_dir: Option<PathBuf>,
+
+    /// A report the first workspace that handles [`ReportWindowRequested`]
+    /// opens the send window on.
+    pending_report_window: Option<ReportWindowRequest>,
+
+    /// The two organization sources of the off switch, as the app start read
+    /// them (`docs/SETTINGS.md`). Empty in tests and embeds.
+    report_off_sources: crate::report_offer::ReportOffSources,
 }
 
 impl AppStateEntity {
+    /// Tracks platform closure, even when a save task keeps the view alive.
+    pub fn register_connection_edit_window(
+        &mut self,
+        profile_id: Uuid,
+        handle: WindowHandle<Root>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.connection_edit_windows.insert(profile_id, handle);
+        if self.connection_edit_window_closed_subscription.is_none() {
+            let state = cx.weak_entity();
+            self.connection_edit_window_closed_subscription =
+                Some(cx.on_window_closed(move |cx, window_id| {
+                    if let Some(state) = state.upgrade() {
+                        state.update(cx, |state, _| {
+                            state
+                                .connection_edit_windows
+                                .retain(|_, handle| handle.window_id() != window_id);
+                        });
+                    }
+                }));
+        }
+    }
+
+    /// Returns whether a live editor was focused; removes a stale handle.
+    pub fn focus_connection_edit_window(
+        &mut self,
+        profile_id: Uuid,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let Some(handle) = self.connection_edit_windows.get(&profile_id).copied() else {
+            return false;
+        };
+        if handle
+            .update(cx, |_, window, _| window.activate_window())
+            .is_ok()
+        {
+            return true;
+        }
+        self.connection_edit_windows.remove(&profile_id);
+        false
+    }
+
+    /// Refuses deletion of a live editor's profile and asks it to explain why.
+    pub fn refuse_connection_delete(
+        &mut self,
+        profile_id: Uuid,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        if !self.focus_connection_edit_window(profile_id, cx) {
+            return false;
+        }
+        cx.emit(ConnectionEditAttentionRequested(profile_id));
+        true
+    }
+
     /// Creates a new `AppStateEntity` wrapping a fresh `AppState`.
     ///
     /// Repositories are read from the `AppState`'s internally constructed storage
@@ -330,6 +431,8 @@ impl AppStateEntity {
         Ok(Self {
             inner,
             settings_window: None,
+            connection_edit_windows: HashMap::new(),
+            connection_edit_window_closed_subscription: None,
             saved_charts,
             dashboards,
             saved_queries,
@@ -345,6 +448,11 @@ impl AppStateEntity {
             pending_update_dialog: None,
             notifications: NotificationCenter::new(),
             pending_approval_focus: None,
+            // The real folder: this is the app's own state, and the next start
+            // offers what a panic left there (ADR 0008).
+            reports_pending_dir: datatab_storage::paths::reports_pending_dir().ok(),
+            pending_report_window: None,
+            report_off_sources: Default::default(),
         })
     }
 
@@ -373,6 +481,8 @@ impl AppStateEntity {
         Ok(Self {
             inner,
             settings_window: None,
+            connection_edit_windows: HashMap::new(),
+            connection_edit_window_closed_subscription: None,
             saved_charts,
             dashboards,
             saved_queries,
@@ -388,6 +498,11 @@ impl AppStateEntity {
             pending_update_dialog: None,
             notifications: NotificationCenter::new(),
             pending_approval_focus: None,
+            // Left unset: a test or an embed names its own folder, so nothing
+            // reads the reports of the user running the tests.
+            reports_pending_dir: None,
+            pending_report_window: None,
+            report_off_sources: Default::default(),
         })
     }
 
@@ -431,6 +546,47 @@ impl AppStateEntity {
         cx: &mut gpui::Context<Self>,
     ) {
         cx.emit(OpenAuditRequested(correlation_id));
+    }
+
+    /// The folder holding this channel's pending reports, when the app start
+    /// named one. `None`: nothing is offered and nothing is read.
+    pub fn reports_pending_dir(&self) -> Option<&std::path::Path> {
+        self.reports_pending_dir.as_deref()
+    }
+
+    /// Points the pending-report reads at `dir`. A test or an embed names its
+    /// own folder; the running app gets the channel's folder from
+    /// `datatab_storage::paths::reports_pending_dir()`.
+    pub fn set_reports_pending_dir(&mut self, dir: Option<PathBuf>) {
+        self.reports_pending_dir = dir;
+    }
+
+    /// The environment variable and the managed file, as the app start read
+    /// them. The setting is read from `general_settings` at each draw instead.
+    pub fn report_off_sources(&self) -> &crate::report_offer::ReportOffSources {
+        &self.report_off_sources
+    }
+
+    /// Records the two organization sources. The app start calls this once,
+    /// before the first window.
+    pub fn set_report_off_sources(&mut self, sources: crate::report_offer::ReportOffSources) {
+        self.report_off_sources = sources;
+    }
+
+    /// Holds a request to show one report for the workspace, and tells it the
+    /// request is waiting.
+    pub fn request_report_window(
+        &mut self,
+        request: ReportWindowRequest,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.pending_report_window = Some(request.clone());
+        cx.emit(ReportWindowRequested(request));
+    }
+
+    /// Takes the waiting report-window request, if no workspace took it yet.
+    pub fn take_pending_report_window(&mut self) -> Option<ReportWindowRequest> {
+        self.pending_report_window.take()
     }
 
     /// Resets the unread-error counter to zero.
@@ -522,9 +678,11 @@ impl std::ops::DerefMut for AppStateEntity {
 // ============================================================================
 
 impl EventEmitter<AppStateChanged> for AppStateEntity {}
+impl EventEmitter<ConnectionEditAttentionRequested> for AppStateEntity {}
 impl EventEmitter<ObjectTreeEvent> for AppStateEntity {}
 impl EventEmitter<UserErrorReported> for AppStateEntity {}
 impl EventEmitter<OpenAuditRequested> for AppStateEntity {}
+impl EventEmitter<ReportWindowRequested> for AppStateEntity {}
 impl EventEmitter<crate::updates::UpdateDialogRequested> for AppStateEntity {}
 
 #[cfg(feature = "mcp")]

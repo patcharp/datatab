@@ -1749,6 +1749,11 @@ impl SchemaDiffDocument {
                     .map(|c| c.risk)
                     .chain(w.table_action.as_ref().map(|(_, risk)| *risk))
             })
+            // `max`, not `compose`: a schema-diff risk comes from
+            // `classify_schema_alter`, whose classes are `AdminSafe`, `Admin`
+            // and `AdminDestructive`, so no operand can be `Destructive` and
+            // the two folds agree here. A source that can produce a row change
+            // must switch this line to `compose`.
             .fold(ExecutionClassification::AdminSafe, |acc, risk| {
                 acc.max(risk)
             });
@@ -2226,7 +2231,12 @@ impl SchemaDiffDocument {
     }
 
     /// The other databases of the target's connection and the other open
-    /// relational connections, in the order the picker lists them.
+    /// relational connections that speak SQL, in the order the picker lists
+    /// them.
+    ///
+    /// A relation whose driver has another query language (CQL) is left out: a
+    /// schema diff applies SQL DDL, so it could not be applied to that
+    /// connection.
     pub(super) fn live_reference_candidates(&self, cx: &App) -> (Vec<String>, Vec<(Uuid, String)>) {
         let database_candidates = same_connection_reference_databases(
             &self.connection_databases,
@@ -2239,9 +2249,7 @@ impl SchemaDiffDocument {
             .connections()
             .iter()
             .filter(|(id, connected)| {
-                **id != self.profile_id
-                    && connected.connection.metadata().category
-                        == datatab_core::DatabaseCategory::Relational
+                **id != self.profile_id && connected.connection.metadata().supports_schema_diff()
             })
             .map(|(id, connected)| (*id, connected.profile.name.clone()))
             .collect();

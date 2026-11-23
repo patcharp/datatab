@@ -56,6 +56,10 @@ tree-sitter-html = { workspace = true, optional = true }
 
 [dev-dependencies]
 gpui = { workspace = true, features = ["test-support"] }
+# The typography contract test reads the bundled faces' cmap and OS/2 weight
+# through the same parser gpui uses for fonts, so a face that ships without
+# Thai glyphs fails there instead of on screen.
+ttf-parser = "0.25"
 # The syntax tests exercise every bundled grammar.
 bolt = { path = ".", features = [
     "syntax-json",

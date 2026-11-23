@@ -2,8 +2,19 @@ use super::refusal::PanicOnReadSecretStore;
 use super::*;
 
 fn broken_reference_state(field: &str, kind: &str) -> (AppState, Uuid) {
+    broken_reference_state_for(
+        ConnectionProfile::new("broken source", DbConfig::default_postgres()),
+        field,
+        kind,
+    )
+}
+
+fn broken_reference_state_for(
+    mut profile: ConnectionProfile,
+    field: &str,
+    kind: &str,
+) -> (AppState, Uuid) {
     let runtime = datatab_storage::bootstrap::StorageRuntime::in_memory().expect("storage");
-    let mut profile = ConnectionProfile::new("broken source", DbConfig::default_postgres());
     profile.save_password = true;
     let reference = match kind {
         "dotenv" => datatab_core::ValueRef::dotenv("unused-source", "PASSWORD"),
@@ -11,8 +22,12 @@ fn broken_reference_state(field: &str, kind: &str) -> (AppState, Uuid) {
         _ => panic!("unknown fixture kind"),
     };
     profile.value_refs.insert(field.into(), reference);
-    crate::config_loader::save_profiles(&runtime, std::slice::from_ref(&profile))
-        .expect("save profile");
+    crate::config_loader::save_profiles(
+        &runtime,
+        std::slice::from_ref(&profile),
+        &std::collections::HashSet::new(),
+    )
+    .expect("save profile");
     let column = if kind == "dotenv" {
         "env_key"
     } else {
@@ -51,8 +66,12 @@ fn unknown_value_ref_kind_flags_field_and_refuses_before_secret_reads() {
             .value_refs
             .insert(field.into(), datatab_core::ValueRef::env("UNUSED_SOURCE"));
         let other = ConnectionProfile::new("unaffected", DbConfig::default_postgres());
-        crate::config_loader::save_profiles(&runtime, &[profile.clone(), other.clone()])
-            .expect("save profiles");
+        crate::config_loader::save_profiles(
+            &runtime,
+            &[profile.clone(), other.clone()],
+            &std::collections::HashSet::new(),
+        )
+        .expect("save profiles");
         runtime.open_datatab_db().expect("database").execute(
             "UPDATE cfg_connection_profile_value_refs SET ref_kind = 'retired-kind' WHERE profile_id = ?1",
             [profile.id.to_string()],
@@ -110,8 +129,12 @@ fn stored_param_value_ref_flags_profile_and_postgres_still_loads() {
             datatab_core::ValueRef::secret("aws-ssm", "/db/value", None),
         );
         let other = ConnectionProfile::new("unaffected", DbConfig::default_postgres());
-        crate::config_loader::save_profiles(&runtime, &[profile.clone(), other.clone()])
-            .expect("save profiles");
+        crate::config_loader::save_profiles(
+            &runtime,
+            &[profile.clone(), other.clone()],
+            &std::collections::HashSet::new(),
+        )
+        .expect("save profiles");
         runtime
             .open_datatab_db()
             .expect("database")
@@ -404,4 +427,64 @@ fn broken_value_ref_manager_refuses_unresolved_password_without_writes() {
         assert_eq!(reloaded.profiles()[0].name, "broken source");
         assert!(!reloaded.value_ref_diagnostics(profile_id).is_empty());
     }
+}
+
+#[test]
+#[cfg(feature = "sqlite")]
+fn broken_value_ref_save_without_a_password_field_clears_the_diagnostic() {
+    let (mut state, profile_id) = broken_reference_state_for(
+        ConnectionProfile::new("broken source", DbConfig::default_sqlite()),
+        "password",
+        "dotenv",
+    );
+    let mut profile = state.profiles()[0].clone();
+    profile.value_refs.remove("password");
+    profile.name = "saved without password field".into();
+    state
+        .update_profile_from_connection_manager(profile, "")
+        .expect("a driver without a password field has nothing to resolve");
+    assert!(state.value_ref_diagnostics(profile_id).is_empty());
+    let reloaded = AppState::new_with_storage_runtime(state.storage_runtime).expect("reload");
+    assert!(reloaded.value_ref_diagnostics(profile_id).is_empty());
+    assert_eq!(reloaded.profiles()[0].name, "saved without password field");
+}
+
+#[test]
+#[cfg(feature = "postgres")]
+fn broken_value_ref_app_guard_refuses_with_its_own_text() {
+    let (mut state, profile_id) = broken_reference_state("password", "dotenv");
+    let mut profile = state.profiles()[0].clone();
+    profile.value_refs.insert(
+        "password".into(),
+        datatab_core::ValueRef::env("REPLACEMENT_PASSWORD"),
+    );
+    // The guard accepts any non-literal source (the `Some(_) => true` arm),
+    // whatever text the form hands it; the same input must reach both checks.
+    assert!(state.check_connection_manager_save(&profile, "").is_ok());
+    profile
+        .value_refs
+        .insert("password".into(), datatab_core::ValueRef::literal(""));
+    let error = state
+        .update_profile_from_connection_manager(profile, "")
+        .expect_err("an empty literal is unresolved");
+    assert_eq!(
+        error.to_string(),
+        "Invalid profile: Choose a new source for the password or turn off Save password."
+    );
+    assert!(!state.value_ref_diagnostics(profile_id).is_empty());
+}
+
+#[test]
+#[cfg(feature = "postgres")]
+fn broken_value_ref_literal_password_of_spaces_is_unresolved_and_padded_is_resolved() {
+    let (state, _) = broken_reference_state("password", "dotenv");
+    let mut profile = state.profiles()[0].clone();
+    profile
+        .value_refs
+        .insert("password".into(), datatab_core::ValueRef::literal("x"));
+    assert!(!state.connection_manager_password_is_resolved(&profile, "   "));
+    assert!(state.connection_manager_password_is_resolved(&profile, " x "));
+    profile.value_refs.remove("password");
+    assert!(!state.connection_manager_password_is_resolved(&profile, "   "));
+    assert!(state.connection_manager_password_is_resolved(&profile, " x "));
 }

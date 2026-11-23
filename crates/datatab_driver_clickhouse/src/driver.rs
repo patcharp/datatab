@@ -106,8 +106,30 @@ pub static METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverMetadata 
         supports_deferrable: false,
     }),
     limits: None,
-    ssl_modes: None,
-    ssl_cert_fields: None,
+    ssl_modes: Some(&[
+        datatab_core::SslModeOption {
+            id: "disable",
+            label: "disable (unverified)",
+        },
+        datatab_core::SslModeOption {
+            id: "require",
+            label: "require (unverified)",
+        },
+        datatab_core::SslModeOption {
+            id: "verify-ca",
+            label: "verify-ca (hostname not checked)",
+        },
+        datatab_core::SslModeOption {
+            id: "verify-full",
+            label: "verify-full",
+        },
+    ]),
+    ssl_cert_fields: Some(datatab_core::SslCertFields {
+        root_cert: true,
+        client_cert: true,
+        root_cert_modes: Some(&["verify-ca", "verify-full"]),
+        client_cert_modes: Some(&["require", "verify-ca", "verify-full"]),
+    }),
     classification_override: None,
     default_chunk_size: None,
     supports_lock_timeout: false,
@@ -240,6 +262,19 @@ impl DbDriver for ClickHouseDriver {
             database,
             request_timeout_seconds,
             allow_insecure_http_password,
+            ssl_mode: Some(values.get("ssl_mode").cloned().unwrap_or_default()),
+            ssl_root_cert_path: values
+                .get("ssl_root_cert_path")
+                .filter(|value| !value.trim().is_empty())
+                .cloned(),
+            ssl_client_cert_path: values
+                .get("ssl_client_cert_path")
+                .filter(|value| !value.trim().is_empty())
+                .cloned(),
+            ssl_client_key_path: values
+                .get("ssl_client_key_path")
+                .filter(|value| !value.trim().is_empty())
+                .cloned(),
         })
     }
 
@@ -251,8 +286,22 @@ impl DbDriver for ClickHouseDriver {
             database,
             request_timeout_seconds,
             allow_insecure_http_password,
+            ssl_mode,
+            ssl_root_cert_path,
+            ssl_client_cert_path,
+            ssl_client_key_path,
         } = config
         {
+            for (key, value) in [
+                ("ssl_mode", ssl_mode),
+                ("ssl_root_cert_path", ssl_root_cert_path),
+                ("ssl_client_cert_path", ssl_client_cert_path),
+                ("ssl_client_key_path", ssl_client_key_path),
+            ] {
+                if let Some(value) = value {
+                    values.insert(key.into(), value.clone());
+                }
+            }
             values.insert("url".to_string(), url.clone());
             values.insert("user".to_string(), user.clone());
             values.insert("database".to_string(), database.clone());
@@ -275,18 +324,24 @@ impl DbDriver for ClickHouseDriver {
         values
     }
 
+    fn validate_profile(&self, profile: &datatab_core::ConnectionProfile) -> Result<(), DbError> {
+        crate::tls::TlsOptions::from_profile(profile).map(|_| ())
+    }
+
     fn connect_with_secrets(
         &self,
         profile: &datatab_core::ConnectionProfile,
         password: Option<&SecretString>,
         _ssh_secret: Option<&SecretString>,
     ) -> Result<Box<dyn datatab_core::Connection>, DbError> {
+        let tls = crate::tls::TlsOptions::from_profile(profile)?;
         let DbConfig::ClickHouse {
             url,
             user,
             database,
             request_timeout_seconds,
             allow_insecure_http_password,
+            ..
         } = &profile.config
         else {
             return Err(DbError::InvalidProfile(
@@ -299,13 +354,14 @@ impl DbDriver for ClickHouseDriver {
                 "Request timeout must be between 1 and {MAX_REQUEST_TIMEOUT_SECONDS} seconds"
             )));
         }
-        let client = ClickHouseHttpClient::new(
+        let client = ClickHouseHttpClient::new_with_tls(
             url,
             user.clone(),
             password.cloned(),
             database.clone(),
             Duration::from_secs(timeout),
             *allow_insecure_http_password,
+            &tls,
         )
         .map_err(|error| {
             crate::error_formatter::ClickHouseErrorFormatter::into_connection_error(&error)
@@ -389,6 +445,34 @@ mod tests {
         FormFieldKind, FormValues, LiteralValue, Predicate, PredicateValue, Projection,
         QueryGenerator, SourceTable, VisualQuerySpec,
     };
+
+    #[test]
+    fn tls_metadata_declares_modes_and_field_visibility() {
+        let modes = METADATA
+            .ssl_modes
+            .expect("ClickHouse must declare TLS modes");
+        assert_eq!(
+            modes
+                .iter()
+                .map(|mode| (mode.id, mode.label))
+                .collect::<Vec<_>>(),
+            vec![
+                ("disable", "disable (unverified)"),
+                ("require", "require (unverified)"),
+                ("verify-ca", "verify-ca (hostname not checked)"),
+                ("verify-full", "verify-full"),
+            ]
+        );
+        let fields = METADATA.ssl_cert_fields.expect("TLS certificate fields");
+        for (mode, expected) in [
+            ("disable", (false, false)),
+            ("require", (false, true)),
+            ("verify-ca", (true, true)),
+            ("verify-full", (true, true)),
+        ] {
+            assert_eq!(fields.visible_for_mode(mode), expected, "{mode}");
+        }
+    }
 
     #[test]
     fn metadata_declares_request_row_limit() {
@@ -539,6 +623,10 @@ mod tests {
                 database: "events".to_string(),
                 request_timeout_seconds: None,
                 allow_insecure_http_password: false,
+                ssl_mode: None,
+                ssl_root_cert_path: None,
+                ssl_client_cert_path: None,
+                ssl_client_key_path: None,
             },
         );
         let password = SecretString::from("secret".to_string());

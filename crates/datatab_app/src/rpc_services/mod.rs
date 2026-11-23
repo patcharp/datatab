@@ -227,22 +227,19 @@ where
     DriverServiceAdaptation::Registered { driver_id, service }
 }
 
-pub(crate) fn adapt_auth_provider_service(
-    descriptor: RpcServiceDescriptor,
-    provider_exists: impl FnOnce(&str) -> bool,
-    audit_emitter: Option<Arc<dyn ExternalAuditEmitter>>,
-) -> AuthProviderServiceAdaptation<Arc<dyn DynAuthProvider>> {
-    adapt_auth_provider_service_with(descriptor, provider_exists, |socket_id, launch| {
-        RpcAuthProvider::probe(socket_id, launch.cloned())
-            .map(|provider| {
-                let provider = match audit_emitter {
-                    Some(ref emitter) => provider.with_audit_emitter(emitter.clone()),
-                    None => provider,
-                };
-                Arc::new(provider) as Arc<dyn DynAuthProvider>
-            })
-            .map_err(Box::new)
-    })
+pub(crate) fn auth_provider_probe_input(
+    descriptor: &RpcServiceDescriptor,
+) -> Option<(String, Option<IpcServiceLaunchConfig>)> {
+    if !descriptor.config.enabled
+        || descriptor.config.kind != RpcServiceKind::AuthProvider
+        || validate_auth_provider_contract(&descriptor.config).is_err()
+    {
+        return None;
+    }
+    Some((
+        descriptor.config.socket_id.clone(),
+        descriptor.auth_provider_launch().cloned(),
+    ))
 }
 
 pub(crate) fn adapt_auth_provider_service_with<T, Probe>(

@@ -5,9 +5,10 @@
 ///
 /// - MCP governance data is NEVER written to any bundle, regardless of options.
 ///   This is a hard security invariant enforced here, not delegated to the caller.
-/// - `value_refs` are always included in the cleartext `value_refs` map. All variants,
-///   including `ValueRef::Literal`, are emitted as cleartext references. A `Literal` is
-///   a static inline value (not a secret locator) and carries no inherent secrecy.
+/// - `value_refs` are included in the cleartext `value_refs` map, with one exception:
+///   a `ValueRef::Literal` on a field the driver hints `Secret` is the secret itself.
+///   It is never written; the field becomes a `Secret` `RequiredRef`, so the importer
+///   asks for it. A `Literal` on any other field is a static inline value and stays.
 /// - Hooks and `settings_overrides` are excluded by default; opt-in via
 ///   `ExportOptions::{include_hooks, include_settings_overrides}`.
 /// - Hook `env` entries are NEVER written in cleartext. They are moved to the
@@ -17,10 +18,13 @@
 /// - SSH private-key bytes are staged into `[secrets]` only when
 ///   `ExportOptions::embed_ssh_keys = true`; otherwise the key becomes a
 ///   `required_ref`.
-/// - A `ConnectionProfile` has exactly one connection secret. When multiple form
-///   fields carry the `Secret` hint, only the first is backed by the connection
-///   keyring entry; any additional `Secret`-hinted fields that have no distinct
-///   keyring ref become `RequiredRef` entries.
+/// - A `ConnectionProfile` has one connection secret (its password slot). When
+///   multiple form fields carry the `Secret` hint, only the first is backed by
+///   the connection keyring entry; any additional `Secret`-hinted fields that
+///   have no distinct keyring ref become `RequiredRef` entries.
+/// - A secret field an RPC driver keeps in its own keyring entry
+///   (`ConnectionProfile::keyring_secret_fields`) is never exported as a value:
+///   each one becomes a `Secret` `RequiredRef`, so the importer asks for it.
 /// - Plaintext export (`EncryptionChoice::Plaintext`) requires `forced: true`; the
 ///   pipeline returns `PortabilityError::PlaintextForceMissing` otherwise.
 use std::collections::{BTreeMap, HashMap};
@@ -182,11 +186,20 @@ pub fn export(
             }
         }
 
+        push_keyring_field_refs(profile, &mut required_refs, &mut report);
+
         let auth_profile_local_id = profile.auth_profile_id.map(|id| id.to_string());
 
         let access = build_access_entry(profile);
 
-        let value_refs = build_value_refs(profile, &mut staged_secrets, &mut report);
+        let value_refs = build_value_refs(
+            profile,
+            values,
+            hints,
+            &mut required_refs,
+            &mut staged_secrets,
+            &mut report,
+        );
 
         let (hooks_payload, include_hooks) = if opts.include_hooks {
             match profile.hooks.as_ref() {
@@ -317,6 +330,30 @@ fn driver_ref_for(driver_id: &str) -> DriverRef {
     DriverRef { reference }
 }
 
+/// Adds a `Secret` required reference for each secret field the profile keeps
+/// in its own keyring entry. Its value stays out of the bundle; the
+/// importer asks for it and stores it in the new profile's entry. A field
+/// that already has a reference is not listed twice.
+fn push_keyring_field_refs(
+    profile: &datatab_core::ConnectionProfile,
+    required_refs: &mut Vec<RequiredRef>,
+    report: &mut ExportReport,
+) {
+    for field_id in &profile.keyring_secret_fields {
+        if required_refs
+            .iter()
+            .any(|existing| &existing.field == field_id)
+        {
+            continue;
+        }
+        required_refs.push(RequiredRef {
+            field: field_id.clone(),
+            kind: RequiredRefKind::Secret,
+        });
+        report.required_ref_count += 1;
+    }
+}
+
 fn build_access_entry(profile: &datatab_core::ConnectionProfile) -> Option<AccessEntry> {
     use datatab_core::access::AccessKind;
 
@@ -339,20 +376,41 @@ fn build_access_entry(profile: &datatab_core::ConnectionProfile) -> Option<Acces
 
 /// Build the `value_refs` map for a connection entry.
 ///
-/// All `ValueRef` variants — including `Literal` — are serialized as cleartext
-/// references in the output map. A `Literal` is a static inline value (not a secret
-/// locator) and carries no inherent secrecy; it belongs in the cleartext section
-/// alongside `Env`, `Auth`, and `Secret` locators.
+/// `Env`, `Dotenv`, `File`, `Secret` and `Auth` are locators and go to the cleartext
+/// map. A `Literal` goes there too, except on a field the driver hints `Secret`: it
+/// is the secret itself, so the field becomes a `Secret` required reference and
+/// the value is not written.
 ///
 /// Conversion failures push a warning rather than silently dropping the entry.
 fn build_value_refs(
     profile: &datatab_core::ConnectionProfile,
+    values: &datatab_core::FormValues,
+    hints: &dyn FieldHintResolver,
+    required_refs: &mut Vec<RequiredRef>,
     _staged_secrets: &mut HashMap<String, String>,
     report: &mut ExportReport,
 ) -> HashMap<String, toml::Value> {
     let mut out: HashMap<String, toml::Value> = HashMap::new();
 
     for (field_key, vref) in &profile.value_refs {
+        if matches!(vref, datatab_core::values::ValueRef::Literal { .. })
+            && matches!(
+                hints.hint(profile, field_key, values),
+                ExportFieldHint::Secret
+            )
+        {
+            if !required_refs
+                .iter()
+                .any(|existing| &existing.field == field_key)
+            {
+                required_refs.push(RequiredRef {
+                    field: field_key.clone(),
+                    kind: RequiredRefKind::Secret,
+                });
+                report.required_ref_count += 1;
+            }
+            continue;
+        }
         match serde_json::to_value(vref)
             .map_err(|e| e.to_string())
             .and_then(|jv| toml::Value::try_from(jv).map_err(|e| e.to_string()))
@@ -1302,6 +1360,62 @@ mod tests {
         );
     }
 
+    /// A secret field of an RPC driver form that is not called `password`
+    /// is hinted `Secret` from its kind, and its form value never reaches
+    /// the bundle, whichever way the connection password is exported.
+    #[test]
+    fn secret_hinted_field_value_never_reaches_the_bundle() {
+        struct SecretHintForApiToken;
+
+        impl FieldHintResolver for SecretHintForApiToken {
+            fn hint(
+                &self,
+                _p: &ConnectionProfile,
+                field_id: &str,
+                _v: &FormValues,
+            ) -> ExportFieldHint {
+                if field_id == "api_token" {
+                    ExportFieldHint::Secret
+                } else {
+                    ExportFieldHint::Include
+                }
+            }
+        }
+
+        let profile = postgres_profile();
+        let mut values = FormValues::default();
+        values.insert(
+            "api_token".to_string(),
+            "sentinel-api-token-7f3a91".to_string(),
+        );
+        values.insert("host".to_string(), "db.example".to_string());
+        let graph = simple_graph(&profile, values);
+
+        for connection_password in [
+            crate::IncludeExclude::Include,
+            crate::IncludeExclude::Exclude,
+        ] {
+            let opts = ExportOptions {
+                connection_password,
+                ..default_opts_plaintext()
+            };
+            let (bytes, _) = export(
+                &graph,
+                &opts,
+                &SecretHintForApiToken,
+                &NoTransforms,
+                &NoSecrets,
+            )
+            .expect("export");
+            let text = String::from_utf8(bytes).expect("utf8");
+            assert!(
+                !text.contains("sentinel-api-token-7f3a91"),
+                "secret field value must not appear in bundle: {text}"
+            );
+            assert!(text.contains("db.example"));
+        }
+    }
+
     // --- R1: Two Secret-hinted fields — binding is deterministic (lexicographic) ---
     //
     // Fields are iterated in lexicographic order. With "api_secret" and "password":
@@ -1424,6 +1538,58 @@ mod tests {
             "rpc: prefix must be stripped from reference: {}",
             dr.reference
         );
+    }
+
+    // --- #415: a Literal on a secret-kind field is the secret, never exported ---
+
+    #[test]
+    fn literal_value_ref_on_a_secret_field_becomes_a_required_ref() {
+        use datatab_core::values::ValueRef;
+
+        struct SecretHintForPasswordOnly;
+
+        impl FieldHintResolver for SecretHintForPasswordOnly {
+            fn hint(
+                &self,
+                _p: &ConnectionProfile,
+                field_id: &str,
+                _v: &FormValues,
+            ) -> ExportFieldHint {
+                if field_id == "password" {
+                    ExportFieldHint::Secret
+                } else {
+                    ExportFieldHint::Include
+                }
+            }
+        }
+
+        let mut profile = postgres_profile();
+        profile.value_refs.insert(
+            "password".to_string(),
+            ValueRef::literal("sentinel-literal-password-91b2"),
+        );
+        profile
+            .value_refs
+            .insert("db_user".to_string(), ValueRef::literal("readonly_user"));
+        let graph = simple_graph(&profile, FormValues::default());
+
+        let (bytes, report) = export(
+            &graph,
+            &default_opts_plaintext(),
+            &SecretHintForPasswordOnly,
+            &NoTransforms,
+            &NoSecrets,
+        )
+        .expect("export");
+
+        let text = String::from_utf8(bytes).expect("utf8");
+        assert!(
+            !text.contains("sentinel-literal-password-91b2"),
+            "a literal secret must not appear in the bundle: {text}"
+        );
+        assert!(text.contains("readonly_user"), "a plain literal stays");
+        assert_eq!(report.required_ref_count, 1);
+        assert!(text.contains("required_refs"), "{text}");
     }
 
     // --- P3: ValueRef::Literal is a cleartext reference, not a secret ---

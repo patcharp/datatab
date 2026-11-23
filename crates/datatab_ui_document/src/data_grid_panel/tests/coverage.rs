@@ -131,7 +131,7 @@ fn the_edit_bar_is_covered(cx: &mut TestAppContext) {
 /// table menu.
 #[gpui::test]
 fn the_fk_references_are_covered(cx: &mut TestAppContext) {
-    let (app_state, profile_id) = register_stub_connection(cx, Arc::new(StubConnection));
+    let (app_state, profile_id) = register_stub_connection(cx, Arc::new(StubConnection::new()));
 
     cx.update(|cx| {
         app_state.update(cx, |app, _| {

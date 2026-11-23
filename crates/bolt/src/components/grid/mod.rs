@@ -683,8 +683,8 @@ pub struct HeaderResize<'a> {
 /// The header is static: the host owns sorting and menus. With `resize`
 /// set, each cell also carries a [`column_resize_handle`] on its trailing
 /// edge; the host keeps [`track_column_resize`] on its grid root and stores
-/// the widths. It names the cells through `id_base` and applies the grid font family by
-/// wrapping the returned element (`.font_family(fonts::grid_family(cx))`),
+/// the widths. It names the cells through `id_base` and the host gives it the
+/// grid font by wrapping the returned element (`.font(fonts::grid_font(cx))`),
 /// the same way it covers the rows. `header_height` is the scaled header
 /// height, which the host derives from [`GridMetrics::HEADER_HEIGHT`] (see
 /// `fonts::grid_header_height`).

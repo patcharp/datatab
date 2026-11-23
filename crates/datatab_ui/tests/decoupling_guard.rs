@@ -8,8 +8,6 @@
 //! comments (`//`) are all excluded from the check.
 //!
 //! Explicit allow-list (suppressed even when found inside a string literal):
-//! - `CloudWatchLogsInsightsQl` — the `QueryLanguage` enum variant name that
-//!   must keep its capitalization for wire compatibility.
 //! - Lines inside `#[cfg(test)]` blocks — test-only assertions may reference
 //!   the word as part of "must not contain CloudWatch" assertions.
 
@@ -159,17 +157,6 @@ fn no_cloudwatch_string_literal_in_ui_crates() {
                 // (surrounded by double quotes). This excludes identifiers,
                 // type names, and code comments.
                 if !line.contains("\"CloudWatch") {
-                    continue;
-                }
-
-                // Allow-list: lines where the only match is within the
-                // canonical `QueryLanguage` enum variant name.
-                let stripped = line
-                    .replace("CloudWatchLogsInsightsQl", "")
-                    .replace("CloudWatchLogs\"", "")
-                    .replace("CloudWatchLogs {", "");
-
-                if !stripped.contains("\"CloudWatch") {
                     continue;
                 }
 

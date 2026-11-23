@@ -312,6 +312,13 @@ pub fn auth_field_secret_ref(profile_id: &uuid::Uuid, field_id: &str) -> String 
     format!("datatab:auth:{}:{}", profile_id, field_id)
 }
 
+/// Keyring reference for one secret-kind form field of a connection other
+/// than its primary password (for example an RPC driver's `api_token`). One
+/// entry per (profile, field).
+pub fn connection_field_secret_ref(profile_id: &uuid::Uuid, field_id: &str) -> String {
+    format!("datatab:conn:{}:field:{}", profile_id, field_id)
+}
+
 pub fn create_secret_store() -> Box<dyn SecretStore> {
     let keyring_store = KeyringSecretStore::new();
     if keyring_store.is_available() {

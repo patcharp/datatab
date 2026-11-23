@@ -2,7 +2,9 @@
 # Build DataTab.app on a Mac. Set MACOS_SIGN_IDENTITY for project signing;
 # without it, local builds use an ad-hoc signature.
 #
-# Run from the root of a DataTab checkout:
+# The script finds the root from its own location under scripts/.
+# For --sign-only and --dmg-only, only this script and the existing app are needed.
+# Examples from the checkout root:
 #   sh scripts/build-macos.sh                       # for this Mac, 4 build jobs
 #   JOBS=8 sh scripts/build-macos.sh
 #   sh scripts/build-macos.sh x86_64-apple-darwin   # Intel app, on any Mac

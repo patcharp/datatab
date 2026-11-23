@@ -2,9 +2,9 @@ use datatab_core::secrecy::SecretString;
 use datatab_core::{
     Connection, ConnectionProfile, CrudResult, DatabaseCategory, DbConfig, DbDriver, DbError,
     DbKind, DdlCapabilities, DriverCapabilities, DriverFormDef, DriverLimits, DriverMetadata,
-    FormFieldKind, FormSection, FormTab, FormValues, Icon, MutationCapabilities, QueryCapabilities,
-    QueryHandle, QueryLanguage, QueryRequest, QueryResult, RowDelete, RowInsert, RowPatch,
-    SchemaLoadingStrategy, SchemaSnapshot, SqlDialect, SqlLanguageService, SyntaxInfo,
+    FormFieldKind, FormSection, FormTab, FormValues, FormattedError, Icon, MutationCapabilities,
+    QueryCapabilities, QueryHandle, QueryLanguage, QueryRequest, QueryResult, RowDelete, RowInsert,
+    RowPatch, SchemaLoadingStrategy, SchemaSnapshot, SqlDialect, SqlLanguageService, SyntaxInfo,
     TransactionCapabilities, TransferFamily, field, field_required,
 };
 use datatab_core::{DatabaseInfo, DefaultSqlDialect};
@@ -26,6 +26,9 @@ pub enum FakeQueryOutcome {
     // Box to keep all variants at a similar size; QueryResult grew with metadata_extra.
     Success(Box<QueryResult>),
     Error(String),
+    /// A failure the test describes field by field, for the paths that read
+    /// more than the message — an error position, for one.
+    Formatted(Box<FormattedError>),
     Timeout,
     Cancelled,
 }
@@ -39,6 +42,7 @@ impl FakeQueryOutcome {
         match self {
             Self::Success(result) => Ok(*result.clone()),
             Self::Error(message) => Err(Box::new(DbError::query_failed(message.clone()))),
+            Self::Formatted(error) => Err(Box::new(error.as_ref().clone().into_query_error())),
             Self::Timeout => Err(Box::new(DbError::Timeout)),
             Self::Cancelled => Err(Box::new(DbError::Cancelled)),
         }
@@ -138,6 +142,14 @@ impl FakeDriver {
     pub fn with_query_error(self, sql: impl Into<String>, message: impl Into<String>) -> Self {
         rwlock_write(&self.state.query_outcomes)
             .insert(sql.into(), FakeQueryOutcome::Error(message.into()));
+        self
+    }
+
+    /// Fails `sql` with a `FormattedError` the test builds, the way a driver
+    /// reports a code, a detail or a position its engine named.
+    pub fn with_query_formatted_error(self, sql: impl Into<String>, error: FormattedError) -> Self {
+        rwlock_write(&self.state.query_outcomes)
+            .insert(sql.into(), FakeQueryOutcome::Formatted(Box::new(error)));
         self
     }
 
@@ -349,6 +361,10 @@ impl DbDriver for FakeDriver {
                 allow_insecure_http_password: values
                     .get("allow_insecure_http_password")
                     .is_some_and(|value| value == "true"),
+                ssl_mode: values.get("ssl_mode").cloned(),
+                ssl_root_cert_path: values.get("ssl_root_cert_path").cloned(),
+                ssl_client_cert_path: values.get("ssl_client_cert_path").cloned(),
+                ssl_client_key_path: values.get("ssl_client_key_path").cloned(),
             },
             DbKind::Turso => DbConfig::Turso {
                 url: get_string(values, "url", ""),
@@ -358,6 +374,22 @@ impl DbDriver for FakeDriver {
                 ducklake_catalog: None,
                 ducklake_data_path: None,
                 init_sql: None,
+            },
+            DbKind::Cassandra => DbConfig::Cassandra {
+                contact_points: get_string(values, "contact_points", "localhost"),
+                port: values
+                    .get("port")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or(9042),
+                datacenter: get_string(values, "datacenter", ""),
+                keyspace: get_string(values, "keyspace", ""),
+                user: get_string(values, "user", ""),
+                ssl_mode: values.get("ssl_mode").cloned(),
+                ssl_root_cert_path: values.get("ssl_root_cert_path").cloned(),
+                ssl_client_cert_path: values.get("ssl_client_cert_path").cloned(),
+                ssl_client_key_path: values.get("ssl_client_key_path").cloned(),
+                ssh_tunnel: None,
+                ssh_tunnel_profile_id: None,
             },
         };
 
@@ -477,7 +509,21 @@ impl DbDriver for FakeDriver {
                 database,
                 request_timeout_seconds,
                 allow_insecure_http_password,
+                ssl_mode,
+                ssl_root_cert_path,
+                ssl_client_cert_path,
+                ssl_client_key_path,
             } => {
+                for (key, value) in [
+                    ("ssl_mode", ssl_mode),
+                    ("ssl_root_cert_path", ssl_root_cert_path),
+                    ("ssl_client_cert_path", ssl_client_cert_path),
+                    ("ssl_client_key_path", ssl_client_key_path),
+                ] {
+                    if let Some(value) = value {
+                        values.insert(key.into(), value.clone());
+                    }
+                }
                 values.insert("url".to_string(), url.clone());
                 values.insert("user".to_string(), user.clone());
                 values.insert("database".to_string(), database.clone());
@@ -496,6 +542,21 @@ impl DbDriver for FakeDriver {
             }
             DbConfig::Turso { url } => {
                 values.insert("url".to_string(), url.clone());
+            }
+            DbConfig::Cassandra {
+                contact_points,
+                port,
+                datacenter,
+                keyspace,
+                user,
+                // TLS is the shared Transport control's, as in the real driver.
+                ..
+            } => {
+                values.insert("contact_points".to_string(), contact_points.clone());
+                values.insert("port".to_string(), port.to_string());
+                values.insert("datacenter".to_string(), datacenter.clone());
+                values.insert("keyspace".to_string(), keyspace.clone());
+                values.insert("user".to_string(), user.clone());
             }
             DbConfig::External { values: vals, .. } => {
                 values.extend(vals.clone());
@@ -660,7 +721,7 @@ impl Connection for FakeConnection {
             | DbKind::ReservedCloudWatchLogs
             | DbKind::ReservedS3
             | DbKind::ReservedAwsSecrets => SchemaLoadingStrategy::SingleDatabase,
-            DbKind::ClickHouse | DbKind::DuckDB | DbKind::InfluxDB => {
+            DbKind::ClickHouse | DbKind::DuckDB | DbKind::InfluxDB | DbKind::Cassandra => {
                 SchemaLoadingStrategy::LazyPerDatabase
             }
             DbKind::Turso => SchemaLoadingStrategy::SingleDatabase,
@@ -716,6 +777,13 @@ fn active_database_from_profile(profile: &ConnectionProfile) -> Option<String> {
         DbConfig::Redshift { database, .. } => Some(database.clone()),
         DbConfig::ClickHouse { database, .. } => Some(database.clone()),
         DbConfig::Turso { .. } => None,
+        DbConfig::Cassandra { keyspace, .. } => {
+            if keyspace.is_empty() {
+                None
+            } else {
+                Some(keyspace.clone())
+            }
+        }
         DbConfig::External { values, .. } => values.get("database").cloned(),
     }
 }
@@ -737,6 +805,7 @@ fn metadata_for_kind(kind: DbKind) -> &'static DriverMetadata {
         DbKind::Redshift => &REDSHIFT_METADATA,
         DbKind::ClickHouse => &FAKE_CLICKHOUSE_METADATA,
         DbKind::Turso => &FAKE_TURSO_METADATA,
+        DbKind::Cassandra => &FAKE_CASSANDRA_METADATA,
         // DuckDB is an embedded SQL engine; the SQLite fake covers it. The
         // reserved wire slots have no fake and share it.
         DbKind::DuckDB
@@ -764,6 +833,7 @@ fn form_for_kind(kind: DbKind) -> &'static DriverFormDef {
         DbKind::Redshift => &REDSHIFT_FORM,
         DbKind::ClickHouse => &CLICKHOUSE_FORM,
         DbKind::Turso => &TURSO_FORM,
+        DbKind::Cassandra => &CASSANDRA_FORM,
     }
 }
 
@@ -1299,6 +1369,67 @@ static TURSO_FORM: LazyLock<DriverFormDef> = LazyLock::new(|| DriverFormDef {
     }],
 });
 
+static FAKE_CASSANDRA_METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverMetadata {
+    id: "fake-cassandra".into(),
+    display_name: "Fake Cassandra".into(),
+    description: "Deterministic fake driver for tests".into(),
+    category: DatabaseCategory::Relational,
+    // CQL is not SQL, so the real driver is no transfer target; the fake
+    // follows it so a UI test sees the same tree.
+    transfer_family: TransferFamily::Incompatible,
+    deployment_class: None,
+    query_language: QueryLanguage::Cql,
+    capabilities: DriverCapabilities::RELATIONAL_BASE & !DriverCapabilities::TRANSACTIONS,
+    default_port: Some(9042),
+    uri_scheme: "cassandra".into(),
+    icon: Icon::Database,
+    syntax: Some(SyntaxInfo {
+        identifier_quote: '"',
+        string_quote: '\'',
+        placeholder_style: datatab_core::PlaceholderStyle::QuestionMark,
+        supports_schemas: true,
+        default_schema: None,
+        // CQL folds unquoted identifiers to lower case, as the real driver says.
+        case_sensitive_identifiers: false,
+        misreads_unknown_quoted_identifiers: false,
+    }),
+    query: Some(QueryCapabilities::default()),
+    mutation: Some(MutationCapabilities::default()),
+    ddl: Some(DdlCapabilities::default()),
+    transactions: None,
+    limits: Some(DriverLimits::default()),
+    ssl_modes: None,
+    ssl_cert_fields: None,
+    classification_override: None,
+    default_chunk_size: None,
+    supports_lock_timeout: false,
+    editor_profile: None,
+});
+
+static CASSANDRA_FORM: LazyLock<DriverFormDef> = LazyLock::new(|| DriverFormDef {
+    tabs: vec![FormTab {
+        id: "main".into(),
+        label: "Main".into(),
+        sections: vec![FormSection {
+            title: "Connection".into(),
+            icon: None,
+            fields: vec![
+                field_required(
+                    "contact_points",
+                    "Contact Points",
+                    FormFieldKind::Text,
+                    "localhost",
+                ),
+                field("port", "Port", FormFieldKind::Number, "9042"),
+                field("datacenter", "Datacenter", FormFieldKind::Text, "dc1"),
+                field("keyspace", "Keyspace", FormFieldKind::Text, ""),
+                field("user", "User", FormFieldKind::Text, ""),
+                field("password", "Password", FormFieldKind::Password, ""),
+            ],
+        }],
+    }],
+});
+
 static FAKE_INFLUXDB_METADATA: LazyLock<DriverMetadata> = LazyLock::new(|| DriverMetadata {
     id: "fake-influxdb".into(),
     display_name: "Fake InfluxDB".into(),
@@ -1519,6 +1650,7 @@ mod tests {
             (DbKind::SQLite, SchemaLoadingStrategy::SingleDatabase),
             (DbKind::Turso, SchemaLoadingStrategy::SingleDatabase),
             (DbKind::DuckDB, SchemaLoadingStrategy::LazyPerDatabase),
+            (DbKind::Cassandra, SchemaLoadingStrategy::LazyPerDatabase),
             (DbKind::MongoDB, SchemaLoadingStrategy::SingleDatabase),
             (DbKind::Redis, SchemaLoadingStrategy::SingleDatabase),
             (DbKind::ClickHouse, SchemaLoadingStrategy::LazyPerDatabase),
@@ -1561,6 +1693,7 @@ mod tests {
                 DbKind::ClickHouse => DbConfig::default_clickhouse(),
                 DbKind::Turso => DbConfig::default_turso(),
                 DbKind::DuckDB => DbConfig::default_duckdb(),
+                DbKind::Cassandra => DbConfig::default_cassandra(),
                 // No case above uses a reserved wire slot.
                 DbKind::ReservedDynamoDb
                 | DbKind::ReservedCloudWatchLogs

@@ -27,8 +27,6 @@ use datatab_driver_redis::{RdbAnalyzer, RedisDriver};
 use datatab_test_support::containers;
 use std::io::Write;
 use std::time::Duration;
-use testcontainers::core::ExecCommand;
-use testcontainers::{Container, GenericImage};
 
 fn connect_redis(uri: String) -> Result<Box<dyn datatab_core::Connection>, DbError> {
     let driver = RedisDriver::new();
@@ -66,13 +64,13 @@ fn connect_redis(uri: String) -> Result<Box<dyn datatab_core::Connection>, DbErr
 
 /// Copies `/data/dump.rdb` out of the container's own filesystem via
 /// `docker exec cat` and writes it to a fresh temp file on the host.
-fn fetch_dump_rdb(container: &Container<GenericImage>) -> tempfile::NamedTempFile {
-    let mut exec_result = container
-        .exec(ExecCommand::new(["cat", "/data/dump.rdb"]))
+fn fetch_dump_rdb(container: &str) -> tempfile::NamedTempFile {
+    let output = std::process::Command::new("docker")
+        .args(["exec", container, "cat", "/data/dump.rdb"])
+        .output()
         .expect("exec cat dump.rdb should succeed");
-    let bytes = exec_result
-        .stdout_to_vec()
-        .expect("reading dump.rdb bytes from exec stdout should succeed");
+    assert!(output.status.success(), "exec cat dump.rdb failed");
+    let bytes = output.stdout;
     assert!(!bytes.is_empty(), "dump.rdb must not be empty after SAVE");
 
     let mut file = tempfile::NamedTempFile::new().expect("creating host temp file should succeed");

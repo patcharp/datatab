@@ -366,6 +366,8 @@ DbConfig::External {
 
 `values` contains the field values collected from your `form_definition`.
 
+A `Password` or `WriteOnly` field other than `password` is kept in the OS keyring, not in DataTab's database. DataTab reads it into `values` just before it sends `OpenSession`. The profile JSON may also carry `keyring_secret_fields`, a list of the ids of those fields. It names fields only, never values. A service can ignore it; DataTab omits it when the list is empty.
+
 The service should parse `profile_json`, expect `DbConfig::External`, and validate required fields again server-side.
 
 ## Request/response overview

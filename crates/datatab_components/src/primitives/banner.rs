@@ -32,6 +32,12 @@ impl BannerBlock {
         Self(bolt::primitives::BannerBlock::new(variant, title).default_icon(default_icon(variant)))
     }
 
+    /// Sets the element id, so tests and automation find the banner by name.
+    pub fn id(mut self, id: impl Into<gpui::ElementId>) -> Self {
+        self.0 = self.0.id(id);
+        self
+    }
+
     /// Replace the default leading icon.
     pub fn with_icon(mut self, icon: impl IntoElement) -> Self {
         self.0 = self.0.with_icon(icon);

@@ -431,6 +431,11 @@ impl Render for Workspace {
             .min_w_0()
             .h_full()
             .ml(IslandMetrics::GAP)
+            // The next start's offer of a report a panic left sits above the
+            // tabs: one line, closed by any answer, never blocking the app.
+            .when(self.report_notice.read(cx).is_visible(), |island| {
+                island.child(self.report_notice.clone())
+            })
             .when(has_tabs, |island| island.child(self.tab_bar.clone()))
             .child(div().flex_1().min_h_0().child(document_panes));
 
@@ -983,6 +988,14 @@ impl Render for Workspace {
                             cx,
                         ),
                     ))
+            })
+            // The send window draws over everything, the notifications
+            // popover included: it is a modal and takes the keyboard.
+            .when(self.report_send.read(cx).is_visible(), |el| {
+                el.child(
+                    deferred(self.report_send.clone())
+                        .with_priority(super::notifications::NOTIFICATIONS_LAYER_PRIORITY + 1),
+                )
             })
             // Delete confirmation modal rendered at workspace level for proper centering
             .when_some(

@@ -65,6 +65,7 @@ impl ClickHouseHttpClient {
 
     /// `allow_insecure_http_password` is the connection's opt-in to send a
     /// non-empty password over a non-loopback `http://` endpoint.
+    #[cfg(test)]
     pub(crate) fn new(
         endpoint: &str,
         user: String,
@@ -72,6 +73,34 @@ impl ClickHouseHttpClient {
         default_database: String,
         timeout: Duration,
         allow_insecure_http_password: bool,
+    ) -> Result<Self, ClickHouseHttpError> {
+        let mut config = datatab_core::DbConfig::default_clickhouse();
+        if let datatab_core::DbConfig::ClickHouse { url, ssl_mode, .. } = &mut config {
+            *url = endpoint.to_string();
+            *ssl_mode = None;
+        }
+        let profile = datatab_core::ConnectionProfile::new("test", config);
+        let tls = crate::tls::TlsOptions::from_profile(&profile)
+            .map_err(|error| ClickHouseHttpError::Transport(error.to_string()))?;
+        Self::new_with_tls(
+            endpoint,
+            user,
+            password,
+            default_database,
+            timeout,
+            allow_insecure_http_password,
+            &tls,
+        )
+    }
+
+    pub(crate) fn new_with_tls(
+        endpoint: &str,
+        user: String,
+        password: Option<SecretString>,
+        default_database: String,
+        timeout: Duration,
+        allow_insecure_http_password: bool,
+        tls: &crate::tls::TlsOptions<'_>,
     ) -> Result<Self, ClickHouseHttpError> {
         let mut endpoint = parse_endpoint(endpoint)?;
         let has_password = password
@@ -85,13 +114,16 @@ impl ClickHouseHttpClient {
         }
         endpoint.set_query(None);
 
-        let client = Client::builder()
+        let builder = Client::builder()
             .timeout(timeout)
             .gzip(true)
             .tcp_nodelay(true)
             .use_rustls_tls()
             .redirect(Policy::none())
-            .user_agent(datatab_core::client_identity())
+            .user_agent(datatab_core::client_identity());
+        let client = tls
+            .configure(builder)
+            .map_err(|error| ClickHouseHttpError::Transport(error.to_string()))?
             .build()
             .map_err(|error| ClickHouseHttpError::Transport(error.to_string()))?;
 

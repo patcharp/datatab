@@ -22,6 +22,7 @@ redshift = ["datatab_driver_redshift"]
 clickhouse = ["datatab_driver_clickhouse"]
 turso = ["datatab_driver_turso"]
 duckdb = ["datatab_driver_duckdb"]
+cassandra = ["datatab_driver_cassandra"]
 
 [dependencies]
 # DataTab core crates
@@ -43,6 +44,7 @@ datatab_driver_redshift = { workspace = true, optional = true }
 datatab_driver_clickhouse = { workspace = true, optional = true }
 datatab_driver_turso = { workspace = true, optional = true }
 datatab_driver_duckdb = { workspace = true, optional = true }
+datatab_driver_cassandra = { workspace = true, optional = true }
 
 # MCP SDK
 rmcp = { version = "2.0.0", features = ["server", "macros", "transport-io"] }

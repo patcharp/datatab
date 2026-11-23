@@ -103,3 +103,17 @@ fn retired_category_slots_answer_like_the_other_reserved_slots() {
         );
     }
 }
+
+/// Only the three reserved wire slots are reserved.
+#[test]
+fn only_the_reserved_slots_are_reserved() {
+    for reserved in [
+        QueryLanguage::ReservedCloudWatchLogsInsightsQl,
+        QueryLanguage::ReservedOpenSearchPpl,
+        QueryLanguage::ReservedOpenSearchSql,
+    ] {
+        assert!(reserved.is_reserved(), "{reserved:?}");
+    }
+    assert!(!QueryLanguage::Sql.is_reserved());
+    assert!(!QueryLanguage::Custom("dialect".to_string()).is_reserved());
+}

@@ -24,7 +24,6 @@ use datatab_components::fonts;
 use datatab_components::icons::AppIcon;
 use datatab_components::primitives::{Icon, Kbd, Text};
 use datatab_components::tokens::{ChromeColors, ConsoleMetrics, FontSizes, Spacing};
-use datatab_components::typography::AppFonts;
 use datatab_core::observability::actions as audit_actions;
 use datatab_core::observability::{
     EventCategory, EventOrigin, EventOutcome, EventRecord, EventSeverity,
@@ -781,7 +780,7 @@ impl NativeConsole {
             .pt(Spacing::SM)
             .pb(ConsoleMetrics::PADDING_BOTTOM)
             .px(ConsoleMetrics::PADDING_X)
-            .font_family(datatab_components::fonts::editor_family(cx))
+            .font(datatab_components::fonts::editor_font(cx))
             .text_size(fonts::editor_scaled(cx, ConsoleMetrics::FONT))
             .line_height(fonts::editor_scaled(cx, ConsoleMetrics::LINE_HEIGHT))
             // Up and Down walk the history, unless an open completion menu

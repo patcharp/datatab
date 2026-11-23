@@ -42,9 +42,6 @@ pub struct TitleCrumb {
 /// runs them.
 pub type TitleBarHandler = Box<dyn Fn(&mut Window, &mut App) + 'static>;
 
-/// Title bar height for Linux CSD mode. Used for layout and client inset reporting.
-pub const TITLE_BAR_HEIGHT: gpui::Pixels = px(32.0);
-
 /// Request client decorations on every Linux desktop.
 #[cfg(target_os = "linux")]
 pub fn decoration_request() -> Option<WindowDecorations> {
@@ -78,17 +75,13 @@ pub fn should_render_csd(_window: &Window) -> bool {
     false
 }
 
-/// Conditionally renders a CSD title bar for Linux and configures the client inset.
+/// Conditionally renders a CSD title bar for Linux.
 ///
 /// Call this at the start of every top-level window's `Render::render()` and store
 /// the result. Prepend it as the first child of the root flex column.
 ///
-/// Returns `Some(element)` when CSD is active (Linux Wayland with compositor granting
-/// CSD), `None` otherwise. When `None` is returned on Linux, the client inset is
-/// explicitly reset to zero to prevent stale insets.
-///
-/// Pass `crumbs` to render a breadcrumb trail after the app name. An empty slice
-/// renders the title alone (same behavior as before).
+/// Returns `Some(element)` when CSD is active, `None` otherwise. The window
+/// border owns the client inset.
 pub fn render_csd_title_bar(
     window: &mut Window,
     cx: &mut App,
@@ -232,22 +225,12 @@ pub fn apply_shell_titlebar_options(options: &mut WindowOptions) {
     options.app_owns_titlebar_drag = cfg!(target_os = "macos");
 }
 
-/// Reports whether the app draws its own title bar this frame and sets the
-/// client inset to match.
+/// Reports whether the app draws its own title bar this frame.
 ///
 /// Call once per render of a top-level window that embeds its own title bar
-/// row. When CSD is active the inset is set to `TITLE_BAR_HEIGHT`; otherwise,
-/// on Linux, it is reset to zero so a window that left CSD mode does not keep
-/// a stale inset.
+/// row. The window border owns the client inset.
 pub fn prepare_client_decorations(window: &mut Window) -> bool {
-    if !should_render_csd(window) {
-        #[cfg(target_os = "linux")]
-        window.set_client_inset(px(0.0));
-        return false;
-    }
-
-    window.set_client_inset(TITLE_BAR_HEIGHT);
-    true
+    should_render_csd(window)
 }
 
 /// The window-management area of a title bar. It delegates dragging and

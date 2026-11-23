@@ -7,6 +7,7 @@
 #![recursion_limit = "2048"]
 
 pub mod connection_manager;
+pub mod reports;
 pub mod settings;
 pub mod ssh_host_picker;
 pub mod ssh_shared;

@@ -30,6 +30,7 @@ datatab_driver_redshift = { workspace = true, optional = true }
 datatab_driver_clickhouse = { workspace = true, optional = true }
 datatab_driver_turso = { workspace = true, optional = true }
 datatab_driver_duckdb = { workspace = true, optional = true }
+datatab_driver_cassandra = { workspace = true, optional = true }
 datatab_portability.workspace = true
 datatab_lua = { workspace = true, optional = true }
 datatab_approval = { workspace = true, optional = true }
@@ -63,6 +64,7 @@ redshift = ["datatab_driver_redshift", "datatab_mcp_server?/redshift"]
 clickhouse = ["datatab_driver_clickhouse", "datatab_mcp_server?/clickhouse"]
 turso = ["datatab_driver_turso", "datatab_mcp_server?/turso"]
 duckdb = ["datatab_driver_duckdb", "datatab_mcp_server?/duckdb"]
+cassandra = ["datatab_driver_cassandra", "datatab_mcp_server?/cassandra"]
 lua = ["datatab_lua"]
 mcp = ["datatab_approval", "datatab_mcp", "datatab_mcp_server", "datatab_policy", "datatab_core/mcp"]
 

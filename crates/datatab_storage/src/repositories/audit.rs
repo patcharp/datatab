@@ -500,6 +500,35 @@ impl AuditRepository {
             source: rusqlite::Error::InvalidParameterName(e.to_string()),
         })?;
 
+        Self::query_on(&conn, filter)
+    }
+
+    /// The newest `limit` events, or `Ok(None)` when another thread holds the
+    /// connection.
+    ///
+    /// This is the read side of the panic hook: it must never wait for the
+    /// database, so a busy connection means an empty audit trail rather than a
+    /// blocked panic.
+    pub fn try_recent(&self, limit: usize) -> Result<Option<Vec<AuditEventDto>>, RepositoryError> {
+        use std::sync::TryLockError;
+
+        let conn = match self.conn.try_lock() {
+            Ok(conn) => conn,
+            Err(TryLockError::WouldBlock) | Err(TryLockError::Poisoned(_)) => return Ok(None),
+        };
+
+        let filter = AuditQueryFilter {
+            limit: Some(limit),
+            ..AuditQueryFilter::default()
+        };
+
+        Self::query_on(&conn, &filter).map(Some)
+    }
+
+    fn query_on(
+        conn: &Connection,
+        filter: &AuditQueryFilter,
+    ) -> Result<Vec<AuditEventDto>, RepositoryError> {
         let mut sql = String::from(
             "SELECT id, actor_id, tool_id, decision, reason,
                     profile_id, classification, duration_ms, created_at, created_at_epoch_ms,

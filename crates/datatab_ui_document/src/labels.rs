@@ -24,6 +24,12 @@ pub(crate) fn grid_reload_blocked_by_pending_edits() -> String {
     datatab_i18n::t!("document.data.grid.edit_bar.reload_blocked")
 }
 
+/// Why the grid's header offers no sort: the rows' database cannot order the
+/// view, so the grid neither asks for an order nor pretends to have one.
+pub(crate) fn sort_unavailable() -> String {
+    datatab_i18n::t!("document.data.grid.sorting.unavailable")
+}
+
 /// Warning shown when a reload that carries unsaved edits over could not
 /// find `count` of the edited rows in the reloaded rows, so their edits were
 /// dropped.
@@ -619,15 +625,6 @@ pub(crate) fn delete_confirm_copy(count: usize) -> (String, String) {
     }
 }
 
-/// Summary of the last run at the end of the editor toolbar
-/// ("last run 0.32 s").
-pub(crate) fn code_toolbar_last_run_label(seconds: f64) -> String {
-    datatab_i18n::t!(
-        "document.code.toolbar.last_run",
-        seconds = format!("{seconds:.2}")
-    )
-}
-
 /// Task-panel description for a running script, with the query language's
 /// display name interpolated.
 pub(crate) fn run_script_task_label(language_name: &str) -> String {
@@ -787,6 +784,9 @@ pub(crate) fn dangerous_query_title(kind: datatab_core::DangerousQueryKind) -> S
         DangerousQueryKind::MongoAggregateWrite => {
             datatab_i18n::t!("document.code.dangerous_query.kind.mongo_aggregate_write.title")
         }
+        DangerousQueryKind::CqlPartialKeyDelete => {
+            datatab_i18n::t!("document.code.dangerous_query.kind.cql_partial_key_delete.title")
+        }
         DangerousQueryKind::RedisFlushAll => {
             datatab_i18n::t!("document.code.dangerous_query.kind.redis_flush_all.title")
         }
@@ -847,6 +847,9 @@ pub(crate) fn dangerous_query_body(kind: datatab_core::DangerousQueryKind) -> St
         }
         DangerousQueryKind::MongoAggregateWrite => {
             datatab_i18n::t!("document.code.dangerous_query.kind.mongo_aggregate_write.body")
+        }
+        DangerousQueryKind::CqlPartialKeyDelete => {
+            datatab_i18n::t!("document.code.dangerous_query.kind.cql_partial_key_delete.body")
         }
         DangerousQueryKind::RedisFlushAll => {
             datatab_i18n::t!("document.code.dangerous_query.kind.redis_flush_all.body")
@@ -3825,8 +3828,8 @@ mod tests {
         bucket_encryption_choice_label, buckets_table_summary_line, builder_mode_label,
         bulk_delete_success_label, chart_degraded_copy, chart_dock_shape_label,
         chart_rail_why_text, chart_save_failed_error, chart_save_no_profile_binding_error,
-        chart_saved_toast, chart_toolbar_points_label, code_toolbar_last_run_label,
-        comparator_label, configure_chart_kind_label, context_menu_clipboard_copied_toast,
+        chart_saved_toast, chart_toolbar_points_label, comparator_label,
+        configure_chart_kind_label, context_menu_clipboard_copied_toast,
         context_menu_clipboard_copy_failed_error, context_menu_clipboard_non_utf8_error,
         context_menu_document_insert_failed_error, context_menu_document_update_failed_error,
         context_menu_export_dialog_fallback_failed_error, context_menu_export_dialog_title,
@@ -3890,6 +3893,7 @@ mod tests {
         DangerousQueryKind::MongoDropCollection,
         DangerousQueryKind::MongoDropDatabase,
         DangerousQueryKind::MongoAggregateWrite,
+        DangerousQueryKind::CqlPartialKeyDelete,
         DangerousQueryKind::RedisFlushAll,
         DangerousQueryKind::RedisFlushDb,
         DangerousQueryKind::RedisMultiDelete,
@@ -4293,7 +4297,6 @@ mod tests {
             "document.code.toolbar.cancel",
             "document.code.toolbar.checking",
             "document.code.toolbar.run",
-            "document.code.toolbar.last_run",
             "document.code.toolbar.run_in_new_tab",
             "document.code.toolbar.read_only",
             "document.code.toolbar.saved",
@@ -4361,11 +4364,6 @@ mod tests {
         let en = datatab_i18n::t!("document.code.script_confirm.title", locale = "en");
 
         assert_eq!(en, "Run entire script");
-    }
-
-    #[test]
-    fn code_toolbar_last_run_label_formats_two_decimals() {
-        assert_eq!(code_toolbar_last_run_label(0.3214), "last run 0.32 s");
     }
 
     #[test]
@@ -4498,6 +4496,16 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_sort_unavailable_label_resolves_in_english() {
+        let value = crate::labels::sort_unavailable();
+        assert!(!value.is_empty(), "the reason must say something");
+        assert!(
+            value.contains("cannot sort"),
+            "the reason names the limitation: {value}"
+        );
+    }
+
     fn dangerous_query_title_key(kind: DangerousQueryKind) -> &'static str {
         match kind {
             DangerousQueryKind::DeleteNoWhere => {
@@ -4524,6 +4532,9 @@ mod tests {
             }
             DangerousQueryKind::MongoAggregateWrite => {
                 "document.code.dangerous_query.kind.mongo_aggregate_write.title"
+            }
+            DangerousQueryKind::CqlPartialKeyDelete => {
+                "document.code.dangerous_query.kind.cql_partial_key_delete.title"
             }
             DangerousQueryKind::RedisFlushAll => {
                 "document.code.dangerous_query.kind.redis_flush_all.title"
@@ -4569,6 +4580,9 @@ mod tests {
             }
             DangerousQueryKind::MongoAggregateWrite => {
                 "document.code.dangerous_query.kind.mongo_aggregate_write.body"
+            }
+            DangerousQueryKind::CqlPartialKeyDelete => {
+                "document.code.dangerous_query.kind.cql_partial_key_delete.body"
             }
             DangerousQueryKind::RedisFlushAll => {
                 "document.code.dangerous_query.kind.redis_flush_all.body"

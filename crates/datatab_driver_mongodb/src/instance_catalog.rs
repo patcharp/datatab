@@ -73,7 +73,7 @@ pub const SERVER_STATUS_PATHS: &[(
     (
         "mem.resident",
         "mongo.mem.resident",
-        "Resident memory (MB)",
+        "Resident memory",
         "Memory",
         InstanceMetricUnit::Bytes,
         InstanceMetricKind::Gauge,
@@ -685,6 +685,56 @@ impl InstanceCatalog for MongoInstanceCatalog {
     }
 }
 
+const BYTES_PER_MEGABYTE: f64 = 1_048_576.0;
+
+/// Factor that turns the raw `serverStatus` value at `path` into the unit the
+/// catalog declares. `mem.resident` is reported in megabytes, but the metric
+/// is declared in bytes.
+fn server_status_scale(path: &str) -> f64 {
+    match path {
+        "mem.resident" => BYTES_PER_MEGABYTE,
+        _ => 1.0,
+    }
+}
+
+/// Turns a `serverStatus` document into the one-row metric result, in the unit
+/// the catalog declares.
+fn metric_result_from_status(
+    status: &Document,
+    path: &str,
+    metric_id: &str,
+    display_name: &str,
+) -> Result<QueryResult, DbError> {
+    let value = MongoInstanceCatalog::extract_path(status, path).ok_or_else(|| {
+        DbError::QueryFailed(
+            format!(
+                "serverStatus path '{}' not found — metric '{}' is not available \
+                 on this MongoDB version or deployment (Atlas, in-memory engine, \
+                 or older server may omit this field)",
+                path, metric_id
+            )
+            .into(),
+        )
+    })?;
+
+    let value = value * server_status_scale(path);
+    let row: Row = vec![Value::Int(now_epoch_ms()), Value::Float(value)];
+
+    Ok(QueryResult {
+        shape: QueryResultShape::Table,
+        columns: vec![timestamp_col("timestamp_ms"), float_col(display_name)],
+        rows: vec![row],
+        affected_rows: None,
+        execution_time: Duration::ZERO,
+        text_body: None,
+        raw_bytes: None,
+        next_page_token: None,
+        resolved_window: None,
+        metadata_extra: None,
+        additional_results: Vec::new(),
+    })
+}
+
 pub(crate) fn dispatch_metric_series(
     client: &Client,
     metric_id: &str,
@@ -696,35 +746,7 @@ pub(crate) fn dispatch_metric_series(
     match entry {
         Some((path, metric_id_str, display_name, _, _, _)) => {
             let status = run_server_status(client)?;
-            let value = MongoInstanceCatalog::extract_path(&status, path).ok_or_else(|| {
-                DbError::QueryFailed(
-                    format!(
-                        "serverStatus path '{}' not found — metric '{}' is not available \
-                         on this MongoDB version or deployment (Atlas, in-memory engine, \
-                         or older server may omit this field)",
-                        path, metric_id_str
-                    )
-                    .into(),
-                )
-            })?;
-
-            let columns = vec![timestamp_col("timestamp_ms"), float_col(display_name)];
-
-            let row: Row = vec![Value::Int(now_epoch_ms()), Value::Float(value)];
-
-            Ok(QueryResult {
-                shape: QueryResultShape::Table,
-                columns,
-                rows: vec![row],
-                affected_rows: None,
-                execution_time: Duration::ZERO,
-                text_body: None,
-                raw_bytes: None,
-                next_page_token: None,
-                resolved_window: None,
-                metadata_extra: None,
-                additional_results: Vec::new(),
-            })
+            metric_result_from_status(&status, path, metric_id_str, display_name)
         }
         None => Err(DbError::NotSupported(format!(
             "unknown instance metric: {metric_id}"
@@ -971,6 +993,49 @@ mod tests {
             MongoInstanceCatalog::extract_path(&status, "nonexistent.path"),
             None
         );
+    }
+
+    /// `serverStatus` reports `mem.resident` in megabytes; the metric is
+    /// declared in bytes, so the fetch must scale it and the label must not
+    /// name a unit.
+    #[test]
+    fn resident_memory_is_declared_and_scaled_as_bytes() {
+        let metric = MongoInstanceCatalog::static_metrics()
+            .into_iter()
+            .find(|metric| metric.id == "mongo.mem.resident")
+            .expect("mongo.mem.resident must be declared");
+        assert_eq!(metric.unit, InstanceMetricUnit::Bytes);
+        assert!(
+            !metric.display_name.contains("MB"),
+            "label {:?} must not name a unit other than the declared bytes",
+            metric.display_name
+        );
+
+        let mut status = Document::new();
+        status.insert("mem", bson::doc! { "resident": 256_i32 });
+        let result = metric_result_from_status(
+            &status,
+            "mem.resident",
+            "mongo.mem.resident",
+            &metric.display_name,
+        )
+        .expect("a status with mem.resident must yield a result");
+        assert_eq!(result.rows[0][1], Value::Float(268_435_456.0));
+    }
+
+    /// Byte-valued and count paths pass through unscaled.
+    #[test]
+    fn other_paths_are_not_scaled() {
+        let mut status = Document::new();
+        status.insert("opcounters", bson::doc! { "query": 42_i32 });
+        let result = metric_result_from_status(
+            &status,
+            "opcounters.query",
+            "mongo.opcounters.query",
+            "Queries / sec",
+        )
+        .expect("a status with opcounters.query must yield a result");
+        assert_eq!(result.rows[0][1], Value::Float(42.0));
     }
 
     #[test]

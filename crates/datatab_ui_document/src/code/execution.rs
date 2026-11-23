@@ -1,6 +1,7 @@
 use super::*;
 use crate::data_grid_panel::{LimitedRowActions, LimitedRowTotal};
 use datatab_core::observability::actions as audit_actions;
+use std::ops::Range;
 
 /// Resolve the `ExecutionSourceContext` for the next query, giving precedence
 /// to a panel-emitted override window over the input-field fallback.
@@ -98,6 +99,82 @@ fn show_read_only_profile_toast(cx: &mut App) {
         .meta_right(now_hms())
         .action(copy_action(msg))
         .push(cx);
+}
+
+/// True for the characters a SQL token is built from.
+fn is_token_char(candidate: char) -> bool {
+    candidate.is_alphanumeric() || candidate == '_'
+}
+
+/// The range of the token that holds `byte` in `text`.
+///
+/// A position that lands between tokens, on a quote or a comma for one, has no
+/// token under it, so the range is just that character: the caret then sits on
+/// exactly where the run stopped. A position past the end has nothing there and
+/// gives an empty range at the end, which is a caret and not a selection.
+fn token_range_at(text: &str, byte: usize) -> Range<usize> {
+    let byte = byte.min(text.len());
+    let at_token = text[byte..].chars().next().is_some_and(is_token_char);
+
+    if !at_token {
+        let end = text[byte..]
+            .chars()
+            .next()
+            .map_or(byte, |candidate| byte + candidate.len_utf8());
+        return byte..end;
+    }
+
+    let start = text[..byte]
+        .char_indices()
+        .rev()
+        .map_while(|(index, candidate)| is_token_char(candidate).then_some(index))
+        .last()
+        .unwrap_or(byte);
+
+    let end = text[byte..]
+        .char_indices()
+        .map_while(|(index, candidate)| {
+            is_token_char(candidate).then_some(byte + index + candidate.len_utf8())
+        })
+        .last()
+        .unwrap_or(byte);
+
+    start..end
+}
+
+/// The buffer range to put the cursor on for a driver's position in a run.
+///
+/// `origin` is the buffer offset the run's text started at and `statement_len`
+/// its length, so the run's own text is one slice of the buffer. Both the
+/// character offset and that slice are clamped to the buffer: the user may have
+/// edited it while the query ran, and a driver number is never trusted to point
+/// inside it. `None` when the run started outside the buffer.
+fn error_cursor_range(
+    buffer: &str,
+    origin: usize,
+    statement_len: usize,
+    character_offset: usize,
+) -> Option<Range<usize>> {
+    if origin > buffer.len() || !buffer.is_char_boundary(origin) {
+        return None;
+    }
+
+    // The user may have edited the buffer while the run was out, so the
+    // statement's end is clamped to it and moved back onto a character.
+    let mut statement_end = origin.saturating_add(statement_len).min(buffer.len());
+    while !buffer.is_char_boundary(statement_end) {
+        statement_end -= 1;
+    }
+    let statement = buffer.get(origin..statement_end)?;
+
+    let byte_in_statement = statement
+        .char_indices()
+        .nth(character_offset)
+        .map(|(index, _)| index)
+        .unwrap_or(statement.len());
+
+    let range = token_range_at(statement, byte_in_statement);
+    Some(origin + range.start..origin + range.end)
 }
 
 fn task_target_for_execution(
@@ -1027,8 +1104,13 @@ impl CodeDocument {
                 // The cleanup rolls back the connection's transaction. A query
                 // that never reached the driver left nothing to undo, and
                 // rolling back would discard a transaction the user opened.
-                if dispatched && let Err(error) = connection.cleanup_after_cancel() {
-                    log::warn!("Cleanup after cancel failed: {error}");
+                if dispatched {
+                    crate::cancel_cleanup::cleanup_after_cancel_in_background(
+                        connection.clone(),
+                        "Query",
+                        cx,
+                    )
+                    .await;
                 }
 
                 let inner_result = this.update(cx, |doc, cx| {
@@ -1465,9 +1547,53 @@ impl CodeDocument {
         }
 
         self.execution.load_all_rows = None;
-        let (query, from_selection) = self.auto_refresh_query(cx);
-        self.execution.query_origin = if from_selection { None } else { Some(0) };
+        let (query, _from_selection) = self.auto_refresh_query(cx);
+        // An unattended refresh is not a run the user started, so it leaves no
+        // origin for a failure to move the cursor through: a tick must never
+        // pull the caret out of what the user is typing.
+        self.execution.query_origin = None;
         self.run_query_text_with(query, false, ReadOnlyEnforcement::Required, window, cx);
+    }
+
+    /// Puts the cursor where a failed run's error points, selecting the token
+    /// there.
+    ///
+    /// Only a run that still knows where its text started can move the cursor,
+    /// and only when the driver reported a position. The editor is not focused
+    /// on purpose: a run started from elsewhere must not pull focus out of the
+    /// surface the user has moved to, and the results panel is left untouched.
+    fn reveal_error_position(
+        &mut self,
+        statement: &str,
+        position: datatab_core::ErrorPosition,
+        cx: &mut Context<Self>,
+    ) {
+        // A batch's offset indexes the statement the server failed on, while
+        // the run's origin marks where the whole script starts. Drivers also
+        // disagree about the frame of the number: SQLite prepares each
+        // statement from the remaining text, PostgreSQL counts from the whole
+        // submitted string. No driver-agnostic rule puts those together, so a
+        // batch leaves the cursor alone rather than guessing.
+        if self.effective_language().statement_count(statement) > 1 {
+            return;
+        }
+
+        let Some(origin) = self.execution.query_origin else {
+            return;
+        };
+        let Some(character_offset) = position.resolve_character_offset(statement) else {
+            return;
+        };
+
+        let buffer = self.editor.input_state.read(cx).value();
+        let Some(range) = error_cursor_range(&buffer, origin, statement.len(), character_offset)
+        else {
+            return;
+        };
+
+        self.editor
+            .input_state
+            .update(cx, |state, cx| state.set_selected_range(range, cx));
     }
 
     /// Turns auto-refresh off and tells the user why: the query cannot run
@@ -1673,6 +1799,20 @@ impl CodeDocument {
                 let error_msg = e.to_string();
                 record.error = Some(error_msg.clone());
                 self.state = DocumentState::Error;
+
+                // A driver that names where the failure is puts the cursor
+                // there, so the user sees the character the server stopped on
+                // instead of the one they left behind. A script has no
+                // statement the position indexes, and a read-only refusal is
+                // not a failure of the query's text, so neither moves it.
+                let error_position = if is_script || read_only_refused {
+                    None
+                } else {
+                    e.formatted().and_then(|formatted| formatted.position)
+                };
+                if let Some(position) = error_position {
+                    self.reveal_error_position(&pending.query, position, cx);
+                }
 
                 // A read-only refusal on an unattended run is expected: the
                 // fallback to Manual below tells the user, so it is not shown
@@ -1928,6 +2068,9 @@ impl CodeDocument {
         grid.update(cx, |grid, cx| {
             grid.set_side_panels_hosted(true);
             grid.set_result_caption(caption, cx);
+            // The rows came from the editor's hand-written statement, so the
+            // grid explains why they cannot be edited.
+            grid.mark_free_form_query_result(cx);
         });
 
         if let Some(panel) = self.source.source_time_range_panel.clone() {
@@ -4210,7 +4353,7 @@ mod result_tab_keyboard_tests {
     #[gpui::test]
     fn the_pane_actions_list_the_result_tabs_and_the_results_area(cx: &mut TestAppContext) {
         let (document, window) = document_with_result_tabs(cx, 2);
-        let actions = window.update(|_, cx| document.read(cx).pane_actions(&document));
+        let actions = window.update(|_, cx| document.read(cx).pane_actions(&document, cx));
 
         let entries: Vec<(&str, Option<Command>)> = actions
             .iter()
@@ -4290,7 +4433,7 @@ mod result_tab_keyboard_tests {
         let menu: Vec<String> = window.update(|_, cx| {
             document
                 .read(cx)
-                .pane_actions(&document)
+                .pane_actions(&document, cx)
                 .iter()
                 .map(|action| action.id.to_string())
                 .collect()
@@ -4359,7 +4502,7 @@ mod result_tab_keyboard_tests {
         });
         window.run_until_parked();
 
-        let actions = window.update(|_, cx| document.read(cx).pane_actions(&document));
+        let actions = window.update(|_, cx| document.read(cx).pane_actions(&document, cx));
         let refresh = actions
             .iter()
             .find(|action| action.id == "refresh")
@@ -4902,6 +5045,309 @@ mod auto_refresh_tests {
         assert_eq!(
             executed(&driver),
             vec![("SELECT 1".to_string(), ReadOnlyEnforcement::Required)]
+        );
+    }
+}
+
+#[cfg(test)]
+mod error_position_tests {
+    // Explicit imports rather than the parent glob: combining `use super::*`
+    // with `#[gpui::test]` sends the gpui_macros expansion into unbounded
+    // recursion.
+    use crate::code::CodeDocument;
+    use datatab_components::theme;
+    use datatab_core::{
+        ConnectionProfile, DbConfig, DbKind, ErrorPosition, FormattedError, QueryLanguage,
+        WritePrivilege,
+    };
+    use datatab_storage::bootstrap::StorageRuntime;
+    use datatab_test_support::FakeDriver;
+    use datatab_ui_base::AppStateEntity;
+    use datatab_ui_base::modals::test_host::host_modal;
+    use datatab_ui_base::toast::{ToastGlobal, ToastHost};
+    use gpui::{AppContext as _, Entity, TestAppContext, VisualTestContext};
+    use std::ops::Range;
+
+    const STATEMENT: &str = "SELECT id, FROM t";
+
+    /// Opens a SQL code document connected through `driver` and holding
+    /// `content`, with the cursor at its start.
+    fn open_connected<'a>(
+        cx: &'a mut TestAppContext,
+        driver: &FakeDriver,
+        content: &str,
+    ) -> (Entity<CodeDocument>, &'a mut VisualTestContext) {
+        cx.update(theme::init);
+        cx.update(datatab_ui_base::keymap::init_keymap);
+        let _toasts = cx.update(|cx| {
+            let host = cx.new(|_| ToastHost::new());
+            cx.set_global(ToastGlobal { host: host.clone() });
+            host
+        });
+        let app_state = cx.new(|_| {
+            AppStateEntity::new_with_storage_runtime(
+                StorageRuntime::in_memory().expect("in-memory storage"),
+            )
+            .expect("app state")
+        });
+
+        let profile = ConnectionProfile::new(
+            "fake",
+            DbConfig::SQLite {
+                path: ":memory:".into(),
+                connection_id: None,
+            },
+        );
+        let connection = driver.connect_arc(&profile).expect("fake connection");
+        let profile_id = profile.id;
+        cx.update(|cx| {
+            app_state.update(cx, |app, _| {
+                app.apply_connect_profile(
+                    profile,
+                    connection,
+                    None,
+                    None,
+                    false,
+                    WritePrivilege::Unknown,
+                );
+            });
+        });
+
+        let content = content.to_string();
+        let (document, _outside, window) = host_modal(cx, move |window, cx| {
+            let mut document =
+                CodeDocument::new_with_language(app_state, None, QueryLanguage::Sql, window, cx);
+            document.connection_id = Some(profile_id);
+            document.set_content(&content, window, cx);
+            document
+        });
+        window.run_until_parked();
+
+        (document, window)
+    }
+
+    fn set_cursor(window: &mut VisualTestContext, document: &Entity<CodeDocument>, offset: usize) {
+        window.update(|_, cx| {
+            document.update(cx, |document, cx| {
+                document
+                    .editor
+                    .input_state
+                    .update(cx, |state, cx| state.set_selected_range(offset..offset, cx));
+            });
+        });
+    }
+
+    fn selected_range(
+        window: &mut VisualTestContext,
+        document: &Entity<CodeDocument>,
+    ) -> Range<usize> {
+        window.update(|_, cx| {
+            document
+                .read(cx)
+                .editor
+                .input_state
+                .read(cx)
+                .selected_range()
+        })
+    }
+
+    fn run(window: &mut VisualTestContext, document: &Entity<CodeDocument>) {
+        window.update(|window, cx| {
+            document.update(cx, |document, cx| document.run_query(window, cx));
+        });
+        settle(window);
+    }
+
+    /// Runs the whole buffer the way the script confirmation's "run the
+    /// script" answer does: origin 0, and the whole text as one request.
+    fn run_whole_buffer(
+        window: &mut VisualTestContext,
+        document: &Entity<CodeDocument>,
+        text: &str,
+    ) {
+        window.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.execution.query_origin = Some(0);
+                document.run_query_text(text.to_string(), false, window, cx);
+            });
+        });
+        settle(window);
+    }
+
+    /// Fires one auto-refresh tick, the way the refresh timer does.
+    fn auto_refresh_tick(window: &mut VisualTestContext, document: &Entity<CodeDocument>) {
+        window.update(|window, cx| {
+            document.update(cx, |document, cx| {
+                document.refresh.refresh_policy =
+                    datatab_core::RefreshPolicy::Interval { every_secs: 5 };
+                document.pending.auto_refresh = true;
+                document.process_pending_auto_refresh(window, cx);
+            });
+        });
+        settle(window);
+    }
+
+    fn settle(window: &mut VisualTestContext) {
+        for _ in 0..3 {
+            window.run_until_parked();
+            window.update(|window, _| window.refresh());
+        }
+        window.run_until_parked();
+    }
+
+    /// A driver that names the failing token must leave the cursor on it,
+    /// with the token selected, so the user sees the character the server
+    /// stopped on rather than the one they left behind.
+    #[gpui::test]
+    fn a_failure_with_a_position_puts_the_cursor_on_the_token(cx: &mut TestAppContext) {
+        let driver = FakeDriver::new(DbKind::SQLite).with_query_formatted_error(
+            STATEMENT,
+            FormattedError::new("near \"FROM\": syntax error")
+                .with_position(ErrorPosition::from_byte_offset(STATEMENT, 11)),
+        );
+        let (document, window) = open_connected(cx, &driver, STATEMENT);
+        set_cursor(window, &document, 0);
+
+        run(window, &document);
+
+        assert_eq!(
+            selected_range(window, &document),
+            11..15,
+            "the token FROM, which the error points at, is selected"
+        );
+        let focused = window.update(|window, cx| document.read(cx).focus_handle.is_focused(window));
+        assert!(!focused, "a run must not pull focus into the editor");
+    }
+
+    /// A number a driver got wrong, or an error from another statement, must
+    /// clamp to the end of the text instead of being applied blindly.
+    #[gpui::test]
+    fn a_position_past_the_end_clamps_to_it(cx: &mut TestAppContext) {
+        let driver = FakeDriver::new(DbKind::SQLite).with_query_formatted_error(
+            STATEMENT,
+            FormattedError::new("syntax error")
+                .with_position(ErrorPosition::from_byte_offset(STATEMENT, 400)),
+        );
+        let (document, window) = open_connected(cx, &driver, STATEMENT);
+        set_cursor(window, &document, 0);
+
+        run(window, &document);
+
+        assert_eq!(
+            selected_range(window, &document),
+            STATEMENT.len()..STATEMENT.len(),
+            "the caret sits at the end of the statement, not past it"
+        );
+    }
+
+    /// Every driver that reports no position — Redis, MongoDB, an RPC peer —
+    /// keeps today's behaviour: the cursor stays where the user left it.
+    #[gpui::test]
+    fn a_driver_that_reports_no_position_leaves_the_cursor_alone(cx: &mut TestAppContext) {
+        let driver = FakeDriver::new(DbKind::SQLite)
+            .with_query_formatted_error(STATEMENT, FormattedError::new("syntax error"));
+        let (document, window) = open_connected(cx, &driver, STATEMENT);
+        set_cursor(window, &document, 5);
+
+        run(window, &document);
+
+        assert_eq!(
+            selected_range(window, &document),
+            5..5,
+            "without a position the cursor does not move"
+        );
+    }
+
+    /// A run of one statement inside a longer buffer must place the cursor
+    /// through the statement's own origin, not at the top of the buffer.
+    #[gpui::test]
+    fn a_position_is_placed_through_the_statement_origin(cx: &mut TestAppContext) {
+        let second = "SELECT id, FROM t";
+        let content = format!("SELECT 1;\n{second}");
+        let driver = FakeDriver::new(DbKind::SQLite).with_query_formatted_error(
+            second,
+            FormattedError::new("near \"FROM\": syntax error")
+                .with_position(ErrorPosition::from_byte_offset(second, 11)),
+        );
+        let (document, window) = open_connected(cx, &driver, &content);
+        set_cursor(window, &document, content.len() - 1);
+
+        run(window, &document);
+
+        assert_eq!(
+            selected_range(window, &document),
+            21..25,
+            "FROM of the second statement is selected"
+        );
+    }
+
+    /// A whole-script run submits several statements in one request, and the
+    /// driver's offset indexes the statement that failed. Nothing
+    /// driver-agnostic maps that onto the buffer from the run's origin, so the
+    /// caret must stay where the user left it.
+    #[gpui::test]
+    fn a_whole_script_failure_leaves_the_caret_alone(cx: &mut TestAppContext) {
+        let failing = "SELECT id, FROM t";
+        let content = format!("SELECT 1;\n{failing}");
+        let driver = FakeDriver::new(DbKind::SQLite).with_query_formatted_error(
+            &content,
+            FormattedError::new("near \"FROM\": syntax error")
+                .with_position(ErrorPosition::from_byte_offset(failing, 11)),
+        );
+        let (document, window) = open_connected(cx, &driver, &content);
+        set_cursor(window, &document, 5);
+
+        run_whole_buffer(window, &document, &content);
+
+        assert_eq!(
+            selected_range(window, &document),
+            5..5,
+            "a batch leaves the caret where it was"
+        );
+    }
+
+    /// An auto-refresh tick is not a run the user started, so a failure during
+    /// it must not pull the caret out of what the user is typing.
+    #[gpui::test]
+    fn an_auto_refresh_failure_leaves_the_caret_alone(cx: &mut TestAppContext) {
+        let driver = FakeDriver::new(DbKind::SQLite)
+            .with_read_only_enforcement()
+            .with_query_formatted_error(
+                STATEMENT,
+                FormattedError::new("near \"FROM\": syntax error")
+                    .with_position(ErrorPosition::from_byte_offset(STATEMENT, 11)),
+            );
+        let (document, window) = open_connected(cx, &driver, STATEMENT);
+        set_cursor(window, &document, 3);
+
+        auto_refresh_tick(window, &document);
+
+        assert_eq!(
+            selected_range(window, &document),
+            3..3,
+            "a refresh tick leaves the caret where the user put it"
+        );
+    }
+
+    /// A line without an offset, the way MySQL reports a syntax error, puts
+    /// the cursor at the start of that line.
+    #[gpui::test]
+    fn a_line_only_position_puts_the_cursor_at_the_start_of_the_line(cx: &mut TestAppContext) {
+        let content = "SELECT a,\nSELECT b,\nSELECT c FROM t";
+        let driver = FakeDriver::new(DbKind::SQLite).with_query_formatted_error(
+            content,
+            FormattedError::new("You have an error in your SQL syntax near 'FROM t' at line 3")
+                .with_position(ErrorPosition::from_line(3)),
+        );
+        let (document, window) = open_connected(cx, &driver, content);
+        set_cursor(window, &document, 0);
+
+        run(window, &document);
+
+        assert_eq!(
+            selected_range(window, &document),
+            20..26,
+            "the cursor lands on SELECT, the first token of line 3"
         );
     }
 }

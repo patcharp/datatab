@@ -23,6 +23,100 @@ use crate::types::{
     parse_clickhouse_type,
 };
 
+fn clickhouse_create_table(table: &TableInfo) -> Result<String, DbError> {
+    if let Some(foreign_key) = table.foreign_keys.as_deref().unwrap_or_default().first() {
+        return Err(DbError::NotSupported(format!(
+            "CREATE TABLE cannot express foreign key '{}'",
+            foreign_key.name
+        )));
+    }
+    if let Some(constraint) = table.constraints.as_deref().unwrap_or_default().first() {
+        return Err(DbError::NotSupported(format!(
+            "CREATE TABLE cannot express constraint '{}'",
+            constraint.name
+        )));
+    }
+    let hints = table.storage_hints.as_deref().unwrap_or_default();
+    let engine = hints
+        .iter()
+        .find(|hint| hint.label == introspection::ENGINE_HINT_LABEL)
+        .and_then(|hint| hint.detail.as_deref())
+        .unwrap_or("MergeTree");
+    let engine = match engine {
+        "MergeTree" => "MergeTree",
+        "SharedMergeTree"
+        | "SharedReplacingMergeTree"
+        | "SharedSummingMergeTree"
+        | "SharedAggregatingMergeTree"
+        | "SharedCollapsingMergeTree"
+        | "SharedVersionedCollapsingMergeTree"
+        | "SharedGraphiteMergeTree"
+        | "SharedReplicatedMergeTree"
+        | "SharedReplicatedReplacingMergeTree"
+        | "SharedReplicatedSummingMergeTree"
+        | "SharedReplicatedAggregatingMergeTree"
+        | "SharedReplicatedCollapsingMergeTree"
+        | "SharedReplicatedVersionedCollapsingMergeTree"
+        | "SharedReplicatedGraphiteMergeTree" => engine.strip_prefix("Shared").unwrap_or(engine),
+        _ => {
+            return Err(DbError::NotSupported(format!(
+                "CREATE TABLE cannot preserve engine '{engine}'"
+            )));
+        }
+    };
+    let sorting_key = hints
+        .iter()
+        .find(|hint| hint.label == introspection::SORTING_KEY_HINT_LABEL)
+        .and_then(|hint| hint.detail.as_deref())
+        .filter(|key| !key.is_empty());
+    let columns = table.columns.as_deref().unwrap_or_default();
+    let lines: Vec<String> = columns
+        .iter()
+        .map(|column| {
+            let data_type = if column.nullable
+                && !clickhouse_type_is_nullable(&parse_clickhouse_type(&column.type_name))
+            {
+                format!("Nullable({})", column.type_name)
+            } else {
+                column.type_name.clone()
+            };
+            let default = column
+                .default_value
+                .as_ref()
+                .map(|value| format!(" DEFAULT {value}"))
+                .unwrap_or_default();
+            format!(
+                "    {} {}{}",
+                CLICKHOUSE_DIALECT.quote_identifier(&column.name),
+                data_type,
+                default
+            )
+        })
+        .collect();
+    let primary_key: Vec<String> = columns
+        .iter()
+        .filter(|column| column.is_primary_key)
+        .map(|column| CLICKHOUSE_DIALECT.quote_identifier(&column.name))
+        .collect();
+    let ordering = if let Some(key) = sorting_key {
+        let key = key
+            .strip_prefix('(')
+            .and_then(|key| key.strip_suffix(')'))
+            .unwrap_or(key);
+        format!("({key})")
+    } else if primary_key.is_empty() {
+        "tuple()".to_string()
+    } else {
+        format!("({})", primary_key.join(", "))
+    };
+    Ok(format!(
+        "CREATE TABLE {} (\n{}\n) ENGINE = {engine} ORDER BY {};",
+        CLICKHOUSE_DIALECT.qualified_table(table.schema.as_deref(), &table.name),
+        lines.join(",\n"),
+        ordering
+    ))
+}
+
 /// `readonly = 2` refuses writes and DDL but, unlike `readonly = 1`, still
 /// accepts the per-request settings DataTab sends with every query.
 const READ_ONLY_SETTINGS: &[(&str, &str)] = &[("readonly", "2")];
@@ -429,6 +523,44 @@ impl Connection for ClickHouseConnection {
         SchemaLoadingStrategy::LazyPerDatabase
     }
 
+    fn code_generators(&self) -> Vec<datatab_core::CodeGeneratorInfo> {
+        vec![
+            datatab_core::CodeGeneratorInfo {
+                id: "create_table".into(),
+                label: "CREATE TABLE".into(),
+                scope: datatab_core::CodeGenScope::Table,
+                order: 10,
+                destructive: false,
+            },
+            datatab_core::CodeGeneratorInfo {
+                id: "drop_table".into(),
+                label: "DROP TABLE".into(),
+                scope: datatab_core::CodeGenScope::Table,
+                order: 20,
+                destructive: true,
+            },
+        ]
+    }
+
+    fn code_gen_capabilities(&self) -> datatab_core::CodeGenCapabilities {
+        datatab_core::CodeGenCapabilities::CREATE_TABLE
+            | datatab_core::CodeGenCapabilities::DROP_TABLE
+    }
+
+    fn generate_code(&self, generator_id: &str, table: &TableInfo) -> Result<String, DbError> {
+        match generator_id {
+            "create_table" => clickhouse_create_table(table),
+            "drop_table" => Ok(format!(
+                "DROP TABLE IF EXISTS {};",
+                CLICKHOUSE_DIALECT.qualified_table(table.schema.as_deref(), &table.name)
+            )),
+            _ => Err(DbError::NotSupported(format!(
+                "Code generator '{}' not supported",
+                generator_id
+            ))),
+        }
+    }
+
     fn dialect(&self) -> &dyn SqlDialect {
         &CLICKHOUSE_DIALECT
     }
@@ -641,6 +773,7 @@ fn table_result(
 
 #[cfg(test)]
 mod tests {
+    mod schema_diff;
     use super::{
         ClickHouseConnection, ClickHouseGrantRow, classify_clickhouse_grant_row,
         classify_clickhouse_grants, parse_limited_response, parse_response,

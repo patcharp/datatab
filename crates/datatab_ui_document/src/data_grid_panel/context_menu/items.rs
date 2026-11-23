@@ -99,6 +99,16 @@ pub(super) fn build_context_menu_items(
         disabled: false,
     }];
 
+    items.push(ContextMenuItem {
+        label: datatab_i18n::t!("document.data.context_menu.item.copy_column_name").into(),
+        action: Some(ContextMenuAction::CopyColumnName),
+        icon: Some(AppIcon::Copy),
+        is_separator: false,
+        is_danger: false,
+        detail: None,
+        disabled: false,
+    });
+
     // Offered for read-only results too — the panel is how a long JSON or XML
     // value gets read at all, whether or not it can be changed. It still needs
     // a row under the cursor: without one there is no value to show.

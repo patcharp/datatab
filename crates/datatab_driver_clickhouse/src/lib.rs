@@ -19,6 +19,7 @@ mod introspection;
 #[cfg(test)]
 mod language_service;
 mod table_views;
+mod tls;
 pub mod types;
 
 pub use connection::ClickHouseConnection;

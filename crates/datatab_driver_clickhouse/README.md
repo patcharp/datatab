@@ -2,14 +2,16 @@
 
 Column-oriented analytical database over HTTP.
 
-## At a glance
+## Features
+
+### At a glance
 
 - **Category** — Relational
 - **Query language** — SQL
 - **Default port** — 8123
 - **URI scheme** — `http`
 
-## Connecting
+### Connecting
 
 The driver speaks ClickHouse's HTTP interface rather than the native protocol, so
 the endpoint is a URL and not a host/port pair.
@@ -23,7 +25,25 @@ the endpoint is a URL and not a host/port pair.
 | Password | — | Held in the OS keyring and sent as HTTP Basic auth |
 | Allow password over unencrypted HTTP | Off | Lets a password go to a non-loopback `http://` server |
 
-## Features
+### TLS and operations
+
+- TLS modes: `disable (unverified)` uses plain HTTP; `require (unverified)`
+  encrypts HTTPS without checking the server certificate; `verify-ca` verifies
+  its chain against the supplied CA; `verify-full` also verifies the hostname.
+  Verification modes require a root CA PEM path and trust only that CA bundle,
+  including private or self-signed roots. TLS modes require an `https://` URL;
+  `disable` requires `http://`.
+- Mutual TLS in `require`, `verify-ca` and `verify-full`, using a client
+  certificate PEM and matching unencrypted private key PEM. Both paths must be
+  set together. Certificate paths remain paths, never secret references.
+- Saved connections from before TLS mode selection keep their existing
+  system-root and hostname verification on HTTPS (or plain HTTP for an HTTP
+  URL). Loading does not rewrite them. New or edited connections must select
+  an explicit mode. Unknown, blank or conflicting modes, missing required CA
+  paths, unused CA paths and incomplete client identities are refused before
+  hooks, secret reads or network access.
+
+- Schema diff generates whole-table CREATE and DROP statements.
 
 - Blocking HTTP(S) transport built on rustls, authenticating with HTTP Basic.
 - A password is sent only over `https://` or to a loopback server. For a
@@ -80,6 +100,13 @@ arrives fully structured rather than as raw text:
 
 ## Limitations
 
+- No encrypted client private keys or certificate-store identities. Certificate
+  and key files must each fit within 1 MiB. There is no automatic fallback from
+  a failed CA or identity load, and no HTTP-to-HTTPS upgrade. `verify-ca` does
+  not check the hostname; `require` does not verify the server certificate.
+
+- Schema-diff CREATE keeps a ClickHouse reference table’s sorting key and emits recognized Cloud Shared engines as their underlying engines: MergeTree, ReplacingMergeTree, SummingMergeTree, AggregatingMergeTree, CollapsingMergeTree, VersionedCollapsingMergeTree, GraphiteMergeTree, and their Replicated forms. Engine arguments are not preserved and may need hand editing. Unknown `Shared*` names and other unsupported engines are refused by name. It maps primary keys to ORDER BY for ordering, but ClickHouse does not enforce uniqueness; foreign keys, unique and check constraints are refused by name. Cross-engine diffs copy source type names and may need hand editing; ClickHouse refuses unknown types.
+
 - No SSH tunnels.
 - With **Allow password over unencrypted HTTP** on, the password crosses the
   network in clear text, Base64-encoded in the HTTP Basic header. Anyone on the
@@ -92,7 +119,7 @@ arrives fully structured rather than as raw text:
   queries can allocate a whole result (within the HTTP response-body cap). The
   driver reports no lock-timeout support.
 - No structured `INSERT`, `UPDATE`, `DELETE`, DDL, or data-transfer support. Write
-  SQL runs only when typed explicitly into the editor, so the grid is read-only and
+  SQL can also run from schema diff; the grid is read-only and
   the driver is not a transfer target.
 - One SQL statement per request; multi-statement scripts are not batched.
 - HTTP response bodies are capped at 128 MiB. The cap applies to queries

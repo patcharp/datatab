@@ -1,40 +1,58 @@
 use super::*;
 use crate::ui::labels::settings_default_connection_name;
+use datatab_core::LogErr as _;
 
 impl Workspace {
+    /// Makes every Settings window of this app state forward its events to
+    /// this workspace, whichever surface opens it.
+    pub(in crate::ui::views::workspace) fn register_settings_forwarder(
+        &self,
+        cx: &mut Context<Self>,
+    ) {
+        let workspace = cx.entity().downgrade();
+        datatab_ui_windows::settings::set_settings_event_forwarder(
+            &self.app_state,
+            std::rc::Rc::new(move |event, cx| {
+                workspace
+                    .update(cx, |this, cx| this.handle_settings_event(event, cx))
+                    .log_err();
+            }),
+            cx,
+        );
+    }
+
+    fn handle_settings_event(
+        &mut self,
+        event: &datatab_ui_windows::settings::SettingsEvent,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            datatab_ui_windows::settings::SettingsEvent::OpenScript { path } => {
+                self.open_script_from_path(path.clone(), cx);
+            }
+            datatab_ui_windows::settings::SettingsEvent::OpenLoginModal {
+                provider_name,
+                profile_name,
+                url,
+                login,
+            } => {
+                self.pending_login_modal_open = Some(PendingSettingsLogin {
+                    provider_name: provider_name.clone(),
+                    profile_name: profile_name.clone(),
+                    url: url.clone(),
+                    login: login.clone(),
+                });
+                cx.notify();
+            }
+        }
+    }
+
     pub(in crate::ui::views::workspace) fn open_settings(&self, cx: &mut Context<Self>) {
-        let workspace = cx.entity().clone();
         datatab_ui_windows::settings::open_or_focus_settings(
             self.app_state.clone(),
             None,
             cx,
-            move |settings, cx| {
-                cx.subscribe(
-                    settings,
-                    move |_settings, event: &datatab_ui_windows::settings::SettingsEvent, cx| {
-                        workspace.update(cx, |this, cx| match event {
-                            datatab_ui_windows::settings::SettingsEvent::OpenScript { path } => {
-                                this.open_script_from_path(path.clone(), cx);
-                            }
-                            datatab_ui_windows::settings::SettingsEvent::OpenLoginModal {
-                                provider_name,
-                                profile_name,
-                                url,
-                                login,
-                            } => {
-                                this.pending_login_modal_open = Some(PendingSettingsLogin {
-                                    provider_name: provider_name.clone(),
-                                    profile_name: profile_name.clone(),
-                                    url: url.clone(),
-                                    login: login.clone(),
-                                });
-                                cx.notify();
-                            }
-                        });
-                    },
-                )
-                .detach();
-            },
+            |_settings, _cx| {},
         );
     }
 
@@ -128,5 +146,87 @@ impl Workspace {
             cx,
             |_settings, _cx| {},
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Explicit imports: the parent glob with `#[gpui::test]` sends the
+    // gpui_macros expansion into unbounded recursion.
+    use crate::ui::views::workspace::Workspace;
+    use datatab_core::LogErr as _;
+    use datatab_ui_base::AppStateEntity;
+    use datatab_ui_windows::settings::{SettingsEvent, SettingsSectionId};
+    use gpui::{AppContext as _, TestAppContext};
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Removes the file when the test ends, also when an assert fails.
+    struct RemoveOnDrop(std::path::PathBuf);
+
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            std::fs::remove_file(&self.0).log_err();
+        }
+    }
+
+    /// A Settings window opened by a surface that passes no setup of its own
+    /// (Auth Profiles shortcut, connection manager, About) still reaches the
+    /// workspace: its events are forwarded once.
+    #[gpui::test]
+    fn settings_opened_without_setup_still_reaches_the_workspace(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        cx.update(datatab_components::theme::init);
+        cx.update(datatab_ui_base::keymap::init_keymap);
+        let app_state = cx.update(|cx| {
+            cx.new(|_| {
+                let runtime = datatab_storage::bootstrap::StorageRuntime::in_memory()
+                    .expect("in-memory storage");
+                AppStateEntity::new_with_storage_runtime(runtime).expect("test storage setup")
+            })
+        });
+
+        let holder: Rc<RefCell<Option<gpui::Entity<Workspace>>>> = Rc::default();
+        let (_, window) = cx.add_window_view({
+            let app_state = app_state.clone();
+            let holder = holder.clone();
+            move |window, cx| {
+                let workspace = cx.new(|cx| Workspace::new(app_state, window, cx));
+                holder.replace(Some(workspace.clone()));
+                gpui_component::Root::new(workspace, window, cx)
+            }
+        });
+        window.run_until_parked();
+        let workspace = holder.borrow().clone().expect("workspace created");
+
+        let path = std::env::temp_dir().join(format!(
+            "datatab-settings-forwarder-{}.lua",
+            std::process::id()
+        ));
+        std::fs::write(&path, "-- forwarded").expect("write the script");
+        let _script_file = RemoveOnDrop(path.clone());
+
+        let captured = Rc::new(RefCell::new(None));
+        let captured_for_setup = captured.clone();
+        window.update(|_, cx| {
+            datatab_ui_windows::settings::open_or_focus_settings(
+                app_state.clone(),
+                Some(SettingsSectionId::AuthProfiles),
+                cx,
+                move |settings, _| {
+                    captured_for_setup.replace(Some(settings.clone()));
+                },
+            );
+        });
+        let settings = captured.borrow().clone().expect("the window opened");
+        window.update(|_, cx| {
+            settings.update(cx, |_, cx| {
+                cx.emit(SettingsEvent::OpenScript { path: path.clone() });
+            });
+        });
+        window.run_until_parked();
+
+        let opened = window.update(|_, cx| workspace.read(cx).tab_manager.read(cx).len());
+        assert_eq!(opened, 1, "the workspace opened the script once");
     }
 }

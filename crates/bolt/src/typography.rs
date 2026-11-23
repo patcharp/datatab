@@ -23,10 +23,17 @@ impl AppFonts {
     pub const DISPLAY: &'static str = "Archivo Expanded";
     /// Data face: grid cells, keys, queries, identifiers, key hints and numeric readouts.
     pub const MONO: &'static str = "JetBrains Mono";
-    pub const MONO_FALLBACK: &'static str = "monospace";
+    /// Face under the data face, for the text [`Self::MONO`] has no glyph for.
+    ///
+    /// JetBrains Mono covers no Thai code point, so Thai data in a grid cell or
+    /// an editor line used to fall through to a system font at a size that did
+    /// not match the Latin text beside it. No Noto Sans Mono carries Thai, so
+    /// the data face stays the Latin mono family and this bundled Thai family
+    /// sits under it.
+    pub const MONO_FALLBACK: &'static str = "Noto Sans Thai";
 }
 
-pub const BUNDLED_FONT_ASSETS: [BundledFontAsset; 13] = [
+pub const BUNDLED_FONT_ASSETS: [BundledFontAsset; 17] = [
     BundledFontAsset {
         family: AppFonts::INTERFACE,
         file_name: "IBMPlexSansThai-Regular.ttf",
@@ -92,6 +99,26 @@ pub const BUNDLED_FONT_ASSETS: [BundledFontAsset; 13] = [
         file_name: "JetBrainsMono-BoldItalic.ttf",
         data: include_bytes!("../assets/fonts/JetBrainsMono-BoldItalic.ttf"),
     },
+    BundledFontAsset {
+        family: AppFonts::MONO_FALLBACK,
+        file_name: "NotoSansThai-Regular.ttf",
+        data: include_bytes!("../assets/fonts/NotoSansThai-Regular.ttf"),
+    },
+    BundledFontAsset {
+        family: AppFonts::MONO_FALLBACK,
+        file_name: "NotoSansThai-Medium.ttf",
+        data: include_bytes!("../assets/fonts/NotoSansThai-Medium.ttf"),
+    },
+    BundledFontAsset {
+        family: AppFonts::MONO_FALLBACK,
+        file_name: "NotoSansThai-SemiBold.ttf",
+        data: include_bytes!("../assets/fonts/NotoSansThai-SemiBold.ttf"),
+    },
+    BundledFontAsset {
+        family: AppFonts::MONO_FALLBACK,
+        file_name: "NotoSansThai-Bold.ttf",
+        data: include_bytes!("../assets/fonts/NotoSansThai-Bold.ttf"),
+    },
 ];
 
 pub fn bundled_font_data() -> Vec<Cow<'static, [u8]>> {
@@ -120,8 +147,11 @@ mod tests {
     fn font_contract_splits_interface_display_and_data_families() {
         assert_eq!(AppFonts::INTERFACE, "IBM Plex Sans Thai");
         assert_eq!(AppFonts::DISPLAY, "Archivo Expanded");
+        // The Latin data face does not change: Thai arrives through the
+        // fallback under it, never by swapping the family of grid cells and
+        // queries.
         assert_eq!(AppFonts::MONO, "JetBrains Mono");
-        assert_eq!(AppFonts::MONO_FALLBACK, "monospace");
+        assert_eq!(AppFonts::MONO_FALLBACK, "Noto Sans Thai");
     }
 
     #[test]
@@ -147,6 +177,34 @@ mod tests {
                 (AppFonts::MONO, "JetBrainsMono-SemiBoldItalic.ttf"),
                 (AppFonts::MONO, "JetBrainsMono-Bold.ttf"),
                 (AppFonts::MONO, "JetBrainsMono-BoldItalic.ttf"),
+                (AppFonts::MONO_FALLBACK, "NotoSansThai-Regular.ttf"),
+                (AppFonts::MONO_FALLBACK, "NotoSansThai-Medium.ttf"),
+                (AppFonts::MONO_FALLBACK, "NotoSansThai-SemiBold.ttf"),
+                (AppFonts::MONO_FALLBACK, "NotoSansThai-Bold.ttf"),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_data_faces_thai_fallback_is_bundled_not_the_system_generic() {
+        // A generic family would resolve to whatever font the platform picks,
+        // which is the bug #137 reports: Thai data at the wrong size in the
+        // grid. The fallback is a family the app ships.
+        assert_ne!(AppFonts::MONO_FALLBACK, "monospace");
+
+        let faces: Vec<_> = BUNDLED_FONT_ASSETS
+            .iter()
+            .filter(|asset| asset.family == AppFonts::MONO_FALLBACK)
+            .map(|asset| asset.file_name)
+            .collect();
+
+        assert_eq!(
+            faces,
+            vec![
+                "NotoSansThai-Regular.ttf",
+                "NotoSansThai-Medium.ttf",
+                "NotoSansThai-SemiBold.ttf",
+                "NotoSansThai-Bold.ttf",
             ]
         );
     }

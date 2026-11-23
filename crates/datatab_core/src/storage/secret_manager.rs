@@ -1,6 +1,6 @@
 use crate::{ConnectionProfile, DbConfig, ProxyProfile, SecretStore, SshTunnelProfile};
 use log::error;
-use secrecy::SecretString;
+use secrecy::{ExposeSecret, SecretString};
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -21,6 +21,91 @@ impl HasSecretRef for ProxyProfile {
     }
 }
 
+fn read_secret_store(
+    secret_store: &RwLock<Box<dyn SecretStore>>,
+) -> std::sync::RwLockReadGuard<'_, Box<dyn SecretStore>> {
+    match secret_store.read() {
+        Ok(guard) => guard,
+        Err(poison_err) => {
+            log::warn!("Secret store RwLock poisoned, recovering...");
+            poison_err.into_inner()
+        }
+    }
+}
+
+/// Password and SSH entry operations over a shared store, without application state.
+pub struct ProfileSecrets<'a> {
+    secret_store: &'a RwLock<Box<dyn SecretStore>>,
+}
+
+impl<'a> ProfileSecrets<'a> {
+    pub fn new(secret_store: &'a RwLock<Box<dyn SecretStore>>) -> Self {
+        Self { secret_store }
+    }
+
+    fn store_read(&self) -> std::sync::RwLockReadGuard<'_, Box<dyn SecretStore>> {
+        read_secret_store(self.secret_store)
+    }
+
+    pub fn save_password(
+        &self,
+        profile: &ConnectionProfile,
+        password: &SecretString,
+    ) -> Result<(), crate::DbError> {
+        if !profile.save_password {
+            return Ok(());
+        }
+
+        let store = self.store_read();
+
+        if !store.is_available() {
+            return Err(crate::DbError::NotSupported(
+                "System keyring unavailable".to_string(),
+            ));
+        }
+
+        store.set(&profile.secret_ref(), password)
+    }
+
+    pub fn delete_password(&self, profile: &ConnectionProfile) {
+        let store = self.store_read();
+
+        if !store.is_available() {
+            return;
+        }
+
+        if let Err(e) = store.delete(&profile.secret_ref()) {
+            error!("Failed to delete password: {:?}", e);
+        }
+    }
+
+    pub fn save_ssh_password(&self, profile: &ConnectionProfile, secret: &SecretString) {
+        let store = self.store_read();
+
+        if !store.is_available() {
+            log::warn!("Secret store unavailable; SSH password was NOT persisted");
+            return;
+        }
+
+        if let Err(e) = store.set(&profile.ssh_secret_ref(), secret) {
+            error!("Failed to save SSH secret: {:?}", e);
+        }
+    }
+
+    pub fn delete_ssh_password(&self, profile: &ConnectionProfile) {
+        let store = self.store_read();
+
+        if !store.is_available() {
+            return;
+        }
+
+        if let Err(e) = store.delete(&profile.ssh_secret_ref()) {
+            error!("Failed to delete SSH secret: {:?}", e);
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct SecretManager {
     secret_store: Arc<RwLock<Box<dyn SecretStore>>>,
 }
@@ -33,13 +118,7 @@ impl SecretManager {
     }
 
     fn store_read(&self) -> std::sync::RwLockReadGuard<'_, Box<dyn SecretStore>> {
-        match self.secret_store.read() {
-            Ok(guard) => guard,
-            Err(poison_err) => {
-                log::warn!("Secret store RwLock poisoned, recovering...");
-                poison_err.into_inner()
-            }
-        }
+        read_secret_store(&self.secret_store)
     }
 
     pub fn is_available(&self) -> bool {
@@ -96,6 +175,18 @@ impl SecretManager {
         }
     }
 
+    /// Deletes an entry for a caller that must report a failed cleanup.
+    /// Unlike best-effort deletion, an unavailable store is a failure too.
+    pub fn try_delete_by_ref(&self, secret_ref: &str) -> Result<(), crate::DbError> {
+        let store = self.store_read();
+        if !store.is_available() {
+            return Err(crate::DbError::NotSupported(
+                "System keyring unavailable".into(),
+            ));
+        }
+        store.delete(secret_ref)
+    }
+
     /// Deletes a secret stored under an explicit keyring reference.
     pub fn delete_by_ref(&self, secret_ref: &str) {
         let store = self.store_read();
@@ -149,33 +240,13 @@ impl SecretManager {
         profile: &ConnectionProfile,
         password: &SecretString,
     ) -> Result<(), crate::DbError> {
-        if !profile.save_password {
-            return Ok(());
-        }
-
-        let store = self.store_read();
-
-        if !store.is_available() {
-            return Err(crate::DbError::NotSupported(
-                "System keyring unavailable".to_string(),
-            ));
-        }
-
-        store.set(&profile.secret_ref(), password)
+        ProfileSecrets::new(&self.secret_store).save_password(profile, password)
     }
 }
 
 impl SecretManager {
     pub fn delete_password(&self, profile: &ConnectionProfile) {
-        let store = self.store_read();
-
-        if !store.is_available() {
-            return;
-        }
-
-        if let Err(e) = store.delete(&profile.secret_ref()) {
-            error!("Failed to delete password: {:?}", e);
-        }
+        ProfileSecrets::new(&self.secret_store).delete_password(profile)
     }
 
     /// The password saved for `profile`. `Ok(None)` means no password is
@@ -214,28 +285,11 @@ impl SecretManager {
     }
 
     pub fn save_ssh_password(&self, profile: &ConnectionProfile, secret: &SecretString) {
-        let store = self.store_read();
-
-        if !store.is_available() {
-            log::warn!("Secret store unavailable; SSH password was NOT persisted");
-            return;
-        }
-
-        if let Err(e) = store.set(&profile.ssh_secret_ref(), secret) {
-            error!("Failed to save SSH secret: {:?}", e);
-        }
+        ProfileSecrets::new(&self.secret_store).save_ssh_password(profile, secret)
     }
 
     pub fn delete_ssh_password(&self, profile: &ConnectionProfile) {
-        let store = self.store_read();
-
-        if !store.is_available() {
-            return;
-        }
-
-        if let Err(e) = store.delete(&profile.ssh_secret_ref()) {
-            error!("Failed to delete SSH secret: {:?}", e);
-        }
+        ProfileSecrets::new(&self.secret_store).delete_ssh_password(profile)
     }
 
     pub fn get_ssh_tunnel_secret(&self, tunnel: &SshTunnelProfile) -> Option<SecretString> {
@@ -317,6 +371,11 @@ impl SecretManager {
                 ssh_tunnel_profile_id,
                 ..
             } => (ssh_tunnel.as_ref(), *ssh_tunnel_profile_id),
+            DbConfig::Cassandra {
+                ssh_tunnel,
+                ssh_tunnel_profile_id,
+                ..
+            } => (ssh_tunnel.as_ref(), *ssh_tunnel_profile_id),
             DbConfig::SQLite { .. }
             | DbConfig::InfluxDB { .. }
             | DbConfig::ClickHouse { .. }
@@ -351,34 +410,127 @@ pub fn password_lives_in_keyring(profile: &ConnectionProfile) -> bool {
     profile.save_password && !profile.value_refs.contains_key("password")
 }
 
-/// The keyring password a connect hands the driver, given the keyring read.
+/// The keyring password a connect hands the driver.
 ///
-/// A profile that does not save its password gets none, even if a stale
-/// entry survives in the keyring. A read failure fails the connect only when
-/// the driver authenticates with a password and the keyring is where it
-/// lives: anything else resolves its password elsewhere or needs none, so a
-/// locked keyring must not block it.
+/// `read` runs only when the keyring is where the profile keeps its password:
+/// a profile that does not save its password, or that takes it from a value
+/// ref, gets none, and a locked keyring cannot block or leak into it. A read
+/// failure fails the connect only when the driver authenticates with a
+/// password; a driver without one ignores it.
 pub fn keyring_password_for_connect(
     profile: &ConnectionProfile,
     driver_requires_password: bool,
-    read: Result<Option<SecretString>, crate::DbError>,
+    read: impl FnOnce() -> Result<Option<SecretString>, crate::DbError>,
 ) -> Result<Option<SecretString>, String> {
-    match read {
-        Ok(password) => Ok(password.filter(|_| profile.save_password)),
-        Err(error) if driver_requires_password && password_lives_in_keyring(profile) => {
-            Err(format!(
-                "Could not read the password from the system keyring (it may be locked): {error}"
-            ))
-        }
+    if !password_lives_in_keyring(profile) {
+        return Ok(None);
+    }
+
+    match read() {
+        Ok(password) => Ok(password),
+        Err(error) if driver_requires_password => Err(format!(
+            "Could not read the password from the system keyring (it may be locked): {error}"
+        )),
         Err(error) => {
             log::warn!(
-                "Ignoring keyring read failure for profile '{}', whose password is not saved \
-                 in the keyring: {error}",
+                "Ignoring keyring read failure for profile '{}', whose driver needs no \
+                 password: {error}",
                 profile.name
             );
             Ok(None)
         }
     }
+}
+
+/// The profile a connect hands the driver when some of its secret form fields
+/// live in the keyring: a clone with each such field read from the keyring
+/// into its `External` values. `None` when no field needs a read, so the
+/// caller passes the profile it has. Keep the clone to the driver call: the
+/// values must not reach anything that is saved, shown or logged.
+///
+/// `read` runs only for a field the profile marks as kept in the keyring and
+/// whose value is still empty; a value already there (typed in the form, or
+/// resolved from a value source) wins. A field whose entry is missing or
+/// cannot be read fails the connect with a reason naming the field's label
+/// from `form`, so the driver is never called without it.
+pub fn profile_with_keyring_fields(
+    profile: &ConnectionProfile,
+    form: &crate::DriverFormDef,
+    read: impl Fn(&str) -> Result<Option<SecretString>, crate::DbError>,
+) -> Result<Option<ConnectionProfile>, String> {
+    if matches!(profile.config, DbConfig::ClickHouse { .. })
+        && [
+            "ssl_mode",
+            "ssl_root_cert_path",
+            "ssl_client_cert_path",
+            "ssl_client_key_path",
+        ]
+        .iter()
+        .any(|field| profile.keyring_secret_fields.contains(*field))
+    {
+        return Err(
+            "ClickHouse TLS settings are literal paths and modes, never keyring fields".into(),
+        );
+    }
+    let DbConfig::External { values, .. } = &profile.config else {
+        return Ok(None);
+    };
+    let pending: Vec<&String> = profile
+        .keyring_secret_fields
+        .iter()
+        .filter(|field_id| values.get(*field_id).is_none_or(String::is_empty))
+        .collect();
+    if pending.is_empty() {
+        return Ok(None);
+    }
+
+    let mut filled = profile.clone();
+    let DbConfig::External { values, .. } = &mut filled.config else {
+        return Ok(None);
+    };
+    for field_id in pending {
+        let label = form
+            .field(field_id)
+            .map_or(field_id.as_str(), |field| field.label.as_str());
+        let secret_ref = crate::connection_field_secret_ref(&profile.id, field_id);
+        match read(&secret_ref) {
+            Ok(Some(secret)) => {
+                values.insert(field_id.clone(), secret.expose_secret().to_string());
+            }
+            Ok(None) => {
+                return Err(format!(
+                    "The secret field '{label}' has no saved value in the system keyring. \
+                     Edit the connection and enter it again."
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Could not read the secret field '{label}' from the system keyring \
+                     (it may be locked): {error}"
+                ));
+            }
+        }
+    }
+    Ok(Some(filled))
+}
+
+/// [`profile_with_keyring_fields`] reading from a shared secret store. A
+/// store without a keyring behind it has no entry to give.
+pub fn profile_with_keyring_fields_from(
+    profile: &ConnectionProfile,
+    form: &crate::DriverFormDef,
+    secret_store: &RwLock<Box<dyn SecretStore>>,
+) -> Result<Option<ConnectionProfile>, String> {
+    profile_with_keyring_fields(profile, form, |secret_ref| {
+        let store = match secret_store.read() {
+            Ok(store) => store,
+            Err(poison_err) => poison_err.into_inner(),
+        };
+        if !store.is_available() {
+            return Ok(None);
+        }
+        store.get(secret_ref)
+    })
 }
 
 #[cfg(test)]
@@ -402,7 +554,7 @@ mod keyring_password_tests {
 
     #[test]
     fn a_locked_keyring_fails_a_profile_that_saves_its_password() {
-        let error = keyring_password_for_connect(&profile(true), true, locked())
+        let error = keyring_password_for_connect(&profile(true), true, locked)
             .expect_err("a locked keyring is not an absent password");
 
         assert!(
@@ -416,7 +568,7 @@ mod keyring_password_tests {
 
     #[test]
     fn a_locked_keyring_does_not_block_a_profile_that_does_not_save_its_password() {
-        let password = keyring_password_for_connect(&profile(false), true, locked())
+        let password = keyring_password_for_connect(&profile(false), true, locked)
             .expect("the keyring holds nothing this profile needs");
 
         assert!(password.is_none());
@@ -432,7 +584,7 @@ mod keyring_password_tests {
             },
         );
 
-        let password = keyring_password_for_connect(&profile, true, locked())
+        let password = keyring_password_for_connect(&profile, true, locked)
             .expect("the value ref resolves the password elsewhere");
 
         assert!(password.is_none());
@@ -440,11 +592,9 @@ mod keyring_password_tests {
 
     #[test]
     fn a_readable_keyring_returns_the_saved_password() {
-        let password = keyring_password_for_connect(
-            &profile(true),
-            true,
-            Ok(Some(SecretString::from("saved password"))),
-        )
+        let password = keyring_password_for_connect(&profile(true), true, || {
+            Ok(Some(SecretString::from("saved password")))
+        })
         .expect("keyring read succeeds")
         .expect("a saved password is returned");
 
@@ -453,7 +603,7 @@ mod keyring_password_tests {
 
     #[test]
     fn a_locked_keyring_does_not_block_a_driver_without_a_password() {
-        let password = keyring_password_for_connect(&profile(true), false, locked())
+        let password = keyring_password_for_connect(&profile(true), false, locked)
             .expect("the driver authenticates without a password");
 
         assert!(password.is_none());
@@ -461,14 +611,29 @@ mod keyring_password_tests {
 
     #[test]
     fn a_stale_entry_is_not_used_by_a_profile_that_does_not_save_its_password() {
-        let password = keyring_password_for_connect(
-            &profile(false),
-            true,
-            Ok(Some(SecretString::from("stale password"))),
-        )
+        let password = keyring_password_for_connect(&profile(false), true, || {
+            Ok(Some(SecretString::from("stale password")))
+        })
         .expect("keyring read succeeds");
 
         assert!(password.is_none());
+    }
+
+    #[test]
+    fn a_keyring_the_password_does_not_live_in_is_not_read() {
+        let mut value_ref = profile(true);
+        value_ref
+            .value_refs
+            .insert("password".to_string(), ValueRef::env("PGPASSWORD"));
+
+        for profile in [profile(false), value_ref] {
+            let password = keyring_password_for_connect(&profile, true, || {
+                panic!("the keyring must not be read")
+            })
+            .expect("nothing is read");
+
+            assert!(password.is_none());
+        }
     }
 }
 
@@ -657,5 +822,113 @@ mod tests {
         }));
 
         assert!(manager.get_ssh_secret_for_profile(&profile, &[]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod keyring_field_tests {
+    use super::profile_with_keyring_fields;
+    use crate::secrecy::SecretString;
+    use crate::{ConnectionProfile, DbConfig, DbError, DbKind};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+
+    fn external_profile(values: &[(&str, &str)], marked: &[&str]) -> ConnectionProfile {
+        let mut profile = ConnectionProfile::new_with_driver(
+            "rpc",
+            DbKind::Postgres,
+            "rpc:fake",
+            DbConfig::External {
+                kind: DbKind::Postgres,
+                values: values
+                    .iter()
+                    .map(|(key, value)| (key.to_string(), value.to_string()))
+                    .collect(),
+            },
+        );
+        profile.keyring_secret_fields = marked.iter().map(|field| field.to_string()).collect();
+        profile
+    }
+
+    static FORM: std::sync::LazyLock<crate::DriverFormDef> = std::sync::LazyLock::new(|| {
+        use crate::{FormFieldKind, FormSection, FormTab, field};
+        crate::DriverFormDef {
+            tabs: vec![FormTab {
+                id: "main".into(),
+                label: "Main".into(),
+                sections: vec![FormSection {
+                    title: "Auth".into(),
+                    icon: None,
+                    fields: vec![field("api_token", "API token", FormFieldKind::Password, "")],
+                }],
+            }],
+        }
+    });
+
+    fn values(profile: &ConnectionProfile) -> &HashMap<String, String> {
+        let DbConfig::External { values, .. } = &profile.config else {
+            panic!("not an external config");
+        };
+        values
+    }
+
+    #[test]
+    fn a_marked_field_is_read_from_the_keyring_into_a_clone() {
+        let profile = external_profile(&[("host", "h")], &["api_token"]);
+        let expected_ref = crate::connection_field_secret_ref(&profile.id, "api_token");
+        let reads = RefCell::new(Vec::new());
+
+        let filled = profile_with_keyring_fields(&profile, &FORM, |secret_ref| {
+            reads.borrow_mut().push(secret_ref.to_string());
+            Ok(Some(SecretString::from("token-value")))
+        })
+        .expect("keyring read succeeds")
+        .expect("a clone carries the field");
+
+        assert_eq!(reads.into_inner(), vec![expected_ref]);
+        assert_eq!(
+            values(&filled).get("api_token").map(String::as_str),
+            Some("token-value")
+        );
+        assert!(
+            !values(&profile).contains_key("api_token"),
+            "the source stays clean"
+        );
+    }
+
+    #[test]
+    fn the_keyring_is_not_read_for_an_unmarked_or_filled_field() {
+        for profile in [
+            external_profile(&[("api_token", "")], &[]),
+            external_profile(&[("api_token", "typed")], &["api_token"]),
+            ConnectionProfile::new("pg", DbConfig::default_postgres()),
+        ] {
+            let filled = profile_with_keyring_fields(&profile, &FORM, |_| {
+                panic!("the keyring must not be read")
+            })
+            .expect("nothing is read");
+            assert!(filled.is_none());
+        }
+    }
+
+    #[test]
+    fn a_locked_keyring_fails_the_connect() {
+        let profile = external_profile(&[], &["api_token"]);
+        let error = profile_with_keyring_fields(&profile, &FORM, |_| {
+            Err(DbError::IoError(std::io::Error::other("locked")))
+        })
+        .expect_err("a locked keyring fails the connect");
+        assert!(error.contains("locked"), "{error}");
+        assert!(error.contains("API token"), "{error}");
+    }
+
+    /// A marked field whose entry is gone fails the connect, naming the
+    /// field, instead of connecting without it (#411 triage round 2, point 2).
+    #[test]
+    fn a_missing_keyring_entry_fails_the_connect() {
+        let profile = external_profile(&[], &["api_token"]);
+        let error = profile_with_keyring_fields(&profile, &FORM, |_| Ok(None))
+            .expect_err("a missing entry fails the connect");
+        assert!(error.contains("API token"), "{error}");
     }
 }

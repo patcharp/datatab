@@ -49,6 +49,13 @@ pub struct UserFacingError {
     pub cause: Option<String>,
     pub suggested_action: Option<String>,
     pub correlation_id: Uuid,
+    /// The driver the failure came from, as the call site knows it (`postgres`,
+    /// `rpc:<socket_id>`). A report maps it to a closed value or drops it, so
+    /// this never carries a path out of the app.
+    pub driver_id: Option<String>,
+    /// The driver or error code, such as a SQLSTATE. A report keeps it only
+    /// when it matches the short-token pattern.
+    pub error_code: Option<String>,
 }
 
 impl UserFacingError {
@@ -62,6 +69,8 @@ impl UserFacingError {
             cause: None,
             suggested_action: None,
             correlation_id: Uuid::now_v7(),
+            driver_id: None,
+            error_code: None,
         }
     }
 
@@ -80,6 +89,23 @@ impl UserFacingError {
         self
     }
 
+    /// Records the driver the failure came from, for the report's `driver_id`.
+    pub fn with_driver_id(mut self, driver_id: impl Into<String>) -> Self {
+        self.driver_id = Some(driver_id.into());
+        self
+    }
+
+    /// Records a short driver or error code, for the report's `error_code`.
+    pub fn with_error_code(mut self, code: impl Into<String>) -> Self {
+        self.error_code = Some(code.into());
+        self
+    }
+
+    /// The data the "Send report…" action needs, without the toast text.
+    pub fn send_report_request(&self) -> SendReportRequest {
+        SendReportRequest::from_error(self)
+    }
+
     /// Test-only seam: override the auto-generated correlation id.
     pub fn with_correlation_id(mut self, id: Uuid) -> Self {
         self.correlation_id = id;
@@ -94,6 +120,7 @@ impl UserFacingError {
             (None, None, None) => None,
             _ => Some(fe.to_string()),
         };
+        let error_code = fe.code.clone();
 
         Self {
             kind,
@@ -102,6 +129,33 @@ impl UserFacingError {
             cause,
             suggested_action: None,
             correlation_id: Uuid::now_v7(),
+            driver_id: None,
+            error_code,
+        }
+    }
+}
+
+/// What a "Send report…" action carries for one user-facing error.
+///
+/// It holds no free text: the toast summary and cause never reach a report, so
+/// this type only names the closed fields the report builder accepts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendReportRequest {
+    pub correlation_id: Uuid,
+    pub error_kind: &'static str,
+    pub severity: EventSeverity,
+    pub driver_id: Option<String>,
+    pub error_code: Option<String>,
+}
+
+impl SendReportRequest {
+    pub fn from_error(error: &UserFacingError) -> Self {
+        Self {
+            correlation_id: error.correlation_id,
+            error_kind: error.kind.as_str(),
+            severity: error.severity,
+            driver_id: error.driver_id.clone(),
+            error_code: error.error_code.clone(),
         }
     }
 }
@@ -167,6 +221,10 @@ pub fn report_error(err: UserFacingError, cx: &mut App) {
         )))
         .action(view_in_audit);
 
+    if crate::report_offer::reports_offered(cx) {
+        toast = toast.action(send_report_action(err.send_report_request()));
+    }
+
     toast.push(cx);
 
     if let Some(app_state_global) = cx.try_global::<AppStateGlobal>() {
@@ -180,6 +238,25 @@ pub fn report_error(err: UserFacingError, cx: &mut App) {
             s.note_user_error(err.correlation_id, err.severity, cx);
         });
     }
+}
+
+/// Builds the "Send report…" action of an error toast.
+///
+/// It opens the send window through the workspace, and it is drawn only when
+/// the off switch lets a report be offered: an organization that turned
+/// reports off must not see the button at all (ADR 0008, `docs/SETTINGS.md`).
+fn send_report_action(request: SendReportRequest) -> crate::toast::ToastAction {
+    crate::toast::ToastAction::new("send-report", datatab_i18n::t!("errors.action.send_report"))
+        // The window it opens is the error's outcome, not the toast's: the toast
+        // may still close on its own timer.
+        .lets_toast_close()
+        .on_click(move |cx: &mut App| {
+            if let Some(global) = cx.try_global::<crate::app_state_entity::AppStateGlobal>() {
+                let entity = global.entity.clone();
+                let request = crate::app_state_entity::ReportWindowRequest::Error(request.clone());
+                entity.update(cx, |state, cx| state.request_report_window(request, cx));
+            }
+        })
 }
 
 /// Emits the tracing event the audit bridge turns into the audit row.
@@ -236,6 +313,81 @@ pub fn report_error_async(err: UserFacingError, cx: &AsyncApp) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_error_kind_name_is_reportable() {
+        // No wildcard arm: a new `ErrorKind` variant fails to compile here, so
+        // this list, the array below and the report's allowlist are updated
+        // together rather than a name being dropped silently.
+        fn reportable_arm(kind: ErrorKind) -> &'static str {
+            match kind {
+                ErrorKind::Storage
+                | ErrorKind::Network
+                | ErrorKind::Auth
+                | ErrorKind::Hook
+                | ErrorKind::Driver
+                | ErrorKind::User
+                | ErrorKind::Config => kind.as_str(),
+            }
+        }
+
+        let all = [
+            ErrorKind::Storage,
+            ErrorKind::Network,
+            ErrorKind::Auth,
+            ErrorKind::Hook,
+            ErrorKind::Driver,
+            ErrorKind::User,
+            ErrorKind::Config,
+        ];
+        let names: Vec<&'static str> = all.into_iter().map(reportable_arm).collect();
+
+        assert_eq!(
+            names.len(),
+            datatab_diagnostics::builder::ERROR_KINDS.len(),
+            "the report allowlist must name every ErrorKind"
+        );
+
+        for name in names {
+            assert!(
+                datatab_diagnostics::builder::ERROR_KINDS.contains(&name),
+                "{name} is missing from the report allowlist"
+            );
+        }
+    }
+
+    #[test]
+    fn send_report_request_carries_only_the_closed_fields() {
+        let err = UserFacingError::new(ErrorKind::Network, "dial failed")
+            .with_driver_id("rpc:/run/user/1000/datatab/peer.sock")
+            .with_error_code("08006")
+            .with_cause("secret detail")
+            .with_suggested_action("retry");
+
+        let request = err.send_report_request();
+
+        assert_eq!(request.correlation_id, err.correlation_id);
+        assert_eq!(request.error_kind, "network");
+        assert_eq!(request.severity, EventSeverity::Error);
+        assert_eq!(
+            request.driver_id.as_deref(),
+            Some("rpc:/run/user/1000/datatab/peer.sock"),
+            "the request keeps the raw id; the report builder closes it"
+        );
+        assert_eq!(request.error_code.as_deref(), Some("08006"));
+    }
+
+    #[test]
+    fn from_formatted_takes_the_code_for_the_report() {
+        let formatted = FormattedError::new("syntax error")
+            .with_detail("near SELECT")
+            .with_code("42601");
+
+        let err = UserFacingError::from_formatted(ErrorKind::Driver, formatted);
+
+        assert_eq!(err.error_code.as_deref(), Some("42601"));
+        assert!(err.driver_id.is_none());
+    }
 
     #[test]
     fn new_defaults_to_error_severity() {
@@ -514,5 +666,133 @@ mod lifetime_tests {
             assert!(state.notifications.error(first_id).is_some());
             assert!(state.notifications.error(second_id).is_some());
         });
+    }
+}
+
+/// The "Send report…" action: drawn when reports may be offered, gone when
+/// the off switch says no, and carrying the closed fields of the error.
+#[cfg(test)]
+mod report_action_tests {
+    use datatab_core::observability::EventSeverity;
+    use datatab_storage::bootstrap::StorageRuntime;
+    use gpui::{AppContext as _, Entity, TestAppContext};
+
+    use super::{ErrorKind, UserFacingError, report_error};
+    use crate::app_state_entity::{AppStateEntity, AppStateGlobal};
+    use crate::report_offer::ReportOfferSeam;
+    use crate::toast::{ToastGlobal, ToastHost};
+
+    fn setup(cx: &mut TestAppContext) -> (Entity<AppStateEntity>, Entity<ToastHost>) {
+        let app_state = cx.update(|cx| {
+            cx.new(|_| {
+                AppStateEntity::new_with_storage_runtime(
+                    StorageRuntime::in_memory().expect("isolated storage runtime"),
+                )
+                .expect("test storage setup")
+            })
+        });
+        let host = cx.update(|cx| {
+            let host = cx.new(|_| ToastHost::new());
+            cx.set_global(ToastGlobal { host: host.clone() });
+            cx.set_global(AppStateGlobal {
+                entity: app_state.clone(),
+            });
+            host
+        });
+        (app_state, host)
+    }
+
+    /// The ids of the buttons the newest toast offers.
+    fn toast_action_ids(host: &Entity<ToastHost>, cx: &TestAppContext) -> Vec<String> {
+        host.read_with(cx, |host, _cx| {
+            let id = host.latest_toast_id().expect("a toast is on screen");
+            host.toast_controls(id)
+                .expect("controls of the newest toast")
+                .actions
+                .into_iter()
+                .map(|action| action.id.to_string())
+                .collect()
+        })
+    }
+
+    #[gpui::test]
+    fn an_error_toast_offers_send_report_when_reports_may_be_offered(cx: &mut TestAppContext) {
+        let (_app_state, host) = setup(cx);
+        cx.update(|cx| cx.set_global(ReportOfferSeam(|_| true)));
+
+        cx.update(|cx| {
+            report_error(
+                UserFacingError::new(ErrorKind::Driver, "query failed").with_driver_id("postgres"),
+                cx,
+            )
+        });
+
+        let ids = toast_action_ids(&host, cx);
+        assert!(ids.contains(&"send-report".to_string()), "{ids:?}");
+    }
+
+    #[gpui::test]
+    fn the_off_switch_takes_send_report_off_the_toast(cx: &mut TestAppContext) {
+        let (_app_state, host) = setup(cx);
+        cx.update(|cx| cx.set_global(ReportOfferSeam(|_| false)));
+
+        cx.update(|cx| report_error(UserFacingError::new(ErrorKind::Storage, "disk full"), cx));
+
+        let ids = toast_action_ids(&host, cx);
+        assert!(!ids.contains(&"send-report".to_string()), "{ids:?}");
+    }
+
+    #[gpui::test]
+    fn without_the_seam_no_toast_offers_a_report(cx: &mut TestAppContext) {
+        let (_app_state, host) = setup(cx);
+
+        cx.update(|cx| report_error(UserFacingError::new(ErrorKind::Storage, "disk full"), cx));
+
+        let ids = toast_action_ids(&host, cx);
+        assert!(!ids.contains(&"send-report".to_string()), "{ids:?}");
+    }
+
+    /// Pressing the action hands the workspace the report request, and only
+    /// the closed fields of the error travel with it.
+    #[gpui::test]
+    fn pressing_send_report_hands_over_the_closed_fields(cx: &mut TestAppContext) {
+        let (app_state, host) = setup(cx);
+        cx.update(|cx| cx.set_global(ReportOfferSeam(|_| true)));
+
+        let error = UserFacingError::new(ErrorKind::Driver, "query failed")
+            .with_severity(EventSeverity::Warn)
+            .with_driver_id("postgres")
+            .with_error_code("42P01");
+        let expected = error.send_report_request();
+        cx.update(|cx| report_error(error, cx));
+
+        let (toast_id, index) = host.read_with(cx, |host, _cx| {
+            let id = host.latest_toast_id().expect("a toast is on screen");
+            let index = host
+                .toast_controls(id)
+                .expect("controls")
+                .actions
+                .iter()
+                .position(|action| action.id == "send-report")
+                .expect("the toast offers Send report");
+            (id, index)
+        });
+
+        cx.update(|cx| ToastHost::run_action(&host, toast_id, index, cx));
+
+        let request =
+            cx.update(|cx| app_state.update(cx, |state, _| state.take_pending_report_window()));
+        assert_eq!(
+            request,
+            Some(crate::app_state_entity::ReportWindowRequest::Error(
+                expected
+            )),
+            "the request carries the closed fields and no free text"
+        );
+        assert_eq!(
+            cx.update(|cx| app_state.update(cx, |state, _| state.take_pending_report_window())),
+            None,
+            "one press hands over one request"
+        );
     }
 }

@@ -142,6 +142,20 @@ impl DataGridPanel {
         self.side_panels_hosted = hosted;
     }
 
+    /// Marks the result rows as the editor's own free-form query result, so
+    /// the grid explains why they cannot be edited. Only the host that knows
+    /// the rows came from a hand-written statement sets this; the instance
+    /// inspector's metric grids and any other `new_for_result` host leave it
+    /// off and get no such explanation.
+    pub fn mark_free_form_query_result(&mut self, cx: &mut Context<Self>) {
+        if self.free_form_query_result {
+            return;
+        }
+
+        self.free_form_query_result = true;
+        cx.notify();
+    }
+
     /// The mode currently displayed in the result view. Alias of
     /// `result_view_mode` used by `ResultPanel` wiring in `DataDocument`.
     pub fn current_result_view_mode(&self) -> ResultViewMode {
